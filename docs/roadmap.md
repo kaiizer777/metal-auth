@@ -1,7 +1,5 @@
 # metal-auth Roadmap
 
-> **Note**: This crate's feature scope mirrors the sibling `go-auth` project.
-
 | Feature | Status | Target | Notes |
 | :--- | :--- | :--- | :--- |
 | Email/Password Auth | Planned | v1 | Argon2id hashing, secure credential validation |

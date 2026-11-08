@@ -1,7 +1,6 @@
 //! # metal-auth
 //!
-//! A composable, honest-about-its-limits authentication library for Rust,
-//! inspired by Better Auth. Sibling project to `go-auth`.
+//! A composable, modular authentication library for Rust.
 //!
 //! This crate follows strict facade discipline: `lib.rs` acts purely as an export
 //! gateway and entrypoint facade. All concrete implementations reside in dedicated

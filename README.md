@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/metal-auth/metal-auth/actions/workflows/ci.yml/badge.svg)](https://github.com/metal-auth/metal-auth/actions)
 
-> **metal-auth** — a composable, honest-about-its-limits authentication library for Rust, inspired by Better Auth. Sibling project to [go-auth](https://github.com/example/go-auth) (Go).
+> **metal-auth** — a composable, modular authentication library for Rust.
 
 ---
 
@@ -22,7 +22,7 @@
 
 ## Project Structure
 
-This project strictly enforces modern Rust module conventions and facade discipline, mirroring its sibling Go project (`go-auth`):
+This project strictly enforces modern Rust module conventions and facade discipline:
 
 ```text
 metal-auth/

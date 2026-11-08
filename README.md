@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/metal-auth.svg)](https://crates.io/crates/metal-auth)
 [![Documentation](https://docs.rs/metal-auth/badge.svg)](https://docs.rs/metal-auth)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![CI](https://github.com/metal-auth/metal-auth/actions/workflows/ci.yml/badge.svg)](https://github.com/metal-auth/metal-auth/actions)
+[![CI](https://img.shields.io/badge/CI-planned-lightgrey)](https://github.com/kaiizer777/metal-auth/actions)
 
 > **metal-auth** — a composable, modular authentication library for Rust.
 

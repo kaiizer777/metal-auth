@@ -1,4 +1,4 @@
-# **metal-auth** — A composable, modular authentication library for Rust.
+# **Metal-Auth** — A composable, modular authentication library for Rust.
 
 [![Crates.io](https://img.shields.io/crates/v/metal-auth.svg)](https://crates.io/crates/metal-auth)
 [![Documentation](https://docs.rs/metal-auth/badge.svg)](https://docs.rs/metal-auth)

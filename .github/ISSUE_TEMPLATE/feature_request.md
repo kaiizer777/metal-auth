@@ -15,8 +15,8 @@ A clear and concise description of what you want to happen.
 **Describe alternatives you've considered**
 A clear and concise description of any alternative solutions or features you've considered.
 
-**Scope & Roadmap Alignment**
-Does this align with [docs/roadmap.md](../../docs/roadmap.md) or should it be considered for [docs/not-in-v1.md](../../docs/not-in-v1.md)?
+**Scope Alignment**
+Does this align with metal-auth's core goals as a modular, lightweight authentication library?
 
 **Additional context**
 Add any other context or screenshots about the feature request here.

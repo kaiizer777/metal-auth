@@ -15,11 +15,6 @@
 
 ---
 
-## Scope & Roadmap
-
-- [Roadmap](docs/roadmap.md) — Planned v1 features and release targets.
-- [Not in v1](docs/not-in-v1.md) — Features intentionally deferred to v2+ (e.g. WebAuthn, 2FA/TOTP, SAML/SCIM).
-
 ## Project Structure
 
 This project strictly enforces modern Rust module conventions and facade discipline:
@@ -43,9 +38,7 @@ metal-auth/
 │       └── credential_password.rs # Email/password authentication plugin
 ├── examples/
 │   └── basic_axum.rs          # Basic example integration with Axum
-└── docs/
-    ├── roadmap.md             # v1 Scope tracking
-    └── not-in-v1.md           # Out-of-scope / deferred feature list
+└── docs/                      # Documentation and architecture guides
 ```
 
 ### Why this structure?

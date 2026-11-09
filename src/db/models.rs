@@ -50,7 +50,10 @@ impl From<&User> for UserResponse {
 }
 
 /// Session entity stored with a cryptographic hash of the session token.
-#[derive(Debug, Clone, Serialize, FromRow, PartialEq, Eq)]
+///
+/// Intentionally does NOT derive `Serialize` to prevent `token_hash`
+/// from leaking across API responses.
+#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
 pub struct Session {
     pub id: Uuid,
     pub user_id: Uuid,
@@ -61,7 +64,10 @@ pub struct Session {
 }
 
 /// Single-use email verification token entity.
-#[derive(Debug, Clone, Serialize, FromRow, PartialEq, Eq)]
+///
+/// Intentionally does NOT derive `Serialize` to prevent `token_hash`
+/// from leaking across API responses.
+#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
 pub struct VerificationToken {
     pub id: Uuid,
     pub user_id: Uuid,
@@ -72,7 +78,10 @@ pub struct VerificationToken {
 }
 
 /// Single-use password reset token entity.
-#[derive(Debug, Clone, Serialize, FromRow, PartialEq, Eq)]
+///
+/// Intentionally does NOT derive `Serialize` to prevent `token_hash`
+/// from leaking across API responses.
+#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
 pub struct PasswordResetToken {
     pub id: Uuid,
     pub user_id: Uuid,

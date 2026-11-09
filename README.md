@@ -53,10 +53,15 @@ Coming soon (not yet published to crates.io).
 metal-auth = "0.1.0" # Not yet published
 ```
 
+---
+
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and development workflow. Please review our [Code of Conduct](CODE_OF_CONDUCT.md).
+Please review [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines, code style, and architectural boundaries.
+All contributors are expected to uphold the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+---
 
 ## License
 
-Distributed under the [MIT License](LICENSE).
+This project is licensed under the [MIT License](LICENSE).

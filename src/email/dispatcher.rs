@@ -6,13 +6,11 @@ use tracing::{error, warn};
 use crate::email::hook::SharedEmailSender;
 use crate::email::payload::{PasswordResetEmailPayload, VerificationEmailPayload};
 
-#[allow(dead_code)]
-fn build_verification_url(base_url: &str, token: &str) -> String {
+pub fn build_verification_url(base_url: &str, token: &str) -> String {
     format!("{}/auth/verify/email?token={}", base_url, token)
 }
 
-#[allow(dead_code)]
-fn build_reset_url(base_url: &str, token: &str) -> String {
+pub fn build_reset_url(base_url: &str, token: &str) -> String {
     format!("{}/auth/password/reset?token={}", base_url, token)
 }
 
@@ -32,10 +30,21 @@ impl EmailDispatcher {
         }
     }
 
-    pub async fn dispatch_verification(&self, payload: VerificationEmailPayload) {
+    pub fn build_verification_url(base_url: &str, token: &str) -> String {
+        build_verification_url(base_url, token)
+    }
+
+    pub fn build_reset_url(base_url: &str, token: &str) -> String {
+        build_reset_url(base_url, token)
+    }
+
+    pub async fn dispatch_verification(
+        &self,
+        payload: VerificationEmailPayload,
+    ) -> tokio::task::JoinHandle<()> {
         let Some(sender) = self.sender.clone() else {
             warn!("no email sender configured; dropping verification email");
-            return;
+            return tokio::spawn(async {});
         };
         let timeout = self.timeout;
 
@@ -50,18 +59,22 @@ impl EmailDispatcher {
                     }
                     Ok(Ok(())) => {}
                 }
-            });
+            })
         } else {
             if let Err(e) = sender.send_verification_email(payload).await {
                 error!(op = "verification", err = %e, "email dispatch failed");
             }
+            tokio::spawn(async {})
         }
     }
 
-    pub async fn dispatch_password_reset(&self, payload: PasswordResetEmailPayload) {
+    pub async fn dispatch_password_reset(
+        &self,
+        payload: PasswordResetEmailPayload,
+    ) -> tokio::task::JoinHandle<()> {
         let Some(sender) = self.sender.clone() else {
             warn!("no email sender configured; dropping password reset email");
-            return;
+            return tokio::spawn(async {});
         };
         let timeout = self.timeout;
 
@@ -77,11 +90,12 @@ impl EmailDispatcher {
                     }
                     Ok(Ok(())) => {}
                 }
-            });
+            })
         } else {
             if let Err(e) = sender.send_password_reset_email(payload).await {
                 error!(op = "password_reset", err = %e, "email dispatch failed");
             }
+            tokio::spawn(async {})
         }
     }
 }
@@ -93,5 +107,26 @@ impl fmt::Debug for EmailDispatcher {
             .field("async_dispatch", &self.async_dispatch)
             .field("sender", &self.sender.is_some())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_verification_url() {
+        assert_eq!(
+            build_verification_url("https://example.com", "token-123"),
+            "https://example.com/auth/verify/email?token=token-123"
+        );
+    }
+
+    #[test]
+    fn test_build_reset_url() {
+        assert_eq!(
+            build_reset_url("https://example.com", "token-456"),
+            "https://example.com/auth/password/reset?token=token-456"
+        );
     }
 }

@@ -4,12 +4,10 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use metal_auth::email::hook::LocalEmailSender;
 use metal_auth::{
     Config, ConfigError, EmailDispatcher, PasswordResetEmailPayload, SharedEmailSender,
     VerificationEmailPayload,
 };
-use serde_json;
 use tokio::time::sleep;
 use tracing::Level;
 use uuid::Uuid;
@@ -80,10 +78,7 @@ impl metal_auth::EmailSender for MockSender {
         }
         this.captured_v.lock().unwrap().replace(payload);
         if this.fail {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "boom",
-            )));
+            return Err(Box::new(std::io::Error::other("boom")));
         }
         Ok(())
     }
@@ -98,10 +93,7 @@ impl metal_auth::EmailSender for MockSender {
         }
         this.captured_r.lock().unwrap().replace(payload);
         if this.fail {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "boom",
-            )));
+            return Err(Box::new(std::io::Error::other("boom")));
         }
         Ok(())
     }
@@ -142,9 +134,9 @@ fn payload_serialization_roundtrip() {
 
 #[tokio::test]
 async fn full_payload_assertion() {
+    let _guard = LOG_LOCK.lock().await;
     init_logs();
     clear_logs();
-    let _guard = LOG_LOCK.lock().await;
     let captured = Arc::new(Mutex::new(None));
     let mock = MockSender {
         delay_ms: 0,
@@ -156,8 +148,8 @@ async fn full_payload_assertion() {
     let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_secs(10), true);
 
     let payload = sample_verification();
-    dispatcher.dispatch_verification(payload.clone()).await;
-    sleep(Duration::from_millis(50)).await;
+    let handle = dispatcher.dispatch_verification(payload.clone()).await;
+    handle.await.unwrap();
 
     let got = captured.lock().unwrap().clone().unwrap();
     assert_eq!(got.user_id, payload.user_id);
@@ -169,9 +161,9 @@ async fn full_payload_assertion() {
 
 #[tokio::test]
 async fn full_reset_payload_assertion() {
+    let _guard = LOG_LOCK.lock().await;
     init_logs();
     clear_logs();
-    let _guard = LOG_LOCK.lock().await;
     let captured = Arc::new(Mutex::new(None));
     let mock = MockSender {
         delay_ms: 0,
@@ -183,8 +175,8 @@ async fn full_reset_payload_assertion() {
     let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_secs(10), true);
 
     let payload = sample_reset();
-    dispatcher.dispatch_password_reset(payload.clone()).await;
-    sleep(Duration::from_millis(50)).await;
+    let handle = dispatcher.dispatch_password_reset(payload.clone()).await;
+    handle.await.unwrap();
 
     let got = captured.lock().unwrap().clone().unwrap();
     assert_eq!(got.user_id, payload.user_id);
@@ -196,9 +188,9 @@ async fn full_reset_payload_assertion() {
 
 #[tokio::test]
 async fn sync_dispatch_awaits_and_logs_error() {
+    let _guard = LOG_LOCK.lock().await;
     init_logs();
     clear_logs();
-    let _guard = LOG_LOCK.lock().await;
     let captured = Arc::new(Mutex::new(None));
     let mock = MockSender {
         delay_ms: 0,
@@ -209,30 +201,33 @@ async fn sync_dispatch_awaits_and_logs_error() {
     let sender: SharedEmailSender = Arc::new(mock);
     let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_secs(10), false);
 
-    dispatcher
+    let handle = dispatcher
         .dispatch_verification(sample_verification())
         .await;
+    handle.await.unwrap();
     assert!(log_text().contains("email dispatch failed"));
 }
 
 #[tokio::test]
 async fn none_sender_warns_no_panic() {
+    let _guard = LOG_LOCK.lock().await;
     init_logs();
     clear_logs();
-    let _guard = LOG_LOCK.lock().await;
     let dispatcher = EmailDispatcher::new(None, Duration::from_secs(10), true);
-    dispatcher
+    let h1 = dispatcher
         .dispatch_verification(sample_verification())
         .await;
-    dispatcher.dispatch_password_reset(sample_reset()).await;
+    h1.await.unwrap();
+    let h2 = dispatcher.dispatch_password_reset(sample_reset()).await;
+    h2.await.unwrap();
     assert!(log_text().contains("no email sender configured"));
 }
 
 #[tokio::test]
 async fn hook_returns_err_is_logged() {
+    let _guard = LOG_LOCK.lock().await;
     init_logs();
     clear_logs();
-    let _guard = LOG_LOCK.lock().await;
     let captured = Arc::new(Mutex::new(None));
     let mock = MockSender {
         delay_ms: 0,
@@ -242,18 +237,18 @@ async fn hook_returns_err_is_logged() {
     };
     let sender: SharedEmailSender = Arc::new(mock);
     let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_secs(10), true);
-    dispatcher
+    let handle = dispatcher
         .dispatch_verification(sample_verification())
         .await;
-    sleep(Duration::from_millis(100)).await;
+    handle.await.unwrap();
     assert!(log_text().contains("email dispatch failed"));
 }
 
 #[tokio::test]
 async fn async_dispatch_non_blocking() {
+    let _guard = LOG_LOCK.lock().await;
     init_logs();
     clear_logs();
-    let _guard = LOG_LOCK.lock().await;
     let captured = Arc::new(Mutex::new(None));
     let mock = MockSender {
         delay_ms: 500,
@@ -265,17 +260,18 @@ async fn async_dispatch_non_blocking() {
     let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_secs(10), true);
 
     let start = Instant::now();
-    dispatcher
+    let handle = dispatcher
         .dispatch_verification(sample_verification())
         .await;
     assert!(start.elapsed() < Duration::from_millis(100));
+    handle.await.unwrap();
 }
 
 #[tokio::test]
 async fn timeout_does_not_panic() {
+    let _guard = LOG_LOCK.lock().await;
     init_logs();
     clear_logs();
-    let _guard = LOG_LOCK.lock().await;
     let captured = Arc::new(Mutex::new(None));
     let mock = MockSender {
         delay_ms: 200,
@@ -285,10 +281,10 @@ async fn timeout_does_not_panic() {
     };
     let sender: SharedEmailSender = Arc::new(mock);
     let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_millis(50), true);
-    dispatcher
+    let handle = dispatcher
         .dispatch_verification(sample_verification())
         .await;
-    sleep(Duration::from_millis(150)).await;
+    handle.await.unwrap();
     assert!(log_text().contains("timed out"));
 }
 
@@ -310,4 +306,22 @@ fn empty_base_url_rejected() {
         cfg.validate(),
         Err(ConfigError::MissingEnvVar("BASE_URL"))
     ));
+}
+
+#[test]
+fn build_verification_url_formatting() {
+    let url = EmailDispatcher::build_verification_url("https://auth.example.com", "token-xyz");
+    assert_eq!(
+        url,
+        "https://auth.example.com/auth/verify/email?token=token-xyz"
+    );
+}
+
+#[test]
+fn build_reset_url_formatting() {
+    let url = EmailDispatcher::build_reset_url("https://auth.example.com", "token-abc");
+    assert_eq!(
+        url,
+        "https://auth.example.com/auth/password/reset?token=token-abc"
+    );
 }

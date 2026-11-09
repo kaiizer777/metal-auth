@@ -1,11 +1,11 @@
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::time::Duration;
 
-use crate::config::Config;
+use crate::{config::Config, error::AppError};
 
 pub mod models;
 
-pub async fn init_pool(cfg: &Config) -> Result<PgPool, sqlx::Error> {
+pub async fn init_pool(cfg: &Config) -> Result<PgPool, AppError> {
     let pool = PgPoolOptions::new()
         .max_connections(cfg.max_connections)
         .min_connections(cfg.min_connections)
@@ -14,10 +14,21 @@ pub async fn init_pool(cfg: &Config) -> Result<PgPool, sqlx::Error> {
         .await
         .map_err(|e| {
             tracing::error!("Failed to connect to database: {e}");
-            e
+            match e {
+                sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut | sqlx::Error::Tls(_) => {
+                    AppError::DatabaseUnavailable(e)
+                }
+                other => AppError::Database(other),
+            }
         })?;
 
-    sqlx::migrate!("./migrations").run(&pool).await?;
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("Database migration failed: {e}");
+            AppError::Migration(e)
+        })?;
 
     Ok(pool)
 }

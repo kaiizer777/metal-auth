@@ -1,11 +1,13 @@
+use std::str::FromStr;
+
 use axum::{
     body::Body,
     http::{Method, Request, StatusCode, header},
 };
 use chrono::Utc;
 use metal_auth::{
-    AppError, AppState, Auth, Config, PasswordResetToken, Session, User, UserResponse,
-    VerificationToken,
+    AppError, AppState, Auth, Config, ConfigError, ErrorCode, ErrorResponse, PasswordResetToken,
+    Session, User, UserResponse, VerificationToken,
 };
 use sqlx::PgPool;
 use tower::Service;
@@ -27,7 +29,7 @@ async fn test_auth_facade_and_router_boot() {
     let state = AppState::new(pool, cfg);
     let mut auth = Auth::from_state(state).unwrap();
 
-    // 1. Unknown route returns 404
+    // 1. Unknown route returns 404 with standardized error response envelope
     let req = Request::builder()
         .uri("/unknown-route")
         .method(Method::GET)
@@ -36,6 +38,11 @@ async fn test_auth_facade_and_router_boot() {
 
     let resp = auth.router.call(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    let err_envelope: ErrorResponse = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(err_envelope.code, ErrorCode::NotFound);
+    assert_eq!(err_envelope.message, "Not found");
 
     // 2. Preflight OPTIONS request handled by CORS layer
     let preflight_req = Request::builder()
@@ -95,7 +102,7 @@ async fn test_auth_new_fails_gracefully_on_invalid_db() {
     };
 
     let result = Auth::new(cfg).await;
-    assert!(result.is_err());
+    assert!(matches!(result, Err(AppError::DatabaseUnavailable(_))));
 }
 
 #[test]
@@ -150,11 +157,70 @@ fn test_facade_re_exported_models_contract() {
 
 #[test]
 fn test_facade_re_exported_error_contract() {
+    use std::error::Error;
+
     let not_found = AppError::NotFound;
-    let internal = AppError::Internal("test reason".into());
+    let internal = AppError::Internal;
 
     assert_eq!(not_found.to_string(), "not found");
     assert_eq!(internal.to_string(), "internal error");
+
+    assert_eq!(ErrorCode::NotFound, ErrorCode::NotFound);
+    let resp = ErrorResponse {
+        code: ErrorCode::NotFound,
+        message: "Not found".to_string(),
+    };
+    assert_eq!(resp.code, ErrorCode::NotFound);
+
+    let cfg_err = ConfigError::MissingEnvVar("DATABASE_URL");
+    assert_eq!(
+        cfg_err.to_string(),
+        "missing environment variable: DATABASE_URL"
+    );
+
+    let unicode_err = ConfigError::NonUnicodeEnvVar("DATABASE_URL");
+    assert_eq!(
+        unicode_err.to_string(),
+        "environment variable is not valid unicode: DATABASE_URL"
+    );
+
+    let parse_err: Result<u16, _> = "invalid-port".parse();
+    let port_err = ConfigError::InvalidPort(parse_err.unwrap_err());
+    assert_eq!(port_err.to_string(), "invalid port");
+    assert!(port_err.source().is_some());
+
+    let origin_err = ConfigError::InvalidOrigin {
+        value: "bad\norigin".to_string(),
+        source: axum::http::HeaderValue::from_str("bad\norigin").unwrap_err(),
+    };
+    assert_eq!(origin_err.to_string(), "invalid CORS origin: bad\norigin");
+    assert!(origin_err.source().is_some());
+
+    let method_err = ConfigError::InvalidMethod {
+        value: "BAD METHOD".to_string(),
+        source: axum::http::Method::from_str("BAD METHOD").unwrap_err(),
+    };
+    assert_eq!(method_err.to_string(), "invalid CORS method: BAD METHOD");
+    assert!(method_err.source().is_some());
+
+    let header_err = ConfigError::InvalidHeader {
+        value: "Bad Header".to_string(),
+        source: axum::http::header::HeaderName::from_str("Bad Header").unwrap_err(),
+    };
+    assert_eq!(header_err.to_string(), "invalid CORS header: Bad Header");
+    assert!(header_err.source().is_some());
+
+    let app_cfg_err = AppError::Config(ConfigError::MissingEnvVar("DATABASE_URL"));
+    assert_eq!(app_cfg_err.to_string(), "configuration error");
+    assert!(app_cfg_err.source().is_some());
+
+    let app_db_err = AppError::Database(sqlx::Error::RowNotFound);
+    assert_eq!(app_db_err.to_string(), "database error");
+    assert!(app_db_err.source().is_some());
+
+    let app_db_unavail = AppError::DatabaseUnavailable(sqlx::Error::PoolTimedOut);
+    assert_eq!(app_db_unavail.to_string(), "database unavailable");
+    assert!(app_db_unavail.source().is_some());
 }
 
 #[tokio::test]
@@ -172,5 +238,43 @@ async fn test_auth_boot_fails_fast_on_invalid_cors() {
     let pool = PgPool::connect_lazy(&cfg.database_url).expect("lazy pool creation");
     let state = AppState::new(pool, cfg);
     let result = Auth::from_state(state);
-    assert!(result.is_err());
+    assert!(matches!(
+        result,
+        Err(AppError::Config(ConfigError::InvalidOrigin { ref value, .. })) if value == "invalid\norigin"
+    ));
+}
+
+#[tokio::test]
+async fn test_auth_new_fails_fast_on_invalid_cors_before_db() {
+    let cfg = Config {
+        database_url: "not-a-valid-database-url".into(),
+        port: 3000,
+        allowed_origins: vec!["invalid\norigin".into()],
+        allowed_methods: vec!["GET".into()],
+        allowed_headers: vec!["Content-Type".into()],
+        max_connections: 2,
+        min_connections: 1,
+    };
+
+    let result = Auth::new(cfg).await;
+    assert!(matches!(
+        result,
+        Err(AppError::Config(ConfigError::InvalidOrigin { ref value, .. })) if value == "invalid\norigin"
+    ));
+}
+
+#[tokio::test]
+async fn test_auth_new_fails_with_database_error_on_malformed_url() {
+    let cfg = Config {
+        database_url: "not-a-valid-database-url".into(),
+        port: 3000,
+        allowed_origins: vec![],
+        allowed_methods: vec!["GET".into()],
+        allowed_headers: vec!["Content-Type".into()],
+        max_connections: 2,
+        min_connections: 1,
+    };
+
+    let result = Auth::new(cfg).await;
+    assert!(matches!(result, Err(AppError::Database(_))));
 }

@@ -4,8 +4,8 @@ use axum::{
 };
 use chrono::Utc;
 use metal_auth::{
-    AppError, AppState, Auth, Config, PasswordResetToken, Session, User, UserResponse,
-    VerificationToken,
+    AppError, AppState, Auth, Config, ConfigError, ErrorCode, ErrorResponse, PasswordResetToken,
+    Session, User, UserResponse, VerificationToken,
 };
 use sqlx::PgPool;
 use tower::Service;
@@ -27,7 +27,7 @@ async fn test_auth_facade_and_router_boot() {
     let state = AppState::new(pool, cfg);
     let mut auth = Auth::from_state(state).unwrap();
 
-    // 1. Unknown route returns 404
+    // 1. Unknown route returns 404 with standardized error response envelope
     let req = Request::builder()
         .uri("/unknown-route")
         .method(Method::GET)
@@ -36,6 +36,11 @@ async fn test_auth_facade_and_router_boot() {
 
     let resp = auth.router.call(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    let err_envelope: ErrorResponse = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(err_envelope.code, ErrorCode::NotFound);
+    assert_eq!(err_envelope.message, "Not found");
 
     // 2. Preflight OPTIONS request handled by CORS layer
     let preflight_req = Request::builder()
@@ -95,7 +100,7 @@ async fn test_auth_new_fails_gracefully_on_invalid_db() {
     };
 
     let result = Auth::new(cfg).await;
-    assert!(result.is_err());
+    assert!(matches!(result, Err(AppError::DatabaseUnavailable(_))));
 }
 
 #[test]
@@ -151,10 +156,27 @@ fn test_facade_re_exported_models_contract() {
 #[test]
 fn test_facade_re_exported_error_contract() {
     let not_found = AppError::NotFound;
-    let internal = AppError::Internal("test reason".into());
+    let internal = AppError::Internal;
 
     assert_eq!(not_found.to_string(), "not found");
     assert_eq!(internal.to_string(), "internal error");
+
+    assert_eq!(ErrorCode::NotFound, ErrorCode::NotFound);
+    let resp = ErrorResponse {
+        code: ErrorCode::NotFound,
+        message: "Not found".to_string(),
+    };
+    assert_eq!(resp.code, ErrorCode::NotFound);
+
+    let cfg_err = ConfigError::MissingEnvVar("DATABASE_URL");
+    assert_eq!(
+        cfg_err.to_string(),
+        "missing environment variable: DATABASE_URL"
+    );
+
+    let parse_err: Result<u16, _> = "invalid-port".parse();
+    let port_err = ConfigError::InvalidPort(parse_err.unwrap_err());
+    assert!(port_err.to_string().starts_with("invalid port:"));
 }
 
 #[tokio::test]
@@ -172,5 +194,8 @@ async fn test_auth_boot_fails_fast_on_invalid_cors() {
     let pool = PgPool::connect_lazy(&cfg.database_url).expect("lazy pool creation");
     let state = AppState::new(pool, cfg);
     let result = Auth::from_state(state);
-    assert!(result.is_err());
+    assert!(matches!(
+        result,
+        Err(AppError::Config(ConfigError::InvalidOrigin(_)))
+    ));
 }

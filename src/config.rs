@@ -1,5 +1,7 @@
 use std::str::FromStr;
 
+use crate::error::ConfigError;
+
 pub const DEFAULT_PORT: u16 = 3000;
 pub const DEFAULT_MAX_CONNECTIONS: u32 = 25;
 pub const DEFAULT_MIN_CONNECTIONS: u32 = 2;
@@ -34,31 +36,32 @@ impl std::fmt::Debug for Config {
 }
 
 impl Config {
-    pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn validate(&self) -> Result<(), ConfigError> {
         for origin in &self.allowed_origins {
             let trimmed = origin.trim();
             if trimmed != "*" {
                 axum::http::HeaderValue::from_str(trimmed)
-                    .map_err(|e| format!("invalid CORS origin '{origin}': {e}"))?;
+                    .map_err(ConfigError::InvalidOrigin)?;
             }
         }
         for method in &self.allowed_methods {
             axum::http::Method::from_str(method.trim())
-                .map_err(|e| format!("invalid CORS method '{method}': {e}"))?;
+                .map_err(ConfigError::InvalidMethod)?;
         }
         for header in &self.allowed_headers {
             axum::http::header::HeaderName::from_str(header.trim())
-                .map_err(|e| format!("invalid CORS header '{header}': {e}"))?;
+                .map_err(ConfigError::InvalidHeader)?;
         }
         Ok(())
     }
 
-    pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn from_env() -> Result<Self, ConfigError> {
         dotenvy::dotenv().ok();
 
-        let database_url = std::env::var("DATABASE_URL")?;
+        let database_url = std::env::var("DATABASE_URL")
+            .map_err(|_| ConfigError::MissingEnvVar("DATABASE_URL"))?;
         let port = match std::env::var("PORT") {
-            Ok(val) => val.parse::<u16>()?,
+            Ok(val) => val.parse::<u16>().map_err(ConfigError::InvalidPort)?,
             Err(_) => DEFAULT_PORT,
         };
 
@@ -182,7 +185,7 @@ mod tests {
             max_connections: 5,
             min_connections: 1,
         };
-        assert!(cfg.validate().is_err());
+        assert!(matches!(cfg.validate(), Err(ConfigError::InvalidOrigin(_))));
     }
 
     #[test]
@@ -196,7 +199,7 @@ mod tests {
             max_connections: 5,
             min_connections: 1,
         };
-        assert!(cfg.validate().is_err());
+        assert!(matches!(cfg.validate(), Err(ConfigError::InvalidMethod(_))));
     }
 
     #[test]
@@ -210,6 +213,6 @@ mod tests {
             max_connections: 5,
             min_connections: 1,
         };
-        assert!(cfg.validate().is_err());
+        assert!(matches!(cfg.validate(), Err(ConfigError::InvalidHeader(_))));
     }
 }

@@ -2,6 +2,7 @@
 //!
 //! A composable, modular authentication library for Rust.
 
+pub mod auth;
 pub mod config;
 pub mod db;
 pub mod error;
@@ -13,26 +14,8 @@ pub mod email;
 pub mod oauth;
 pub mod session;
 
+pub use auth::Auth;
 pub use config::Config;
 pub use db::models::*;
-pub use error::AppError;
+pub use error::{AppError, ConfigError, ErrorCode, ErrorResponse};
 pub use state::AppState;
-
-#[derive(Clone)]
-pub struct Auth {
-    pub router: axum::Router,
-}
-
-impl Auth {
-    pub async fn new(cfg: Config) -> Result<Self, Box<dyn std::error::Error>> {
-        let pool = db::init_pool(&cfg).await?;
-        let state = AppState { pool, config: cfg };
-        let router = handler::create_router(state)?;
-        Ok(Self { router })
-    }
-
-    pub fn from_state(state: AppState) -> Result<Self, Box<dyn std::error::Error>> {
-        let router = handler::create_router(state)?;
-        Ok(Self { router })
-    }
-}

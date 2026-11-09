@@ -5,7 +5,7 @@ use axum::http::{
 use std::str::FromStr;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
-use crate::config::Config;
+use crate::{config::Config, error::ConfigError};
 
 /// Construct a `CorsLayer` from the application configuration.
 ///
@@ -14,15 +14,14 @@ use crate::config::Config;
 /// for cookie session support.
 ///
 /// Returns an error if any origin, method, or header in `cfg` cannot be parsed.
-pub fn cors_layer(cfg: &Config) -> Result<CorsLayer, Box<dyn std::error::Error>> {
+pub fn cors_layer(cfg: &Config) -> Result<CorsLayer, ConfigError> {
     let mut origins = Vec::with_capacity(cfg.allowed_origins.len());
     for raw in &cfg.allowed_origins {
         let trimmed = raw.trim();
         if trimmed == "*" {
             continue;
         }
-        let val = HeaderValue::from_str(trimmed)
-            .map_err(|e| format!("invalid CORS origin '{raw}': {e}"))?;
+        let val = HeaderValue::from_str(trimmed).map_err(ConfigError::InvalidOrigin)?;
         origins.push(val);
     }
 
@@ -34,15 +33,13 @@ pub fn cors_layer(cfg: &Config) -> Result<CorsLayer, Box<dyn std::error::Error>>
 
     let mut methods = Vec::with_capacity(cfg.allowed_methods.len());
     for raw in &cfg.allowed_methods {
-        let method = Method::from_str(raw.trim())
-            .map_err(|e| format!("invalid CORS method '{raw}': {e}"))?;
+        let method = Method::from_str(raw.trim()).map_err(ConfigError::InvalidMethod)?;
         methods.push(method);
     }
 
     let mut headers = Vec::with_capacity(cfg.allowed_headers.len());
     for raw in &cfg.allowed_headers {
-        let header = HeaderName::from_str(raw.trim())
-            .map_err(|e| format!("invalid CORS header '{raw}': {e}"))?;
+        let header = HeaderName::from_str(raw.trim()).map_err(ConfigError::InvalidHeader)?;
         headers.push(header);
     }
 
@@ -220,8 +217,10 @@ mod tests {
             min_connections: 1,
         };
 
-        let err = cors_layer(&cfg).unwrap_err();
-        assert!(err.to_string().contains("invalid CORS origin"));
+        assert!(matches!(
+            cors_layer(&cfg),
+            Err(ConfigError::InvalidOrigin(_))
+        ));
     }
 
     #[test]
@@ -236,8 +235,10 @@ mod tests {
             min_connections: 1,
         };
 
-        let err = cors_layer(&cfg).unwrap_err();
-        assert!(err.to_string().contains("invalid CORS method"));
+        assert!(matches!(
+            cors_layer(&cfg),
+            Err(ConfigError::InvalidMethod(_))
+        ));
     }
 
     #[test]
@@ -252,7 +253,9 @@ mod tests {
             min_connections: 1,
         };
 
-        let err = cors_layer(&cfg).unwrap_err();
-        assert!(err.to_string().contains("invalid CORS header"));
+        assert!(matches!(
+            cors_layer(&cfg),
+            Err(ConfigError::InvalidHeader(_))
+        ));
     }
 }

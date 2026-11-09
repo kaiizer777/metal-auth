@@ -7,6 +7,7 @@ pub mod crypto;
 pub mod db;
 pub mod email;
 pub mod error;
+pub mod handler;
 pub mod oauth;
 pub mod session;
 pub mod state;

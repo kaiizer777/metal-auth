@@ -26,10 +26,7 @@ pub struct Auth {
 impl Auth {
     pub async fn new(cfg: Config) -> Result<Self, Box<dyn std::error::Error>> {
         let pool = db::init_pool(&cfg).await?;
-        let state = AppState {
-            pool,
-            config: cfg,
-        };
+        let state = AppState { pool, config: cfg };
         let router = handler::create_router(state)?;
         Ok(Self { router })
     }

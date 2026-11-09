@@ -1,5 +1,5 @@
+use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::time::Duration;
-use sqlx::{postgres::PgPoolOptions, PgPool};
 
 use crate::config::Config;
 
@@ -17,9 +17,7 @@ pub async fn init_pool(cfg: &Config) -> Result<PgPool, sqlx::Error> {
             e
         })?;
 
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await?;
+    sqlx::migrate!("./migrations").run(&pool).await?;
 
     Ok(pool)
 }

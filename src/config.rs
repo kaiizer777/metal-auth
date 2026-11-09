@@ -145,9 +145,8 @@ mod tests {
         assert!(parse_allowed_origins_str("   ,   , ").is_empty());
         assert!(parse_allowed_origins_str("   ,   /   , ///, ").is_empty());
 
-        let parsed = parse_allowed_origins_str(
-            "https://app1.com/, https://app2.com , https://app3.com///",
-        );
+        let parsed =
+            parse_allowed_origins_str("https://app1.com/, https://app2.com , https://app3.com///");
         assert_eq!(
             parsed,
             vec![

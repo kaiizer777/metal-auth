@@ -1,8 +1,8 @@
-use std::str::FromStr;
 use axum::http::{
-    header::{HeaderName, HeaderValue},
     Method,
+    header::{HeaderName, HeaderValue},
 };
+use std::str::FromStr;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
 use crate::config::Config;
@@ -57,10 +57,10 @@ pub fn cors_layer(cfg: &Config) -> Result<CorsLayer, Box<dyn std::error::Error>>
 mod tests {
     use super::*;
     use axum::{
-        body::Body,
-        http::{header, Request, StatusCode},
-        routing::get,
         Router,
+        body::Body,
+        http::{Request, StatusCode, header},
+        routing::get,
     };
     use tower::Service;
 
@@ -89,7 +89,11 @@ mod tests {
 
         let resp = app.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+        assert!(
+            resp.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -197,7 +201,11 @@ mod tests {
 
         let resp = app.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+        assert!(
+            resp.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
     }
 
     #[test]

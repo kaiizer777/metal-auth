@@ -20,21 +20,37 @@ pub enum AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, message) = match &self {
-            AppError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal error"),
-            AppError::NotFound => (StatusCode::NOT_FOUND, "Not found"),
-            AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal error"),
+            AppError::Database(err) => {
+                tracing::error!(error = %err, "internal database error");
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
+            }
+            AppError::NotFound => {
+                tracing::debug!("resource not found");
+                (StatusCode::NOT_FOUND, "Not found")
+            }
+            AppError::Internal(msg) => {
+                tracing::error!(error = %msg, "internal error");
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
+            }
         };
 
-        tracing::error!("{:?}", self);
         (status, Json(json!({ "error": message }))).into_response()
     }
 }
 
-#[test]
-fn test_app_error_status_codes() {
-    let not_found_resp = AppError::NotFound.into_response();
-    assert_eq!(not_found_resp.status(), StatusCode::NOT_FOUND);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let internal_resp = AppError::Internal("disk full".into()).into_response();
-    assert_eq!(internal_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    #[test]
+    fn test_app_error_status_codes() {
+        let not_found_resp = AppError::NotFound.into_response();
+        assert_eq!(not_found_resp.status(), StatusCode::NOT_FOUND);
+
+        let internal_resp = AppError::Internal("disk full".into()).into_response();
+        assert_eq!(internal_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let db_resp = AppError::Database(sqlx::Error::RowNotFound).into_response();
+        assert_eq!(db_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }

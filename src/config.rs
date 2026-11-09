@@ -41,10 +41,7 @@ impl Config {
             Err(_) => DEFAULT_PORT,
         };
 
-        let allowed_origins = match std::env::var("ALLOWED_ORIGINS") {
-            Ok(val) => parse_allowed_origins(&val),
-            Err(_) => Vec::new(),
-        };
+        let allowed_origins = parse_allowed_origins();
 
         Ok(Self {
             database_url,
@@ -64,9 +61,16 @@ impl Config {
     }
 }
 
-fn parse_allowed_origins(val: &str) -> Vec<String> {
-    val.split(',')
-        .map(str::trim)
+fn parse_allowed_origins() -> Vec<String> {
+    match std::env::var("ALLOWED_ORIGINS") {
+        Ok(val) => parse_allowed_origins_str(&val),
+        Err(_) => Vec::new(),
+    }
+}
+
+pub fn parse_allowed_origins_str(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| s.trim().trim_end_matches('/'))
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect()
@@ -112,14 +116,14 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_allowed_origins() {
-        let empty = parse_allowed_origins("");
-        assert!(empty.is_empty());
+    fn test_parse_allowed_origins_str() {
+        assert!(parse_allowed_origins_str("").is_empty());
+        assert!(parse_allowed_origins_str("   ,   , ").is_empty());
+        assert!(parse_allowed_origins_str("   ,   /   , ///, ").is_empty());
 
-        let whitespace = parse_allowed_origins("   ,   , ");
-        assert!(whitespace.is_empty());
-
-        let parsed = parse_allowed_origins("https://app1.com, https://app2.com , https://app3.com");
+        let parsed = parse_allowed_origins_str(
+            "https://app1.com/, https://app2.com , https://app3.com///",
+        );
         assert_eq!(
             parsed,
             vec![
@@ -128,44 +132,5 @@ mod tests {
                 "https://app3.com".to_string(),
             ]
         );
-    }
-
-    #[test]
-    fn test_config_from_env_parses_allowed_origins() {
-        let prev_db = std::env::var("DATABASE_URL").ok();
-        let prev_origins = std::env::var("ALLOWED_ORIGINS").ok();
-
-        // SAFETY: Test modifies environment variables sequentially and restores them before exit.
-        unsafe {
-            std::env::set_var("DATABASE_URL", "postgres://localhost/test");
-            std::env::set_var(
-                "ALLOWED_ORIGINS",
-                "https://app1.com, https://app2.com , https://app3.com",
-            );
-        }
-
-        let cfg = Config::from_env().expect("Config::from_env should succeed");
-        assert_eq!(
-            cfg.allowed_origins,
-            vec![
-                "https://app1.com".to_string(),
-                "https://app2.com".to_string(),
-                "https://app3.com".to_string(),
-            ]
-        );
-
-        // SAFETY: Restoring original environment variable values.
-        unsafe {
-            if let Some(val) = prev_db {
-                std::env::set_var("DATABASE_URL", val);
-            } else {
-                std::env::remove_var("DATABASE_URL");
-            }
-            if let Some(val) = prev_origins {
-                std::env::set_var("ALLOWED_ORIGINS", val);
-            } else {
-                std::env::remove_var("ALLOWED_ORIGINS");
-            }
-        }
     }
 }

@@ -20,7 +20,7 @@ A clear and concise description of what you expected to happen.
 
 **Environment:**
 - OS: [e.g. Linux, macOS, Windows]
-- Rust version: [e.g. 1.97.1]
+- Rust version: [e.g. 1.85.0]
 - metal-auth version: [e.g. 0.1.0]
 
 **Additional context**

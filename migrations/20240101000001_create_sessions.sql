@@ -7,5 +7,4 @@ CREATE TABLE sessions (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_sessions_user_id    ON sessions(user_id);
-CREATE INDEX idx_sessions_token_hash ON sessions(token_hash);
+CREATE INDEX idx_sessions_user_id ON sessions(user_id);

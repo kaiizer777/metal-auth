@@ -1,6 +1,6 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -259,11 +259,16 @@ async fn async_dispatch_non_blocking() {
     let sender: SharedEmailSender = Arc::new(mock);
     let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_secs(10), true);
 
-    let start = Instant::now();
-    let handle = dispatcher
-        .dispatch_verification(sample_verification())
-        .await;
-    assert!(start.elapsed() < Duration::from_millis(100));
+    let handle_res = tokio::time::timeout(
+        Duration::from_millis(100),
+        dispatcher.dispatch_verification(sample_verification()),
+    )
+    .await;
+    assert!(
+        handle_res.is_ok(),
+        "dispatch_verification must return immediately in async mode"
+    );
+    let handle = handle_res.unwrap();
     handle.await.unwrap();
 }
 
@@ -315,6 +320,20 @@ fn build_verification_url_formatting() {
         url,
         "https://auth.example.com/auth/verify/email?token=token-xyz"
     );
+    let trailing_slash_url =
+        EmailDispatcher::build_verification_url("https://auth.example.com/", "token-xyz");
+    assert_eq!(
+        trailing_slash_url,
+        "https://auth.example.com/auth/verify/email?token=token-xyz"
+    );
+    let encoded_url = EmailDispatcher::build_verification_url(
+        "https://auth.example.com/",
+        "token with spaces+symbols",
+    );
+    assert_eq!(
+        encoded_url,
+        "https://auth.example.com/auth/verify/email?token=token%20with%20spaces%2Bsymbols"
+    );
 }
 
 #[test]
@@ -323,5 +342,19 @@ fn build_reset_url_formatting() {
     assert_eq!(
         url,
         "https://auth.example.com/auth/password/reset?token=token-abc"
+    );
+    let trailing_slash_url =
+        EmailDispatcher::build_reset_url("https://auth.example.com/", "token-abc");
+    assert_eq!(
+        trailing_slash_url,
+        "https://auth.example.com/auth/password/reset?token=token-abc"
+    );
+    let encoded_url = EmailDispatcher::build_reset_url(
+        "https://auth.example.com/",
+        "token with spaces+symbols",
+    );
+    assert_eq!(
+        encoded_url,
+        "https://auth.example.com/auth/password/reset?token=token%20with%20spaces%2Bsymbols"
     );
 }

@@ -6,12 +6,44 @@ use tracing::{error, warn};
 use crate::email::hook::SharedEmailSender;
 use crate::email::payload::{PasswordResetEmailPayload, VerificationEmailPayload};
 
+fn percent_encode_token(input: &str) -> String {
+    let needs_encoding = input.bytes().any(|b| {
+        !matches!(
+            b,
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~'
+        )
+    });
+    if !needs_encoding {
+        return input.to_string();
+    }
+
+    const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(input.len() + 16);
+    for byte in input.bytes() {
+        if matches!(
+            byte,
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~'
+        ) {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(HEX_UPPER[(byte >> 4) as usize] as char);
+            encoded.push(HEX_UPPER[(byte & 0x0F) as usize] as char);
+        }
+    }
+    encoded
+}
+
 pub fn build_verification_url(base_url: &str, token: &str) -> String {
-    format!("{}/auth/verify/email?token={}", base_url, token)
+    let base = base_url.trim_end_matches('/');
+    let encoded_token = percent_encode_token(token);
+    format!("{}/auth/verify/email?token={}", base, encoded_token)
 }
 
 pub fn build_reset_url(base_url: &str, token: &str) -> String {
-    format!("{}/auth/password/reset?token={}", base_url, token)
+    let base = base_url.trim_end_matches('/');
+    let encoded_token = percent_encode_token(token);
+    format!("{}/auth/password/reset?token={}", base, encoded_token)
 }
 
 #[derive(Clone)]
@@ -120,6 +152,14 @@ mod tests {
             build_verification_url("https://example.com", "token-123"),
             "https://example.com/auth/verify/email?token=token-123"
         );
+        assert_eq!(
+            build_verification_url("https://example.com/", "token-123"),
+            "https://example.com/auth/verify/email?token=token-123"
+        );
+        assert_eq!(
+            build_verification_url("https://example.com/", "token with spaces+symbols"),
+            "https://example.com/auth/verify/email?token=token%20with%20spaces%2Bsymbols"
+        );
     }
 
     #[test]
@@ -127,6 +167,14 @@ mod tests {
         assert_eq!(
             build_reset_url("https://example.com", "token-456"),
             "https://example.com/auth/password/reset?token=token-456"
+        );
+        assert_eq!(
+            build_reset_url("https://example.com/", "token-456"),
+            "https://example.com/auth/password/reset?token=token-456"
+        );
+        assert_eq!(
+            build_reset_url("https://example.com/", "token with spaces+symbols"),
+            "https://example.com/auth/password/reset?token=token%20with%20spaces%2Bsymbols"
         );
     }
 }

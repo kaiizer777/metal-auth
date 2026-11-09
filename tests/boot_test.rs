@@ -25,7 +25,7 @@ async fn test_auth_facade_and_router_boot() {
 
     let pool = PgPool::connect_lazy(&cfg.database_url).expect("lazy pool creation");
     let state = AppState::new(pool, cfg);
-    let mut auth = Auth::from_state(state);
+    let mut auth = Auth::from_state(state).unwrap();
 
     // 1. Unknown route returns 404
     let req = Request::builder()
@@ -153,4 +153,22 @@ fn test_facade_re_exported_error_contract() {
 
     assert_eq!(not_found.to_string(), "not found");
     assert_eq!(internal.to_string(), "internal error");
+}
+
+#[tokio::test]
+async fn test_auth_boot_fails_fast_on_invalid_cors() {
+    let cfg = Config {
+        database_url: "postgres://user:pass@localhost:5432/metal_auth_test".into(),
+        port: 8080,
+        allowed_origins: vec!["invalid\norigin".into()],
+        allowed_methods: vec!["GET".into()],
+        allowed_headers: vec!["Content-Type".into()],
+        max_connections: 10,
+        min_connections: 2,
+    };
+
+    let pool = PgPool::connect_lazy(&cfg.database_url).expect("lazy pool creation");
+    let state = AppState::new(pool, cfg);
+    let result = Auth::from_state(state);
+    assert!(result.is_err());
 }

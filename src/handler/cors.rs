@@ -12,14 +12,19 @@ use crate::config::Config;
 /// If `cfg.allowed_origins` is empty, cross-origin requests are denied by default
 /// using `AllowOrigin::list([])`. Credentials (`allow_credentials(true)`) are enabled
 /// for cookie session support.
-pub fn cors_layer(cfg: &Config) -> CorsLayer {
-    let origins: Vec<HeaderValue> = cfg
-        .allowed_origins
-        .iter()
-        .map(|o| o.trim())
-        .filter(|o| *o != "*")
-        .filter_map(|o| HeaderValue::from_str(o).ok())
-        .collect();
+///
+/// Returns an error if any origin, method, or header in `cfg` cannot be parsed.
+pub fn cors_layer(cfg: &Config) -> Result<CorsLayer, Box<dyn std::error::Error>> {
+    let mut origins = Vec::with_capacity(cfg.allowed_origins.len());
+    for raw in &cfg.allowed_origins {
+        let trimmed = raw.trim();
+        if trimmed == "*" {
+            continue;
+        }
+        let val = HeaderValue::from_str(trimmed)
+            .map_err(|e| format!("invalid CORS origin '{raw}': {e}"))?;
+        origins.push(val);
+    }
 
     let allow_origin = if origins.is_empty() {
         AllowOrigin::list([])
@@ -27,23 +32,25 @@ pub fn cors_layer(cfg: &Config) -> CorsLayer {
         AllowOrigin::list(origins)
     };
 
-    let methods: Vec<Method> = cfg
-        .allowed_methods
-        .iter()
-        .filter_map(|m| Method::from_str(m).ok())
-        .collect();
+    let mut methods = Vec::with_capacity(cfg.allowed_methods.len());
+    for raw in &cfg.allowed_methods {
+        let method = Method::from_str(raw.trim())
+            .map_err(|e| format!("invalid CORS method '{raw}': {e}"))?;
+        methods.push(method);
+    }
 
-    let headers: Vec<HeaderName> = cfg
-        .allowed_headers
-        .iter()
-        .filter_map(|h| HeaderName::from_str(h).ok())
-        .collect();
+    let mut headers = Vec::with_capacity(cfg.allowed_headers.len());
+    for raw in &cfg.allowed_headers {
+        let header = HeaderName::from_str(raw.trim())
+            .map_err(|e| format!("invalid CORS header '{raw}': {e}"))?;
+        headers.push(header);
+    }
 
-    CorsLayer::new()
+    Ok(CorsLayer::new()
         .allow_origin(allow_origin)
         .allow_methods(AllowMethods::list(methods))
         .allow_headers(AllowHeaders::list(headers))
-        .allow_credentials(true)
+        .allow_credentials(true))
 }
 
 #[cfg(test)]
@@ -71,7 +78,7 @@ mod tests {
 
         let mut app = Router::new()
             .route("/test", get(|| async { "ok" }))
-            .layer(cors_layer(&cfg));
+            .layer(cors_layer(&cfg).unwrap());
 
         let req = Request::builder()
             .uri("/test")
@@ -99,7 +106,7 @@ mod tests {
 
         let mut app = Router::new()
             .route("/test", get(|| async { "ok" }))
-            .layer(cors_layer(&cfg));
+            .layer(cors_layer(&cfg).unwrap());
 
         let req = Request::builder()
             .uri("/test")
@@ -138,7 +145,7 @@ mod tests {
 
         let mut app = Router::new()
             .route("/test", get(|| async { "ok" }))
-            .layer(cors_layer(&cfg));
+            .layer(cors_layer(&cfg).unwrap());
 
         let req = Request::builder()
             .uri("/test")
@@ -179,7 +186,7 @@ mod tests {
 
         let mut app = Router::new()
             .route("/test", get(|| async { "ok" }))
-            .layer(cors_layer(&cfg));
+            .layer(cors_layer(&cfg).unwrap());
 
         let req = Request::builder()
             .uri("/test")
@@ -191,5 +198,53 @@ mod tests {
         let resp = app.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+    }
+
+    #[test]
+    fn test_cors_layer_rejects_malformed_origin() {
+        let cfg = Config {
+            database_url: "postgres://localhost/test".into(),
+            port: 3000,
+            allowed_origins: vec!["invalid\norigin".into()],
+            allowed_methods: vec!["GET".into()],
+            allowed_headers: vec!["Content-Type".into()],
+            max_connections: 5,
+            min_connections: 1,
+        };
+
+        let err = cors_layer(&cfg).unwrap_err();
+        assert!(err.to_string().contains("invalid CORS origin"));
+    }
+
+    #[test]
+    fn test_cors_layer_rejects_malformed_method() {
+        let cfg = Config {
+            database_url: "postgres://localhost/test".into(),
+            port: 3000,
+            allowed_origins: vec!["https://app.example.com".into()],
+            allowed_methods: vec!["INVALID METHOD WITH SPACES".into()],
+            allowed_headers: vec!["Content-Type".into()],
+            max_connections: 5,
+            min_connections: 1,
+        };
+
+        let err = cors_layer(&cfg).unwrap_err();
+        assert!(err.to_string().contains("invalid CORS method"));
+    }
+
+    #[test]
+    fn test_cors_layer_rejects_malformed_header() {
+        let cfg = Config {
+            database_url: "postgres://localhost/test".into(),
+            port: 3000,
+            allowed_origins: vec!["https://app.example.com".into()],
+            allowed_methods: vec!["GET".into()],
+            allowed_headers: vec!["Invalid Header With Spaces".into()],
+            max_connections: 5,
+            min_connections: 1,
+        };
+
+        let err = cors_layer(&cfg).unwrap_err();
+        assert!(err.to_string().contains("invalid CORS header"));
     }
 }

@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 pub const DEFAULT_PORT: u16 = 3000;
 pub const DEFAULT_MAX_CONNECTIONS: u32 = 25;
 pub const DEFAULT_MIN_CONNECTIONS: u32 = 2;
@@ -32,6 +34,25 @@ impl std::fmt::Debug for Config {
 }
 
 impl Config {
+    pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+        for origin in &self.allowed_origins {
+            let trimmed = origin.trim();
+            if trimmed != "*" {
+                axum::http::HeaderValue::from_str(trimmed)
+                    .map_err(|e| format!("invalid CORS origin '{origin}': {e}"))?;
+            }
+        }
+        for method in &self.allowed_methods {
+            axum::http::Method::from_str(method.trim())
+                .map_err(|e| format!("invalid CORS method '{method}': {e}"))?;
+        }
+        for header in &self.allowed_headers {
+            axum::http::header::HeaderName::from_str(header.trim())
+                .map_err(|e| format!("invalid CORS header '{header}': {e}"))?;
+        }
+        Ok(())
+    }
+
     pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
         dotenvy::dotenv().ok();
 
@@ -43,7 +64,7 @@ impl Config {
 
         let allowed_origins = parse_allowed_origins();
 
-        Ok(Self {
+        let cfg = Self {
             database_url,
             port,
             allowed_origins,
@@ -57,7 +78,10 @@ impl Config {
                 .collect(),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             min_connections: DEFAULT_MIN_CONNECTIONS,
-        })
+        };
+
+        cfg.validate()?;
+        Ok(cfg)
     }
 }
 
@@ -132,5 +156,61 @@ mod tests {
                 "https://app3.com".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn test_config_validate_success() {
+        let cfg = Config {
+            database_url: "postgres://localhost/test".into(),
+            port: 3000,
+            allowed_origins: vec!["https://app.example.com".into(), "*".into()],
+            allowed_methods: vec!["GET".into(), "POST".into()],
+            allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
+            max_connections: 5,
+            min_connections: 1,
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validate_rejects_malformed_origin() {
+        let cfg = Config {
+            database_url: "postgres://localhost/test".into(),
+            port: 3000,
+            allowed_origins: vec!["bad\norigin".into()],
+            allowed_methods: vec!["GET".into()],
+            allowed_headers: vec!["Content-Type".into()],
+            max_connections: 5,
+            min_connections: 1,
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validate_rejects_malformed_method() {
+        let cfg = Config {
+            database_url: "postgres://localhost/test".into(),
+            port: 3000,
+            allowed_origins: vec!["https://app.example.com".into()],
+            allowed_methods: vec!["BAD METHOD".into()],
+            allowed_headers: vec!["Content-Type".into()],
+            max_connections: 5,
+            min_connections: 1,
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validate_rejects_malformed_header() {
+        let cfg = Config {
+            database_url: "postgres://localhost/test".into(),
+            port: 3000,
+            allowed_origins: vec!["https://app.example.com".into()],
+            allowed_methods: vec!["GET".into()],
+            allowed_headers: vec!["Bad Header".into()],
+            max_connections: 5,
+            min_connections: 1,
+        };
+        assert!(cfg.validate().is_err());
     }
 }

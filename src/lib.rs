@@ -30,12 +30,12 @@ impl Auth {
             pool,
             config: cfg,
         };
-        let router = handler::create_router(state);
+        let router = handler::create_router(state)?;
         Ok(Self { router })
     }
 
-    pub fn from_state(state: AppState) -> Self {
-        let router = handler::create_router(state);
-        Self { router }
+    pub fn from_state(state: AppState) -> Result<Self, Box<dyn std::error::Error>> {
+        let router = handler::create_router(state)?;
+        Ok(Self { router })
     }
 }

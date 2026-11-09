@@ -6,7 +6,7 @@ The `metal-auth` team takes the security of our library seriously.
 
 If you discover a security vulnerability, please **DO NOT** open a public issue on GitHub. Instead, report it privately via email:
 
-- **Email**: security@metal-auth.dev
+- **Email**: mdsufiyanbari866@gmail.com
 
 ### Information to Include
 When reporting a vulnerability, please provide:

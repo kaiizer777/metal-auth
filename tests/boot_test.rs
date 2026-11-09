@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    http::{header, Method, Request, StatusCode},
+    http::{Method, Request, StatusCode, header},
 };
 use chrono::Utc;
 use metal_auth::{
@@ -74,10 +74,12 @@ async fn test_auth_facade_and_router_boot() {
         .unwrap();
 
     let denied_resp = auth.router.call(denied_req).await.unwrap();
-    assert!(denied_resp
-        .headers()
-        .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-        .is_none());
+    assert!(
+        denied_resp
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none()
+    );
 }
 
 #[tokio::test]

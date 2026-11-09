@@ -16,6 +16,8 @@ pub fn cors_layer(cfg: &Config) -> CorsLayer {
     let origins: Vec<HeaderValue> = cfg
         .allowed_origins
         .iter()
+        .map(|o| o.trim())
+        .filter(|o| *o != "*")
         .filter_map(|o| HeaderValue::from_str(o).ok())
         .collect();
 
@@ -161,5 +163,33 @@ mod tests {
                 .unwrap(),
             "true"
         );
+    }
+
+    #[tokio::test]
+    async fn test_cors_layer_wildcard_origin_filtered_out() {
+        let cfg = Config {
+            database_url: "postgres://localhost/test".into(),
+            port: 3000,
+            allowed_origins: vec!["*".into(), " * ".into()],
+            allowed_methods: vec!["GET".into(), "POST".into()],
+            allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
+            max_connections: 5,
+            min_connections: 1,
+        };
+
+        let mut app = Router::new()
+            .route("/test", get(|| async { "ok" }))
+            .layer(cors_layer(&cfg));
+
+        let req = Request::builder()
+            .uri("/test")
+            .method(Method::GET)
+            .header(header::ORIGIN, "https://anywhere.com")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
     }
 }

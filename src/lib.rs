@@ -1,41 +1,41 @@
 //! # metal-auth
 //!
 //! A composable, modular authentication library for Rust.
-//!
-//! This crate follows strict facade discipline: `lib.rs` acts purely as an export
-//! gateway and entrypoint facade. All concrete implementations reside in dedicated
-//! single-purpose modules.
 
-pub mod adapters;
+pub mod config;
+pub mod db;
+pub mod error;
+pub mod handler;
+pub mod state;
+
 pub mod crypto;
+pub mod email;
 pub mod oauth;
-pub mod plugins;
-pub mod ratelimit;
-pub mod schema;
 pub mod session;
 
-/// Configuration options for the `MetalAuth` instance.
-#[derive(Debug, Clone, Default)]
-pub struct Config {
-    // TODO: Define base configuration fields (e.g. secret keys, base URLs, cookie options).
+pub use config::Config;
+pub use db::models::*;
+pub use error::AppError;
+pub use state::AppState;
+
+#[derive(Clone)]
+pub struct Auth {
+    pub router: axum::Router,
 }
 
-/// Primary authentication facade and entry point.
-#[derive(Debug)]
-pub struct MetalAuth {
-    // TODO: Hold initialized adapters, plugins, and configuration.
-}
+impl Auth {
+    pub async fn new(cfg: Config) -> Result<Self, Box<dyn std::error::Error>> {
+        let pool = db::init_pool(&cfg).await?;
+        let state = AppState {
+            pool,
+            config: cfg,
+        };
+        let router = handler::create_router(state)?;
+        Ok(Self { router })
+    }
 
-/// Builder for constructing a configured [`MetalAuth`] instance.
-#[derive(Debug, Default)]
-pub struct MetalAuthBuilder {
-    // TODO: Implement builder state for adapters, plugins, and configuration.
-}
-
-impl MetalAuth {
-    /// Creates a new [`MetalAuthBuilder`] instance.
-    #[must_use]
-    pub fn builder() -> MetalAuthBuilder {
-        MetalAuthBuilder::default()
+    pub fn from_state(state: AppState) -> Result<Self, Box<dyn std::error::Error>> {
+        let router = handler::create_router(state)?;
+        Ok(Self { router })
     }
 }

@@ -10,3 +10,40 @@ keywords = ["auth", "authentication", "session", "oauth2", "security"]
 categories = ["authentication", "web-programming"]
 
 [dependencies]
+# async runtime
+tokio = { version = "1", features = ["macros", "rt"] }
+
+# web framework
+axum = "0.7"
+
+# DB
+sqlx = { version = "0.8", features = [
+    "postgres",
+    "runtime-tokio",
+    "tls-rustls",
+    "macros",
+    "uuid",
+    "chrono",
+    "migrate",
+] }
+
+# middleware
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# types
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# error handling
+thiserror = "2"
+
+# env
+dotenvy = "0.15"
+
+# tracing
+tracing = "0.1"

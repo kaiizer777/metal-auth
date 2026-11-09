@@ -68,7 +68,7 @@ fn parse_allowed_origins() -> Vec<String> {
     }
 }
 
-pub fn parse_allowed_origins_str(raw: &str) -> Vec<String> {
+fn parse_allowed_origins_str(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(|s| s.trim().trim_end_matches('/'))
         .filter(|s| !s.is_empty())

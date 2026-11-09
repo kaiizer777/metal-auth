@@ -21,7 +21,10 @@ pub fn cors_layer(cfg: &Config) -> Result<CorsLayer, ConfigError> {
         if trimmed == "*" {
             continue;
         }
-        let val = HeaderValue::from_str(trimmed).map_err(ConfigError::InvalidOrigin)?;
+        let val = HeaderValue::from_str(trimmed).map_err(|source| ConfigError::InvalidOrigin {
+            value: trimmed.to_string(),
+            source,
+        })?;
         origins.push(val);
     }
 
@@ -33,13 +36,22 @@ pub fn cors_layer(cfg: &Config) -> Result<CorsLayer, ConfigError> {
 
     let mut methods = Vec::with_capacity(cfg.allowed_methods.len());
     for raw in &cfg.allowed_methods {
-        let method = Method::from_str(raw.trim()).map_err(ConfigError::InvalidMethod)?;
+        let trimmed = raw.trim();
+        let method = Method::from_str(trimmed).map_err(|source| ConfigError::InvalidMethod {
+            value: trimmed.to_string(),
+            source,
+        })?;
         methods.push(method);
     }
 
     let mut headers = Vec::with_capacity(cfg.allowed_headers.len());
     for raw in &cfg.allowed_headers {
-        let header = HeaderName::from_str(raw.trim()).map_err(ConfigError::InvalidHeader)?;
+        let trimmed = raw.trim();
+        let header =
+            HeaderName::from_str(trimmed).map_err(|source| ConfigError::InvalidHeader {
+                value: trimmed.to_string(),
+                source,
+            })?;
         headers.push(header);
     }
 
@@ -219,7 +231,7 @@ mod tests {
 
         assert!(matches!(
             cors_layer(&cfg),
-            Err(ConfigError::InvalidOrigin(_))
+            Err(ConfigError::InvalidOrigin { ref value, .. }) if value == "invalid\norigin"
         ));
     }
 
@@ -237,7 +249,7 @@ mod tests {
 
         assert!(matches!(
             cors_layer(&cfg),
-            Err(ConfigError::InvalidMethod(_))
+            Err(ConfigError::InvalidMethod { ref value, .. }) if value == "INVALID METHOD WITH SPACES"
         ));
     }
 
@@ -255,7 +267,7 @@ mod tests {
 
         assert!(matches!(
             cors_layer(&cfg),
-            Err(ConfigError::InvalidHeader(_))
+            Err(ConfigError::InvalidHeader { ref value, .. }) if value == "Invalid Header With Spaces"
         ));
     }
 }

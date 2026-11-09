@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use axum::{
     body::Body,
     http::{Method, Request, StatusCode, header},
@@ -155,6 +157,8 @@ fn test_facade_re_exported_models_contract() {
 
 #[test]
 fn test_facade_re_exported_error_contract() {
+    use std::error::Error;
+
     let not_found = AppError::NotFound;
     let internal = AppError::Internal;
 
@@ -174,9 +178,49 @@ fn test_facade_re_exported_error_contract() {
         "missing environment variable: DATABASE_URL"
     );
 
+    let unicode_err = ConfigError::NonUnicodeEnvVar("DATABASE_URL");
+    assert_eq!(
+        unicode_err.to_string(),
+        "environment variable is not valid unicode: DATABASE_URL"
+    );
+
     let parse_err: Result<u16, _> = "invalid-port".parse();
     let port_err = ConfigError::InvalidPort(parse_err.unwrap_err());
-    assert!(port_err.to_string().starts_with("invalid port:"));
+    assert_eq!(port_err.to_string(), "invalid port");
+    assert!(port_err.source().is_some());
+
+    let origin_err = ConfigError::InvalidOrigin {
+        value: "bad\norigin".to_string(),
+        source: axum::http::HeaderValue::from_str("bad\norigin").unwrap_err(),
+    };
+    assert_eq!(origin_err.to_string(), "invalid CORS origin: bad\norigin");
+    assert!(origin_err.source().is_some());
+
+    let method_err = ConfigError::InvalidMethod {
+        value: "BAD METHOD".to_string(),
+        source: axum::http::Method::from_str("BAD METHOD").unwrap_err(),
+    };
+    assert_eq!(method_err.to_string(), "invalid CORS method: BAD METHOD");
+    assert!(method_err.source().is_some());
+
+    let header_err = ConfigError::InvalidHeader {
+        value: "Bad Header".to_string(),
+        source: axum::http::header::HeaderName::from_str("Bad Header").unwrap_err(),
+    };
+    assert_eq!(header_err.to_string(), "invalid CORS header: Bad Header");
+    assert!(header_err.source().is_some());
+
+    let app_cfg_err = AppError::Config(ConfigError::MissingEnvVar("DATABASE_URL"));
+    assert_eq!(app_cfg_err.to_string(), "configuration error");
+    assert!(app_cfg_err.source().is_some());
+
+    let app_db_err = AppError::Database(sqlx::Error::RowNotFound);
+    assert_eq!(app_db_err.to_string(), "database error");
+    assert!(app_db_err.source().is_some());
+
+    let app_db_unavail = AppError::DatabaseUnavailable(sqlx::Error::PoolTimedOut);
+    assert_eq!(app_db_unavail.to_string(), "database unavailable");
+    assert!(app_db_unavail.source().is_some());
 }
 
 #[tokio::test]
@@ -196,6 +240,41 @@ async fn test_auth_boot_fails_fast_on_invalid_cors() {
     let result = Auth::from_state(state);
     assert!(matches!(
         result,
-        Err(AppError::Config(ConfigError::InvalidOrigin(_)))
+        Err(AppError::Config(ConfigError::InvalidOrigin { ref value, .. })) if value == "invalid\norigin"
     ));
+}
+
+#[tokio::test]
+async fn test_auth_new_fails_fast_on_invalid_cors_before_db() {
+    let cfg = Config {
+        database_url: "not-a-valid-database-url".into(),
+        port: 3000,
+        allowed_origins: vec!["invalid\norigin".into()],
+        allowed_methods: vec!["GET".into()],
+        allowed_headers: vec!["Content-Type".into()],
+        max_connections: 2,
+        min_connections: 1,
+    };
+
+    let result = Auth::new(cfg).await;
+    assert!(matches!(
+        result,
+        Err(AppError::Config(ConfigError::InvalidOrigin { ref value, .. })) if value == "invalid\norigin"
+    ));
+}
+
+#[tokio::test]
+async fn test_auth_new_fails_with_database_error_on_malformed_url() {
+    let cfg = Config {
+        database_url: "not-a-valid-database-url".into(),
+        port: 3000,
+        allowed_origins: vec![],
+        allowed_methods: vec!["GET".into()],
+        allowed_headers: vec!["Content-Type".into()],
+        max_connections: 2,
+        min_connections: 1,
+    };
+
+    let result = Auth::new(cfg).await;
+    assert!(matches!(result, Err(AppError::Database(_))));
 }

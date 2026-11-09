@@ -34,31 +34,46 @@ pub enum ConfigError {
     #[error("missing environment variable: {0}")]
     MissingEnvVar(&'static str),
 
-    #[error("invalid port: {0}")]
+    #[error("environment variable is not valid unicode: {0}")]
+    NonUnicodeEnvVar(&'static str),
+
+    #[error("invalid port")]
     InvalidPort(#[from] ParseIntError),
 
-    #[error("invalid CORS origin: {0}")]
-    InvalidOrigin(#[from] InvalidHeaderValue),
+    #[error("invalid CORS origin: {value}")]
+    InvalidOrigin {
+        value: String,
+        #[source]
+        source: InvalidHeaderValue,
+    },
 
-    #[error("invalid CORS method: {0}")]
-    InvalidMethod(#[from] InvalidMethod),
+    #[error("invalid CORS method: {value}")]
+    InvalidMethod {
+        value: String,
+        #[source]
+        source: InvalidMethod,
+    },
 
-    #[error("invalid CORS header: {0}")]
-    InvalidHeader(#[from] InvalidHeaderName),
+    #[error("invalid CORS header: {value}")]
+    InvalidHeader {
+        value: String,
+        #[source]
+        source: InvalidHeaderName,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
-    #[error("configuration error: {0}")]
+    #[error("configuration error")]
     Config(#[from] ConfigError),
 
-    #[error("database error: {0}")]
+    #[error("database error")]
     Database(#[from] sqlx::Error),
 
-    #[error("database unavailable: {0}")]
+    #[error("database unavailable")]
     DatabaseUnavailable(#[source] sqlx::Error),
 
-    #[error("migration error: {0}")]
+    #[error("migration error")]
     Migration(#[from] sqlx::migrate::MigrateError),
 
     #[error("not found")]

@@ -14,7 +14,12 @@ pub async fn init_pool(cfg: &Config) -> Result<PgPool, AppError> {
         .await
         .map_err(|e| {
             tracing::error!("Failed to connect to database: {e}");
-            AppError::DatabaseUnavailable(e)
+            match e {
+                sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut | sqlx::Error::Tls(_) => {
+                    AppError::DatabaseUnavailable(e)
+                }
+                other => AppError::Database(other),
+            }
         })?;
 
     sqlx::migrate!("./migrations")

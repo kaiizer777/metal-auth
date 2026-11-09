@@ -40,17 +40,29 @@ impl Config {
         for origin in &self.allowed_origins {
             let trimmed = origin.trim();
             if trimmed != "*" {
-                axum::http::HeaderValue::from_str(trimmed)
-                    .map_err(ConfigError::InvalidOrigin)?;
+                axum::http::HeaderValue::from_str(trimmed).map_err(|source| {
+                    ConfigError::InvalidOrigin {
+                        value: trimmed.to_string(),
+                        source,
+                    }
+                })?;
             }
         }
         for method in &self.allowed_methods {
-            axum::http::Method::from_str(method.trim())
-                .map_err(ConfigError::InvalidMethod)?;
+            let trimmed = method.trim();
+            axum::http::Method::from_str(trimmed).map_err(|source| ConfigError::InvalidMethod {
+                value: trimmed.to_string(),
+                source,
+            })?;
         }
         for header in &self.allowed_headers {
-            axum::http::header::HeaderName::from_str(header.trim())
-                .map_err(ConfigError::InvalidHeader)?;
+            let trimmed = header.trim();
+            axum::http::header::HeaderName::from_str(trimmed).map_err(|source| {
+                ConfigError::InvalidHeader {
+                    value: trimmed.to_string(),
+                    source,
+                }
+            })?;
         }
         Ok(())
     }
@@ -58,14 +70,24 @@ impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
         dotenvy::dotenv().ok();
 
-        let database_url = std::env::var("DATABASE_URL")
-            .map_err(|_| ConfigError::MissingEnvVar("DATABASE_URL"))?;
+        let database_url = match std::env::var("DATABASE_URL") {
+            Ok(val) => val,
+            Err(std::env::VarError::NotPresent) => {
+                return Err(ConfigError::MissingEnvVar("DATABASE_URL"));
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar("DATABASE_URL"));
+            }
+        };
         let port = match std::env::var("PORT") {
             Ok(val) => val.parse::<u16>().map_err(ConfigError::InvalidPort)?,
-            Err(_) => DEFAULT_PORT,
+            Err(std::env::VarError::NotPresent) => DEFAULT_PORT,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar("PORT"));
+            }
         };
 
-        let allowed_origins = parse_allowed_origins();
+        let allowed_origins = parse_allowed_origins()?;
 
         let cfg = Self {
             database_url,
@@ -88,10 +110,13 @@ impl Config {
     }
 }
 
-fn parse_allowed_origins() -> Vec<String> {
+fn parse_allowed_origins() -> Result<Vec<String>, ConfigError> {
     match std::env::var("ALLOWED_ORIGINS") {
-        Ok(val) => parse_allowed_origins_str(&val),
-        Err(_) => Vec::new(),
+        Ok(val) => Ok(parse_allowed_origins_str(&val)),
+        Err(std::env::VarError::NotPresent) => Ok(Vec::new()),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(ConfigError::NonUnicodeEnvVar("ALLOWED_ORIGINS"))
+        }
     }
 }
 
@@ -185,7 +210,10 @@ mod tests {
             max_connections: 5,
             min_connections: 1,
         };
-        assert!(matches!(cfg.validate(), Err(ConfigError::InvalidOrigin(_))));
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidOrigin { ref value, .. }) if value == "bad\norigin"
+        ));
     }
 
     #[test]
@@ -199,7 +227,10 @@ mod tests {
             max_connections: 5,
             min_connections: 1,
         };
-        assert!(matches!(cfg.validate(), Err(ConfigError::InvalidMethod(_))));
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidMethod { ref value, .. }) if value == "BAD METHOD"
+        ));
     }
 
     #[test]
@@ -213,6 +244,9 @@ mod tests {
             max_connections: 5,
             min_connections: 1,
         };
-        assert!(matches!(cfg.validate(), Err(ConfigError::InvalidHeader(_))));
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidHeader { ref value, .. }) if value == "Bad Header"
+        ));
     }
 }

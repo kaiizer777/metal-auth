@@ -84,6 +84,7 @@ BEGIN
           AND data_type IN ('text', 'character varying')
     ) THEN
         EXECUTE 'DELETE FROM verification_tokens WHERE token_hash !~ ''^[0-9a-fA-F]{64}$''';
+        EXECUTE 'DELETE FROM verification_tokens a USING verification_tokens b WHERE a.ctid < b.ctid AND LOWER(a.token_hash) = LOWER(b.token_hash)';
         EXECUTE 'ALTER TABLE verification_tokens ALTER COLUMN token_hash TYPE BYTEA USING decode(token_hash, ''hex'')';
     END IF;
 END $$;
@@ -210,6 +211,7 @@ BEGIN
           AND data_type IN ('text', 'character varying')
     ) THEN
         EXECUTE 'DELETE FROM password_reset_tokens WHERE token_hash !~ ''^[0-9a-fA-F]{64}$''';
+        EXECUTE 'DELETE FROM password_reset_tokens a USING password_reset_tokens b WHERE a.ctid < b.ctid AND LOWER(a.token_hash) = LOWER(b.token_hash)';
         EXECUTE 'ALTER TABLE password_reset_tokens ALTER COLUMN token_hash TYPE BYTEA USING decode(token_hash, ''hex'')';
     END IF;
 END $$;

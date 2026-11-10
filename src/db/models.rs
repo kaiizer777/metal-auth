@@ -69,11 +69,9 @@ pub struct Session {
 /// from leaking across API responses.
 #[derive(Debug, Clone, FromRow, PartialEq, Eq)]
 pub struct VerificationToken {
-    pub id: Uuid,
+    pub token_hash: Vec<u8>,
     pub user_id: Uuid,
-    pub token_hash: String,
     pub expires_at: DateTime<Utc>,
-    pub used: bool,
     pub created_at: DateTime<Utc>,
 }
 
@@ -83,11 +81,9 @@ pub struct VerificationToken {
 /// from leaking across API responses.
 #[derive(Debug, Clone, FromRow, PartialEq, Eq)]
 pub struct PasswordResetToken {
-    pub id: Uuid,
+    pub token_hash: Vec<u8>,
     pub user_id: Uuid,
-    pub token_hash: String,
     pub expires_at: DateTime<Utc>,
-    pub used: bool,
     pub created_at: DateTime<Utc>,
 }
 

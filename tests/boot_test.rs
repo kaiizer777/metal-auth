@@ -135,24 +135,22 @@ fn test_facade_re_exported_models_contract() {
     assert_eq!(session.user_id, uid);
 
     let v_token = VerificationToken {
-        id: Uuid::new_v4(),
+        token_hash: vec![0u8; 32],
         user_id: uid,
-        token_hash: "v_token_hash".into(),
         expires_at: now,
-        used: false,
         created_at: now,
     };
-    assert!(!v_token.used);
+    assert_eq!(v_token.user_id, uid);
+    assert_eq!(v_token.token_hash.len(), 32);
 
     let r_token = PasswordResetToken {
-        id: Uuid::new_v4(),
+        token_hash: vec![1u8; 32],
         user_id: uid,
-        token_hash: "r_token_hash".into(),
         expires_at: now,
-        used: false,
         created_at: now,
     };
-    assert!(!r_token.used);
+    assert_eq!(r_token.user_id, uid);
+    assert_eq!(r_token.token_hash.len(), 32);
 }
 
 #[test]

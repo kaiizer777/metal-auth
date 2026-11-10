@@ -83,14 +83,8 @@ BEGIN
           AND column_name = 'token_hash' 
           AND data_type IN ('text', 'character varying')
     ) THEN
-        ALTER TABLE verification_tokens 
-            ALTER COLUMN token_hash TYPE BYTEA 
-            USING (
-                CASE 
-                    WHEN length(token_hash) = 64 THEN decode(token_hash, 'hex')
-                    ELSE token_hash::bytea
-                END
-            );
+        EXECUTE 'DELETE FROM verification_tokens WHERE token_hash !~ ''^[0-9a-fA-F]{64}$''';
+        EXECUTE 'ALTER TABLE verification_tokens ALTER COLUMN token_hash TYPE BYTEA USING decode(token_hash, ''hex'')';
     END IF;
 END $$;
 
@@ -130,6 +124,7 @@ BEGIN
     END IF;
 END $$;
 
+DROP INDEX IF EXISTS idx_verification_tokens_user_id;
 CREATE INDEX IF NOT EXISTS idx_vt_user_id ON verification_tokens (user_id);
 
 -- ============================================================================
@@ -214,14 +209,8 @@ BEGIN
           AND column_name = 'token_hash' 
           AND data_type IN ('text', 'character varying')
     ) THEN
-        ALTER TABLE password_reset_tokens 
-            ALTER COLUMN token_hash TYPE BYTEA 
-            USING (
-                CASE 
-                    WHEN length(token_hash) = 64 THEN decode(token_hash, 'hex')
-                    ELSE token_hash::bytea
-                END
-            );
+        EXECUTE 'DELETE FROM password_reset_tokens WHERE token_hash !~ ''^[0-9a-fA-F]{64}$''';
+        EXECUTE 'ALTER TABLE password_reset_tokens ALTER COLUMN token_hash TYPE BYTEA USING decode(token_hash, ''hex'')';
     END IF;
 END $$;
 
@@ -261,4 +250,5 @@ BEGIN
     END IF;
 END $$;
 
+DROP INDEX IF EXISTS idx_password_reset_tokens_user_id;
 CREATE INDEX IF NOT EXISTS idx_prt_user_id ON password_reset_tokens (user_id);

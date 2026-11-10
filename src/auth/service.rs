@@ -18,10 +18,10 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::{
+    auth::models::{validate_email, validate_password},
     config::AppConfig,
     crypto::{
         argon2::{generate_dummy_hash, hash_password, verify_password},
-        blocklist::is_common_password,
         token::{generate_token, hash_token},
     },
     email::{EmailDispatcher, PasswordResetEmailPayload, VerificationEmailPayload},
@@ -30,7 +30,7 @@ use crate::{
 
 pub struct AuthServiceImpl {
     pool: PgPool,
-    config: Arc<AppConfig>,
+    pub config: Arc<AppConfig>,
     /// Pre-computed dummy PHC string used on login when no user row is found.
     /// Hashed at construction with the SAME Argon2 params as `config` — a param
     /// mismatch would still leak existence via timing delta.
@@ -56,39 +56,6 @@ impl AuthServiceImpl {
         })
     }
 
-    // ─── Password validation helpers ─────────────────────────────────────────
-
-    fn validate_password(&self, password: &str) -> AppResult<()> {
-        let count = password.chars().count(); // Unicode code points, not bytes
-        if count < self.config.password_min_len {
-            return Err(AppError::PasswordTooShort);
-        }
-        if count > self.config.password_max_len {
-            return Err(AppError::PasswordTooLong);
-        }
-        if is_common_password(password) {
-            return Err(AppError::PasswordTooCommon);
-        }
-        Ok(())
-    }
-
-    fn validate_email(email: &str) -> AppResult<()> {
-        let trimmed = email.trim();
-        if trimmed.is_empty() {
-            return Err(AppError::InvalidEmail);
-        }
-        // Basic format: must contain '@' with non-empty local and domain parts
-        let at = trimmed.rfind('@').ok_or(AppError::InvalidEmail)?;
-        if at == 0 || at + 1 >= trimmed.len() {
-            return Err(AppError::InvalidEmail);
-        }
-        let domain = &trimmed[at + 1..];
-        if domain.is_empty() || !domain.contains('.') {
-            return Err(AppError::InvalidEmail);
-        }
-        Ok(())
-    }
-
     // ─── Signup ──────────────────────────────────────────────────────────────
 
     /// Register a new account.
@@ -97,8 +64,8 @@ impl AuthServiceImpl {
     /// task, even on duplicate email. Handler always sends 200. Duplicate emails
     /// are logged internally only.
     pub async fn signup(&self, email: &str, password: &str) -> AppResult<()> {
-        Self::validate_email(email)?;
-        self.validate_password(password)?;
+        validate_email(email)?;
+        validate_password(password, &self.config)?;
 
         let config = Arc::clone(&self.config);
         let pw = password.to_string();
@@ -285,7 +252,7 @@ impl AuthServiceImpl {
     /// of whether the email exists. The SELECT round-trip cost is structurally
     /// identical on the found and not-found paths.
     pub async fn request_password_reset(&self, email: &str) -> AppResult<()> {
-        Self::validate_email(email)?;
+        validate_email(email)?;
         let normalized_email = email.trim().to_lowercase();
 
         // Always run the same SELECT — round-trip cost is structurally identical
@@ -342,7 +309,7 @@ impl AuthServiceImpl {
     ///
     /// On success: UPDATE password, DELETE ALL reset tokens for this user.
     pub async fn reset_password(&self, token: &str, new_password: &str) -> AppResult<()> {
-        self.validate_password(new_password)?;
+        validate_password(new_password, &self.config)?;
 
         let token_hash = hash_token(token)?;
 
@@ -427,41 +394,35 @@ mod tests {
 
     #[test]
     fn validate_email_accepts_valid_formats() {
-        assert!(AuthServiceImpl::validate_email("user@example.com").is_ok());
-        assert!(AuthServiceImpl::validate_email("user.name+tag@example.co.uk").is_ok());
-        assert!(AuthServiceImpl::validate_email("admin@sub.domain.org").is_ok());
+        assert!(validate_email("user@example.com").is_ok());
+        assert!(validate_email("user.name+tag@example.co.uk").is_ok());
+        assert!(validate_email("admin@sub.domain.org").is_ok());
     }
 
     #[test]
     fn validate_email_handles_whitespace() {
-        assert!(AuthServiceImpl::validate_email("  user@example.com  ").is_ok());
-        assert!(AuthServiceImpl::validate_email("\tuser@domain.com\n").is_ok());
+        assert!(validate_email("  user@example.com  ").is_ok());
+        assert!(validate_email("\tuser@domain.com\n").is_ok());
     }
 
     #[test]
     fn validate_email_rejects_invalid_formats() {
+        assert!(matches!(validate_email(""), Err(AppError::InvalidEmail)));
+        assert!(matches!(validate_email("   "), Err(AppError::InvalidEmail)));
         assert!(matches!(
-            AuthServiceImpl::validate_email(""),
+            validate_email("plainaddress"),
             Err(AppError::InvalidEmail)
         ));
         assert!(matches!(
-            AuthServiceImpl::validate_email("   "),
+            validate_email("@missinglocal.com"),
             Err(AppError::InvalidEmail)
         ));
         assert!(matches!(
-            AuthServiceImpl::validate_email("plainaddress"),
+            validate_email("missingdomain@"),
             Err(AppError::InvalidEmail)
         ));
         assert!(matches!(
-            AuthServiceImpl::validate_email("@missinglocal.com"),
-            Err(AppError::InvalidEmail)
-        ));
-        assert!(matches!(
-            AuthServiceImpl::validate_email("missingdomain@"),
-            Err(AppError::InvalidEmail)
-        ));
-        assert!(matches!(
-            AuthServiceImpl::validate_email("missingdot@domain"),
+            validate_email("missingdot@domain"),
             Err(AppError::InvalidEmail)
         ));
     }
@@ -469,24 +430,20 @@ mod tests {
     #[tokio::test]
     async fn validate_password_accepts_valid_passwords() {
         let service = create_test_service();
-        assert!(
-            service
-                .validate_password("correct-horse-battery-staple")
-                .is_ok()
-        );
-        assert!(service.validate_password("SecurePass#2026!").is_ok());
+        assert!(validate_password("correct-horse-battery-staple", &service.config).is_ok());
+        assert!(validate_password("SecurePass#2026!", &service.config).is_ok());
     }
 
     #[tokio::test]
     async fn validate_password_counts_unicode_code_points() {
         let service = create_test_service();
-        assert!(service.validate_password("🦀🦀🦀🦀🦀🦀🦀🦀").is_ok());
+        assert!(validate_password("🦀🦀🦀🦀🦀🦀🦀🦀", &service.config).is_ok());
         assert!(matches!(
-            service.validate_password("🦀🦀🦀🦀🦀🦀🦀"),
+            validate_password("🦀🦀🦀🦀🦀🦀🦀", &service.config),
             Err(AppError::PasswordTooShort)
         ));
         assert!(matches!(
-            service.validate_password("1234567"),
+            validate_password("1234567", &service.config),
             Err(AppError::PasswordTooShort)
         ));
     }
@@ -495,20 +452,20 @@ mod tests {
     async fn validate_password_enforces_max_length_128() {
         let service = create_test_service();
         let exact_128 = "a".repeat(128);
-        assert!(service.validate_password(&exact_128).is_ok());
+        assert!(validate_password(&exact_128, &service.config).is_ok());
 
         let over_128 = "a".repeat(129);
         assert!(matches!(
-            service.validate_password(&over_128),
+            validate_password(&over_128, &service.config),
             Err(AppError::PasswordTooLong)
         ));
 
         let unicode_128 = "🦀".repeat(128);
-        assert!(service.validate_password(&unicode_128).is_ok());
+        assert!(validate_password(&unicode_128, &service.config).is_ok());
 
         let unicode_129 = "🦀".repeat(129);
         assert!(matches!(
-            service.validate_password(&unicode_129),
+            validate_password(&unicode_129, &service.config),
             Err(AppError::PasswordTooLong)
         ));
     }
@@ -517,19 +474,19 @@ mod tests {
     async fn validate_password_rejects_common_passwords() {
         let service = create_test_service();
         assert!(matches!(
-            service.validate_password("password"),
+            validate_password("password", &service.config),
             Err(AppError::PasswordTooCommon)
         ));
         assert!(matches!(
-            service.validate_password("12345678"),
+            validate_password("12345678", &service.config),
             Err(AppError::PasswordTooCommon)
         ));
         assert!(matches!(
-            service.validate_password("PASSWORD"),
+            validate_password("PASSWORD", &service.config),
             Err(AppError::PasswordTooCommon)
         ));
         assert!(matches!(
-            service.validate_password("Admin1234"),
+            validate_password("Admin1234", &service.config),
             Err(AppError::PasswordTooCommon)
         ));
     }

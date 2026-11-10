@@ -326,29 +326,23 @@ impl AuthServiceImpl {
     /// Consume a reset token and set a new password.
     ///
     /// Performance & Security:
-    /// Validates token existence and expiry before any CPU-intensive password hashing
-    /// to prevent CPU exhaustion DoS attacks.
-    /// Cleans expired tokens on expiry branch.
+    /// Atomically consumes token via DELETE RETURNING before computing Argon2id hash
+    /// with zero open DB connection, eliminating pool starvation and CPU exhaustion DoS.
     /// Revokes ALL remaining reset tokens for the user upon success.
     pub async fn reset_password(&self, token: &str, new_password: &str) -> AppResult<()> {
         validate_password(new_password, &self.config)?;
         let token_hash = hash_token(token)?;
 
-        let mut tx = self.pool.begin().await.map_err(AppError::Database)?;
-
         let maybe_row = sqlx::query(
             "DELETE FROM password_reset_tokens WHERE token_hash = $1 RETURNING user_id, expires_at",
         )
         .bind(&token_hash[..])
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&self.pool)
         .await
         .map_err(AppError::Database)?;
 
         let row = match maybe_row {
-            None => {
-                let _ = tx.rollback().await;
-                return Err(AppError::InvalidToken);
-            }
+            None => return Err(AppError::InvalidToken),
             Some(r) => r,
         };
 
@@ -356,16 +350,17 @@ impl AuthServiceImpl {
         let user_id: Uuid = row.get("user_id");
 
         if expires_at < Utc::now() {
-            tx.commit().await.map_err(AppError::Database)?;
             return Err(AppError::TokenExpired);
         }
 
-        // Token is valid and consumed. Compute hash now.
+        // Token consumed. Zero DB connection held during CPU-intensive hashing.
         let config = Arc::clone(&self.config);
         let pw = new_password.to_string();
         let new_hash = tokio::task::spawn_blocking(move || hash_password(&pw, &config))
             .await
             .map_err(|_| AppError::Internal)??;
+
+        let mut tx = self.pool.begin().await.map_err(AppError::Database)?;
 
         sqlx::query("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2")
             .bind(&new_hash)

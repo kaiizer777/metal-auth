@@ -134,19 +134,22 @@ impl PasswordResetConfirmRequest {
 
 pub fn validate_email(email: &str) -> AppResult<()> {
     let trimmed = email.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || trimmed.len() > 255 {
         return Err(AppError::InvalidEmail);
     }
-    let at = trimmed.rfind('@').ok_or(AppError::InvalidEmail)?;
-    if at == 0 || at + 1 >= trimmed.len() {
+    if trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return Err(AppError::InvalidEmail);
     }
-    let domain = &trimmed[at + 1..];
-    if domain.is_empty()
-        || domain.starts_with('.')
-        || domain.ends_with('.')
-        || !domain.contains('.')
-    {
+    let mut parts = trimmed.split('@');
+    let local = parts.next().ok_or(AppError::InvalidEmail)?;
+    let domain = parts.next().ok_or(AppError::InvalidEmail)?;
+    if parts.next().is_some() {
+        return Err(AppError::InvalidEmail);
+    }
+    if local.is_empty() || domain.is_empty() {
+        return Err(AppError::InvalidEmail);
+    }
+    if domain.starts_with('.') || domain.ends_with('.') || !domain.contains('.') || domain.contains("..") {
         return Err(AppError::InvalidEmail);
     }
     Ok(())
@@ -246,6 +249,12 @@ mod tests {
             "@example.com",
             "user@",
             "user@example",
+            "user@domain..com",
+            "user@.domain.com",
+            "user@domain.com.",
+            "user@extra@domain.com",
+            "user space@domain.com",
+            "user\x00@domain.com",
         ];
         for email in invalid_emails {
             let req = SignupRequest {
@@ -257,6 +266,13 @@ mod tests {
                 "expected InvalidEmail for: {email}"
             );
         }
+
+        let too_long_email = format!("{}@example.com", "a".repeat(245)); // 245 + 12 = 257 > 255
+        let req = SignupRequest {
+            email: too_long_email,
+            password: "SecurePassword123!".to_string(),
+        };
+        assert!(matches!(req.validate(&config), Err(AppError::InvalidEmail)));
     }
 
     #[test]

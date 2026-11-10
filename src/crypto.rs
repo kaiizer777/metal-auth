@@ -5,6 +5,5 @@ pub mod blocklist;
 pub mod token;
 
 pub use argon2::{generate_dummy_hash, hash_password, verify_password};
-pub(crate) use argon2::hash_password_with_params;
 pub use blocklist::is_common_password;
 pub use token::{generate_token, hash_token, sha256_of_hex_token};

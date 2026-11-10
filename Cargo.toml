@@ -37,7 +37,6 @@ sqlx = { version = "0.8", features = [
 ] }
 
 # middleware
-tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 
 # serialization
@@ -63,4 +62,5 @@ test-utils = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread"] }
+tower = { version = "0.4", features = ["util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

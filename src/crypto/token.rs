@@ -79,18 +79,16 @@ mod tests {
         // Odd length
         assert!(matches!(hash_token("123"), Err(AppError::InvalidToken)));
         // 62 chars (too short)
-        assert!(matches!(
-            hash_token("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e"),
-            Err(AppError::InvalidToken)
-        ));
+        let too_short = "0".repeat(62);
+        assert!(matches!(hash_token(&too_short), Err(AppError::InvalidToken)));
         // 66 chars (too long)
+        let too_long = "0".repeat(66);
+        assert!(matches!(hash_token(&too_long), Err(AppError::InvalidToken)));
+        // Valid length (64 chars) but non-hex char
+        let invalid_char = format!("{}z", "0".repeat(63));
+        assert_eq!(invalid_char.len(), 64);
         assert!(matches!(
-            hash_token("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021"),
-            Err(AppError::InvalidToken)
-        ));
-        // Valid length but non-hex char
-        assert!(matches!(
-            hash_token("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1z"),
+            hash_token(&invalid_char),
             Err(AppError::InvalidToken)
         ));
     }

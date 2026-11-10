@@ -142,7 +142,11 @@ pub fn validate_email(email: &str) -> AppResult<()> {
         return Err(AppError::InvalidEmail);
     }
     let domain = &trimmed[at + 1..];
-    if domain.is_empty() || !domain.contains('.') {
+    if domain.is_empty()
+        || domain.starts_with('.')
+        || domain.ends_with('.')
+        || !domain.contains('.')
+    {
         return Err(AppError::InvalidEmail);
     }
     Ok(())

@@ -9,7 +9,7 @@ use metal_auth::{
     handler::create_router,
 };
 use serde_json::json;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -569,14 +569,15 @@ async fn test_require_email_verification_block() {
     let config = ctx.state.auth_service.config.clone();
     let password_hash = hash_password(password, &config).unwrap();
 
-    let row = sqlx::query!(
+    let row = sqlx::query(
         "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, false) RETURNING id",
-        email,
-        password_hash,
     )
+    .bind(&email)
+    .bind(&password_hash)
     .fetch_one(&ctx.pool)
     .await
     .unwrap();
+    let user_id: Uuid = row.get("id");
 
     // Login with unverified email must return 403 Forbidden with EMAIL_NOT_VERIFIED
     let req = json_request(
@@ -591,10 +592,10 @@ async fn test_require_email_verification_block() {
     assert_eq!(err.code, ErrorCode::EmailNotVerified);
 
     // Once email is verified, login must succeed
-    sqlx::query!(
+    sqlx::query(
         "UPDATE users SET email_verified = true WHERE id = $1",
-        row.id
     )
+    .bind(user_id)
     .execute(&ctx.pool)
     .await
     .unwrap();
@@ -607,7 +608,7 @@ async fn test_require_email_verification_block() {
     let resp2 = ctx.router.oneshot(req2).await.unwrap();
     let (status2, body2, _) = response_json(resp2).await;
     assert_eq!(status2, StatusCode::OK);
-    assert_eq!(body2["user_id"], row.id.to_string());
+    assert_eq!(body2["user_id"], user_id.to_string());
 }
 
 #[tokio::test]
@@ -621,24 +622,25 @@ async fn test_token_replay_and_expiry() {
     let config = ctx.state.auth_service.config.clone();
     let password_hash = hash_password(password, &config).unwrap();
 
-    let user_row = sqlx::query!(
+    let user_row = sqlx::query(
         "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, false) RETURNING id",
-        email,
-        password_hash,
     )
+    .bind(&email)
+    .bind(&password_hash)
     .fetch_one(&ctx.pool)
     .await
     .unwrap();
+    let user_id: Uuid = user_row.get("id");
 
     let (raw_token, stored_hash) = generate_token();
     let expires_at = Utc::now() + Duration::hours(24);
 
-    sqlx::query!(
+    sqlx::query(
         "INSERT INTO verification_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
-        stored_hash.as_slice(),
-        user_row.id,
-        expires_at,
     )
+    .bind(stored_hash.as_slice())
+    .bind(user_id)
+    .bind(expires_at)
     .execute(&ctx.pool)
     .await
     .unwrap();
@@ -670,28 +672,29 @@ async fn test_reset_password_revokes_all_tokens() {
     let config = ctx.state.auth_service.config.clone();
     let password_hash = hash_password(password, &config).unwrap();
 
-    let user_row = sqlx::query!(
+    let user_row = sqlx::query(
         "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true) RETURNING id",
-        email,
-        password_hash,
     )
+    .bind(&email)
+    .bind(&password_hash)
     .fetch_one(&ctx.pool)
     .await
     .unwrap();
+    let user_id: Uuid = user_row.get("id");
 
     let (token1, hash1) = generate_token();
     let (token2, hash2) = generate_token();
     let expires_at = Utc::now() + Duration::hours(1);
 
-    sqlx::query!(
+    sqlx::query(
         "INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3), ($4, $5, $6)",
-        hash1.as_slice(),
-        user_row.id,
-        expires_at,
-        hash2.as_slice(),
-        user_row.id,
-        expires_at,
     )
+    .bind(hash1.as_slice())
+    .bind(user_id)
+    .bind(expires_at)
+    .bind(hash2.as_slice())
+    .bind(user_id)
+    .bind(expires_at)
     .execute(&ctx.pool)
     .await
     .unwrap();

@@ -451,8 +451,32 @@ fn base_url_validation_rejects_invalid_urls() {
         make_cfg("https://").validate(),
         Err(ConfigError::InvalidEnvVar("BASE_URL"))
     ));
+    assert!(matches!(
+        make_cfg("https://example.com?tenant=x").validate(),
+        Err(ConfigError::InvalidEnvVar("BASE_URL"))
+    ));
     assert!(make_cfg("https://example.com").validate().is_ok());
     assert!(make_cfg("http://localhost:3000").validate().is_ok());
+}
+
+#[test]
+fn base_url_validation_rejects_query_string() {
+    let cfg = Config {
+        database_url: "postgres://localhost/test".into(),
+        port: 3000,
+        allowed_origins: vec![],
+        allowed_methods: vec!["GET".into()],
+        allowed_headers: vec!["Content-Type".into()],
+        max_connections: 5,
+        min_connections: 1,
+        base_url: "https://example.com?tenant=x".into(),
+        email_dispatch_timeout: Duration::from_secs(10),
+        async_email_dispatch: true,
+    };
+    assert!(matches!(
+        cfg.validate(),
+        Err(ConfigError::InvalidEnvVar("BASE_URL"))
+    ));
 }
 
 #[test]

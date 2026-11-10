@@ -54,7 +54,10 @@ impl Config {
             .base_url
             .parse::<axum::http::Uri>()
             .map_err(|_| ConfigError::InvalidEnvVar("BASE_URL"))?;
-        if !matches!(uri.scheme_str(), Some("http" | "https")) || uri.authority().is_none() {
+        if !matches!(uri.scheme_str(), Some("http" | "https"))
+            || uri.authority().is_none()
+            || uri.query().is_some()
+        {
             return Err(ConfigError::InvalidEnvVar("BASE_URL"));
         }
         if self.email_dispatch_timeout == Duration::ZERO {

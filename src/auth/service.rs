@@ -100,32 +100,35 @@ impl AuthServiceImpl {
         Self::validate_email(email)?;
         self.validate_password(password)?;
 
-        let password_hash = hash_password(password, &self.config)?;
-        let email_lc = email.to_lowercase();
+        let config = Arc::clone(&self.config);
+        let pw = password.to_string();
+        let password_hash = tokio::task::spawn_blocking(move || hash_password(&pw, &config))
+            .await
+            .map_err(|_| AppError::Internal)??;
+
+        let normalized_email = email.trim().to_lowercase();
 
         // Attempt insert; detect duplicate via UNIQUE constraint violation
         let result = sqlx::query!(
             "INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id",
-            email_lc,
+            normalized_email,
             password_hash,
         )
         .fetch_one(&self.pool)
         .await;
 
-        let (user_id, is_duplicate) = match result {
-            Ok(row) => (row.id, false),
+        let maybe_user_id = match result {
+            Ok(row) => Some(row.id),
             Err(sqlx::Error::Database(ref db_err)) if db_err.code().as_deref() == Some("23505") => {
                 // Unique constraint violation — duplicate email
                 // Anti-enum: log internally, never expose to caller
-                tracing::info!(email = %email_lc, "signup attempt on existing account");
-                // We still need a user_id-shaped value for the dispatcher spawn —
-                // create a placeholder so the spawn cost is structurally identical
-                (Uuid::nil(), true)
+                tracing::info!(email = %normalized_email, "signup attempt on existing account");
+                None
             }
             Err(e) => return Err(AppError::Database(e)),
         };
 
-        if !is_duplicate {
+        if let Some(user_id) = maybe_user_id {
             // Generate and store verification token
             let (raw_token, token_hash) = generate_token();
             let ttl = self.config.verification_token_ttl_secs as i64;
@@ -143,7 +146,7 @@ impl AuthServiceImpl {
 
             // Fire-and-forget email dispatch — never await on HTTP path
             let dispatcher = Arc::clone(&self.dispatcher);
-            let email_clone = email_lc.clone();
+            let email_clone = normalized_email.clone();
             tokio::spawn(async move {
                 dispatcher.dispatch_verification(VerificationEmailPayload {
                     to_email: email_clone,
@@ -152,14 +155,9 @@ impl AuthServiceImpl {
                 });
             });
         } else {
-            // Timing parity: spawn a no-op task with equivalent cost
-            let dispatcher = Arc::clone(&self.dispatcher);
+            // Timing parity: spawn a no-op task without dispatching malformed payloads
             tokio::spawn(async move {
-                dispatcher.dispatch_verification(VerificationEmailPayload {
-                    to_email: String::new(),
-                    token: String::new(),
-                    user_id: Uuid::nil(),
-                });
+                // No-op for spawn timing parity without external dispatch side-effects
             });
         }
 
@@ -173,11 +171,11 @@ impl AuthServiceImpl {
     /// Anti-enumeration: always runs Argon2 verify even when email not found.
     /// Timing delta between "wrong password" and "unknown email" must be negligible.
     pub async fn login(&self, email: &str, password: &str) -> AppResult<Uuid> {
-        let email_lc = email.to_lowercase();
+        let normalized_email = email.trim().to_lowercase();
 
         let maybe_user = sqlx::query!(
             "SELECT id, password_hash, email_verified FROM users WHERE email = $1",
-            email_lc,
+            normalized_email,
         )
         .fetch_optional(&self.pool)
         .await
@@ -288,13 +286,16 @@ impl AuthServiceImpl {
     /// identical on the found and not-found paths.
     pub async fn request_password_reset(&self, email: &str) -> AppResult<()> {
         Self::validate_email(email)?;
-        let email_lc = email.to_lowercase();
+        let normalized_email = email.trim().to_lowercase();
 
         // Always run the same SELECT — round-trip cost is structurally identical
-        let maybe_user = sqlx::query!("SELECT id, email FROM users WHERE email = $1", email_lc,)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(AppError::Database)?;
+        let maybe_user = sqlx::query!(
+            "SELECT id, email FROM users WHERE email = $1",
+            normalized_email,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(AppError::Database)?;
 
         if let Some(user) = maybe_user {
             let (raw_token, token_hash) = generate_token();
@@ -377,7 +378,11 @@ impl AuthServiceImpl {
             return Err(AppError::TokenExpired);
         }
 
-        let new_hash = hash_password(new_password, &self.config)?;
+        let config = Arc::clone(&self.config);
+        let pw = new_password.to_string();
+        let new_hash = tokio::task::spawn_blocking(move || hash_password(&pw, &config))
+            .await
+            .map_err(|_| AppError::Internal)??;
         let user_id = row.user_id;
 
         sqlx::query!(
@@ -400,5 +405,132 @@ impl AuthServiceImpl {
 
         tx.commit().await.map_err(AppError::Database)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::email::test_utils::CapturingEmailSender;
+
+    fn create_test_service() -> AuthServiceImpl {
+        let pool = PgPool::connect_lazy("postgres://localhost/test").expect("lazy pool");
+        let config = Arc::new(AppConfig {
+            argon2_m_cost: 19456,
+            argon2_t_cost: 2,
+            argon2_p_cost: 1,
+            ..Default::default()
+        });
+        let dispatcher = Arc::new(EmailDispatcher::new(CapturingEmailSender::default()));
+        AuthServiceImpl::new(pool, config, dispatcher).expect("test service")
+    }
+
+    #[test]
+    fn validate_email_accepts_valid_formats() {
+        assert!(AuthServiceImpl::validate_email("user@example.com").is_ok());
+        assert!(AuthServiceImpl::validate_email("user.name+tag@example.co.uk").is_ok());
+        assert!(AuthServiceImpl::validate_email("admin@sub.domain.org").is_ok());
+    }
+
+    #[test]
+    fn validate_email_handles_whitespace() {
+        assert!(AuthServiceImpl::validate_email("  user@example.com  ").is_ok());
+        assert!(AuthServiceImpl::validate_email("\tuser@domain.com\n").is_ok());
+    }
+
+    #[test]
+    fn validate_email_rejects_invalid_formats() {
+        assert!(matches!(
+            AuthServiceImpl::validate_email(""),
+            Err(AppError::InvalidEmail)
+        ));
+        assert!(matches!(
+            AuthServiceImpl::validate_email("   "),
+            Err(AppError::InvalidEmail)
+        ));
+        assert!(matches!(
+            AuthServiceImpl::validate_email("plainaddress"),
+            Err(AppError::InvalidEmail)
+        ));
+        assert!(matches!(
+            AuthServiceImpl::validate_email("@missinglocal.com"),
+            Err(AppError::InvalidEmail)
+        ));
+        assert!(matches!(
+            AuthServiceImpl::validate_email("missingdomain@"),
+            Err(AppError::InvalidEmail)
+        ));
+        assert!(matches!(
+            AuthServiceImpl::validate_email("missingdot@domain"),
+            Err(AppError::InvalidEmail)
+        ));
+    }
+
+    #[tokio::test]
+    async fn validate_password_accepts_valid_passwords() {
+        let service = create_test_service();
+        assert!(
+            service
+                .validate_password("correct-horse-battery-staple")
+                .is_ok()
+        );
+        assert!(service.validate_password("SecurePass#2026!").is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_password_counts_unicode_code_points() {
+        let service = create_test_service();
+        assert!(service.validate_password("🦀🦀🦀🦀🦀🦀🦀🦀").is_ok());
+        assert!(matches!(
+            service.validate_password("🦀🦀🦀🦀🦀🦀🦀"),
+            Err(AppError::PasswordTooShort)
+        ));
+        assert!(matches!(
+            service.validate_password("1234567"),
+            Err(AppError::PasswordTooShort)
+        ));
+    }
+
+    #[tokio::test]
+    async fn validate_password_enforces_max_length_128() {
+        let service = create_test_service();
+        let exact_128 = "a".repeat(128);
+        assert!(service.validate_password(&exact_128).is_ok());
+
+        let over_128 = "a".repeat(129);
+        assert!(matches!(
+            service.validate_password(&over_128),
+            Err(AppError::PasswordTooLong)
+        ));
+
+        let unicode_128 = "🦀".repeat(128);
+        assert!(service.validate_password(&unicode_128).is_ok());
+
+        let unicode_129 = "🦀".repeat(129);
+        assert!(matches!(
+            service.validate_password(&unicode_129),
+            Err(AppError::PasswordTooLong)
+        ));
+    }
+
+    #[tokio::test]
+    async fn validate_password_rejects_common_passwords() {
+        let service = create_test_service();
+        assert!(matches!(
+            service.validate_password("password"),
+            Err(AppError::PasswordTooCommon)
+        ));
+        assert!(matches!(
+            service.validate_password("12345678"),
+            Err(AppError::PasswordTooCommon)
+        ));
+        assert!(matches!(
+            service.validate_password("PASSWORD"),
+            Err(AppError::PasswordTooCommon)
+        ));
+        assert!(matches!(
+            service.validate_password("Admin1234"),
+            Err(AppError::PasswordTooCommon)
+        ));
     }
 }

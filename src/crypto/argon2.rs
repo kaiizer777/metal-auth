@@ -26,7 +26,7 @@ pub fn hash_password(password: &str, config: &AppConfig) -> Result<String, AppEr
 }
 
 /// Hash `password` using Argon2id with caller-supplied parameters.
-pub fn hash_password_with_params(
+pub(crate) fn hash_password_with_params(
     password: &str,
     m_cost: u32,
     t_cost: u32,

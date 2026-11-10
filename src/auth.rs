@@ -43,7 +43,7 @@ impl Auth {
         cfg: Config,
         sender: Option<SharedEmailSender>,
     ) -> Result<Self, AppError> {
-        let auth_config = Arc::new(AppConfig::from_env().unwrap_or_default());
+        let auth_config = Arc::new(AppConfig::from_env()?);
         Self::with_config_and_sender(cfg, auth_config, sender).await
     }
 

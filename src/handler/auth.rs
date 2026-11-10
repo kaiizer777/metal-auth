@@ -36,7 +36,10 @@ pub fn routes(service: Arc<AuthServiceImpl>) -> Router {
         .route("/login", axum::routing::post(login))
         .route("/logout", axum::routing::post(logout))
         .route("/verify", axum::routing::post(verify_email))
-        .route("/password/reset-request", axum::routing::post(request_password_reset))
+        .route(
+            "/password/reset-request",
+            axum::routing::post(request_password_reset),
+        )
         .route("/password/reset", axum::routing::post(reset_password))
         .with_state(state)
 }

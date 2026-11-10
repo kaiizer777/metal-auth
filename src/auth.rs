@@ -7,9 +7,9 @@ use crate::{config::Config, db, error::AppError, handler, state::AppState};
 pub mod models;
 pub mod service;
 
+pub use crate::handler::auth_routes;
 pub use models::*;
 pub use service::{AuthService, AuthServiceImpl};
-pub use crate::handler::auth_routes;
 
 #[derive(Clone)]
 pub struct Auth {

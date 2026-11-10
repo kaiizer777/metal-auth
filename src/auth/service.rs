@@ -28,6 +28,16 @@ use crate::{
     error::{AppError, AppResult},
 };
 
+#[allow(async_fn_in_trait)]
+pub trait AuthService: Send + Sync {
+    async fn signup(&self, email: &str, password: &str) -> AppResult<()>;
+    async fn login(&self, email: &str, password: &str) -> AppResult<Uuid>;
+    async fn logout(&self, session_id: &str) -> AppResult<()>;
+    async fn verify_email(&self, token: &str) -> AppResult<()>;
+    async fn request_password_reset(&self, email: &str) -> AppResult<()>;
+    async fn reset_password(&self, token: &str, new_password: &str) -> AppResult<()>;
+}
+
 pub struct AuthServiceImpl {
     pool: PgPool,
     pub config: Arc<AppConfig>,
@@ -61,8 +71,8 @@ impl AuthServiceImpl {
     /// Register a new account.
     ///
     /// Anti-enumeration: always returns `Ok(())` and always spawns a dispatcher
-    /// task, even on duplicate email. Handler always sends 200. Duplicate emails
-    /// are logged internally only.
+    /// task, even on duplicate email. Duplicate emails roll back the transaction
+    /// cleanly without leaking account existence.
     pub async fn signup(&self, email: &str, password: &str) -> AppResult<()> {
         validate_email(email)?;
         validate_password(password, &self.config)?;
@@ -75,58 +85,62 @@ impl AuthServiceImpl {
 
         let normalized_email = email.trim().to_lowercase();
 
+        let mut tx = self.pool.begin().await.map_err(AppError::Database)?;
+
         // Attempt insert; detect duplicate via UNIQUE constraint violation
         let result = sqlx::query!(
             "INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id",
             normalized_email,
             password_hash,
         )
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await;
 
-        let maybe_user_id = match result {
-            Ok(row) => Some(row.id),
+        let user_id = match result {
+            Ok(row) => row.id,
             Err(sqlx::Error::Database(ref db_err)) if db_err.code().as_deref() == Some("23505") => {
-                // Unique constraint violation — duplicate email
-                // Anti-enum: log internally, never expose to caller
+                let _ = tx.rollback().await;
                 tracing::info!(email = %normalized_email, "signup attempt on existing account");
-                None
+                tokio::spawn(async move {});
+                return Ok(());
             }
-            Err(e) => return Err(AppError::Database(e)),
+            Err(e) => {
+                let _ = tx.rollback().await;
+                return Err(AppError::Database(e));
+            }
         };
 
-        if let Some(user_id) = maybe_user_id {
-            // Generate and store verification token
-            let (raw_token, token_hash) = generate_token();
-            let ttl = self.config.verification_token_ttl_secs as i64;
-            let expires_at = Utc::now() + chrono::Duration::seconds(ttl);
+        // Generate and store verification token inside same transaction
+        let (raw_token, token_hash) = generate_token();
+        let ttl = self.config.verification_token_ttl_secs as i64;
+        let expires_at = Utc::now() + chrono::Duration::seconds(ttl);
 
-            sqlx::query!(
-                "INSERT INTO verification_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
-                &token_hash,
-                user_id,
-                expires_at,
-            )
-            .execute(&self.pool)
-            .await
-            .map_err(AppError::Database)?;
+        let insert_res = sqlx::query!(
+            "INSERT INTO verification_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
+            &token_hash[..],
+            user_id,
+            expires_at,
+        )
+        .execute(&mut *tx)
+        .await;
 
-            // Fire-and-forget email dispatch — never await on HTTP path
-            let dispatcher = Arc::clone(&self.dispatcher);
-            let email_clone = normalized_email.clone();
-            tokio::spawn(async move {
-                dispatcher.dispatch_verification(VerificationEmailPayload {
-                    to_email: email_clone,
-                    token: raw_token,
-                    user_id,
-                });
-            });
-        } else {
-            // Timing parity: spawn a no-op task without dispatching malformed payloads
-            tokio::spawn(async move {
-                // No-op for spawn timing parity without external dispatch side-effects
-            });
+        if let Err(e) = insert_res {
+            let _ = tx.rollback().await;
+            return Err(AppError::Database(e));
         }
+
+        tx.commit().await.map_err(AppError::Database)?;
+
+        // Fire-and-forget email dispatch — never await on HTTP path
+        let dispatcher = Arc::clone(&self.dispatcher);
+        let email_clone = normalized_email.clone();
+        tokio::spawn(async move {
+            dispatcher.dispatch_verification(VerificationEmailPayload {
+                to_email: email_clone,
+                token: raw_token,
+                user_id,
+            });
+        });
 
         Ok(())
     }
@@ -192,19 +206,19 @@ impl AuthServiceImpl {
 
     /// Consume an email verification token and mark the user's email as verified.
     ///
-    /// Token lifecycle (all within a single transaction, prevents replay):
-    /// 1. Hex-decode the 64-char token → SHA-256 → lookup by `token_hash`
-    /// 2. If no row: `InvalidToken`
-    /// 3. If `expires_at < NOW()`: DELETE row + `TokenExpired`
-    /// 4. If valid: DELETE row + UPDATE `users.email_verified = true`
+    /// TOCTOU-free atomic deletion & consumption:
+    /// Atomically deletes the token row and retrieves user_id & expires_at.
+    /// If missing, returns `InvalidToken`.
+    /// If expired, returns `TokenExpired`.
+    /// On success, updates user's `email_verified = true` and `updated_at = NOW()`.
     pub async fn verify_email(&self, token: &str) -> AppResult<()> {
         let token_hash = hash_token(token)?;
 
         let mut tx = self.pool.begin().await.map_err(AppError::Database)?;
 
         let maybe_row = sqlx::query!(
-            "SELECT user_id, expires_at FROM verification_tokens WHERE token_hash = $1",
-            &token_hash,
+            "DELETE FROM verification_tokens WHERE token_hash = $1 RETURNING user_id, expires_at",
+            &token_hash[..],
         )
         .fetch_optional(&mut *tx)
         .await
@@ -212,28 +226,19 @@ impl AuthServiceImpl {
 
         let row = match maybe_row {
             None => {
-                tx.rollback().await.map_err(AppError::Database)?;
+                let _ = tx.rollback().await;
                 return Err(AppError::InvalidToken);
             }
             Some(r) => r,
         };
 
-        // DELETE first (single-use: prevent replay even if we return early)
-        sqlx::query!(
-            "DELETE FROM verification_tokens WHERE token_hash = $1",
-            &token_hash,
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(AppError::Database)?;
-
         if row.expires_at < Utc::now() {
-            tx.commit().await.map_err(AppError::Database)?;
+            let _ = tx.rollback().await;
             return Err(AppError::TokenExpired);
         }
 
         sqlx::query!(
-            "UPDATE users SET email_verified = true WHERE id = $1",
+            "UPDATE users SET email_verified = true, updated_at = NOW() WHERE id = $1",
             row.user_id,
         )
         .execute(&mut *tx)
@@ -249,8 +254,7 @@ impl AuthServiceImpl {
     /// Initiate a password reset flow.
     ///
     /// Anti-enumeration: always queries DB and always returns `Ok(())` regardless
-    /// of whether the email exists. The SELECT round-trip cost is structurally
-    /// identical on the found and not-found paths.
+    /// of whether the email exists. Spawns timing-parity dummy task if not found.
     pub async fn request_password_reset(&self, email: &str) -> AppResult<()> {
         validate_email(email)?;
         let normalized_email = email.trim().to_lowercase();
@@ -271,7 +275,7 @@ impl AuthServiceImpl {
 
             sqlx::query!(
                 "INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
-                &token_hash,
+                &token_hash[..],
                 user.id,
                 expires_at,
             )
@@ -280,7 +284,7 @@ impl AuthServiceImpl {
             .map_err(AppError::Database)?;
 
             let dispatcher = Arc::clone(&self.dispatcher);
-            let email_clone = user.email.clone();
+            let email_clone = normalized_email.clone();
             let uid = user.id;
             tokio::spawn(async move {
                 dispatcher.dispatch_password_reset(PasswordResetEmailPayload {
@@ -289,9 +293,9 @@ impl AuthServiceImpl {
                     user_id: uid,
                 });
             });
+        } else {
+            tokio::spawn(async move {});
         }
-        // On not-found path: no DB write, no email, but function still returns Ok(()).
-        // The SELECT above already equalized the round-trip cost.
 
         Ok(())
     }
@@ -300,24 +304,26 @@ impl AuthServiceImpl {
 
     /// Consume a reset token and set a new password.
     ///
-    /// Validation order per spec:
-    /// 1. Body parse (caller's responsibility — handled in handler layer)
-    /// 2. Password length >= min Unicode code points
-    /// 3. Password length <= max
-    /// 4. Common password blocklist
-    /// 5. Token lookup (hex-decode → SHA-256 → SELECT+DELETE in txn)
-    ///
-    /// On success: UPDATE password, DELETE ALL reset tokens for this user.
+    /// Performance & Concurrency:
+    /// Argon2id hashing is executed outside the DB transaction to avoid connection starvation.
+    /// TOCTOU-free atomic deletion consumes the token row directly.
+    /// Revokes ALL remaining reset tokens for the user upon success.
     pub async fn reset_password(&self, token: &str, new_password: &str) -> AppResult<()> {
         validate_password(new_password, &self.config)?;
-
         let token_hash = hash_token(token)?;
+
+        // Compute hash outside of DB transaction to prevent holding pool connection
+        let config = Arc::clone(&self.config);
+        let pw = new_password.to_string();
+        let new_hash = tokio::task::spawn_blocking(move || hash_password(&pw, &config))
+            .await
+            .map_err(|_| AppError::Internal)??;
 
         let mut tx = self.pool.begin().await.map_err(AppError::Database)?;
 
         let maybe_row = sqlx::query!(
-            "SELECT user_id, expires_at FROM password_reset_tokens WHERE token_hash = $1",
-            &token_hash,
+            "DELETE FROM password_reset_tokens WHERE token_hash = $1 RETURNING user_id, expires_at",
+            &token_hash[..],
         )
         .fetch_optional(&mut *tx)
         .await
@@ -325,35 +331,21 @@ impl AuthServiceImpl {
 
         let row = match maybe_row {
             None => {
-                tx.rollback().await.map_err(AppError::Database)?;
+                let _ = tx.rollback().await;
                 return Err(AppError::InvalidToken);
             }
             Some(r) => r,
         };
 
-        // DELETE the specific token first (single-use)
-        sqlx::query!(
-            "DELETE FROM password_reset_tokens WHERE token_hash = $1",
-            &token_hash,
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(AppError::Database)?;
-
         if row.expires_at < Utc::now() {
-            tx.commit().await.map_err(AppError::Database)?;
+            let _ = tx.rollback().await;
             return Err(AppError::TokenExpired);
         }
 
-        let config = Arc::clone(&self.config);
-        let pw = new_password.to_string();
-        let new_hash = tokio::task::spawn_blocking(move || hash_password(&pw, &config))
-            .await
-            .map_err(|_| AppError::Internal)??;
         let user_id = row.user_id;
 
         sqlx::query!(
-            "UPDATE users SET password_hash = $1 WHERE id = $2",
+            "UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2",
             new_hash,
             user_id,
         )
@@ -361,7 +353,7 @@ impl AuthServiceImpl {
         .await
         .map_err(AppError::Database)?;
 
-        // Invalidate ALL remaining reset tokens for this user (spec §1.5)
+        // Invalidate ALL remaining reset tokens for this user
         sqlx::query!(
             "DELETE FROM password_reset_tokens WHERE user_id = $1",
             user_id,
@@ -375,10 +367,37 @@ impl AuthServiceImpl {
     }
 }
 
+impl AuthService for AuthServiceImpl {
+    async fn signup(&self, email: &str, password: &str) -> AppResult<()> {
+        self.signup(email, password).await
+    }
+
+    async fn login(&self, email: &str, password: &str) -> AppResult<Uuid> {
+        self.login(email, password).await
+    }
+
+    async fn logout(&self, session_id: &str) -> AppResult<()> {
+        self.logout(session_id).await
+    }
+
+    async fn verify_email(&self, token: &str) -> AppResult<()> {
+        self.verify_email(token).await
+    }
+
+    async fn request_password_reset(&self, email: &str) -> AppResult<()> {
+        self.request_password_reset(email).await
+    }
+
+    async fn reset_password(&self, token: &str, new_password: &str) -> AppResult<()> {
+        self.reset_password(token, new_password).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::email::test_utils::CapturingEmailSender;
+    use crate::email::{EmailSender, test_utils::CapturingEmailSender};
+    use std::sync::Mutex;
 
     fn create_test_service() -> AuthServiceImpl {
         let pool = PgPool::connect_lazy("postgres://localhost/test").expect("lazy pool");
@@ -390,6 +409,48 @@ mod tests {
         });
         let dispatcher = Arc::new(EmailDispatcher::new(CapturingEmailSender::default()));
         AuthServiceImpl::new(pool, config, dispatcher).expect("test service")
+    }
+
+    #[derive(Clone, Default)]
+    struct ArcCapturingSender {
+        verification_calls: Arc<Mutex<Vec<VerificationEmailPayload>>>,
+        reset_calls: Arc<Mutex<Vec<PasswordResetEmailPayload>>>,
+    }
+
+    impl EmailSender for ArcCapturingSender {
+        fn send_verification(&self, payload: VerificationEmailPayload) {
+            self.verification_calls.lock().unwrap().push(payload);
+        }
+
+        fn send_password_reset(&self, payload: PasswordResetEmailPayload) {
+            self.reset_calls.lock().unwrap().push(payload);
+        }
+    }
+
+    struct DbTestContext {
+        service: AuthServiceImpl,
+        pool: PgPool,
+        sender: ArcCapturingSender,
+    }
+
+    async fn setup_db_context() -> Option<DbTestContext> {
+        dotenvy::dotenv().ok();
+        let url = std::env::var("DATABASE_URL").ok()?;
+        let pool = PgPool::connect(&url).await.ok()?;
+        let config = Arc::new(AppConfig {
+            argon2_m_cost: 19456,
+            argon2_t_cost: 2,
+            argon2_p_cost: 1,
+            ..Default::default()
+        });
+        let sender = ArcCapturingSender::default();
+        let dispatcher = Arc::new(EmailDispatcher::new(sender.clone()));
+        let service = AuthServiceImpl::new(pool.clone(), config, dispatcher).ok()?;
+        Some(DbTestContext {
+            service,
+            pool,
+            sender,
+        })
     }
 
     #[test]
@@ -489,5 +550,233 @@ mod tests {
             validate_password("Admin1234", &service.config),
             Err(AppError::PasswordTooCommon)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_auth_service_trait_object_or_generic() {
+        let service = create_test_service();
+        async fn assert_trait<T: AuthService>(svc: &T) {
+            assert!(svc.logout("sess-123").await.is_ok());
+        }
+        assert_trait(&service).await;
+    }
+
+    #[tokio::test]
+    async fn test_token_replay_prevention() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+
+        let email = format!("replay_{}@example.com", Uuid::new_v4());
+        let password = "SecurePassword123!";
+
+        // Sign up user
+        ctx.service.signup(&email, password).await.unwrap();
+
+        // Give async spawn time to dispatch
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let token = {
+            let calls = ctx.sender.verification_calls.lock().unwrap();
+            let call = calls
+                .iter()
+                .find(|c| c.to_email == email)
+                .expect("token dispatched");
+            call.token.clone()
+        };
+
+        // First verification succeeds
+        let res1 = ctx.service.verify_email(&token).await;
+        assert!(res1.is_ok(), "first verification must succeed: {:?}", res1);
+
+        // Second verification with same token fails (single-use / replay prevention)
+        let res2 = ctx.service.verify_email(&token).await;
+        assert!(
+            matches!(res2, Err(AppError::InvalidToken)),
+            "second verification must fail with InvalidToken: {:?}",
+            res2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_token_expiry_rejection() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+
+        let email = format!("expired_{}@example.com", Uuid::new_v4());
+        let password = "SecurePassword123!";
+        let config = Arc::clone(&ctx.service.config);
+        let password_hash = hash_password(password, &config).unwrap();
+
+        let row = sqlx::query!(
+            "INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id",
+            email,
+            password_hash,
+        )
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+
+        let (raw_token, token_hash) = generate_token();
+        let past_time = Utc::now() - chrono::Duration::hours(2);
+
+        sqlx::query!(
+            "INSERT INTO verification_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
+            &token_hash[..],
+            row.id,
+            past_time,
+        )
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+
+        let res = ctx.service.verify_email(&raw_token).await;
+        assert!(
+            matches!(res, Err(AppError::TokenExpired)),
+            "expired token must be rejected with TokenExpired: {:?}",
+            res
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unverified_email_login_block() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+
+        let email = format!("unverified_{}@example.com", Uuid::new_v4());
+        let password = "SecurePassword123!";
+        let config = Arc::clone(&ctx.service.config);
+        let password_hash = hash_password(password, &config).unwrap();
+
+        // Insert unverified user
+        let row = sqlx::query!(
+            "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, false) RETURNING id",
+            email,
+            password_hash,
+        )
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+
+        // Login must fail because email is unverified
+        let res = ctx.service.login(&email, password).await;
+        assert!(
+            matches!(res, Err(AppError::EmailNotVerified)),
+            "login must be blocked when unverified: {:?}",
+            res
+        );
+
+        // Mark verified
+        sqlx::query!(
+            "UPDATE users SET email_verified = true WHERE id = $1",
+            row.id
+        )
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+
+        // Now login succeeds
+        let res = ctx.service.login(&email, password).await;
+        assert_eq!(res.unwrap(), row.id);
+    }
+
+    #[tokio::test]
+    async fn test_anti_enumeration_signup_and_reset() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+
+        let email = format!("antienum_{}@example.com", Uuid::new_v4());
+        let password = "SecurePassword123!";
+
+        // First signup returns Ok(())
+        let res1 = ctx.service.signup(&email, password).await;
+        assert!(res1.is_ok());
+
+        // Duplicate signup returns Ok(()) without error leak
+        let res2 = ctx.service.signup(&email, password).await;
+        assert!(res2.is_ok(), "duplicate signup must return Ok(())");
+
+        // Request reset for non-existent email returns Ok(())
+        let res3 = ctx
+            .service
+            .request_password_reset("nonexistent_user_99999@example.com")
+            .await;
+        assert!(
+            res3.is_ok(),
+            "unknown email reset request must return Ok(())"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_password_reset_revokes_all_tokens() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+
+        let email = format!("reset_revoke_{}@example.com", Uuid::new_v4());
+        let old_password = "OldSecurePassword123!";
+        let new_password = "NewSecurePassword456!";
+        let config = Arc::clone(&ctx.service.config);
+        let password_hash = hash_password(old_password, &config).unwrap();
+
+        let row = sqlx::query!(
+            "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true) RETURNING id",
+            email,
+            password_hash,
+        )
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+
+        // Insert two distinct reset tokens for this user
+        let (raw_tok1, hash1) = generate_token();
+        let (raw_tok2, hash2) = generate_token();
+        let future_time = Utc::now() + chrono::Duration::hours(1);
+
+        sqlx::query!(
+            "INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
+            &hash1[..],
+            row.id,
+            future_time,
+        )
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+
+        sqlx::query!(
+            "INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
+            &hash2[..],
+            row.id,
+            future_time,
+        )
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+
+        // Reset password using token 1
+        let res = ctx.service.reset_password(&raw_tok1, new_password).await;
+        assert!(res.is_ok(), "reset_password with token 1 must succeed");
+
+        // Token 2 must now be invalid because ALL tokens for the user were revoked
+        let res2 = ctx
+            .service
+            .reset_password(&raw_tok2, "AnotherPassword789!")
+            .await;
+        assert!(
+            matches!(res2, Err(AppError::InvalidToken)),
+            "token 2 must be revoked upon reset: {:?}",
+            res2
+        );
+
+        // Login with old password fails
+        let old_login = ctx.service.login(&email, old_password).await;
+        assert!(matches!(old_login, Err(AppError::InvalidCredentials)));
+
+        // Login with new password succeeds
+        let new_login = ctx.service.login(&email, new_password).await;
+        assert_eq!(new_login.unwrap(), row.id);
     }
 }

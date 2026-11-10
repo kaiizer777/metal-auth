@@ -8,7 +8,7 @@ pub mod models;
 pub mod service;
 
 pub use models::*;
-pub use service::AuthServiceImpl;
+pub use service::{AuthService, AuthServiceImpl};
 
 #[derive(Clone)]
 pub struct Auth {

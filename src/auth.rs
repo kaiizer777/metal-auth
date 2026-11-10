@@ -4,8 +4,10 @@ use axum::Router;
 
 use crate::{config::Config, db, error::AppError, handler, state::AppState};
 
+pub mod models;
 pub mod service;
 
+pub use models::*;
 pub use service::AuthServiceImpl;
 
 #[derive(Clone)]

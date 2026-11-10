@@ -3,6 +3,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::{error::AppError, state::AppState};
 
+pub mod auth;
 pub mod cors;
 
 pub use cors::cors_layer;

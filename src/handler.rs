@@ -52,7 +52,7 @@ mod tests {
         };
 
         let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
-        let state = AppState::new(pool, cfg);
+        let state = AppState::new(pool, cfg).unwrap();
         let _router: Router = create_router(state).unwrap();
     }
 
@@ -72,7 +72,7 @@ mod tests {
         };
 
         let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
-        let state = AppState::new(pool, cfg);
+        let state = AppState::new(pool, cfg).unwrap();
         assert!(create_router(state).is_err());
     }
 
@@ -92,7 +92,7 @@ mod tests {
         };
 
         let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
-        let state = AppState::new(pool, cfg);
+        let state = AppState::new(pool, cfg).unwrap();
         let mut router = create_router(state).unwrap();
 
         let req = Request::builder()

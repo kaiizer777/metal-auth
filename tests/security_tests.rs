@@ -27,7 +27,7 @@ fn create_test_router() -> axum::Router {
         async_email_dispatch: true,
     };
     let pool = PgPool::connect_lazy(&cfg.database_url).expect("lazy pool");
-    let state = AppState::new(pool, cfg);
+    let state = AppState::new(pool, cfg).expect("failed to create app state");
     create_router(state).expect("failed to create router")
 }
 
@@ -53,7 +53,7 @@ async fn setup_live_db() -> Option<LiveDbTestContext> {
         email_dispatch_timeout: std::time::Duration::from_secs(10),
         async_email_dispatch: true,
     };
-    let state = AppState::new(pool.clone(), cfg);
+    let state = AppState::new(pool.clone(), cfg).ok()?;
     let router = create_router(state.clone()).ok()?;
     Some(LiveDbTestContext {
         router,

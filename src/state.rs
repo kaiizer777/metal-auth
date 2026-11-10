@@ -19,8 +19,8 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(pool: PgPool, config: Config) -> Self {
-        let auth_config = Arc::new(AppConfig::from_env().unwrap_or_default());
+    pub fn new(pool: PgPool, config: Config) -> Result<Self, AppError> {
+        let auth_config = Arc::new(AppConfig::from_env()?);
         Self::with_configs_and_dispatcher(pool, config, auth_config, None)
     }
 
@@ -55,23 +55,20 @@ impl AppState {
         config: Config,
         auth_config: Arc<AppConfig>,
         email_dispatcher: Arc<EmailDispatcher>,
-    ) -> Self {
-        let auth_service = Arc::new(
-            AuthServiceImpl::new(
-                pool.clone(),
-                Arc::clone(&auth_config),
-                Arc::clone(&email_dispatcher),
-            )
-            .expect("auth service initialization must succeed"),
-        );
+    ) -> Result<Self, AppError> {
+        let auth_service = Arc::new(AuthServiceImpl::new(
+            pool.clone(),
+            Arc::clone(&auth_config),
+            Arc::clone(&email_dispatcher),
+        )?);
 
-        Self {
+        Ok(Self {
             pool,
             config,
             auth_config,
             auth_service,
             email_dispatcher: Some(email_dispatcher),
-        }
+        })
     }
 
     pub fn with_configs_and_dispatcher(
@@ -79,7 +76,7 @@ impl AppState {
         config: Config,
         auth_config: Arc<AppConfig>,
         email_dispatcher: Option<Arc<EmailDispatcher>>,
-    ) -> Self {
+    ) -> Result<Self, AppError> {
         let dispatcher = email_dispatcher.clone().unwrap_or_else(|| {
             Arc::new(
                 EmailDispatcher::new(
@@ -91,26 +88,27 @@ impl AppState {
             )
         });
 
-        let auth_service = Arc::new(
-            AuthServiceImpl::new(pool.clone(), Arc::clone(&auth_config), dispatcher)
-                .expect("auth service initialization must succeed"),
-        );
+        let auth_service = Arc::new(AuthServiceImpl::new(
+            pool.clone(),
+            Arc::clone(&auth_config),
+            dispatcher,
+        )?);
 
-        Self {
+        Ok(Self {
             pool,
             config,
             auth_config,
             auth_service,
             email_dispatcher,
-        }
+        })
     }
 
     pub fn with_email_dispatcher(
         pool: PgPool,
         config: Config,
         email_dispatcher: Option<Arc<EmailDispatcher>>,
-    ) -> Self {
-        let auth_config = Arc::new(AppConfig::from_env().unwrap_or_default());
+    ) -> Result<Self, AppError> {
+        let auth_config = Arc::new(AppConfig::from_env()?);
         Self::with_configs_and_dispatcher(pool, config, auth_config, email_dispatcher)
     }
 

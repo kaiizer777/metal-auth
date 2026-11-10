@@ -6,8 +6,8 @@ use axum::{
 };
 use chrono::Utc;
 use metal_auth::{
-    AppConfig, AppError, AppState, Auth, Config, ConfigError, ErrorCode, ErrorResponse,
-    PasswordResetToken, Session, User, UserResponse, VerificationToken,
+    AppConfig, AppError, AppState, Auth, Config, ConfigError, EmailDispatcher, ErrorCode,
+    ErrorResponse, PasswordResetToken, Session, User, UserResponse, VerificationToken,
 };
 use sqlx::PgPool;
 use tower::Service;
@@ -29,7 +29,7 @@ async fn test_auth_facade_and_router_boot() {
     };
 
     let pool = PgPool::connect_lazy(&cfg.database_url).expect("lazy pool creation");
-    let state = AppState::new(pool, cfg);
+    let state = AppState::new(pool, cfg).unwrap();
     let mut auth = Auth::from_state(state).unwrap();
 
     // 1. Unknown route returns 404 with standardized error response envelope
@@ -243,7 +243,7 @@ async fn test_auth_boot_fails_fast_on_invalid_cors() {
     };
 
     let pool = PgPool::connect_lazy(&cfg.database_url).expect("lazy pool creation");
-    let state = AppState::new(pool, cfg);
+    let state = AppState::new(pool, cfg).unwrap();
     let result = Auth::from_state(state);
     assert!(matches!(
         result,
@@ -307,15 +307,52 @@ async fn test_state_with_auth_config_propagates_error() {
         email_dispatch_timeout: std::time::Duration::from_secs(10),
         async_email_dispatch: true,
     };
-    let state = AppState::new(pool, cfg);
+    let state = AppState::new(pool.clone(), cfg.clone()).unwrap();
 
     let valid_config = std::sync::Arc::new(AppConfig::default());
-    assert!(state.clone().with_auth_config(valid_config).is_ok());
+    assert!(state.clone().with_auth_config(valid_config.clone()).is_ok());
 
     let invalid_config = std::sync::Arc::new(AppConfig {
         argon2_m_cost: 100,
         ..Default::default()
     });
-    let err = state.with_auth_config(invalid_config);
+    let err = state.with_auth_config(invalid_config.clone());
     assert!(matches!(err, Err(AppError::Config(_))));
+
+    let dispatcher = std::sync::Arc::new(EmailDispatcher::new(
+        None,
+        cfg.email_dispatch_timeout,
+        cfg.async_email_dispatch,
+    ));
+
+    // Test with_dispatcher fallibility
+    assert!(
+        AppState::with_dispatcher(
+            pool.clone(),
+            cfg.clone(),
+            valid_config.clone(),
+            dispatcher.clone()
+        )
+        .is_ok()
+    );
+    let err_disp = AppState::with_dispatcher(
+        pool.clone(),
+        cfg.clone(),
+        invalid_config.clone(),
+        dispatcher.clone(),
+    );
+    assert!(matches!(err_disp, Err(AppError::Config(_))));
+
+    // Test with_configs_and_dispatcher fallibility
+    assert!(
+        AppState::with_configs_and_dispatcher(
+            pool.clone(),
+            cfg.clone(),
+            valid_config,
+            Some(dispatcher),
+        )
+        .is_ok()
+    );
+    let err_cfgs = AppState::with_configs_and_dispatcher(pool, cfg, invalid_config, None);
+    assert!(matches!(err_cfgs, Err(AppError::Config(_))));
 }

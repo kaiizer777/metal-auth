@@ -230,6 +230,59 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
+    /// Validates all configuration bounds per OWASP ASVS 5.0 L1 minimums.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.argon2_m_cost < 19456 {
+            return Err(ConfigError::InvalidValue {
+                field: "argon2_m_cost",
+                reason: "must be at least 19456 KiB",
+            });
+        }
+        if self.argon2_t_cost < 2 {
+            return Err(ConfigError::InvalidValue {
+                field: "argon2_t_cost",
+                reason: "must be at least 2 iterations",
+            });
+        }
+        if self.argon2_p_cost < 1 {
+            return Err(ConfigError::InvalidValue {
+                field: "argon2_p_cost",
+                reason: "must be at least 1 lane",
+            });
+        }
+        if self.password_min_len < 8 {
+            return Err(ConfigError::InvalidValue {
+                field: "password_min_len",
+                reason: "must be at least 8 characters",
+            });
+        }
+        if self.password_max_len > 128 {
+            return Err(ConfigError::InvalidValue {
+                field: "password_max_len",
+                reason: "must not exceed 128 characters",
+            });
+        }
+        if self.password_min_len > self.password_max_len {
+            return Err(ConfigError::InvalidValue {
+                field: "password_min_len",
+                reason: "must not exceed password_max_len",
+            });
+        }
+        if !(900..=3600).contains(&self.verification_token_ttl_secs) {
+            return Err(ConfigError::InvalidValue {
+                field: "verification_token_ttl_secs",
+                reason: "must be between 900 and 3600 seconds",
+            });
+        }
+        if !(900..=3600).contains(&self.reset_token_ttl_secs) {
+            return Err(ConfigError::InvalidValue {
+                field: "reset_token_ttl_secs",
+                reason: "must be between 900 and 3600 seconds",
+            });
+        }
+        Ok(())
+    }
+
     /// Fallible constructor — validates all fields per OWASP ASVS 5.0 L1 minimums.
     ///
     /// Returns typed `ConfigError::InvalidValue` on any out-of-range value.
@@ -244,55 +297,7 @@ impl AppConfig {
         reset_token_ttl_secs: u64,
         require_email_verification: bool,
     ) -> Result<Self, ConfigError> {
-        if argon2_m_cost < 19456 {
-            return Err(ConfigError::InvalidValue {
-                field: "argon2_m_cost",
-                reason: "must be at least 19456 KiB",
-            });
-        }
-        if argon2_t_cost < 2 {
-            return Err(ConfigError::InvalidValue {
-                field: "argon2_t_cost",
-                reason: "must be at least 2 iterations",
-            });
-        }
-        if argon2_p_cost < 1 {
-            return Err(ConfigError::InvalidValue {
-                field: "argon2_p_cost",
-                reason: "must be at least 1 lane",
-            });
-        }
-        if password_min_len < 8 {
-            return Err(ConfigError::InvalidValue {
-                field: "password_min_len",
-                reason: "must be at least 8 characters",
-            });
-        }
-        if password_max_len > 128 {
-            return Err(ConfigError::InvalidValue {
-                field: "password_max_len",
-                reason: "must not exceed 128 characters",
-            });
-        }
-        if password_min_len > password_max_len {
-            return Err(ConfigError::InvalidValue {
-                field: "password_min_len",
-                reason: "must not exceed password_max_len",
-            });
-        }
-        if !(900..=3600).contains(&verification_token_ttl_secs) {
-            return Err(ConfigError::InvalidValue {
-                field: "verification_token_ttl_secs",
-                reason: "must be between 900 and 3600 seconds",
-            });
-        }
-        if !(900..=3600).contains(&reset_token_ttl_secs) {
-            return Err(ConfigError::InvalidValue {
-                field: "reset_token_ttl_secs",
-                reason: "must be between 900 and 3600 seconds",
-            });
-        }
-        Ok(Self {
+        let config = Self {
             argon2_m_cost,
             argon2_t_cost,
             argon2_p_cost,
@@ -301,7 +306,9 @@ impl AppConfig {
             verification_token_ttl_secs,
             reset_token_ttl_secs,
             require_email_verification,
-        })
+        };
+        config.validate()?;
+        Ok(config)
     }
 
     /// Load `AppConfig` from environment variables, falling back to defaults.
@@ -687,5 +694,33 @@ mod tests {
         assert!(cfg.password_max_len <= 128);
         assert!((900..=3600).contains(&cfg.verification_token_ttl_secs));
         assert!((900..=3600).contains(&cfg.reset_token_ttl_secs));
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn app_config_validate_rejects_invalid_bounds() {
+        let cfg = AppConfig {
+            argon2_m_cost: 1000,
+            ..Default::default()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "argon2_m_cost",
+                ..
+            })
+        ));
+
+        let cfg = AppConfig {
+            password_min_len: 5,
+            ..Default::default()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "password_min_len",
+                ..
+            })
+        ));
     }
 }

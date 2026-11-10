@@ -65,6 +65,7 @@ impl AuthServiceImpl {
         config: Arc<AppConfig>,
         dispatcher: Arc<EmailDispatcher>,
     ) -> Result<Self, AppError> {
+        config.validate().map_err(AppError::Config)?;
         let dummy_hash = generate_dummy_hash(&config)?;
         Ok(Self {
             pool,
@@ -427,6 +428,22 @@ mod tests {
             true,
         ));
         AuthServiceImpl::new(pool, config, dispatcher).expect("test service")
+    }
+
+    #[tokio::test]
+    async fn test_auth_service_new_rejects_invalid_config() {
+        let pool = PgPool::connect_lazy("postgres://localhost/test").expect("lazy pool");
+        let invalid_config = Arc::new(AppConfig {
+            argon2_m_cost: 1000,
+            ..Default::default()
+        });
+        let dispatcher = Arc::new(EmailDispatcher::new(
+            None,
+            std::time::Duration::from_secs(10),
+            true,
+        ));
+        let res = AuthServiceImpl::new(pool, invalid_config, dispatcher);
+        assert!(matches!(res, Err(AppError::Config(_))));
     }
 
     #[derive(Clone, Default)]

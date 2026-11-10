@@ -349,10 +349,8 @@ fn build_reset_url_formatting() {
         trailing_slash_url,
         "https://auth.example.com/auth/password/reset?token=token-abc"
     );
-    let encoded_url = EmailDispatcher::build_reset_url(
-        "https://auth.example.com/",
-        "token with spaces+symbols",
-    );
+    let encoded_url =
+        EmailDispatcher::build_reset_url("https://auth.example.com/", "token with spaces+symbols");
     assert_eq!(
         encoded_url,
         "https://auth.example.com/auth/password/reset?token=token%20with%20spaces%2Bsymbols"

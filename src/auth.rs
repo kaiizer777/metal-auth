@@ -1,6 +1,12 @@
+//! Auth module facade — `Auth` entry-point struct and `AuthService` trait.
+
 use axum::Router;
 
 use crate::{config::Config, db, error::AppError, handler, state::AppState};
+
+pub mod service;
+
+pub use service::AuthServiceImpl;
 
 #[derive(Clone)]
 pub struct Auth {

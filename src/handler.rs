@@ -28,7 +28,7 @@ pub fn create_router(state: AppState) -> Result<Router, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{AppConfig, Config};
     use axum::{
         body::Body,
         http::{Method, Request, StatusCode},
@@ -52,7 +52,9 @@ mod tests {
         };
 
         let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
-        let state = AppState::new(pool, cfg).unwrap();
+        let state =
+            AppState::with_configs_and_dispatcher(pool, cfg, Arc::new(AppConfig::default()), None)
+                .unwrap();
         let _router: Router = create_router(state).unwrap();
     }
 
@@ -72,7 +74,9 @@ mod tests {
         };
 
         let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
-        let state = AppState::new(pool, cfg).unwrap();
+        let state =
+            AppState::with_configs_and_dispatcher(pool, cfg, Arc::new(AppConfig::default()), None)
+                .unwrap();
         assert!(create_router(state).is_err());
     }
 
@@ -92,7 +96,9 @@ mod tests {
         };
 
         let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
-        let state = AppState::new(pool, cfg).unwrap();
+        let state =
+            AppState::with_configs_and_dispatcher(pool, cfg, Arc::new(AppConfig::default()), None)
+                .unwrap();
         let mut router = create_router(state).unwrap();
 
         let req = Request::builder()

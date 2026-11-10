@@ -1,10 +1,12 @@
 use std::str::FromStr;
+use std::time::Duration;
 
 use crate::error::ConfigError;
 
 pub const DEFAULT_PORT: u16 = 3000;
 pub const DEFAULT_MAX_CONNECTIONS: u32 = 25;
 pub const DEFAULT_MIN_CONNECTIONS: u32 = 2;
+pub const DEFAULT_EMAIL_DISPATCH_TIMEOUT_SECS: u64 = 10;
 
 // ─── Phase 1 — Infra Config ──────────────────────────────────────────────────
 
@@ -21,6 +23,11 @@ pub struct Config {
     // DB pool
     pub max_connections: u32,
     pub min_connections: u32,
+
+    // Phase 2: email hook dispatch
+    pub base_url: String,
+    pub email_dispatch_timeout: Duration,
+    pub async_email_dispatch: bool,
 }
 
 impl std::fmt::Debug for Config {
@@ -33,12 +40,32 @@ impl std::fmt::Debug for Config {
             .field("allowed_headers", &self.allowed_headers)
             .field("max_connections", &self.max_connections)
             .field("min_connections", &self.min_connections)
+            .field("base_url", &"[REDACTED]")
+            .field("email_dispatch_timeout", &self.email_dispatch_timeout)
+            .field("async_email_dispatch", &self.async_email_dispatch)
             .finish()
     }
 }
 
 impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.base_url.trim().is_empty() {
+            return Err(ConfigError::MissingEnvVar("BASE_URL"));
+        }
+        let uri = self
+            .base_url
+            .parse::<axum::http::Uri>()
+            .map_err(|_| ConfigError::InvalidEnvVar("BASE_URL"))?;
+        if !matches!(uri.scheme_str(), Some("http" | "https"))
+            || uri.authority().is_none()
+            || uri.query().is_some()
+            || uri.authority().is_some_and(|a| a.as_str().contains('@'))
+        {
+            return Err(ConfigError::InvalidEnvVar("BASE_URL"));
+        }
+        if self.email_dispatch_timeout == Duration::ZERO {
+            return Err(ConfigError::InvalidEnvVar("EMAIL_DISPATCH_TIMEOUT_SECS"));
+        }
         for origin in &self.allowed_origins {
             let trimmed = origin.trim();
             if trimmed != "*" {
@@ -91,6 +118,44 @@ impl Config {
 
         let allowed_origins = parse_allowed_origins()?;
 
+        let base_url = match std::env::var("BASE_URL") {
+            Ok(val) => val,
+            Err(std::env::VarError::NotPresent) => {
+                return Err(ConfigError::MissingEnvVar("BASE_URL"));
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar("BASE_URL"));
+            }
+        };
+
+        let email_dispatch_timeout = match std::env::var("EMAIL_DISPATCH_TIMEOUT_SECS") {
+            Ok(val) => {
+                let secs: u64 = val
+                    .parse()
+                    .map_err(|_| ConfigError::InvalidEnvVar("EMAIL_DISPATCH_TIMEOUT_SECS"))?;
+                if secs == 0 {
+                    return Err(ConfigError::InvalidEnvVar("EMAIL_DISPATCH_TIMEOUT_SECS"));
+                }
+                Duration::from_secs(secs)
+            }
+            Err(std::env::VarError::NotPresent) => {
+                Duration::from_secs(DEFAULT_EMAIL_DISPATCH_TIMEOUT_SECS)
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar("EMAIL_DISPATCH_TIMEOUT_SECS"));
+            }
+        };
+
+        let async_email_dispatch = match std::env::var("ASYNC_EMAIL_DISPATCH") {
+            Ok(val) => val
+                .parse::<bool>()
+                .map_err(|_| ConfigError::InvalidEnvVar("ASYNC_EMAIL_DISPATCH"))?,
+            Err(std::env::VarError::NotPresent) => true,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar("ASYNC_EMAIL_DISPATCH"));
+            }
+        };
+
         let cfg = Self {
             database_url,
             port,
@@ -105,6 +170,9 @@ impl Config {
                 .collect(),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             min_connections: DEFAULT_MIN_CONNECTIONS,
+            base_url,
+            email_dispatch_timeout,
+            async_email_dispatch,
         };
 
         cfg.validate()?;
@@ -345,6 +413,9 @@ mod tests {
             allowed_headers: vec!["Content-Type".into()],
             max_connections: DEFAULT_MAX_CONNECTIONS,
             min_connections: DEFAULT_MIN_CONNECTIONS,
+            base_url: "https://example.com".into(),
+            email_dispatch_timeout: Duration::from_secs(10),
+            async_email_dispatch: true,
         };
         assert_eq!(cfg.port, 3000);
         assert_eq!(cfg.max_connections, 25);
@@ -361,11 +432,15 @@ mod tests {
             allowed_headers: vec!["Content-Type".into()],
             max_connections: DEFAULT_MAX_CONNECTIONS,
             min_connections: DEFAULT_MIN_CONNECTIONS,
+            base_url: "https://example.com".into(),
+            email_dispatch_timeout: Duration::from_secs(10),
+            async_email_dispatch: true,
         };
         let debug_output = format!("{cfg:?}");
         assert!(debug_output.contains("[REDACTED]"));
         assert!(!debug_output.contains("super_secret_password"));
         assert!(!debug_output.contains("secret_user"));
+        assert!(!debug_output.contains("https://example.com"));
     }
 
     #[test]
@@ -396,6 +471,9 @@ mod tests {
             allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
             max_connections: 5,
             min_connections: 1,
+            base_url: "https://app.example.com".into(),
+            email_dispatch_timeout: Duration::from_secs(10),
+            async_email_dispatch: true,
         };
         assert!(cfg.validate().is_ok());
     }
@@ -410,6 +488,9 @@ mod tests {
             allowed_headers: vec!["Content-Type".into()],
             max_connections: 5,
             min_connections: 1,
+            base_url: "https://app.example.com".into(),
+            email_dispatch_timeout: Duration::from_secs(10),
+            async_email_dispatch: true,
         };
         assert!(matches!(
             cfg.validate(),
@@ -427,6 +508,9 @@ mod tests {
             allowed_headers: vec!["Content-Type".into()],
             max_connections: 5,
             min_connections: 1,
+            base_url: "https://app.example.com".into(),
+            email_dispatch_timeout: Duration::from_secs(10),
+            async_email_dispatch: true,
         };
         assert!(matches!(
             cfg.validate(),
@@ -444,6 +528,9 @@ mod tests {
             allowed_headers: vec!["Bad Header".into()],
             max_connections: 5,
             min_connections: 1,
+            base_url: "https://app.example.com".into(),
+            email_dispatch_timeout: Duration::from_secs(10),
+            async_email_dispatch: true,
         };
         assert!(matches!(
             cfg.validate(),

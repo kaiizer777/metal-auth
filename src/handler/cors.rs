@@ -83,6 +83,9 @@ mod tests {
             allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
             max_connections: 5,
             min_connections: 1,
+            base_url: "https://example.com".into(),
+            email_dispatch_timeout: std::time::Duration::from_secs(10),
+            async_email_dispatch: true,
         };
 
         let mut app = Router::new()
@@ -115,6 +118,9 @@ mod tests {
             allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
             max_connections: 5,
             min_connections: 1,
+            base_url: "https://example.com".into(),
+            email_dispatch_timeout: std::time::Duration::from_secs(10),
+            async_email_dispatch: true,
         };
 
         let mut app = Router::new()
@@ -154,6 +160,9 @@ mod tests {
             allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
             max_connections: 5,
             min_connections: 1,
+            base_url: "https://example.com".into(),
+            email_dispatch_timeout: std::time::Duration::from_secs(10),
+            async_email_dispatch: true,
         };
 
         let mut app = Router::new()
@@ -195,6 +204,9 @@ mod tests {
             allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
             max_connections: 5,
             min_connections: 1,
+            base_url: "https://example.com".into(),
+            email_dispatch_timeout: std::time::Duration::from_secs(10),
+            async_email_dispatch: true,
         };
 
         let mut app = Router::new()
@@ -227,6 +239,9 @@ mod tests {
             allowed_headers: vec!["Content-Type".into()],
             max_connections: 5,
             min_connections: 1,
+            base_url: "https://example.com".into(),
+            email_dispatch_timeout: std::time::Duration::from_secs(10),
+            async_email_dispatch: true,
         };
 
         assert!(matches!(
@@ -245,6 +260,9 @@ mod tests {
             allowed_headers: vec!["Content-Type".into()],
             max_connections: 5,
             min_connections: 1,
+            base_url: "https://example.com".into(),
+            email_dispatch_timeout: std::time::Duration::from_secs(10),
+            async_email_dispatch: true,
         };
 
         assert!(matches!(
@@ -263,6 +281,9 @@ mod tests {
             allowed_headers: vec!["Invalid Header With Spaces".into()],
             max_connections: 5,
             min_connections: 1,
+            base_url: "https://example.com".into(),
+            email_dispatch_timeout: std::time::Duration::from_secs(10),
+            async_email_dispatch: true,
         };
 
         assert!(matches!(

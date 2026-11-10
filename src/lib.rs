@@ -16,7 +16,10 @@ pub mod state;
 pub use auth::{Auth, AuthService, AuthServiceImpl};
 pub use config::{AppConfig, Config};
 pub use db::models::*;
-pub use email::{EmailDispatcher, NoopEmailSender};
+pub use email::{
+    DynError, EmailDispatcher, EmailSender, NoopEmailSender, PasswordResetEmailPayload,
+    SharedEmailSender, VerificationEmailPayload,
+};
 pub use error::{AppError, AppResult, ConfigError, ErrorCode, ErrorResponse};
 pub use handler::auth_routes;
 pub use state::AppState;

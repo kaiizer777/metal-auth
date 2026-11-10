@@ -22,6 +22,9 @@ fn create_test_router() -> axum::Router {
         allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
         max_connections: 5,
         min_connections: 1,
+        base_url: "https://example.com".into(),
+        email_dispatch_timeout: std::time::Duration::from_secs(10),
+        async_email_dispatch: true,
     };
     let pool = PgPool::connect_lazy(&cfg.database_url).expect("lazy pool");
     let state = AppState::new(pool, cfg);
@@ -46,6 +49,9 @@ async fn setup_live_db() -> Option<LiveDbTestContext> {
         allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
         max_connections: 5,
         min_connections: 1,
+        base_url: "https://example.com".into(),
+        email_dispatch_timeout: std::time::Duration::from_secs(10),
+        async_email_dispatch: true,
     };
     let state = AppState::new(pool.clone(), cfg);
     let router = create_router(state.clone()).ok()?;

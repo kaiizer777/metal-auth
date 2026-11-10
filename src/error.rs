@@ -11,6 +11,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::email::hook::DynError;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ErrorCode {
@@ -51,6 +53,9 @@ pub enum ConfigError {
 
     #[error("invalid port")]
     InvalidPort(#[from] ParseIntError),
+
+    #[error("invalid environment variable: {0}")]
+    InvalidEnvVar(&'static str),
 
     #[error("invalid CORS origin: {value}")]
     InvalidOrigin {
@@ -103,6 +108,16 @@ pub enum AppError {
     #[error("internal error")]
     Internal,
 
+    // Phase 2 — email dispatch
+    #[error("email sender not configured")]
+    EmailHookNotConfigured,
+
+    #[error("email dispatch failed")]
+    EmailDispatchFailed(#[source] DynError),
+
+    #[error("email dispatch timed out")]
+    EmailDispatchTimeout,
+
     // Phase 3 — auth errors
     #[error("invalid credentials")]
     InvalidCredentials,
@@ -149,7 +164,11 @@ impl AppError {
             Self::Migration(_) => ErrorCode::MigrationFailed,
             Self::NotFound => ErrorCode::NotFound,
             Self::MethodNotAllowed => ErrorCode::MethodNotAllowed,
-            Self::Internal => ErrorCode::InternalError,
+            Self::Internal
+            | Self::EmailHookNotConfigured
+            | Self::EmailDispatchFailed(_)
+            | Self::EmailDispatchTimeout
+            | Self::EmailAlreadyExists => ErrorCode::InternalError,
             // Phase 3
             Self::InvalidCredentials => ErrorCode::InvalidCredentials,
             Self::Unauthenticated => ErrorCode::Unauthenticated,
@@ -161,8 +180,6 @@ impl AppError {
             Self::ValidationError(_) => ErrorCode::ValidationError,
             Self::InvalidToken => ErrorCode::InvalidToken,
             Self::TokenExpired => ErrorCode::TokenExpired,
-            // EmailAlreadyExists is internal-only — callers must never surface this
-            Self::EmailAlreadyExists => ErrorCode::InternalError,
         }
     }
 
@@ -176,6 +193,9 @@ impl AppError {
             | Self::Database(_)
             | Self::Migration(_)
             | Self::Internal
+            | Self::EmailHookNotConfigured
+            | Self::EmailDispatchFailed(_)
+            | Self::EmailDispatchTimeout
             | Self::EmailAlreadyExists => StatusCode::INTERNAL_SERVER_ERROR,
             // 401
             Self::InvalidCredentials | Self::Unauthenticated => StatusCode::UNAUTHORIZED,
@@ -201,7 +221,11 @@ impl AppError {
             Self::Migration(_) => "Migration failed",
             Self::NotFound => "Not found",
             Self::MethodNotAllowed => "Method not allowed",
-            Self::Internal | Self::EmailAlreadyExists => "Internal error",
+            Self::Internal
+            | Self::EmailHookNotConfigured
+            | Self::EmailDispatchFailed(_)
+            | Self::EmailDispatchTimeout
+            | Self::EmailAlreadyExists => "Internal error",
             // Phase 3
             Self::InvalidCredentials => "Invalid email or password",
             Self::Unauthenticated => "Authentication required",
@@ -227,6 +251,13 @@ impl IntoResponse for AppError {
             Self::NotFound => tracing::debug!("resource not found"),
             Self::MethodNotAllowed => tracing::debug!("method not allowed"),
             Self::Internal => tracing::error!("internal error"),
+            // Email variants must never reach wire mapping; return a non-wire sentinel.
+            Self::EmailHookNotConfigured
+            | Self::EmailDispatchFailed(_)
+            | Self::EmailDispatchTimeout => {
+                tracing::error!("email variant unexpectedly reached IntoResponse");
+                return (StatusCode::INTERNAL_SERVER_ERROR).into_response();
+            }
             // Phase 3 — log at appropriate levels; never log credentials
             Self::InvalidCredentials => tracing::debug!("invalid credentials attempt"),
             Self::Unauthenticated => tracing::debug!("unauthenticated request"),

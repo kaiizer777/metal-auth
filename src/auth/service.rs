@@ -141,13 +141,20 @@ impl AuthServiceImpl {
 
         // Fire-and-forget email dispatch — never await on HTTP path
         let dispatcher = Arc::clone(&self.dispatcher);
-        let email_clone = normalized_email.clone();
+        let url = EmailDispatcher::build_verification_url(
+            dispatcher.base_url().unwrap_or(""),
+            &raw_token,
+        );
         tokio::spawn(async move {
-            dispatcher.dispatch_verification(VerificationEmailPayload {
-                to_email: email_clone,
-                token: raw_token,
-                user_id,
-            });
+            let _ = dispatcher
+                .dispatch_verification(VerificationEmailPayload {
+                    user_id,
+                    to: normalized_email,
+                    token: raw_token,
+                    url,
+                    expires_at,
+                })
+                .await;
         });
 
         Ok(())
@@ -292,14 +299,19 @@ impl AuthServiceImpl {
             .map_err(AppError::Database)?;
 
             let dispatcher = Arc::clone(&self.dispatcher);
-            let email_clone = normalized_email.clone();
             let uid = user.id;
+            let url =
+                EmailDispatcher::build_reset_url(dispatcher.base_url().unwrap_or(""), &raw_token);
             tokio::spawn(async move {
-                dispatcher.dispatch_password_reset(PasswordResetEmailPayload {
-                    to_email: email_clone,
-                    token: raw_token,
-                    user_id: uid,
-                });
+                let _ = dispatcher
+                    .dispatch_password_reset(PasswordResetEmailPayload {
+                        user_id: uid,
+                        to: normalized_email,
+                        token: raw_token,
+                        url,
+                        expires_at,
+                    })
+                    .await;
             });
         } else {
             tokio::spawn(async move {});
@@ -404,7 +416,7 @@ impl AuthService for AuthServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::email::{EmailSender, test_utils::CapturingEmailSender};
+    use crate::email::EmailSender;
     use std::sync::Mutex;
 
     fn create_test_service() -> AuthServiceImpl {
@@ -415,7 +427,11 @@ mod tests {
             argon2_p_cost: 1,
             ..Default::default()
         });
-        let dispatcher = Arc::new(EmailDispatcher::new(CapturingEmailSender::default()));
+        let dispatcher = Arc::new(EmailDispatcher::new(
+            None,
+            std::time::Duration::from_secs(10),
+            true,
+        ));
         AuthServiceImpl::new(pool, config, dispatcher).expect("test service")
     }
 
@@ -425,13 +441,22 @@ mod tests {
         reset_calls: Arc<Mutex<Vec<PasswordResetEmailPayload>>>,
     }
 
+    #[async_trait::async_trait]
     impl EmailSender for ArcCapturingSender {
-        fn send_verification(&self, payload: VerificationEmailPayload) {
+        async fn send_verification_email(
+            &self,
+            payload: VerificationEmailPayload,
+        ) -> Result<(), crate::email::hook::DynError> {
             self.verification_calls.lock().unwrap().push(payload);
+            Ok(())
         }
 
-        fn send_password_reset(&self, payload: PasswordResetEmailPayload) {
+        async fn send_password_reset_email(
+            &self,
+            payload: PasswordResetEmailPayload,
+        ) -> Result<(), crate::email::hook::DynError> {
             self.reset_calls.lock().unwrap().push(payload);
+            Ok(())
         }
     }
 
@@ -452,7 +477,11 @@ mod tests {
             ..Default::default()
         });
         let sender = ArcCapturingSender::default();
-        let dispatcher = Arc::new(EmailDispatcher::new(sender.clone()));
+        let dispatcher = Arc::new(EmailDispatcher::new(
+            Some(Arc::new(sender.clone())),
+            std::time::Duration::from_secs(10),
+            true,
+        ));
         let service = AuthServiceImpl::new(pool.clone(), config, dispatcher).ok()?;
         Some(DbTestContext {
             service,
@@ -588,7 +617,7 @@ mod tests {
             let calls = ctx.sender.verification_calls.lock().unwrap();
             let call = calls
                 .iter()
-                .find(|c| c.to_email == email)
+                .find(|c| c.to == email)
                 .expect("token dispatched");
             call.token.clone()
         };

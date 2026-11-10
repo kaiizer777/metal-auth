@@ -46,6 +46,9 @@ mod tests {
             allowed_headers: vec!["Authorization".into()],
             max_connections: 5,
             min_connections: 1,
+            base_url: "https://example.com".into(),
+            email_dispatch_timeout: std::time::Duration::from_secs(10),
+            async_email_dispatch: true,
         };
 
         let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
@@ -63,6 +66,9 @@ mod tests {
             allowed_headers: vec!["Authorization".into()],
             max_connections: 5,
             min_connections: 1,
+            base_url: "https://example.com".into(),
+            email_dispatch_timeout: std::time::Duration::from_secs(10),
+            async_email_dispatch: true,
         };
 
         let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
@@ -80,6 +86,9 @@ mod tests {
             allowed_headers: vec!["Authorization".into()],
             max_connections: 5,
             min_connections: 1,
+            base_url: "https://example.com".into(),
+            email_dispatch_timeout: std::time::Duration::from_secs(10),
+            async_email_dispatch: true,
         };
 
         let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();

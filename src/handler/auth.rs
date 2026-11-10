@@ -211,10 +211,7 @@ pub async fn reset_password(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        config::AppConfig,
-        email::{EmailDispatcher, test_utils::CapturingEmailSender},
-    };
+    use crate::{config::AppConfig, email::EmailDispatcher};
     use axum::body::to_bytes;
     use sqlx::PgPool;
 
@@ -228,7 +225,11 @@ mod tests {
             password_max_len: 128,
             ..Default::default()
         });
-        let dispatcher = Arc::new(EmailDispatcher::new(CapturingEmailSender::default()));
+        let dispatcher = Arc::new(EmailDispatcher::new(
+            None,
+            std::time::Duration::from_secs(10),
+            true,
+        ));
         let service =
             Arc::new(AuthServiceImpl::new(pool, config, dispatcher).expect("test service"));
         AuthHandlerState { service }

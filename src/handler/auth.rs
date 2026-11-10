@@ -13,11 +13,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-#[allow(unused_imports)]
 use crate::{
     auth::models::{
         LoginRequest, LoginResponse, MessageResponse, PasswordResetConfirmRequest,
-        PasswordResetRequest, SignupRequest, UserResponse, VerifyEmailRequest,
+        PasswordResetRequest, SignupRequest, VerifyEmailRequest,
     },
     auth::service::AuthServiceImpl,
     error::{AppError, ErrorCode, ErrorResponse},
@@ -62,6 +61,10 @@ pub async fn signup(
         Err(e) => return json_rejection_response(e),
     };
 
+    if let Err(e) = req.validate(&state.service.config) {
+        return service_error_response(e);
+    }
+
     match state.service.signup(&req.email, &req.password).await {
         Ok(()) | Err(AppError::EmailAlreadyExists) => {
             // Anti-enum: both paths return identical 200
@@ -91,6 +94,10 @@ pub async fn login(
         Err(e) => return json_rejection_response(e),
     };
 
+    if let Err(e) = req.validate() {
+        return service_error_response(e);
+    }
+
     match state.service.login(&req.email, &req.password).await {
         Ok(user_id) => (StatusCode::OK, Json(LoginResponse { user_id })).into_response(),
         Err(e) => service_error_response(e),
@@ -118,6 +125,10 @@ pub async fn verify_email(
         Err(e) => return json_rejection_response(e),
     };
 
+    if let Err(e) = req.validate() {
+        return service_error_response(e);
+    }
+
     match state.service.verify_email(&req.token).await {
         Ok(()) => (StatusCode::OK, Json(MessageResponse::new("email verified"))).into_response(),
         Err(e) => service_error_response(e),
@@ -136,6 +147,10 @@ pub async fn request_password_reset(
         Err(e) => return json_rejection_response(e),
     };
 
+    if let Err(e) = req.validate() {
+        return service_error_response(e);
+    }
+
     match state.service.request_password_reset(&req.email).await {
         Ok(()) => (
             StatusCode::OK,
@@ -144,7 +159,6 @@ pub async fn request_password_reset(
             )),
         )
             .into_response(),
-        Err(AppError::InvalidEmail) => service_error_response(AppError::InvalidEmail),
         Err(e) => service_error_response(e),
     }
 }
@@ -161,6 +175,10 @@ pub async fn reset_password(
         Err(e) => return json_rejection_response(e),
     };
 
+    if let Err(e) = req.validate(&state.service.config) {
+        return service_error_response(e);
+    }
+
     match state
         .service
         .reset_password(&req.token, &req.new_password)
@@ -172,5 +190,117 @@ pub async fn reset_password(
         )
             .into_response(),
         Err(e) => service_error_response(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::AppConfig,
+        email::{EmailDispatcher, test_utils::CapturingEmailSender},
+    };
+    use axum::body::to_bytes;
+    use sqlx::PgPool;
+
+    fn create_test_state() -> AuthHandlerState {
+        let pool = PgPool::connect_lazy("postgres://localhost/test").expect("lazy pool");
+        let config = Arc::new(AppConfig {
+            argon2_m_cost: 19456,
+            argon2_t_cost: 2,
+            argon2_p_cost: 1,
+            password_min_len: 8,
+            password_max_len: 128,
+            ..Default::default()
+        });
+        let dispatcher = Arc::new(EmailDispatcher::new(CapturingEmailSender::default()));
+        let service =
+            Arc::new(AuthServiceImpl::new(pool, config, dispatcher).expect("test service"));
+        AuthHandlerState { service }
+    }
+
+    #[tokio::test]
+    async fn login_handler_rejects_empty_credentials_without_db() {
+        let state = create_test_state();
+        let payload = LoginRequest {
+            email: "".to_string(),
+            password: "".to_string(),
+        };
+
+        let resp = login(State(state), Ok(Json(payload))).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err.code, ErrorCode::InvalidCredentials);
+    }
+
+    #[tokio::test]
+    async fn signup_handler_rejects_invalid_password_without_db() {
+        let state = create_test_state();
+        let payload = SignupRequest {
+            email: "valid@example.com".to_string(),
+            password: "short".to_string(),
+        };
+
+        let resp = signup(State(state), Ok(Json(payload))).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err.code, ErrorCode::PasswordTooShort);
+    }
+
+    #[tokio::test]
+    async fn verify_email_handler_rejects_invalid_token_without_db() {
+        let state = create_test_state();
+        let payload = VerifyEmailRequest {
+            token: "not-a-valid-hex-token".to_string(),
+        };
+
+        let resp = verify_email(State(state), Ok(Json(payload))).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err.code, ErrorCode::InvalidToken);
+    }
+
+    #[tokio::test]
+    async fn request_password_reset_handler_rejects_invalid_email_without_db() {
+        let state = create_test_state();
+        let payload = PasswordResetRequest {
+            email: "invalid-email".to_string(),
+        };
+
+        let resp = request_password_reset(State(state), Ok(Json(payload))).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err.code, ErrorCode::InvalidEmail);
+    }
+
+    #[tokio::test]
+    async fn reset_password_handler_rejects_invalid_token_without_db() {
+        let state = create_test_state();
+        let payload = PasswordResetConfirmRequest {
+            token: "short-token".to_string(),
+            new_password: "ValidPassword123!".to_string(),
+        };
+
+        let resp = reset_password(State(state), Ok(Json(payload))).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err.code, ErrorCode::InvalidToken);
+    }
+
+    #[tokio::test]
+    async fn logout_handler_returns_no_content() {
+        let state = create_test_state();
+        let resp = logout(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     }
 }

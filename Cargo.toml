@@ -11,7 +11,7 @@ categories = ["authentication", "web-programming"]
 
 [dependencies]
 # async runtime
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", "sync"] }
+tokio = { version = "1", features = ["macros", "rt", "time", "sync"] }
 
 # web framework
 axum = "0.7"
@@ -52,4 +52,5 @@ tracing = "0.1"
 async-trait = "0.1"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

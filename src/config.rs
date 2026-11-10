@@ -38,7 +38,7 @@ impl std::fmt::Debug for Config {
             .field("allowed_headers", &self.allowed_headers)
             .field("max_connections", &self.max_connections)
             .field("min_connections", &self.min_connections)
-            .field("base_url", &self.base_url)
+            .field("base_url", &"[REDACTED]")
             .field("email_dispatch_timeout", &self.email_dispatch_timeout)
             .field("async_email_dispatch", &self.async_email_dispatch)
             .finish()
@@ -57,6 +57,7 @@ impl Config {
         if !matches!(uri.scheme_str(), Some("http" | "https"))
             || uri.authority().is_none()
             || uri.query().is_some()
+            || uri.authority().is_some_and(|a| a.as_str().contains('@'))
         {
             return Err(ConfigError::InvalidEnvVar("BASE_URL"));
         }
@@ -238,6 +239,7 @@ mod tests {
         assert!(debug_output.contains("[REDACTED]"));
         assert!(!debug_output.contains("super_secret_password"));
         assert!(!debug_output.contains("secret_user"));
+        assert!(!debug_output.contains("https://example.com"));
     }
 
     #[test]

@@ -251,7 +251,7 @@ async fn sync_dispatch_awaits_and_logs_error() {
     clear_logs();
     let captured = Arc::new(Mutex::new(None));
     let mock = MockSender {
-        delay_ms: 0,
+        delay_ms: 20,
         fail: true,
         captured_v: captured.clone(),
         captured_r: Arc::new(Mutex::new(None)),
@@ -259,10 +259,14 @@ async fn sync_dispatch_awaits_and_logs_error() {
     let sender: SharedEmailSender = Arc::new(mock);
     let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_secs(10), false);
 
-    let h = dispatcher
+    let handle = dispatcher
         .dispatch_verification(sample_verification())
         .await;
-    assert!(h.is_none());
+    assert!(handle.is_none(), "synchronous dispatch returns None");
+    assert!(
+        captured.lock().unwrap().is_some(),
+        "sync dispatch must have completed before returning"
+    );
     assert!(log_text().contains("email dispatch failed"));
 }
 
@@ -361,6 +365,21 @@ async fn timeout_does_not_panic() {
     assert!(log_text().contains("timed out"));
 }
 
+#[tokio::test]
+async fn sync_timeout_does_not_panic() {
+    let _guard = LOG_LOCK.lock().await;
+    init_logs();
+    clear_logs();
+
+    let sender: SharedEmailSender = Arc::new(HangingSender);
+    let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_millis(20), false);
+    let handle = dispatcher
+        .dispatch_verification(sample_verification())
+        .await;
+    assert!(handle.is_none(), "sync dispatch returns None");
+    assert!(log_text().contains("timed out"));
+}
+
 #[test]
 fn zero_timeout_rejected() {
     let cfg = Config {
@@ -455,6 +474,10 @@ fn base_url_validation_rejects_invalid_urls() {
         make_cfg("https://example.com?tenant=x").validate(),
         Err(ConfigError::InvalidEnvVar("BASE_URL"))
     ));
+    assert!(matches!(
+        make_cfg("https://user:pass@example.com").validate(),
+        Err(ConfigError::InvalidEnvVar("BASE_URL"))
+    ));
     assert!(make_cfg("https://example.com").validate().is_ok());
     assert!(make_cfg("http://localhost:3000").validate().is_ok());
 }
@@ -470,6 +493,26 @@ fn base_url_validation_rejects_query_string() {
         max_connections: 5,
         min_connections: 1,
         base_url: "https://example.com?tenant=x".into(),
+        email_dispatch_timeout: Duration::from_secs(10),
+        async_email_dispatch: true,
+    };
+    assert!(matches!(
+        cfg.validate(),
+        Err(ConfigError::InvalidEnvVar("BASE_URL"))
+    ));
+}
+
+#[test]
+fn base_url_validation_rejects_userinfo() {
+    let cfg = Config {
+        database_url: "postgres://localhost/test".into(),
+        port: 3000,
+        allowed_origins: vec![],
+        allowed_methods: vec!["GET".into()],
+        allowed_headers: vec!["Content-Type".into()],
+        max_connections: 5,
+        min_connections: 1,
+        base_url: "https://user:pass@example.com".into(),
         email_dispatch_timeout: Duration::from_secs(10),
         async_email_dispatch: true,
     };

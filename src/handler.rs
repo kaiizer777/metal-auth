@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::Router;
 use tower_http::trace::TraceLayer;
 
@@ -6,6 +8,7 @@ use crate::{error::AppError, state::AppState};
 pub mod auth;
 pub mod cors;
 
+pub use auth::routes as auth_routes;
 pub use cors::cors_layer;
 
 async fn fallback_not_found() -> AppError {
@@ -16,10 +19,10 @@ pub fn create_router(state: AppState) -> Result<Router, AppError> {
     let cors = cors_layer(&state.config)?;
 
     Ok(Router::new()
+        .nest("/auth", auth::routes(Arc::clone(&state.auth_service)))
         .fallback(fallback_not_found)
         .layer(cors)
-        .layer(TraceLayer::new_for_http())
-        .with_state(state))
+        .layer(TraceLayer::new_for_http()))
 }
 
 #[cfg(test)]

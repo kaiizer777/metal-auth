@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use axum::{
-    Json,
+    Json, Router,
     extract::{State, rejection::JsonRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -27,6 +27,18 @@ use crate::{
 #[derive(Clone)]
 pub struct AuthHandlerState {
     pub service: Arc<AuthServiceImpl>,
+}
+
+pub fn routes(service: Arc<AuthServiceImpl>) -> Router {
+    let state = AuthHandlerState { service };
+    Router::new()
+        .route("/signup", axum::routing::post(signup))
+        .route("/login", axum::routing::post(login))
+        .route("/logout", axum::routing::post(logout))
+        .route("/verify", axum::routing::post(verify_email))
+        .route("/password/reset-request", axum::routing::post(request_password_reset))
+        .route("/password/reset", axum::routing::post(reset_password))
+        .with_state(state)
 }
 
 // ─── Error mapping helpers ────────────────────────────────────────────────────

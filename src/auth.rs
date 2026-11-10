@@ -9,6 +9,7 @@ pub mod service;
 
 pub use models::*;
 pub use service::{AuthService, AuthServiceImpl};
+pub use crate::handler::auth_routes;
 
 #[derive(Clone)]
 pub struct Auth {
@@ -19,7 +20,7 @@ impl Auth {
     pub async fn new(cfg: Config) -> Result<Self, AppError> {
         cfg.validate()?;
         let pool = db::init_pool(&cfg).await?;
-        let state = AppState { pool, config: cfg };
+        let state = AppState::new(pool, cfg);
         let router = handler::create_router(state)?;
         Ok(Self { router })
     }

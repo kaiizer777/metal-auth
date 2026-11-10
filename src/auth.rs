@@ -43,6 +43,16 @@ impl Auth {
         cfg: Config,
         sender: Option<SharedEmailSender>,
     ) -> Result<Self, AppError> {
+        let auth_config = Arc::new(AppConfig::from_env().unwrap_or_default());
+        Self::with_config_and_sender(cfg, auth_config, sender).await
+    }
+
+    /// Initializes an `Auth` instance with explicit [`AppConfig`] and optional [`SharedEmailSender`].
+    pub async fn with_config_and_sender(
+        cfg: Config,
+        auth_cfg: Arc<AppConfig>,
+        sender: Option<SharedEmailSender>,
+    ) -> Result<Self, AppError> {
         cfg.validate()?;
         let pool = db::init_pool(&cfg).await?;
         let dispatcher = Arc::new(
@@ -51,12 +61,37 @@ impl Auth {
         );
         let auth_service = Arc::new(AuthServiceImpl::new(
             pool.clone(),
-            Arc::new(AppConfig::default()),
+            Arc::clone(&auth_cfg),
             Arc::clone(&dispatcher),
         )?);
         let state = AppState {
             pool,
             config: cfg,
+            auth_config: auth_cfg,
+            auth_service,
+            email_dispatcher: Some(dispatcher),
+        };
+        let router = handler::create_router(state)?;
+        Ok(Self { router })
+    }
+
+    /// Constructs an `Auth` instance with explicit [`AppConfig`] and [`EmailDispatcher`].
+    pub async fn with_dispatcher(
+        cfg: Config,
+        auth_cfg: Arc<AppConfig>,
+        dispatcher: Arc<EmailDispatcher>,
+    ) -> Result<Self, AppError> {
+        cfg.validate()?;
+        let pool = db::init_pool(&cfg).await?;
+        let auth_service = Arc::new(AuthServiceImpl::new(
+            pool.clone(),
+            Arc::clone(&auth_cfg),
+            Arc::clone(&dispatcher),
+        )?);
+        let state = AppState {
+            pool,
+            config: cfg,
+            auth_config: auth_cfg,
             auth_service,
             email_dispatcher: Some(dispatcher),
         };

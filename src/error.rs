@@ -11,6 +11,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::email::hook::DynError;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ErrorCode {
@@ -39,6 +41,9 @@ pub enum ConfigError {
 
     #[error("invalid port")]
     InvalidPort(#[from] ParseIntError),
+
+    #[error("invalid environment variable: {0}")]
+    InvalidEnvVar(&'static str),
 
     #[error("invalid CORS origin: {value}")]
     InvalidOrigin {
@@ -84,6 +89,15 @@ pub enum AppError {
 
     #[error("internal error")]
     Internal,
+
+    #[error("email sender not configured")]
+    EmailHookNotConfigured,
+
+    #[error("email dispatch failed")]
+    EmailDispatchFailed(#[source] DynError),
+
+    #[error("email dispatch timed out")]
+    EmailDispatchTimeout,
 }
 
 impl AppError {
@@ -96,7 +110,10 @@ impl AppError {
             Self::Migration(_) => ErrorCode::MigrationFailed,
             Self::NotFound => ErrorCode::NotFound,
             Self::MethodNotAllowed => ErrorCode::MethodNotAllowed,
-            Self::Internal => ErrorCode::InternalError,
+            Self::Internal
+            | Self::EmailHookNotConfigured
+            | Self::EmailDispatchFailed(_)
+            | Self::EmailDispatchTimeout => ErrorCode::InternalError,
         }
     }
 
@@ -106,9 +123,13 @@ impl AppError {
             Self::DatabaseUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
-            Self::Config(_) | Self::Database(_) | Self::Migration(_) | Self::Internal => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            Self::Config(_)
+            | Self::Database(_)
+            | Self::Migration(_)
+            | Self::Internal
+            | Self::EmailHookNotConfigured
+            | Self::EmailDispatchFailed(_)
+            | Self::EmailDispatchTimeout => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
@@ -121,7 +142,10 @@ impl AppError {
             Self::Migration(_) => "Migration failed",
             Self::NotFound => "Not found",
             Self::MethodNotAllowed => "Method not allowed",
-            Self::Internal => "Internal error",
+            Self::Internal
+            | Self::EmailHookNotConfigured
+            | Self::EmailDispatchFailed(_)
+            | Self::EmailDispatchTimeout => "Internal error",
         }
     }
 }
@@ -136,6 +160,13 @@ impl IntoResponse for AppError {
             Self::NotFound => tracing::debug!("resource not found"),
             Self::MethodNotAllowed => tracing::debug!("method not allowed"),
             Self::Internal => tracing::error!("internal error"),
+            // Email variants must never reach wire mapping; return a non-wire sentinel.
+            Self::EmailHookNotConfigured
+            | Self::EmailDispatchFailed(_)
+            | Self::EmailDispatchTimeout => {
+                tracing::error!("email variant unexpectedly reached IntoResponse");
+                return (StatusCode::INTERNAL_SERVER_ERROR).into_response();
+            }
         }
 
         let status = self.status_code();

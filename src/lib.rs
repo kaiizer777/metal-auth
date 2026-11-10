@@ -19,3 +19,7 @@ pub use config::Config;
 pub use db::models::*;
 pub use error::{AppError, ConfigError, ErrorCode, ErrorResponse};
 pub use state::AppState;
+
+pub use email::dispatcher::EmailDispatcher;
+pub use email::hook::{DynError, EmailSender, SharedEmailSender};
+pub use email::payload::{PasswordResetEmailPayload, VerificationEmailPayload};

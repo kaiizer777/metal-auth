@@ -23,6 +23,9 @@ async fn test_auth_facade_and_router_boot() {
         allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
         max_connections: 10,
         min_connections: 2,
+        base_url: "https://example.com".into(),
+        email_dispatch_timeout: std::time::Duration::from_secs(10),
+        async_email_dispatch: true,
     };
 
     let pool = PgPool::connect_lazy(&cfg.database_url).expect("lazy pool creation");
@@ -99,6 +102,9 @@ async fn test_auth_new_fails_gracefully_on_invalid_db() {
         allowed_headers: vec!["Content-Type".into()],
         max_connections: 2,
         min_connections: 1,
+        base_url: "https://example.com".into(),
+        email_dispatch_timeout: std::time::Duration::from_secs(10),
+        async_email_dispatch: true,
     };
 
     let result = Auth::new(cfg).await;
@@ -233,6 +239,9 @@ async fn test_auth_boot_fails_fast_on_invalid_cors() {
         allowed_headers: vec!["Content-Type".into()],
         max_connections: 10,
         min_connections: 2,
+        base_url: "https://example.com".into(),
+        email_dispatch_timeout: std::time::Duration::from_secs(10),
+        async_email_dispatch: true,
     };
 
     let pool = PgPool::connect_lazy(&cfg.database_url).expect("lazy pool creation");
@@ -254,6 +263,9 @@ async fn test_auth_new_fails_fast_on_invalid_cors_before_db() {
         allowed_headers: vec!["Content-Type".into()],
         max_connections: 2,
         min_connections: 1,
+        base_url: "https://example.com".into(),
+        email_dispatch_timeout: std::time::Duration::from_secs(10),
+        async_email_dispatch: true,
     };
 
     let result = Auth::new(cfg).await;
@@ -273,6 +285,9 @@ async fn test_auth_new_fails_with_database_error_on_malformed_url() {
         allowed_headers: vec!["Content-Type".into()],
         max_connections: 2,
         min_connections: 1,
+        base_url: "https://example.com".into(),
+        email_dispatch_timeout: std::time::Duration::from_secs(10),
+        async_email_dispatch: true,
     };
 
     let result = Auth::new(cfg).await;

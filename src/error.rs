@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ErrorCode {
+    // Phase 1 — infra
     InvalidConfig,
     DatabaseError,
     DatabaseUnavailable,
@@ -21,6 +22,17 @@ pub enum ErrorCode {
     InternalError,
     NotFound,
     MethodNotAllowed,
+    // Phase 3 — auth
+    InvalidCredentials,
+    Unauthenticated,
+    EmailNotVerified,
+    PasswordTooShort,
+    PasswordTooLong,
+    PasswordTooCommon,
+    InvalidEmail,
+    ValidationError,
+    InvalidToken,
+    TokenExpired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +72,12 @@ pub enum ConfigError {
         #[source]
         source: InvalidHeaderName,
     },
+
+    #[error("invalid value for {field}: {reason}")]
+    InvalidValue {
+        field: &'static str,
+        reason: &'static str,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -84,6 +102,41 @@ pub enum AppError {
 
     #[error("internal error")]
     Internal,
+
+    // Phase 3 — auth errors
+    #[error("invalid credentials")]
+    InvalidCredentials,
+
+    #[error("unauthenticated")]
+    Unauthenticated,
+
+    #[error("email not verified")]
+    EmailNotVerified,
+
+    #[error("password too short")]
+    PasswordTooShort,
+
+    #[error("password too long")]
+    PasswordTooLong,
+
+    #[error("password too common")]
+    PasswordTooCommon,
+
+    #[error("invalid email")]
+    InvalidEmail,
+
+    #[error("validation error: {0}")]
+    ValidationError(String),
+
+    #[error("invalid token")]
+    InvalidToken,
+
+    #[error("token expired")]
+    TokenExpired,
+
+    /// Internal-only — never returned to clients. Used for server-side logging of dup-email signups.
+    #[error("email already exists")]
+    EmailAlreadyExists,
 }
 
 impl AppError {
@@ -97,6 +150,19 @@ impl AppError {
             Self::NotFound => ErrorCode::NotFound,
             Self::MethodNotAllowed => ErrorCode::MethodNotAllowed,
             Self::Internal => ErrorCode::InternalError,
+            // Phase 3
+            Self::InvalidCredentials => ErrorCode::InvalidCredentials,
+            Self::Unauthenticated => ErrorCode::Unauthenticated,
+            Self::EmailNotVerified => ErrorCode::EmailNotVerified,
+            Self::PasswordTooShort => ErrorCode::PasswordTooShort,
+            Self::PasswordTooLong => ErrorCode::PasswordTooLong,
+            Self::PasswordTooCommon => ErrorCode::PasswordTooCommon,
+            Self::InvalidEmail => ErrorCode::InvalidEmail,
+            Self::ValidationError(_) => ErrorCode::ValidationError,
+            Self::InvalidToken => ErrorCode::InvalidToken,
+            Self::TokenExpired => ErrorCode::TokenExpired,
+            // EmailAlreadyExists is internal-only — callers must never surface this
+            Self::EmailAlreadyExists => ErrorCode::InternalError,
         }
     }
 
@@ -106,9 +172,23 @@ impl AppError {
             Self::DatabaseUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
-            Self::Config(_) | Self::Database(_) | Self::Migration(_) | Self::Internal => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            Self::Config(_)
+            | Self::Database(_)
+            | Self::Migration(_)
+            | Self::Internal
+            | Self::EmailAlreadyExists => StatusCode::INTERNAL_SERVER_ERROR,
+            // 401
+            Self::InvalidCredentials | Self::Unauthenticated => StatusCode::UNAUTHORIZED,
+            // 403
+            Self::EmailNotVerified => StatusCode::FORBIDDEN,
+            // 400
+            Self::PasswordTooShort
+            | Self::PasswordTooLong
+            | Self::PasswordTooCommon
+            | Self::InvalidEmail
+            | Self::ValidationError(_)
+            | Self::InvalidToken
+            | Self::TokenExpired => StatusCode::BAD_REQUEST,
         }
     }
 
@@ -121,7 +201,18 @@ impl AppError {
             Self::Migration(_) => "Migration failed",
             Self::NotFound => "Not found",
             Self::MethodNotAllowed => "Method not allowed",
-            Self::Internal => "Internal error",
+            Self::Internal | Self::EmailAlreadyExists => "Internal error",
+            // Phase 3
+            Self::InvalidCredentials => "Invalid email or password",
+            Self::Unauthenticated => "Authentication required",
+            Self::EmailNotVerified => "Email address has not been verified",
+            Self::PasswordTooShort => "Password must be at least 8 characters (we recommend 15+)",
+            Self::PasswordTooLong => "Password must not exceed 128 characters",
+            Self::PasswordTooCommon => "Password is too common, please choose a stronger password",
+            Self::InvalidEmail => "Invalid email address",
+            Self::ValidationError(_) => "Invalid request body",
+            Self::InvalidToken => "Invalid or already used token",
+            Self::TokenExpired => "Token has expired",
         }
     }
 }
@@ -136,6 +227,19 @@ impl IntoResponse for AppError {
             Self::NotFound => tracing::debug!("resource not found"),
             Self::MethodNotAllowed => tracing::debug!("method not allowed"),
             Self::Internal => tracing::error!("internal error"),
+            // Phase 3 — log at appropriate levels; never log credentials
+            Self::InvalidCredentials => tracing::debug!("invalid credentials attempt"),
+            Self::Unauthenticated => tracing::debug!("unauthenticated request"),
+            Self::EmailNotVerified => tracing::debug!("login blocked: email not verified"),
+            Self::PasswordTooShort => tracing::debug!("password too short"),
+            Self::PasswordTooLong => tracing::debug!("password too long"),
+            Self::PasswordTooCommon => tracing::debug!("password too common"),
+            Self::InvalidEmail => tracing::debug!("invalid email format"),
+            Self::ValidationError(msg) => tracing::debug!(msg = %msg, "validation error"),
+            Self::InvalidToken => tracing::debug!("invalid or consumed token"),
+            Self::TokenExpired => tracing::debug!("expired token presented"),
+            // EmailAlreadyExists is internal-only — never reaches this handler in normal flow
+            Self::EmailAlreadyExists => tracing::info!("signup attempt on existing account"),
         }
 
         let status = self.status_code();
@@ -147,6 +251,9 @@ impl IntoResponse for AppError {
         (status, Json(payload)).into_response()
     }
 }
+
+/// Convenience alias used throughout the service and handler layers.
+pub type AppResult<T> = Result<T, AppError>;
 
 #[cfg(test)]
 mod tests {
@@ -162,6 +269,17 @@ mod tests {
             (ErrorCode::InternalError, "\"INTERNAL_ERROR\""),
             (ErrorCode::NotFound, "\"NOT_FOUND\""),
             (ErrorCode::MethodNotAllowed, "\"METHOD_NOT_ALLOWED\""),
+            // Phase 3
+            (ErrorCode::InvalidCredentials, "\"INVALID_CREDENTIALS\""),
+            (ErrorCode::Unauthenticated, "\"UNAUTHENTICATED\""),
+            (ErrorCode::EmailNotVerified, "\"EMAIL_NOT_VERIFIED\""),
+            (ErrorCode::PasswordTooShort, "\"PASSWORD_TOO_SHORT\""),
+            (ErrorCode::PasswordTooLong, "\"PASSWORD_TOO_LONG\""),
+            (ErrorCode::PasswordTooCommon, "\"PASSWORD_TOO_COMMON\""),
+            (ErrorCode::InvalidEmail, "\"INVALID_EMAIL\""),
+            (ErrorCode::ValidationError, "\"VALIDATION_ERROR\""),
+            (ErrorCode::InvalidToken, "\"INVALID_TOKEN\""),
+            (ErrorCode::TokenExpired, "\"TOKEN_EXPIRED\""),
         ];
 
         for (code, expected_json) in cases {
@@ -223,6 +341,15 @@ mod tests {
             ),
             (
                 AppError::Config(ConfigError::MissingEnvVar("DATABASE_URL")),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::InvalidConfig,
+                "Invalid configuration",
+            ),
+            (
+                AppError::Config(ConfigError::InvalidValue {
+                    field: "argon2_m_cost",
+                    reason: "must be at least 19456 KiB",
+                }),
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorCode::InvalidConfig,
                 "Invalid configuration",

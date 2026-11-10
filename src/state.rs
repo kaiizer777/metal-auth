@@ -6,6 +6,7 @@ use crate::{
     auth::service::AuthServiceImpl,
     config::{AppConfig, Config},
     email::dispatcher::EmailDispatcher,
+    error::AppError,
 };
 
 #[derive(Clone, Debug)]
@@ -23,7 +24,7 @@ impl AppState {
         Self::with_configs_and_dispatcher(pool, config, auth_config, None)
     }
 
-    pub fn with_auth_config(mut self, auth_config: Arc<AppConfig>) -> Self {
+    pub fn with_auth_config(mut self, auth_config: Arc<AppConfig>) -> Result<Self, AppError> {
         let dispatcher = self.email_dispatcher.clone().unwrap_or_else(|| {
             Arc::new(
                 EmailDispatcher::new(
@@ -34,12 +35,13 @@ impl AppState {
                 .with_base_url(&self.config.base_url),
             )
         });
-        self.auth_service = Arc::new(
-            AuthServiceImpl::new(self.pool.clone(), Arc::clone(&auth_config), dispatcher)
-                .expect("auth service initialization must succeed"),
-        );
+        self.auth_service = Arc::new(AuthServiceImpl::new(
+            self.pool.clone(),
+            Arc::clone(&auth_config),
+            dispatcher,
+        )?);
         self.auth_config = auth_config;
-        self
+        Ok(self)
     }
 
     pub fn with_auth_service(mut self, service: Arc<AuthServiceImpl>) -> Self {

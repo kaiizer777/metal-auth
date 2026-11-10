@@ -6,8 +6,8 @@ use axum::{
 };
 use chrono::Utc;
 use metal_auth::{
-    AppError, AppState, Auth, Config, ConfigError, ErrorCode, ErrorResponse, PasswordResetToken,
-    Session, User, UserResponse, VerificationToken,
+    AppConfig, AppError, AppState, Auth, Config, ConfigError, ErrorCode, ErrorResponse,
+    PasswordResetToken, Session, User, UserResponse, VerificationToken,
 };
 use sqlx::PgPool;
 use tower::Service;
@@ -290,4 +290,32 @@ async fn test_auth_new_fails_with_database_error_on_malformed_url() {
 
     let result = Auth::new(cfg).await;
     assert!(matches!(result, Err(AppError::Database(_))));
+}
+
+#[tokio::test]
+async fn test_state_with_auth_config_propagates_error() {
+    let pool = PgPool::connect_lazy("postgres://localhost/test").expect("lazy pool");
+    let cfg = Config {
+        database_url: "postgres://localhost/test".into(),
+        port: 3000,
+        allowed_origins: vec![],
+        allowed_methods: vec![],
+        allowed_headers: vec![],
+        max_connections: 2,
+        min_connections: 1,
+        base_url: "https://example.com".into(),
+        email_dispatch_timeout: std::time::Duration::from_secs(10),
+        async_email_dispatch: true,
+    };
+    let state = AppState::new(pool, cfg);
+
+    let valid_config = std::sync::Arc::new(AppConfig::default());
+    assert!(state.clone().with_auth_config(valid_config).is_ok());
+
+    let invalid_config = std::sync::Arc::new(AppConfig {
+        argon2_m_cost: 100,
+        ..Default::default()
+    });
+    let err = state.with_auth_config(invalid_config);
+    assert!(matches!(err, Err(AppError::Config(_))));
 }

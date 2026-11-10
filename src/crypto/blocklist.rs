@@ -4,7 +4,7 @@
 //! this list at signup and password reset. Entries shorter than 8 characters
 //! are pre-filtered so the check is fast and accurate.
 //!
-//! The list ships as a `static` â€” loaded once at compile/init time.
+//! The list ships as a `static` — loaded once at compile/init time.
 //! No network calls, no external service dependency.
 
 /// Top 3000 most common passwords (pre-filtered: length >= 8 code points).
@@ -1296,12 +1296,15 @@ static BLOCKLIST: &[&str] = &[
 
 /// Returns `true` if `password` appears in the common password blocklist.
 ///
-/// Comparison is case-sensitive (the blocklist entries are lowercase â€”
-/// callers should normalize if case-insensitive matching is desired).
+/// Comparison is case-insensitive (normalizes input to lowercase before binary search).
 /// Per spec: filtering is done here, not at the call site.
 pub fn is_common_password(password: &str) -> bool {
-    let pw_lower = password.to_lowercase();
-    BLOCKLIST.binary_search(&pw_lower.as_str()).is_ok()
+    if password.chars().any(char::is_uppercase) {
+        let pw_lower = password.to_lowercase();
+        BLOCKLIST.binary_search(&pw_lower.as_str()).is_ok()
+    } else {
+        BLOCKLIST.binary_search(&password).is_ok()
+    }
 }
 
 #[cfg(test)]

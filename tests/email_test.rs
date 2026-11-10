@@ -100,6 +100,57 @@ impl metal_auth::EmailSender for MockSender {
     }
 }
 
+struct NonBlockingSignalSender {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    captured: Arc<Mutex<Option<VerificationEmailPayload>>>,
+}
+
+#[async_trait]
+impl metal_auth::EmailSender for NonBlockingSignalSender {
+    async fn send_verification_email(
+        &self,
+        payload: VerificationEmailPayload,
+    ) -> Result<(), metal_auth::DynError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        self.captured.lock().unwrap().replace(payload);
+        Ok(())
+    }
+
+    async fn send_password_reset_email(
+        &self,
+        _payload: PasswordResetEmailPayload,
+    ) -> Result<(), metal_auth::DynError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(())
+    }
+}
+
+struct HangingSender;
+
+#[async_trait]
+impl metal_auth::EmailSender for HangingSender {
+    async fn send_verification_email(
+        &self,
+        _payload: VerificationEmailPayload,
+    ) -> Result<(), metal_auth::DynError> {
+        let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let _ = rx.await;
+        Ok(())
+    }
+
+    async fn send_password_reset_email(
+        &self,
+        _payload: PasswordResetEmailPayload,
+    ) -> Result<(), metal_auth::DynError> {
+        let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let _ = rx.await;
+        Ok(())
+    }
+}
+
 fn sample_verification() -> VerificationEmailPayload {
     VerificationEmailPayload {
         user_id: Uuid::new_v4(),
@@ -151,6 +202,7 @@ async fn full_payload_assertion() {
     let payload = sample_verification();
     let handle = dispatcher
         .dispatch_verification(payload.clone())
+        .await
         .expect("should return handle");
     handle.await.unwrap();
 
@@ -180,6 +232,7 @@ async fn full_reset_payload_assertion() {
     let payload = sample_reset();
     let handle = dispatcher
         .dispatch_password_reset(payload.clone())
+        .await
         .expect("should return handle");
     handle.await.unwrap();
 
@@ -206,10 +259,10 @@ async fn sync_dispatch_awaits_and_logs_error() {
     let sender: SharedEmailSender = Arc::new(mock);
     let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_secs(10), false);
 
-    let handle = dispatcher
+    let h = dispatcher
         .dispatch_verification(sample_verification())
-        .expect("should return handle");
-    handle.await.unwrap();
+        .await;
+    assert!(h.is_none());
     assert!(log_text().contains("email dispatch failed"));
 }
 
@@ -219,9 +272,11 @@ async fn none_sender_warns_no_panic() {
     init_logs();
     clear_logs();
     let dispatcher = EmailDispatcher::new(None, Duration::from_secs(10), true);
-    let h1 = dispatcher.dispatch_verification(sample_verification());
+    let h1 = dispatcher
+        .dispatch_verification(sample_verification())
+        .await;
     assert!(h1.is_none());
-    let h2 = dispatcher.dispatch_password_reset(sample_reset());
+    let h2 = dispatcher.dispatch_password_reset(sample_reset()).await;
     assert!(h2.is_none());
     assert!(log_text().contains("no email sender configured"));
 }
@@ -242,6 +297,7 @@ async fn hook_returns_err_is_logged() {
     let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_secs(10), true);
     let handle = dispatcher
         .dispatch_verification(sample_verification())
+        .await
         .expect("should return handle");
     handle.await.unwrap();
     assert!(log_text().contains("email dispatch failed"));
@@ -252,30 +308,40 @@ async fn async_dispatch_non_blocking() {
     let _guard = LOG_LOCK.lock().await;
     init_logs();
     clear_logs();
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
     let captured = Arc::new(Mutex::new(None));
-    let mock = MockSender {
-        delay_ms: 500,
-        fail: false,
-        captured_v: captured.clone(),
-        captured_r: Arc::new(Mutex::new(None)),
-    };
-    let sender: SharedEmailSender = Arc::new(mock);
+
+    let sender: SharedEmailSender = Arc::new(NonBlockingSignalSender {
+        entered: entered.clone(),
+        release: release.clone(),
+        captured: captured.clone(),
+    });
     let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_secs(10), true);
 
     let handle = dispatcher
         .dispatch_verification(sample_verification())
+        .await
         .expect("should return handle immediately");
 
-    // Proves non-blocking: sender takes 500ms, so dispatch returns before mock runs
+    // Wait until background task starts executing send_verification_email
+    entered.notified().await;
+
+    // Sender has entered and is suspended waiting on `release`, proving dispatch returned before completion
     assert!(
         captured.lock().unwrap().is_none(),
-        "dispatch returned immediately without awaiting the 500ms mock sender"
+        "dispatch returned immediately without waiting for sender completion"
     );
+    assert!(!handle.is_finished());
 
+    // Release the mock sender to complete
+    release.notify_one();
     handle.await.unwrap();
+
     assert!(
         captured.lock().unwrap().is_some(),
-        "mock sender executed to completion once awaited"
+        "mock sender executed to completion once released"
     );
 }
 
@@ -284,17 +350,12 @@ async fn timeout_does_not_panic() {
     let _guard = LOG_LOCK.lock().await;
     init_logs();
     clear_logs();
-    let captured = Arc::new(Mutex::new(None));
-    let mock = MockSender {
-        delay_ms: 200,
-        fail: false,
-        captured_v: captured,
-        captured_r: Arc::new(Mutex::new(None)),
-    };
-    let sender: SharedEmailSender = Arc::new(mock);
-    let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_millis(50), true);
+
+    let sender: SharedEmailSender = Arc::new(HangingSender);
+    let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_millis(20), true);
     let handle = dispatcher
         .dispatch_verification(sample_verification())
+        .await
         .expect("should return handle");
     handle.await.unwrap();
     assert!(log_text().contains("timed out"));
@@ -353,6 +414,52 @@ fn empty_base_url_rejected() {
         cfg.validate(),
         Err(ConfigError::MissingEnvVar("BASE_URL"))
     ));
+}
+
+#[test]
+fn base_url_validation_rejects_invalid_urls() {
+    let make_cfg = |url: &str| Config {
+        database_url: "postgres://localhost/test".into(),
+        port: 3000,
+        allowed_origins: vec![],
+        allowed_methods: vec!["GET".into()],
+        allowed_headers: vec!["Content-Type".into()],
+        max_connections: 5,
+        min_connections: 1,
+        base_url: url.into(),
+        email_dispatch_timeout: Duration::from_secs(10),
+        async_email_dispatch: true,
+    };
+
+    assert!(matches!(
+        make_cfg("").validate(),
+        Err(ConfigError::MissingEnvVar("BASE_URL"))
+    ));
+    assert!(matches!(
+        make_cfg("   ").validate(),
+        Err(ConfigError::MissingEnvVar("BASE_URL"))
+    ));
+    assert!(matches!(
+        make_cfg("ftp://example.com").validate(),
+        Err(ConfigError::InvalidEnvVar("BASE_URL"))
+    ));
+    assert!(matches!(
+        make_cfg("not-a-url").validate(),
+        Err(ConfigError::InvalidEnvVar("BASE_URL"))
+    ));
+    assert!(matches!(
+        make_cfg("https://").validate(),
+        Err(ConfigError::InvalidEnvVar("BASE_URL"))
+    ));
+    assert!(make_cfg("https://example.com").validate().is_ok());
+    assert!(make_cfg("http://localhost:3000").validate().is_ok());
+}
+
+#[test]
+fn dispatcher_with_base_url_builder() {
+    let dispatcher = EmailDispatcher::new(None, Duration::from_secs(5), true)
+        .with_base_url("https://auth.example.com");
+    assert_eq!(dispatcher.base_url(), Some("https://auth.example.com"));
 }
 
 #[test]

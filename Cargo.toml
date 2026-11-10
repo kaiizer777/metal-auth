@@ -47,7 +47,6 @@ dotenvy = "0.15"
 
 # tracing
 tracing = "0.1"
-trait-variant = "0.1"
 
 # async trait (dyn-compatible email hook)
 async-trait = "0.1"

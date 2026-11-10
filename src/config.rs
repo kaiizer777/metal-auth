@@ -50,6 +50,13 @@ impl Config {
         if self.base_url.trim().is_empty() {
             return Err(ConfigError::MissingEnvVar("BASE_URL"));
         }
+        let uri = self
+            .base_url
+            .parse::<axum::http::Uri>()
+            .map_err(|_| ConfigError::InvalidEnvVar("BASE_URL"))?;
+        if !matches!(uri.scheme_str(), Some("http" | "https")) || uri.authority().is_none() {
+            return Err(ConfigError::InvalidEnvVar("BASE_URL"));
+        }
         if self.email_dispatch_timeout == Duration::ZERO {
             return Err(ConfigError::InvalidEnvVar("EMAIL_DISPATCH_TIMEOUT_SECS"));
         }

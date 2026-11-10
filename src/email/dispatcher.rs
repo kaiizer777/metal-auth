@@ -34,43 +34,68 @@ fn percent_encode_token(input: &str) -> String {
     encoded
 }
 
+/// Constructs a verification URL from a base URL and an unencoded token.
 pub fn build_verification_url(base_url: &str, token: &str) -> String {
     let base = base_url.trim_end_matches('/');
     let encoded_token = percent_encode_token(token);
     format!("{}/auth/verify/email?token={}", base, encoded_token)
 }
 
+/// Constructs a password reset URL from a base URL and an unencoded token.
 pub fn build_reset_url(base_url: &str, token: &str) -> String {
     let base = base_url.trim_end_matches('/');
     let encoded_token = percent_encode_token(token);
     format!("{}/auth/password/reset?token={}", base, encoded_token)
 }
 
+/// Email dispatcher responsible for URL formatting and email delivery dispatch.
 #[derive(Clone)]
 pub struct EmailDispatcher {
     sender: Option<SharedEmailSender>,
     timeout: Duration,
     async_dispatch: bool,
+    base_url: Option<String>,
 }
 
 impl EmailDispatcher {
+    /// Creates a new `EmailDispatcher` with an optional sender, timeout, and dispatch mode.
     pub fn new(sender: Option<SharedEmailSender>, timeout: Duration, async_dispatch: bool) -> Self {
         Self {
             sender,
             timeout,
             async_dispatch,
+            base_url: None,
         }
     }
 
+    /// Configures a base URL on the dispatcher.
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = Some(base_url.into());
+        self
+    }
+
+    /// Returns the configured base URL, if any.
+    pub fn base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
+    }
+
+    /// Constructs a verification URL using the provided base URL and token.
     pub fn build_verification_url(base_url: &str, token: &str) -> String {
         build_verification_url(base_url, token)
     }
 
+    /// Constructs a password reset URL using the provided base URL and token.
     pub fn build_reset_url(base_url: &str, token: &str) -> String {
         build_reset_url(base_url, token)
     }
 
-    pub fn dispatch_verification(
+    /// Dispatches a verification email payload.
+    ///
+    /// In async mode (`async_dispatch == true`), spawns a Tokio task with the configured timeout
+    /// and returns `Some(JoinHandle<()>)`.
+    ///
+    /// In sync mode (`async_dispatch == false`), awaits the sender inline with timeout and returns `None`.
+    pub async fn dispatch_verification(
         &self,
         payload: VerificationEmailPayload,
     ) -> Option<tokio::task::JoinHandle<()>> {
@@ -94,16 +119,26 @@ impl EmailDispatcher {
             });
             Some(handle)
         } else {
-            let handle = tokio::spawn(async move {
-                if let Err(e) = sender.send_verification_email(payload).await {
+            match tokio::time::timeout(timeout, sender.send_verification_email(payload)).await {
+                Err(_elapsed) => {
+                    error!(op = "verification", "email dispatch timed out");
+                }
+                Ok(Err(e)) => {
                     error!(op = "verification", err = %e, "email dispatch failed");
                 }
-            });
-            Some(handle)
+                Ok(Ok(())) => {}
+            }
+            None
         }
     }
 
-    pub fn dispatch_password_reset(
+    /// Dispatches a password reset email payload.
+    ///
+    /// In async mode (`async_dispatch == true`), spawns a Tokio task with the configured timeout
+    /// and returns `Some(JoinHandle<()>)`.
+    ///
+    /// In sync mode (`async_dispatch == false`), awaits the sender inline with timeout and returns `None`.
+    pub async fn dispatch_password_reset(
         &self,
         payload: PasswordResetEmailPayload,
     ) -> Option<tokio::task::JoinHandle<()>> {
@@ -128,12 +163,16 @@ impl EmailDispatcher {
             });
             Some(handle)
         } else {
-            let handle = tokio::spawn(async move {
-                if let Err(e) = sender.send_password_reset_email(payload).await {
+            match tokio::time::timeout(timeout, sender.send_password_reset_email(payload)).await {
+                Err(_elapsed) => {
+                    error!(op = "password_reset", "email dispatch timed out");
+                }
+                Ok(Err(e)) => {
                     error!(op = "password_reset", err = %e, "email dispatch failed");
                 }
-            });
-            Some(handle)
+                Ok(Ok(())) => {}
+            }
+            None
         }
     }
 }
@@ -144,6 +183,7 @@ impl fmt::Debug for EmailDispatcher {
             .field("timeout", &self.timeout)
             .field("async_dispatch", &self.async_dispatch)
             .field("sender", &self.sender.is_some())
+            .field("base_url", &self.base_url)
             .finish()
     }
 }

@@ -71,6 +71,15 @@ impl std::fmt::Debug for EmailDispatcher {
     }
 }
 
+/// No-op email sender — drops all payloads without sending.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopEmailSender;
+
+impl EmailSender for NoopEmailSender {
+    fn send_verification(&self, _payload: VerificationEmailPayload) {}
+    fn send_password_reset(&self, _payload: PasswordResetEmailPayload) {}
+}
+
 /// No-op dispatcher for testing — records nothing, sends nothing.
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils {
@@ -90,5 +99,25 @@ pub mod test_utils {
         fn send_password_reset(&self, payload: PasswordResetEmailPayload) {
             self.reset_calls.lock().unwrap().push(payload);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_noop_email_sender() {
+        let sender = NoopEmailSender;
+        sender.send_verification(VerificationEmailPayload {
+            to_email: "test@example.com".to_string(),
+            token: "0".repeat(64),
+            user_id: Uuid::new_v4(),
+        });
+        sender.send_password_reset(PasswordResetEmailPayload {
+            to_email: "test@example.com".to_string(),
+            token: "0".repeat(64),
+            user_id: Uuid::new_v4(),
+        });
     }
 }

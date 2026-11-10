@@ -48,6 +48,14 @@ pub struct AuthServiceImpl {
     dispatcher: Arc<EmailDispatcher>,
 }
 
+impl std::fmt::Debug for AuthServiceImpl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthServiceImpl")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
 impl AuthServiceImpl {
     /// Constructs the service and pre-computes the dummy Argon2id PHC string.
     ///

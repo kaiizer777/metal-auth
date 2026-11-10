@@ -50,6 +50,9 @@ impl Config {
         if self.base_url.trim().is_empty() {
             return Err(ConfigError::MissingEnvVar("BASE_URL"));
         }
+        if self.email_dispatch_timeout == Duration::ZERO {
+            return Err(ConfigError::InvalidEnvVar("EMAIL_DISPATCH_TIMEOUT_SECS"));
+        }
         for origin in &self.allowed_origins {
             let trimmed = origin.trim();
             if trimmed != "*" {
@@ -117,6 +120,9 @@ impl Config {
                 let secs: u64 = val
                     .parse()
                     .map_err(|_| ConfigError::InvalidEnvVar("EMAIL_DISPATCH_TIMEOUT_SECS"))?;
+                if secs == 0 {
+                    return Err(ConfigError::InvalidEnvVar("EMAIL_DISPATCH_TIMEOUT_SECS"));
+                }
                 Duration::from_secs(secs)
             }
             Err(std::env::VarError::NotPresent) => {

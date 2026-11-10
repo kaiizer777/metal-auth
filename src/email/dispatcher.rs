@@ -70,18 +70,18 @@ impl EmailDispatcher {
         build_reset_url(base_url, token)
     }
 
-    pub async fn dispatch_verification(
+    pub fn dispatch_verification(
         &self,
         payload: VerificationEmailPayload,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> Option<tokio::task::JoinHandle<()>> {
         let Some(sender) = self.sender.clone() else {
-            warn!("no email sender configured; dropping verification email");
-            return tokio::spawn(async {});
+            warn!(op = "verification", "no email sender configured");
+            return None;
         };
         let timeout = self.timeout;
 
         if self.async_dispatch {
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 match tokio::time::timeout(timeout, sender.send_verification_email(payload)).await {
                     Err(_elapsed) => {
                         error!(op = "verification", "email dispatch timed out");
@@ -91,27 +91,30 @@ impl EmailDispatcher {
                     }
                     Ok(Ok(())) => {}
                 }
-            })
+            });
+            Some(handle)
         } else {
-            if let Err(e) = sender.send_verification_email(payload).await {
-                error!(op = "verification", err = %e, "email dispatch failed");
-            }
-            tokio::spawn(async {})
+            let handle = tokio::spawn(async move {
+                if let Err(e) = sender.send_verification_email(payload).await {
+                    error!(op = "verification", err = %e, "email dispatch failed");
+                }
+            });
+            Some(handle)
         }
     }
 
-    pub async fn dispatch_password_reset(
+    pub fn dispatch_password_reset(
         &self,
         payload: PasswordResetEmailPayload,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> Option<tokio::task::JoinHandle<()>> {
         let Some(sender) = self.sender.clone() else {
-            warn!("no email sender configured; dropping password reset email");
-            return tokio::spawn(async {});
+            warn!(op = "password_reset", "no email sender configured");
+            return None;
         };
         let timeout = self.timeout;
 
         if self.async_dispatch {
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 match tokio::time::timeout(timeout, sender.send_password_reset_email(payload)).await
                 {
                     Err(_elapsed) => {
@@ -122,12 +125,15 @@ impl EmailDispatcher {
                     }
                     Ok(Ok(())) => {}
                 }
-            })
+            });
+            Some(handle)
         } else {
-            if let Err(e) = sender.send_password_reset_email(payload).await {
-                error!(op = "password_reset", err = %e, "email dispatch failed");
-            }
-            tokio::spawn(async {})
+            let handle = tokio::spawn(async move {
+                if let Err(e) = sender.send_password_reset_email(payload).await {
+                    error!(op = "password_reset", err = %e, "email dispatch failed");
+                }
+            });
+            Some(handle)
         }
     }
 }

@@ -3,10 +3,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use axum::http::StatusCode;
 use chrono::Utc;
 use metal_auth::{
-    Config, ConfigError, EmailDispatcher, PasswordResetEmailPayload, SharedEmailSender,
-    VerificationEmailPayload,
+    AppError, Config, ConfigError, EmailDispatcher, ErrorCode, PasswordResetEmailPayload,
+    SharedEmailSender, VerificationEmailPayload,
 };
 use tokio::time::sleep;
 use tracing::Level;
@@ -148,7 +149,9 @@ async fn full_payload_assertion() {
     let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_secs(10), true);
 
     let payload = sample_verification();
-    let handle = dispatcher.dispatch_verification(payload.clone()).await;
+    let handle = dispatcher
+        .dispatch_verification(payload.clone())
+        .expect("should return handle");
     handle.await.unwrap();
 
     let got = captured.lock().unwrap().clone().unwrap();
@@ -175,7 +178,9 @@ async fn full_reset_payload_assertion() {
     let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_secs(10), true);
 
     let payload = sample_reset();
-    let handle = dispatcher.dispatch_password_reset(payload.clone()).await;
+    let handle = dispatcher
+        .dispatch_password_reset(payload.clone())
+        .expect("should return handle");
     handle.await.unwrap();
 
     let got = captured.lock().unwrap().clone().unwrap();
@@ -203,7 +208,7 @@ async fn sync_dispatch_awaits_and_logs_error() {
 
     let handle = dispatcher
         .dispatch_verification(sample_verification())
-        .await;
+        .expect("should return handle");
     handle.await.unwrap();
     assert!(log_text().contains("email dispatch failed"));
 }
@@ -214,12 +219,10 @@ async fn none_sender_warns_no_panic() {
     init_logs();
     clear_logs();
     let dispatcher = EmailDispatcher::new(None, Duration::from_secs(10), true);
-    let h1 = dispatcher
-        .dispatch_verification(sample_verification())
-        .await;
-    h1.await.unwrap();
-    let h2 = dispatcher.dispatch_password_reset(sample_reset()).await;
-    h2.await.unwrap();
+    let h1 = dispatcher.dispatch_verification(sample_verification());
+    assert!(h1.is_none());
+    let h2 = dispatcher.dispatch_password_reset(sample_reset());
+    assert!(h2.is_none());
     assert!(log_text().contains("no email sender configured"));
 }
 
@@ -239,7 +242,7 @@ async fn hook_returns_err_is_logged() {
     let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_secs(10), true);
     let handle = dispatcher
         .dispatch_verification(sample_verification())
-        .await;
+        .expect("should return handle");
     handle.await.unwrap();
     assert!(log_text().contains("email dispatch failed"));
 }
@@ -253,23 +256,27 @@ async fn async_dispatch_non_blocking() {
     let mock = MockSender {
         delay_ms: 500,
         fail: false,
-        captured_v: captured,
+        captured_v: captured.clone(),
         captured_r: Arc::new(Mutex::new(None)),
     };
     let sender: SharedEmailSender = Arc::new(mock);
     let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_secs(10), true);
 
-    let handle_res = tokio::time::timeout(
-        Duration::from_millis(100),
-        dispatcher.dispatch_verification(sample_verification()),
-    )
-    .await;
+    let handle = dispatcher
+        .dispatch_verification(sample_verification())
+        .expect("should return handle immediately");
+
+    // Proves non-blocking: sender takes 500ms, so dispatch returns before mock runs
     assert!(
-        handle_res.is_ok(),
-        "dispatch_verification must return immediately in async mode"
+        captured.lock().unwrap().is_none(),
+        "dispatch returned immediately without awaiting the 500ms mock sender"
     );
-    let handle = handle_res.unwrap();
+
     handle.await.unwrap();
+    assert!(
+        captured.lock().unwrap().is_some(),
+        "mock sender executed to completion once awaited"
+    );
 }
 
 #[tokio::test]
@@ -288,9 +295,44 @@ async fn timeout_does_not_panic() {
     let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_millis(50), true);
     let handle = dispatcher
         .dispatch_verification(sample_verification())
-        .await;
+        .expect("should return handle");
     handle.await.unwrap();
     assert!(log_text().contains("timed out"));
+}
+
+#[test]
+fn zero_timeout_rejected() {
+    let cfg = Config {
+        database_url: "postgres://localhost/test".into(),
+        port: 3000,
+        allowed_origins: vec![],
+        allowed_methods: vec!["GET".into()],
+        allowed_headers: vec!["Content-Type".into()],
+        max_connections: 5,
+        min_connections: 1,
+        base_url: "https://example.com".into(),
+        email_dispatch_timeout: Duration::ZERO,
+        async_email_dispatch: true,
+    };
+    assert!(matches!(
+        cfg.validate(),
+        Err(ConfigError::InvalidEnvVar("EMAIL_DISPATCH_TIMEOUT_SECS"))
+    ));
+}
+
+#[test]
+fn email_app_error_methods_do_not_panic() {
+    let variants: [AppError; 3] = [
+        AppError::EmailHookNotConfigured,
+        AppError::EmailDispatchFailed(Box::new(std::io::Error::other("fail"))),
+        AppError::EmailDispatchTimeout,
+    ];
+
+    for err in variants {
+        assert_eq!(err.error_code(), ErrorCode::InternalError);
+        assert_eq!(err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.response_message(), "Internal error");
+    }
 }
 
 #[test]

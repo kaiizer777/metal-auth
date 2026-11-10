@@ -110,12 +110,10 @@ impl AppError {
             Self::Migration(_) => ErrorCode::MigrationFailed,
             Self::NotFound => ErrorCode::NotFound,
             Self::MethodNotAllowed => ErrorCode::MethodNotAllowed,
-            Self::Internal => ErrorCode::InternalError,
-            Self::EmailHookNotConfigured
+            Self::Internal
+            | Self::EmailHookNotConfigured
             | Self::EmailDispatchFailed(_)
-            | Self::EmailDispatchTimeout => {
-                unreachable!("email variants must not reach wire mapping")
-            }
+            | Self::EmailDispatchTimeout => ErrorCode::InternalError,
         }
     }
 
@@ -125,14 +123,13 @@ impl AppError {
             Self::DatabaseUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
-            Self::Config(_) | Self::Database(_) | Self::Migration(_) | Self::Internal => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
-            Self::EmailHookNotConfigured
+            Self::Config(_)
+            | Self::Database(_)
+            | Self::Migration(_)
+            | Self::Internal
+            | Self::EmailHookNotConfigured
             | Self::EmailDispatchFailed(_)
-            | Self::EmailDispatchTimeout => {
-                unreachable!("email variants must not reach wire mapping")
-            }
+            | Self::EmailDispatchTimeout => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
@@ -145,12 +142,10 @@ impl AppError {
             Self::Migration(_) => "Migration failed",
             Self::NotFound => "Not found",
             Self::MethodNotAllowed => "Method not allowed",
-            Self::Internal => "Internal error",
-            Self::EmailHookNotConfigured
+            Self::Internal
+            | Self::EmailHookNotConfigured
             | Self::EmailDispatchFailed(_)
-            | Self::EmailDispatchTimeout => {
-                unreachable!("email variants must not reach wire mapping")
-            }
+            | Self::EmailDispatchTimeout => "Internal error",
         }
     }
 }

@@ -80,7 +80,10 @@ mod tests {
         assert!(matches!(hash_token("123"), Err(AppError::InvalidToken)));
         // 62 chars (too short)
         let too_short = "0".repeat(62);
-        assert!(matches!(hash_token(&too_short), Err(AppError::InvalidToken)));
+        assert!(matches!(
+            hash_token(&too_short),
+            Err(AppError::InvalidToken)
+        ));
         // 66 chars (too long)
         let too_long = "0".repeat(66);
         assert!(matches!(hash_token(&too_long), Err(AppError::InvalidToken)));

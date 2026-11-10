@@ -592,13 +592,11 @@ async fn test_require_email_verification_block() {
     assert_eq!(err.code, ErrorCode::EmailNotVerified);
 
     // Once email is verified, login must succeed
-    sqlx::query(
-        "UPDATE users SET email_verified = true WHERE id = $1",
-    )
-    .bind(user_id)
-    .execute(&ctx.pool)
-    .await
-    .unwrap();
+    sqlx::query("UPDATE users SET email_verified = true WHERE id = $1")
+        .bind(user_id)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
 
     let req2 = json_request(
         Method::POST,

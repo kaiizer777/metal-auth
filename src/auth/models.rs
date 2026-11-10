@@ -149,7 +149,11 @@ pub fn validate_email(email: &str) -> AppResult<()> {
     if local.is_empty() || domain.is_empty() {
         return Err(AppError::InvalidEmail);
     }
-    if domain.starts_with('.') || domain.ends_with('.') || !domain.contains('.') || domain.contains("..") {
+    if domain.starts_with('.')
+        || domain.ends_with('.')
+        || !domain.contains('.')
+        || domain.contains("..")
+    {
         return Err(AppError::InvalidEmail);
     }
     Ok(())

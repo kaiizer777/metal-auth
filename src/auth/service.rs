@@ -96,13 +96,12 @@ impl AuthServiceImpl {
         let mut tx = self.pool.begin().await.map_err(AppError::Database)?;
 
         // Attempt insert; detect duplicate via UNIQUE constraint violation
-        let result = sqlx::query(
-            "INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id",
-        )
-        .bind(&normalized_email)
-        .bind(&password_hash)
-        .fetch_one(&mut *tx)
-        .await;
+        let result =
+            sqlx::query("INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id")
+                .bind(&normalized_email)
+                .bind(&password_hash)
+                .fetch_one(&mut *tx)
+                .await;
 
         let user_id: Uuid = match result {
             Ok(row) => row.get("id"),
@@ -169,13 +168,12 @@ impl AuthServiceImpl {
     pub async fn login(&self, email: &str, password: &str) -> AppResult<Uuid> {
         let normalized_email = email.trim().to_lowercase();
 
-        let maybe_user = sqlx::query(
-            "SELECT id, password_hash, email_verified FROM users WHERE email = $1",
-        )
-        .bind(&normalized_email)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(AppError::Database)?;
+        let maybe_user =
+            sqlx::query("SELECT id, password_hash, email_verified FROM users WHERE email = $1")
+                .bind(&normalized_email)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(AppError::Database)?;
 
         match maybe_user {
             None => {
@@ -258,13 +256,11 @@ impl AuthServiceImpl {
             return Err(AppError::TokenExpired);
         }
 
-        sqlx::query(
-            "UPDATE users SET email_verified = true, updated_at = NOW() WHERE id = $1",
-        )
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(AppError::Database)?;
+        sqlx::query("UPDATE users SET email_verified = true, updated_at = NOW() WHERE id = $1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::Database)?;
 
         tx.commit().await.map_err(AppError::Database)?;
         Ok(())
@@ -281,13 +277,11 @@ impl AuthServiceImpl {
         let normalized_email = email.trim().to_lowercase();
 
         // Always run the same SELECT — round-trip cost is structurally identical
-        let maybe_user = sqlx::query(
-            "SELECT id, email FROM users WHERE email = $1",
-        )
-        .bind(&normalized_email)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(AppError::Database)?;
+        let maybe_user = sqlx::query("SELECT id, email FROM users WHERE email = $1")
+            .bind(&normalized_email)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(AppError::Database)?;
 
         if let Some(user) = maybe_user {
             let user_id: Uuid = user.get("id");
@@ -373,23 +367,19 @@ impl AuthServiceImpl {
             .await
             .map_err(|_| AppError::Internal)??;
 
-        sqlx::query(
-            "UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2",
-        )
-        .bind(&new_hash)
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(AppError::Database)?;
+        sqlx::query("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2")
+            .bind(&new_hash)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::Database)?;
 
         // Invalidate ALL remaining reset tokens for this user
-        sqlx::query(
-            "DELETE FROM password_reset_tokens WHERE user_id = $1",
-        )
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(AppError::Database)?;
+        sqlx::query("DELETE FROM password_reset_tokens WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::Database)?;
 
         tx.commit().await.map_err(AppError::Database)?;
         Ok(())
@@ -655,14 +645,13 @@ mod tests {
         let config = Arc::clone(&ctx.service.config);
         let password_hash = hash_password(password, &config).unwrap();
 
-        let row = sqlx::query(
-            "INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id",
-        )
-        .bind(&email)
-        .bind(&password_hash)
-        .fetch_one(&ctx.pool)
-        .await
-        .unwrap();
+        let row =
+            sqlx::query("INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id")
+                .bind(&email)
+                .bind(&password_hash)
+                .fetch_one(&ctx.pool)
+                .await
+                .unwrap();
         let user_id: Uuid = row.get("id");
 
         let (raw_token, token_hash) = generate_token();
@@ -686,13 +675,12 @@ mod tests {
         );
 
         // Verify expired token was cleaned/deleted from the database
-        let count_row = sqlx::query(
-            "SELECT COUNT(*) as cnt FROM verification_tokens WHERE token_hash = $1",
-        )
-        .bind(&token_hash[..])
-        .fetch_one(&ctx.pool)
-        .await
-        .unwrap();
+        let count_row =
+            sqlx::query("SELECT COUNT(*) as cnt FROM verification_tokens WHERE token_hash = $1")
+                .bind(&token_hash[..])
+                .fetch_one(&ctx.pool)
+                .await
+                .unwrap();
         let cnt: i64 = count_row.get("cnt");
         assert_eq!(cnt, 0, "expired token must be deleted from DB");
     }
@@ -728,13 +716,11 @@ mod tests {
         );
 
         // Mark verified
-        sqlx::query(
-            "UPDATE users SET email_verified = true WHERE id = $1",
-        )
-        .bind(user_id)
-        .execute(&ctx.pool)
-        .await
-        .unwrap();
+        sqlx::query("UPDATE users SET email_verified = true WHERE id = $1")
+            .bind(user_id)
+            .execute(&ctx.pool)
+            .await
+            .unwrap();
 
         // Now login succeeds
         let res = ctx.service.login(&email, password).await;

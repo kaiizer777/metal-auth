@@ -1,7 +1,8 @@
 use chrono::{DateTime, Utc};
-use serde::Serialize;
 use sqlx::FromRow;
 use uuid::Uuid;
+
+pub use crate::auth::models::UserResponse;
 
 /// Internal user database entity.
 ///
@@ -16,37 +17,6 @@ pub struct User {
     pub email_verified: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-}
-
-/// Outbound user representation safe for client responses.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct UserResponse {
-    pub id: Uuid,
-    pub email: String,
-    pub email_verified: bool,
-    pub created_at: DateTime<Utc>,
-}
-
-impl From<User> for UserResponse {
-    fn from(user: User) -> Self {
-        Self {
-            id: user.id,
-            email: user.email,
-            email_verified: user.email_verified,
-            created_at: user.created_at,
-        }
-    }
-}
-
-impl From<&User> for UserResponse {
-    fn from(user: &User) -> Self {
-        Self {
-            id: user.id,
-            email: user.email.clone(),
-            email_verified: user.email_verified,
-            created_at: user.created_at,
-        }
-    }
 }
 
 /// Session entity stored with a cryptographic hash of the session token.

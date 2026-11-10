@@ -1,6 +1,5 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
 use uuid::Uuid;
 
 use crate::{
@@ -9,34 +8,10 @@ use crate::{
     error::{AppError, AppResult},
 };
 
-#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
-pub struct UserRow {
-    pub id: Uuid,
-    pub email: String,
-    pub password_hash: String,
-    pub email_verified: bool,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-pub type User = UserRow;
-
-#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
-pub struct VerificationTokenRow {
-    pub token_hash: Vec<u8>,
-    pub user_id: Uuid,
-    pub expires_at: DateTime<Utc>,
-    pub created_at: DateTime<Utc>,
-}
-pub type VerificationToken = VerificationTokenRow;
-
-#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
-pub struct PasswordResetTokenRow {
-    pub token_hash: Vec<u8>,
-    pub user_id: Uuid,
-    pub expires_at: DateTime<Utc>,
-    pub created_at: DateTime<Utc>,
-}
-pub type PasswordResetToken = PasswordResetTokenRow;
+pub use crate::db::models::{
+    PasswordResetToken, PasswordResetToken as PasswordResetTokenRow, User, User as UserRow,
+    VerificationToken, VerificationToken as VerificationTokenRow,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserResponse {
@@ -46,8 +21,8 @@ pub struct UserResponse {
     pub created_at: DateTime<Utc>,
 }
 
-impl From<UserRow> for UserResponse {
-    fn from(user: UserRow) -> Self {
+impl From<User> for UserResponse {
+    fn from(user: User) -> Self {
         Self {
             id: user.id,
             email: user.email,
@@ -57,8 +32,8 @@ impl From<UserRow> for UserResponse {
     }
 }
 
-impl From<&UserRow> for UserResponse {
-    fn from(user: &UserRow) -> Self {
+impl From<&User> for UserResponse {
+    fn from(user: &User) -> Self {
         Self {
             id: user.id,
             email: user.email.clone(),
@@ -123,8 +98,7 @@ pub struct VerifyEmailRequest {
 
 impl VerifyEmailRequest {
     pub fn validate(&self) -> AppResult<()> {
-        let token = self.token.trim();
-        if token.len() != 64 || !token.chars().all(|c| c.is_ascii_hexdigit()) {
+        if self.token.len() != 64 || !self.token.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(AppError::InvalidToken);
         }
         Ok(())
@@ -150,8 +124,7 @@ pub struct PasswordResetConfirmRequest {
 
 impl PasswordResetConfirmRequest {
     pub fn validate(&self, config: &AppConfig) -> AppResult<()> {
-        let token = self.token.trim();
-        if token.len() != 64 || !token.chars().all(|c| c.is_ascii_hexdigit()) {
+        if self.token.len() != 64 || !self.token.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(AppError::InvalidToken);
         }
         validate_password(&self.new_password, config)?;
@@ -204,7 +177,7 @@ mod tests {
     #[test]
     fn test_user_response_serialization_excludes_password_hash() {
         let now = Utc::now();
-        let user = UserRow {
+        let user = User {
             id: Uuid::new_v4(),
             email: "alice@example.com".to_string(),
             password_hash: "$argon2id$v=19$m=65536,t=3,p=4$dummy_hash".to_string(),
@@ -344,6 +317,46 @@ mod tests {
             token: "".to_string(),
         };
         assert!(matches!(req.validate(), Err(AppError::InvalidToken)));
+
+        // Whitespace-padded valid-length hex is rejected
+        let req = VerifyEmailRequest {
+            token: format!(" {} ", "a".repeat(62)),
+        };
+        assert!(matches!(req.validate(), Err(AppError::InvalidToken)));
+    }
+
+    #[test]
+    fn test_password_reset_request_validation() {
+        // Valid
+        let req = PasswordResetRequest {
+            email: "user@example.com".to_string(),
+        };
+        assert!(req.validate().is_ok());
+
+        // Valid with whitespace (validate_email trims)
+        let req = PasswordResetRequest {
+            email: "  user@example.com  ".to_string(),
+        };
+        assert!(req.validate().is_ok());
+
+        // Invalid emails
+        let invalid_emails = [
+            "",
+            "   ",
+            "invalid",
+            "@example.com",
+            "user@",
+            "user@example",
+        ];
+        for email in invalid_emails {
+            let req = PasswordResetRequest {
+                email: email.to_string(),
+            };
+            assert!(
+                matches!(req.validate(), Err(AppError::InvalidEmail)),
+                "expected InvalidEmail for: {email}"
+            );
+        }
     }
 
     #[test]
@@ -356,6 +369,13 @@ mod tests {
             new_password: "FreshStrongPassword2026!".to_string(),
         };
         assert!(req.validate(&config).is_ok());
+
+        // Whitespace-padded token is rejected
+        let req = PasswordResetConfirmRequest {
+            token: " 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef ".to_string(),
+            new_password: "FreshStrongPassword2026!".to_string(),
+        };
+        assert!(matches!(req.validate(&config), Err(AppError::InvalidToken)));
 
         // Invalid token
         let req = PasswordResetConfirmRequest {

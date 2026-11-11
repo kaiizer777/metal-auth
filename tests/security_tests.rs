@@ -39,8 +39,14 @@ struct LiveDbTestContext {
 
 async fn setup_live_db() -> Option<LiveDbTestContext> {
     dotenvy::dotenv().ok();
-    let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = PgPool::connect(&url).await.ok()?;
+    let url = match std::env::var("DATABASE_URL") {
+        Ok(val) => val,
+        Err(std::env::VarError::NotPresent) => return None,
+        Err(e) => panic!("invalid DATABASE_URL environment variable: {e}"),
+    };
+    let pool = PgPool::connect(&url)
+        .await
+        .expect("failed to connect to DATABASE_URL in live DB test setup");
     let cfg = Config {
         database_url: url.clone(),
         port: 8080,
@@ -53,8 +59,8 @@ async fn setup_live_db() -> Option<LiveDbTestContext> {
         email_dispatch_timeout: std::time::Duration::from_secs(10),
         async_email_dispatch: true,
     };
-    let state = AppState::new(pool.clone(), cfg).ok()?;
-    let router = create_router(state.clone()).ok()?;
+    let state = AppState::new(pool.clone(), cfg).expect("failed to create app state with live DB");
+    let router = create_router(state.clone()).expect("failed to create router for live DB test");
     Some(LiveDbTestContext {
         router,
         pool,
@@ -544,18 +550,53 @@ async fn test_anti_enumeration_password_reset() {
         return;
     };
 
-    let req = json_request(
+    let email = format!("existing_reset_{}@example.com", Uuid::new_v4());
+    let password = "ValidPassword123!";
+    let config = ctx.state.auth_service.config.clone();
+    let password_hash = hash_password(password, &config).unwrap();
+
+    let row = sqlx::query(
+        "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true) RETURNING id",
+    )
+    .bind(&email)
+    .bind(&password_hash)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    let user_id: Uuid = row.get("id");
+
+    let req1 = json_request(
         Method::POST,
         "/auth/password/reset-request",
-        json!({"email": "nonexistent_account_9999@example.com"}),
+        json!({"email": email}),
     );
-    let resp = ctx.router.oneshot(req).await.unwrap();
-    let (status, body, _) = response_json(resp).await;
-    assert_eq!(status, StatusCode::OK);
+    let resp1 = ctx.router.clone().oneshot(req1).await.unwrap();
+    let (status1, body1, _) = response_json(resp1).await;
+
+    let nonexistent_email = format!("nonexistent_{}@example.com", Uuid::new_v4());
+    let req2 = json_request(
+        Method::POST,
+        "/auth/password/reset-request",
+        json!({"email": nonexistent_email}),
+    );
+    let resp2 = ctx.router.oneshot(req2).await.unwrap();
+    let (status2, body2, _) = response_json(resp2).await;
+
+    assert_eq!(status1, StatusCode::OK);
+    assert_eq!(status2, StatusCode::OK);
+    assert_eq!(body1, body2);
     assert_eq!(
-        body["message"],
+        body1["message"],
         "if an account with that email exists, a password reset link has been sent"
     );
+
+    let token_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM password_reset_tokens WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&ctx.pool)
+            .await
+            .unwrap();
+    assert_eq!(token_count, 1);
 }
 
 #[tokio::test]
@@ -725,4 +766,110 @@ async fn test_reset_password_revokes_all_tokens() {
     assert_eq!(status2, StatusCode::BAD_REQUEST);
     let err: ErrorResponse = serde_json::from_str(&body_str2).unwrap();
     assert_eq!(err.code, ErrorCode::InvalidToken);
+}
+
+#[tokio::test]
+async fn test_method_not_allowed_json_envelope() {
+    let router = create_test_router();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/auth/signup")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = router.oneshot(req).await.unwrap();
+    let (status, _, body_str) = response_json(resp).await;
+
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+    assert_eq!(err.code, ErrorCode::MethodNotAllowed);
+    assert_eq!(err.message, "Method not allowed");
+}
+
+#[tokio::test]
+async fn test_expired_verification_token() {
+    let Some(ctx) = setup_live_db().await else {
+        return;
+    };
+
+    let email = format!("expired_verify_{}@example.com", Uuid::new_v4());
+    let password = "ValidPassword123!";
+    let config = ctx.state.auth_service.config.clone();
+    let password_hash = hash_password(password, &config).unwrap();
+
+    let user_row = sqlx::query(
+        "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, false) RETURNING id",
+    )
+    .bind(&email)
+    .bind(&password_hash)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    let user_id: Uuid = user_row.get("id");
+
+    let (raw_token, stored_hash) = generate_token();
+    let expires_at = Utc::now() - Duration::minutes(5);
+
+    sqlx::query(
+        "INSERT INTO verification_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
+    )
+    .bind(stored_hash.as_slice())
+    .bind(user_id)
+    .bind(expires_at)
+    .execute(&ctx.pool)
+    .await
+    .unwrap();
+
+    let req = json_request(Method::POST, "/auth/verify", json!({"token": raw_token}));
+    let resp = ctx.router.oneshot(req).await.unwrap();
+    let (status, _, body_str) = response_json(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+    assert_eq!(err.code, ErrorCode::TokenExpired);
+}
+
+#[tokio::test]
+async fn test_expired_password_reset_token() {
+    let Some(ctx) = setup_live_db().await else {
+        return;
+    };
+
+    let email = format!("expired_reset_{}@example.com", Uuid::new_v4());
+    let password = "ValidPassword123!";
+    let config = ctx.state.auth_service.config.clone();
+    let password_hash = hash_password(password, &config).unwrap();
+
+    let user_row = sqlx::query(
+        "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true) RETURNING id",
+    )
+    .bind(&email)
+    .bind(&password_hash)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    let user_id: Uuid = user_row.get("id");
+
+    let (raw_token, stored_hash) = generate_token();
+    let expires_at = Utc::now() - Duration::minutes(5);
+
+    sqlx::query(
+        "INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
+    )
+    .bind(stored_hash.as_slice())
+    .bind(user_id)
+    .bind(expires_at)
+    .execute(&ctx.pool)
+    .await
+    .unwrap();
+
+    let req = json_request(
+        Method::POST,
+        "/auth/password/reset",
+        json!({"token": raw_token, "new_password": "NewValidPassword123!"}),
+    );
+    let resp = ctx.router.oneshot(req).await.unwrap();
+    let (status, _, body_str) = response_json(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+    assert_eq!(err.code, ErrorCode::TokenExpired);
 }

@@ -130,6 +130,21 @@ mod tests {
     }
 
     #[test]
+    fn dummy_hash_preserves_custom_parameters() {
+        let config = AppConfig {
+            argon2_m_cost: 19456,
+            argon2_t_cost: 2,
+            argon2_p_cost: 1,
+            ..Default::default()
+        };
+        let dummy = generate_dummy_hash(&config).unwrap();
+        assert!(
+            dummy.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"),
+            "Dummy PHC: {dummy}"
+        );
+    }
+
+    #[test]
     fn accepts_multibyte_unicode_password() {
         let config = AppConfig::default();
         let pw = "🔐🔑🗝️🔒🔓🛡️⚔️🏰";

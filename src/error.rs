@@ -230,8 +230,8 @@ impl AppError {
             Self::InvalidCredentials => "Invalid email or password",
             Self::Unauthenticated => "Authentication required",
             Self::EmailNotVerified => "Email address has not been verified",
-            Self::PasswordTooShort => "Password must be at least 8 characters (we recommend 15+)",
-            Self::PasswordTooLong => "Password must not exceed 128 characters",
+            Self::PasswordTooShort => "Password does not meet the minimum length requirement",
+            Self::PasswordTooLong => "Password exceeds the maximum length requirement",
             Self::PasswordTooCommon => "Password is too common, please choose a stronger password",
             Self::InvalidEmail => "Invalid email address",
             Self::ValidationError(_) => "Invalid request body",
@@ -384,6 +384,18 @@ mod tests {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorCode::InvalidConfig,
                 "Invalid configuration",
+            ),
+            (
+                AppError::PasswordTooShort,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::PasswordTooShort,
+                "Password does not meet the minimum length requirement",
+            ),
+            (
+                AppError::PasswordTooLong,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::PasswordTooLong,
+                "Password exceeds the maximum length requirement",
             ),
         ];
 

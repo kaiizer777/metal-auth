@@ -314,15 +314,19 @@ impl AppConfig {
     /// Load `AppConfig` from environment variables, falling back to defaults.
     pub fn from_env() -> Result<Self, ConfigError> {
         dotenvy::dotenv().ok();
+        let defaults = Self::default();
 
-        let argon2_m_cost = parse_env_u32("ARGON2_M_COST", 65536)?;
-        let argon2_t_cost = parse_env_u32("ARGON2_T_COST", 3)?;
-        let argon2_p_cost = parse_env_u32("ARGON2_P_COST", 4)?;
-        let password_min_len = parse_env_usize("PASSWORD_MIN_LEN", 8)?;
-        let password_max_len = parse_env_usize("PASSWORD_MAX_LEN", 128)?;
-        let verification_token_ttl_secs = parse_env_u64("VERIFICATION_TOKEN_TTL_SECS", 1800)?;
-        let reset_token_ttl_secs = parse_env_u64("RESET_TOKEN_TTL_SECS", 900)?;
-        let require_email_verification = parse_env_bool("REQUIRE_EMAIL_VERIFICATION", true)?;
+        let argon2_m_cost = parse_env_u32("ARGON2_M_COST", defaults.argon2_m_cost)?;
+        let argon2_t_cost = parse_env_u32("ARGON2_T_COST", defaults.argon2_t_cost)?;
+        let argon2_p_cost = parse_env_u32("ARGON2_P_COST", defaults.argon2_p_cost)?;
+        let password_min_len = parse_env_usize("PASSWORD_MIN_LEN", defaults.password_min_len)?;
+        let password_max_len = parse_env_usize("PASSWORD_MAX_LEN", defaults.password_max_len)?;
+        let verification_token_ttl_secs =
+            parse_env_u64("VERIFICATION_TOKEN_TTL_SECS", defaults.verification_token_ttl_secs)?;
+        let reset_token_ttl_secs =
+            parse_env_u64("RESET_TOKEN_TTL_SECS", defaults.reset_token_ttl_secs)?;
+        let require_email_verification =
+            parse_env_bool("REQUIRE_EMAIL_VERIFICATION", defaults.require_email_verification)?;
 
         Self::new(
             argon2_m_cost,
@@ -683,17 +687,50 @@ mod tests {
         assert!(AppConfig::new(65536, 3, 4, 8, 128, 3600, 900, false).is_ok());
     }
 
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn app_config_from_env_defaults() {
-        // Clear any env overrides to test defaults
+        let _guard = ENV_LOCK.lock().unwrap();
+        const ENV_VARS: &[&str] = &[
+            "ARGON2_M_COST",
+            "ARGON2_T_COST",
+            "ARGON2_P_COST",
+            "PASSWORD_MIN_LEN",
+            "PASSWORD_MAX_LEN",
+            "VERIFICATION_TOKEN_TTL_SECS",
+            "RESET_TOKEN_TTL_SECS",
+            "REQUIRE_EMAIL_VERIFICATION",
+        ];
+
+        struct EnvGuard<'a>(&'a [&'static str], Vec<Option<String>>);
+        impl Drop for EnvGuard<'_> {
+            fn drop(&mut self) {
+                // SAFETY: Guarded by ENV_LOCK within test process
+                unsafe {
+                    for (&key, val) in self.0.iter().zip(self.1.iter()) {
+                        if let Some(v) = val {
+                            std::env::set_var(key, v);
+                        } else {
+                            std::env::remove_var(key);
+                        }
+                    }
+                }
+            }
+        }
+
+        let saved: Vec<Option<String>> = ENV_VARS.iter().map(|&k| std::env::var(k).ok()).collect();
+        // SAFETY: Guarded by ENV_LOCK within test process
+        unsafe {
+            for &k in ENV_VARS {
+                std::env::remove_var(k);
+            }
+        }
+        let _env_guard = EnvGuard(ENV_VARS, saved);
+
         let cfg = AppConfig::from_env().expect("load default env config");
-        assert!(cfg.argon2_m_cost >= 19456);
-        assert!(cfg.argon2_t_cost >= 2);
-        assert!(cfg.argon2_p_cost >= 1);
-        assert!(cfg.password_min_len >= 8);
-        assert!(cfg.password_max_len <= 128);
-        assert!((900..=3600).contains(&cfg.verification_token_ttl_secs));
-        assert!((900..=3600).contains(&cfg.reset_token_ttl_secs));
+        let expected = AppConfig::default();
+        assert_eq!(cfg, expected);
         assert!(cfg.validate().is_ok());
     }
 

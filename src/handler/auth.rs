@@ -29,18 +29,37 @@ pub struct AuthHandlerState {
     pub service: Arc<AuthServiceImpl>,
 }
 
+async fn method_not_allowed() -> AppError {
+    AppError::MethodNotAllowed
+}
+
 pub fn routes(service: Arc<AuthServiceImpl>) -> Router {
     let state = AuthHandlerState { service };
     Router::new()
-        .route("/signup", axum::routing::post(signup))
-        .route("/login", axum::routing::post(login))
-        .route("/logout", axum::routing::post(logout))
-        .route("/verify", axum::routing::post(verify_email))
+        .route(
+            "/signup",
+            axum::routing::post(signup).fallback(method_not_allowed),
+        )
+        .route(
+            "/login",
+            axum::routing::post(login).fallback(method_not_allowed),
+        )
+        .route(
+            "/logout",
+            axum::routing::post(logout).fallback(method_not_allowed),
+        )
+        .route(
+            "/verify",
+            axum::routing::post(verify_email).fallback(method_not_allowed),
+        )
         .route(
             "/password/reset-request",
-            axum::routing::post(request_password_reset),
+            axum::routing::post(request_password_reset).fallback(method_not_allowed),
         )
-        .route("/password/reset", axum::routing::post(reset_password))
+        .route(
+            "/password/reset",
+            axum::routing::post(reset_password).fallback(method_not_allowed),
+        )
         .with_state(state)
 }
 
@@ -318,5 +337,24 @@ mod tests {
         let state = create_test_state();
         let resp = logout(State(state)).await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn route_method_not_allowed_returns_405_json_envelope() {
+        use tower::ServiceExt;
+        let app = routes(create_test_state().service);
+        let req = axum::http::Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/signup")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err.code, ErrorCode::MethodNotAllowed);
+        assert_eq!(err.message, "Method not allowed");
     }
 }

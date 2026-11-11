@@ -109,7 +109,6 @@ impl AuthServiceImpl {
             Err(sqlx::Error::Database(ref db_err)) if db_err.code().as_deref() == Some("23505") => {
                 let _ = tx.rollback().await;
                 tracing::info!(email = %normalized_email, "signup attempt on existing account");
-                tokio::spawn(async move {});
                 return Ok(());
             }
             Err(e) => {

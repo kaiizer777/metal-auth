@@ -1296,9 +1296,30 @@ static BLOCKLIST: &[&str] = &[
 
 /// Returns `true` if `password` appears in the common password blocklist.
 ///
-/// Comparison is case-insensitive (normalizes input to lowercase before binary search).
-/// Per spec: filtering is done here, not at the call site.
+/// Check if a password matches an entry in the static common password blocklist.
+///
+/// # Case-Folding & Unicode Semantics
+/// Passwords are case-insensitively matched. If the input contains any uppercase
+/// character according to [`char::is_uppercase`], a lowercase copy is allocated via
+/// [`str::to_lowercase`] before searching. If no uppercase characters exist (e.g. all-lowercase
+/// ASCII, digits, punctuation, or unicased scripts), no allocation is performed.
+///
+/// Case-folding adheres to the Unicode Standard's default casing algorithms. On non-ASCII
+/// Unicode inputs, characters lowercase per Unicode rules; non-ASCII passwords will match
+/// only if their case-folded representation exactly equals an entry in the blocklist.
+///
+/// # Binary Search Guarantees & Invariants
+/// - **Ordering**: The static `BLOCKLIST` slice is strictly sorted in byte-lexicographical
+///   order (`Ord for str`), enabling $O(\log N)$ lookup via [`slice::binary_search`].
+/// - **Deduplication**: Every entry in `BLOCKLIST` is strictly monotonic and unique.
+/// - **Length Invariant**: All entries in `BLOCKLIST` have a length of at least 8 code points.
+///   Inputs shorter than 8 code points or empty strings will never match any entry.
+/// - **Search Correctness**: For any input $P$, binary search returns `true` if and only if
+///   $P$ (or its lowercased equivalent) is present in `BLOCKLIST`.
 pub fn is_common_password(password: &str) -> bool {
+    if password.len() < 8 {
+        return false;
+    }
     if password.chars().any(char::is_uppercase) {
         let pw_lower = password.to_lowercase();
         BLOCKLIST.binary_search(&pw_lower.as_str()).is_ok()
@@ -1372,5 +1393,47 @@ mod tests {
             "blocklist too small: {}",
             BLOCKLIST.len()
         );
+    }
+
+    #[test]
+    fn empty_and_short_passwords_not_in_blocklist() {
+        assert!(!is_common_password(""));
+        assert!(!is_common_password("a"));
+        assert!(!is_common_password("1234567"));
+        assert!(!is_common_password("admin"));
+        assert!(!is_common_password("        "));
+    }
+
+    #[test]
+    fn unicode_multibyte_and_non_ascii_passwords_handled() {
+        assert!(!is_common_password("🦀🦀🦀🦀🦀🦀🦀🦀"));
+        assert!(!is_common_password("日本語パスワード123"));
+        assert!(!is_common_password("ПАРОЛЬ123456"));
+        assert!(!is_common_password("ÜberPassword123"));
+    }
+
+    #[test]
+    fn all_blocklist_entries_are_discoverable_lowercase_and_uppercase() {
+        for &entry in BLOCKLIST {
+            assert!(
+                is_common_password(entry),
+                "failed to find entry in blocklist: {entry}"
+            );
+            let upper = entry.to_uppercase();
+            assert!(
+                is_common_password(&upper),
+                "failed to find uppercase version of entry in blocklist: {upper}"
+            );
+        }
+    }
+
+    #[test]
+    fn boundary_entries_found_correctly() {
+        let first = BLOCKLIST.first().unwrap();
+        let last = BLOCKLIST.last().unwrap();
+        assert!(is_common_password(first));
+        assert!(is_common_password(last));
+        assert!(!is_common_password("0000000"));
+        assert!(!is_common_password("zzzzzzzzzzzzzzzz"));
     }
 }

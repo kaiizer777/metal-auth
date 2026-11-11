@@ -84,7 +84,7 @@ pub struct LoginRequest {
 impl LoginRequest {
     pub fn validate(&self) -> AppResult<()> {
         let email = self.email.trim();
-        if email.is_empty() || self.password.is_empty() {
+        if email.is_empty() || self.password.is_empty() || self.password.len() > 1024 {
             return Err(AppError::InvalidCredentials);
         }
         Ok(())
@@ -98,10 +98,7 @@ pub struct VerifyEmailRequest {
 
 impl VerifyEmailRequest {
     pub fn validate(&self) -> AppResult<()> {
-        if self.token.len() != 64 || !self.token.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(AppError::InvalidToken);
-        }
-        Ok(())
+        validate_token(&self.token)
     }
 }
 
@@ -124,12 +121,18 @@ pub struct PasswordResetConfirmRequest {
 
 impl PasswordResetConfirmRequest {
     pub fn validate(&self, config: &AppConfig) -> AppResult<()> {
-        if self.token.len() != 64 || !self.token.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(AppError::InvalidToken);
-        }
+        validate_token(&self.token)?;
         validate_password(&self.new_password, config)?;
         Ok(())
     }
+}
+
+/// Validates that a token is a 64-character lowercase or uppercase hexadecimal string.
+pub fn validate_token(token: &str) -> AppResult<()> {
+    if token.len() != 64 || !token.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        return Err(AppError::InvalidToken);
+    }
+    Ok(())
 }
 
 pub fn validate_email(email: &str) -> AppResult<()> {
@@ -308,6 +311,37 @@ mod tests {
             password: "".to_string(),
         };
         assert!(matches!(req.validate(), Err(AppError::InvalidCredentials)));
+
+        // Password exceeds 1024 bytes (DoS defense)
+        let req = LoginRequest {
+            email: "user@example.com".to_string(),
+            password: "a".repeat(1025),
+        };
+        assert!(matches!(req.validate(), Err(AppError::InvalidCredentials)));
+
+        // Password exactly 1024 bytes is accepted
+        let req = LoginRequest {
+            email: "user@example.com".to_string(),
+            password: "a".repeat(1024),
+        };
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_token_helper() {
+        assert!(validate_token(&"a".repeat(64)).is_ok());
+        assert!(matches!(
+            validate_token(&"a".repeat(63)),
+            Err(AppError::InvalidToken)
+        ));
+        assert!(matches!(
+            validate_token(&"a".repeat(65)),
+            Err(AppError::InvalidToken)
+        ));
+        assert!(matches!(
+            validate_token(&format!("{}z", "a".repeat(63))),
+            Err(AppError::InvalidToken)
+        ));
     }
 
     #[test]

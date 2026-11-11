@@ -1,7 +1,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use tracing::{error, warn};
+use tracing::{Instrument, error, info_span, warn};
 
 use crate::email::hook::SharedEmailSender;
 use crate::email::payload::{PasswordResetEmailPayload, VerificationEmailPayload};
@@ -18,7 +18,7 @@ fn percent_encode_token(input: &str) -> String {
     }
 
     const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
-    let mut encoded = String::with_capacity(input.len() + 16);
+    let mut encoded = String::with_capacity(input.len().saturating_mul(3));
     for byte in input.bytes() {
         if matches!(
             byte,
@@ -106,17 +106,23 @@ impl EmailDispatcher {
         let timeout = self.timeout;
 
         if self.async_dispatch {
-            let handle = tokio::spawn(async move {
-                match tokio::time::timeout(timeout, sender.send_verification_email(payload)).await {
-                    Err(_elapsed) => {
-                        error!(op = "verification", "email dispatch timed out");
+            let span = info_span!("dispatch_verification", user_id = %payload.user_id);
+            let handle = tokio::spawn(
+                async move {
+                    match tokio::time::timeout(timeout, sender.send_verification_email(payload))
+                        .await
+                    {
+                        Err(_elapsed) => {
+                            error!(op = "verification", "email dispatch timed out");
+                        }
+                        Ok(Err(e)) => {
+                            error!(op = "verification", err = %e, "email dispatch failed");
+                        }
+                        Ok(Ok(())) => {}
                     }
-                    Ok(Err(e)) => {
-                        error!(op = "verification", err = %e, "email dispatch failed");
-                    }
-                    Ok(Ok(())) => {}
                 }
-            });
+                .instrument(span),
+            );
             Some(handle)
         } else {
             match tokio::time::timeout(timeout, sender.send_verification_email(payload)).await {
@@ -149,18 +155,23 @@ impl EmailDispatcher {
         let timeout = self.timeout;
 
         if self.async_dispatch {
-            let handle = tokio::spawn(async move {
-                match tokio::time::timeout(timeout, sender.send_password_reset_email(payload)).await
-                {
-                    Err(_elapsed) => {
-                        error!(op = "password_reset", "email dispatch timed out");
+            let span = info_span!("dispatch_password_reset", user_id = %payload.user_id);
+            let handle = tokio::spawn(
+                async move {
+                    match tokio::time::timeout(timeout, sender.send_password_reset_email(payload))
+                        .await
+                    {
+                        Err(_elapsed) => {
+                            error!(op = "password_reset", "email dispatch timed out");
+                        }
+                        Ok(Err(e)) => {
+                            error!(op = "password_reset", err = %e, "email dispatch failed");
+                        }
+                        Ok(Ok(())) => {}
                     }
-                    Ok(Err(e)) => {
-                        error!(op = "password_reset", err = %e, "email dispatch failed");
-                    }
-                    Ok(Ok(())) => {}
                 }
-            });
+                .instrument(span),
+            );
             Some(handle)
         } else {
             match tokio::time::timeout(timeout, sender.send_password_reset_email(payload)).await {
@@ -222,5 +233,19 @@ mod tests {
             build_reset_url("https://example.com/", "token with spaces+symbols"),
             "https://example.com/auth/password/reset?token=token%20with%20spaces%2Bsymbols"
         );
+    }
+
+    #[test]
+    fn test_percent_encode_high_escape() {
+        let input = " !@#$%^&*()";
+        let encoded = percent_encode_token(input);
+        assert_eq!(encoded, "%20%21%40%23%24%25%5E%26%2A%28%29");
+    }
+
+    #[test]
+    fn test_percent_encode_no_escape() {
+        let input = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.~";
+        let encoded = percent_encode_token(input);
+        assert_eq!(encoded, input);
     }
 }

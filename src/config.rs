@@ -49,6 +49,24 @@ impl std::fmt::Debug for Config {
 
 impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.database_url.trim().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "database_url",
+                reason: "must not be empty",
+            });
+        }
+        if self.max_connections == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "max_connections",
+                reason: "must be greater than 0",
+            });
+        }
+        if self.min_connections > self.max_connections {
+            return Err(ConfigError::InvalidValue {
+                field: "min_connections",
+                reason: "must not exceed max_connections",
+            });
+        }
         if self.base_url.trim().is_empty() {
             return Err(ConfigError::MissingEnvVar("BASE_URL"));
         }
@@ -68,6 +86,12 @@ impl Config {
         }
         for origin in &self.allowed_origins {
             let trimmed = origin.trim();
+            if trimmed.ends_with('/') {
+                return Err(ConfigError::InvalidValue {
+                    field: "allowed_origins",
+                    reason: "must not contain trailing slash",
+                });
+            }
             if trimmed != "*" {
                 axum::http::HeaderValue::from_str(trimmed).map_err(|source| {
                     ConfigError::InvalidOrigin {
@@ -581,6 +605,138 @@ mod tests {
         assert!(matches!(
             cfg.validate(),
             Err(ConfigError::InvalidHeader { ref value, .. }) if value == "Bad Header"
+        ));
+    }
+
+    #[test]
+    fn test_config_validate_rejects_empty_database_url() {
+        let cfg = Config {
+            database_url: "".into(),
+            port: 3000,
+            allowed_origins: vec![],
+            allowed_methods: vec!["GET".into()],
+            allowed_headers: vec!["Content-Type".into()],
+            max_connections: 5,
+            min_connections: 1,
+            base_url: "https://app.example.com".into(),
+            email_dispatch_timeout: Duration::from_secs(10),
+            async_email_dispatch: true,
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "database_url",
+                reason: "must not be empty",
+            })
+        ));
+    }
+
+    #[test]
+    fn test_config_validate_rejects_whitespace_database_url() {
+        let cfg = Config {
+            database_url: "   \t\n  ".into(),
+            port: 3000,
+            allowed_origins: vec![],
+            allowed_methods: vec!["GET".into()],
+            allowed_headers: vec!["Content-Type".into()],
+            max_connections: 5,
+            min_connections: 1,
+            base_url: "https://app.example.com".into(),
+            email_dispatch_timeout: Duration::from_secs(10),
+            async_email_dispatch: true,
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "database_url",
+                reason: "must not be empty",
+            })
+        ));
+    }
+
+    #[test]
+    fn test_config_validate_rejects_zero_max_connections() {
+        let cfg = Config {
+            database_url: "postgres://localhost/test".into(),
+            port: 3000,
+            allowed_origins: vec![],
+            allowed_methods: vec!["GET".into()],
+            allowed_headers: vec!["Content-Type".into()],
+            max_connections: 0,
+            min_connections: 0,
+            base_url: "https://app.example.com".into(),
+            email_dispatch_timeout: Duration::from_secs(10),
+            async_email_dispatch: true,
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "max_connections",
+                reason: "must be greater than 0",
+            })
+        ));
+    }
+
+    #[test]
+    fn test_config_validate_rejects_min_connections_greater_than_max() {
+        let cfg = Config {
+            database_url: "postgres://localhost/test".into(),
+            port: 3000,
+            allowed_origins: vec![],
+            allowed_methods: vec!["GET".into()],
+            allowed_headers: vec!["Content-Type".into()],
+            max_connections: 5,
+            min_connections: 6,
+            base_url: "https://app.example.com".into(),
+            email_dispatch_timeout: Duration::from_secs(10),
+            async_email_dispatch: true,
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "min_connections",
+                reason: "must not exceed max_connections",
+            })
+        ));
+    }
+
+    #[test]
+    fn test_config_validate_accepts_equal_min_and_max_connections() {
+        let cfg = Config {
+            database_url: "postgres://localhost/test".into(),
+            port: 3000,
+            allowed_origins: vec![],
+            allowed_methods: vec!["GET".into()],
+            allowed_headers: vec!["Content-Type".into()],
+            max_connections: 5,
+            min_connections: 5,
+            base_url: "https://app.example.com".into(),
+            email_dispatch_timeout: Duration::from_secs(10),
+            async_email_dispatch: true,
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validate_rejects_origin_with_trailing_slash() {
+        let cfg = Config {
+            database_url: "postgres://localhost/test".into(),
+            port: 3000,
+            allowed_origins: vec!["https://app.example.com/".into()],
+            allowed_methods: vec!["GET".into()],
+            allowed_headers: vec!["Content-Type".into()],
+            max_connections: 5,
+            min_connections: 1,
+            base_url: "https://app.example.com".into(),
+            email_dispatch_timeout: Duration::from_secs(10),
+            async_email_dispatch: true,
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "allowed_origins",
+                reason: "must not contain trailing slash",
+            })
         ));
     }
 

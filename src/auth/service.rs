@@ -137,23 +137,21 @@ impl AuthServiceImpl {
 
         tx.commit().await.map_err(AppError::Database)?;
 
-        // Fire-and-forget email dispatch — never await on HTTP path
-        let dispatcher = Arc::clone(&self.dispatcher);
+        // Email dispatch — respects dispatcher.async_dispatch without double tokio::spawn
         let url = EmailDispatcher::build_verification_url(
-            dispatcher.base_url().unwrap_or(""),
+            self.dispatcher.base_url().unwrap_or(""),
             &raw_token,
         );
-        tokio::spawn(async move {
-            let _ = dispatcher
-                .dispatch_verification(VerificationEmailPayload {
-                    user_id,
-                    to: normalized_email,
-                    token: raw_token,
-                    url,
-                    expires_at,
-                })
-                .await;
-        });
+        let _ = self
+            .dispatcher
+            .dispatch_verification(VerificationEmailPayload {
+                user_id,
+                to: normalized_email,
+                token: raw_token,
+                url,
+                expires_at,
+            })
+            .await;
 
         Ok(())
     }
@@ -255,11 +253,17 @@ impl AuthServiceImpl {
             return Err(AppError::TokenExpired);
         }
 
-        sqlx::query("UPDATE users SET email_verified = true, updated_at = NOW() WHERE id = $1")
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(AppError::Database)?;
+        let update_res =
+            sqlx::query("UPDATE users SET email_verified = true, updated_at = NOW() WHERE id = $1")
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(AppError::Database)?;
+
+        if update_res.rows_affected() != 1 {
+            let _ = tx.rollback().await;
+            return Err(AppError::InvalidToken);
+        }
 
         tx.commit().await.map_err(AppError::Database)?;
         Ok(())
@@ -298,21 +302,20 @@ impl AuthServiceImpl {
             .await
             .map_err(AppError::Database)?;
 
-            let dispatcher = Arc::clone(&self.dispatcher);
-            let uid = user_id;
-            let url =
-                EmailDispatcher::build_reset_url(dispatcher.base_url().unwrap_or(""), &raw_token);
-            tokio::spawn(async move {
-                let _ = dispatcher
-                    .dispatch_password_reset(PasswordResetEmailPayload {
-                        user_id: uid,
-                        to: normalized_email,
-                        token: raw_token,
-                        url,
-                        expires_at,
-                    })
-                    .await;
-            });
+            let url = EmailDispatcher::build_reset_url(
+                self.dispatcher.base_url().unwrap_or(""),
+                &raw_token,
+            );
+            let _ = self
+                .dispatcher
+                .dispatch_password_reset(PasswordResetEmailPayload {
+                    user_id,
+                    to: normalized_email,
+                    token: raw_token,
+                    url,
+                    expires_at,
+                })
+                .await;
         }
 
         Ok(())
@@ -359,12 +362,18 @@ impl AuthServiceImpl {
 
         let mut tx = self.pool.begin().await.map_err(AppError::Database)?;
 
-        sqlx::query("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2")
-            .bind(&new_hash)
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(AppError::Database)?;
+        let update_res =
+            sqlx::query("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2")
+                .bind(&new_hash)
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(AppError::Database)?;
+
+        if update_res.rows_affected() != 1 {
+            let _ = tx.rollback().await;
+            return Err(AppError::InvalidToken);
+        }
 
         // Invalidate ALL remaining reset tokens for this user
         sqlx::query("DELETE FROM password_reset_tokens WHERE user_id = $1")
@@ -832,5 +841,99 @@ mod tests {
         // Login with new password succeeds
         let new_login = ctx.service.login(&email, new_password).await;
         assert_eq!(new_login.unwrap(), user_id);
+    }
+
+    #[tokio::test]
+    async fn test_verify_email_rejects_missing_user() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+
+        let non_existent_user_id = Uuid::new_v4();
+        let (raw_token, token_hash) = generate_token();
+        let future_time = Utc::now() + chrono::Duration::hours(1);
+
+        sqlx::query(
+            "INSERT INTO verification_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
+        )
+        .bind(&token_hash[..])
+        .bind(non_existent_user_id)
+        .bind(future_time)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+
+        let res = ctx.service.verify_email(&raw_token).await;
+        assert!(
+            matches!(res, Err(AppError::InvalidToken)),
+            "verify_email must return InvalidToken when user does not exist: {:?}",
+            res
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reset_password_rejects_missing_user() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+
+        let non_existent_user_id = Uuid::new_v4();
+        let (raw_token, token_hash) = generate_token();
+        let future_time = Utc::now() + chrono::Duration::hours(1);
+
+        sqlx::query(
+            "INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
+        )
+        .bind(&token_hash[..])
+        .bind(non_existent_user_id)
+        .bind(future_time)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+
+        let res = ctx
+            .service
+            .reset_password(&raw_token, "NewPassword123!")
+            .await;
+        assert!(
+            matches!(res, Err(AppError::InvalidToken)),
+            "reset_password must return InvalidToken when user does not exist: {:?}",
+            res
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sync_email_dispatch_on_signup() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+
+        // Create service with async_dispatch = false
+        let sender = ArcCapturingSender::default();
+        let dispatcher = Arc::new(EmailDispatcher::new(
+            Some(Arc::new(sender.clone())),
+            std::time::Duration::from_secs(10),
+            false,
+        ));
+        let service = AuthServiceImpl::new(
+            ctx.pool.clone(),
+            Arc::clone(&ctx.service.config),
+            dispatcher,
+        )
+        .unwrap();
+
+        let email = format!("sync_dispatch_{}@example.com", Uuid::new_v4());
+        let password = "SecurePassword123!";
+
+        service.signup(&email, password).await.unwrap();
+
+        // With async_dispatch = false, email must be delivered inline before signup returns
+        let calls = sender.verification_calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "synchronous dispatch must have completed without sleep"
+        );
+        assert_eq!(calls[0].to, email);
     }
 }

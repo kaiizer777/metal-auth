@@ -103,16 +103,13 @@ pub async fn signup(
     }
 
     match state.service.signup(&req.email, &req.password).await {
-        Ok(()) | Err(AppError::EmailAlreadyExists) => {
-            // Anti-enum: both paths return identical 200
-            (
-                StatusCode::OK,
-                Json(MessageResponse::new(
-                    "if this email is new, a verification link has been sent",
-                )),
-            )
-                .into_response()
-        }
+        Ok(()) => (
+            StatusCode::OK,
+            Json(MessageResponse::new(
+                "if this email is new, a verification link has been sent",
+            )),
+        )
+            .into_response(),
         Err(e) => service_error_response(e),
     }
 }

@@ -19,11 +19,17 @@ pub fn generate_token() -> (String, [u8; 32]) {
     (raw_hex, stored_hash)
 }
 
+/// Validate whether `token` is a 64-character ASCII hexadecimal string.
+#[must_use]
+pub fn is_valid_token_format(token: &str) -> bool {
+    token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Decode hex token and compute its SHA-256 digest for DB lookup.
 ///
 /// Validates that the input is valid hex and decodes to exactly 32 bytes (64 hex characters).
 pub fn hash_token(hex_token: &str) -> Result<[u8; 32], AppError> {
-    if hex_token.len() != 64 {
+    if !is_valid_token_format(hex_token) {
         return Err(AppError::InvalidToken);
     }
     let mut bytes = [0u8; 32];
@@ -108,5 +114,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn is_valid_token_format_validates_correctly() {
+        let (valid_token, _) = generate_token();
+        assert!(is_valid_token_format(&valid_token));
+        assert!(is_valid_token_format(&valid_token.to_uppercase()));
+
+        // Empty string
+        assert!(!is_valid_token_format(""));
+
+        // Length variations
+        assert!(!is_valid_token_format(&"a".repeat(63)));
+        assert!(!is_valid_token_format(&"a".repeat(65)));
+
+        // Non-hex chars
+        let with_g = format!("{}g", "a".repeat(63));
+        assert!(!is_valid_token_format(&with_g));
+
+        // Multibyte unicode
+        let with_unicode = format!("{}🦀", "a".repeat(60));
+        assert!(!is_valid_token_format(&with_unicode));
+        assert!(!is_valid_token_format("🔐".repeat(16).as_str()));
+
+        // Whitespace and symbols
+        let with_space = format!("{} ", "a".repeat(63));
+        assert!(!is_valid_token_format(&with_space));
+    }
+
+    #[test]
+    fn hash_token_rejects_empty_string_and_unicode() {
+        assert!(matches!(hash_token(""), Err(AppError::InvalidToken)));
+        assert!(matches!(
+            hash_token("🦀".repeat(16).as_str()),
+            Err(AppError::InvalidToken)
+        ));
+    }
+
+    #[test]
+    fn hash_token_accepts_uppercase_hex() {
+        let (token, stored_hash) = generate_token();
+        let upper = token.to_uppercase();
+        assert!(is_valid_token_format(&upper));
+        let hash = hash_token(&upper).unwrap();
+        assert_eq!(hash, stored_hash);
     }
 }

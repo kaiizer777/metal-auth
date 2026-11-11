@@ -311,23 +311,32 @@ impl AppConfig {
         Ok(config)
     }
 
-    /// Load `AppConfig` from environment variables, falling back to defaults.
-    pub fn from_env() -> Result<Self, ConfigError> {
-        dotenvy::dotenv().ok();
+    /// Load `AppConfig` from a custom key-value lookup function.
+    pub fn from_lookup<F>(lookup: F) -> Result<Self, ConfigError>
+    where
+        F: Fn(&str) -> Result<String, std::env::VarError>,
+    {
         let defaults = Self::default();
 
-        let argon2_m_cost = parse_env_u32("ARGON2_M_COST", defaults.argon2_m_cost)?;
-        let argon2_t_cost = parse_env_u32("ARGON2_T_COST", defaults.argon2_t_cost)?;
-        let argon2_p_cost = parse_env_u32("ARGON2_P_COST", defaults.argon2_p_cost)?;
-        let password_min_len = parse_env_usize("PASSWORD_MIN_LEN", defaults.password_min_len)?;
-        let password_max_len = parse_env_usize("PASSWORD_MAX_LEN", defaults.password_max_len)?;
+        let argon2_m_cost = parse_env_u32(&lookup, "ARGON2_M_COST", defaults.argon2_m_cost)?;
+        let argon2_t_cost = parse_env_u32(&lookup, "ARGON2_T_COST", defaults.argon2_t_cost)?;
+        let argon2_p_cost = parse_env_u32(&lookup, "ARGON2_P_COST", defaults.argon2_p_cost)?;
+        let password_min_len =
+            parse_env_usize(&lookup, "PASSWORD_MIN_LEN", defaults.password_min_len)?;
+        let password_max_len =
+            parse_env_usize(&lookup, "PASSWORD_MAX_LEN", defaults.password_max_len)?;
         let verification_token_ttl_secs = parse_env_u64(
+            &lookup,
             "VERIFICATION_TOKEN_TTL_SECS",
             defaults.verification_token_ttl_secs,
         )?;
-        let reset_token_ttl_secs =
-            parse_env_u64("RESET_TOKEN_TTL_SECS", defaults.reset_token_ttl_secs)?;
+        let reset_token_ttl_secs = parse_env_u64(
+            &lookup,
+            "RESET_TOKEN_TTL_SECS",
+            defaults.reset_token_ttl_secs,
+        )?;
         let require_email_verification = parse_env_bool(
+            &lookup,
             "REQUIRE_EMAIL_VERIFICATION",
             defaults.require_email_verification,
         )?;
@@ -343,10 +352,20 @@ impl AppConfig {
             require_email_verification,
         )
     }
+
+    /// Load `AppConfig` from environment variables, falling back to defaults.
+    pub fn from_env() -> Result<Self, ConfigError> {
+        dotenvy::dotenv().ok();
+        Self::from_lookup(|k| std::env::var(k))
+    }
 }
 
-fn parse_env_u32(key: &'static str, default: u32) -> Result<u32, ConfigError> {
-    match std::env::var(key) {
+fn parse_env_u32(
+    lookup: &impl Fn(&str) -> Result<String, std::env::VarError>,
+    key: &'static str,
+    default: u32,
+) -> Result<u32, ConfigError> {
+    match lookup(key) {
         Ok(val) => val.parse::<u32>().map_err(|_| ConfigError::InvalidValue {
             field: key,
             reason: "must be a valid integer",
@@ -356,8 +375,12 @@ fn parse_env_u32(key: &'static str, default: u32) -> Result<u32, ConfigError> {
     }
 }
 
-fn parse_env_usize(key: &'static str, default: usize) -> Result<usize, ConfigError> {
-    match std::env::var(key) {
+fn parse_env_usize(
+    lookup: &impl Fn(&str) -> Result<String, std::env::VarError>,
+    key: &'static str,
+    default: usize,
+) -> Result<usize, ConfigError> {
+    match lookup(key) {
         Ok(val) => val.parse::<usize>().map_err(|_| ConfigError::InvalidValue {
             field: key,
             reason: "must be a valid integer",
@@ -367,8 +390,12 @@ fn parse_env_usize(key: &'static str, default: usize) -> Result<usize, ConfigErr
     }
 }
 
-fn parse_env_u64(key: &'static str, default: u64) -> Result<u64, ConfigError> {
-    match std::env::var(key) {
+fn parse_env_u64(
+    lookup: &impl Fn(&str) -> Result<String, std::env::VarError>,
+    key: &'static str,
+    default: u64,
+) -> Result<u64, ConfigError> {
+    match lookup(key) {
         Ok(val) => val.parse::<u64>().map_err(|_| ConfigError::InvalidValue {
             field: key,
             reason: "must be a valid integer",
@@ -378,8 +405,12 @@ fn parse_env_u64(key: &'static str, default: u64) -> Result<u64, ConfigError> {
     }
 }
 
-fn parse_env_bool(key: &'static str, default: bool) -> Result<bool, ConfigError> {
-    match std::env::var(key) {
+fn parse_env_bool(
+    lookup: &impl Fn(&str) -> Result<String, std::env::VarError>,
+    key: &'static str,
+    default: bool,
+) -> Result<bool, ConfigError> {
+    match lookup(key) {
         Ok(val) => match val.trim().to_ascii_lowercase().as_str() {
             "true" | "1" | "yes" => Ok(true),
             "false" | "0" | "no" => Ok(false),
@@ -691,51 +722,38 @@ mod tests {
         assert!(AppConfig::new(65536, 3, 4, 8, 128, 3600, 900, false).is_ok());
     }
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn app_config_from_env_defaults() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        const ENV_VARS: &[&str] = &[
-            "ARGON2_M_COST",
-            "ARGON2_T_COST",
-            "ARGON2_P_COST",
-            "PASSWORD_MIN_LEN",
-            "PASSWORD_MAX_LEN",
-            "VERIFICATION_TOKEN_TTL_SECS",
-            "RESET_TOKEN_TTL_SECS",
-            "REQUIRE_EMAIL_VERIFICATION",
-        ];
-
-        struct EnvGuard<'a>(&'a [&'static str], Vec<Option<String>>);
-        impl Drop for EnvGuard<'_> {
-            fn drop(&mut self) {
-                // SAFETY: Guarded by ENV_LOCK within test process
-                unsafe {
-                    for (&key, val) in self.0.iter().zip(self.1.iter()) {
-                        if let Some(v) = val {
-                            std::env::set_var(key, v);
-                        } else {
-                            std::env::remove_var(key);
-                        }
-                    }
-                }
-            }
-        }
-
-        let saved: Vec<Option<String>> = ENV_VARS.iter().map(|&k| std::env::var(k).ok()).collect();
-        // SAFETY: Guarded by ENV_LOCK within test process
-        unsafe {
-            for &k in ENV_VARS {
-                std::env::remove_var(k);
-            }
-        }
-        let _env_guard = EnvGuard(ENV_VARS, saved);
-
-        let cfg = AppConfig::from_env().expect("load default env config");
+        let cfg = AppConfig::from_lookup(|_| Err(std::env::VarError::NotPresent))
+            .expect("load default env config");
         let expected = AppConfig::default();
         assert_eq!(cfg, expected);
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn app_config_from_lookup_overrides() {
+        let lookup = |key: &str| match key {
+            "ARGON2_M_COST" => Ok("32768".to_string()),
+            "ARGON2_T_COST" => Ok("4".to_string()),
+            "ARGON2_P_COST" => Ok("2".to_string()),
+            "PASSWORD_MIN_LEN" => Ok("10".to_string()),
+            "PASSWORD_MAX_LEN" => Ok("64".to_string()),
+            "VERIFICATION_TOKEN_TTL_SECS" => Ok("1200".to_string()),
+            "RESET_TOKEN_TTL_SECS" => Ok("1000".to_string()),
+            "REQUIRE_EMAIL_VERIFICATION" => Ok("false".to_string()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+
+        let cfg = AppConfig::from_lookup(lookup).expect("load overridden config");
+        assert_eq!(cfg.argon2_m_cost, 32768);
+        assert_eq!(cfg.argon2_t_cost, 4);
+        assert_eq!(cfg.argon2_p_cost, 2);
+        assert_eq!(cfg.password_min_len, 10);
+        assert_eq!(cfg.password_max_len, 64);
+        assert_eq!(cfg.verification_token_ttl_secs, 1200);
+        assert_eq!(cfg.reset_token_ttl_secs, 1000);
+        assert!(!cfg.require_email_verification);
     }
 
     #[test]

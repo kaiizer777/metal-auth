@@ -8,6 +8,8 @@ pub const DEFAULT_MAX_CONNECTIONS: u32 = 25;
 pub const DEFAULT_MIN_CONNECTIONS: u32 = 2;
 pub const DEFAULT_EMAIL_DISPATCH_TIMEOUT_SECS: u64 = 10;
 
+// ─── Phase 1 — Infra Config ──────────────────────────────────────────────────
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct Config {
     pub database_url: String,
@@ -196,9 +198,256 @@ fn parse_allowed_origins_str(raw: &str) -> Vec<String> {
         .collect()
 }
 
+// ─── Phase 3 — Auth-specific configuration ───────────────────────────────────
+
+/// Auth-specific runtime configuration validated at construction time.
+///
+/// # Validation rules (enforced in `AppConfig::new`, bypassed in `AppConfig::default`)
+/// - `argon2_m_cost >= 19456`
+/// - `argon2_t_cost >= 2`
+/// - `argon2_p_cost >= 1`
+/// - `8 <= password_min_len <= password_max_len <= 128`
+/// - `900 <= verification_token_ttl_secs <= 3600`
+/// - `900 <= reset_token_ttl_secs <= 3600`
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppConfig {
+    /// Argon2id memory cost in KiB. Default: 65536 (64 MiB — RFC 9106 §4 second option).
+    pub argon2_m_cost: u32,
+    /// Argon2id time cost (iterations). Default: 3.
+    pub argon2_t_cost: u32,
+    /// Argon2id parallelism lanes. Default: 4.
+    pub argon2_p_cost: u32,
+    /// Password minimum length in Unicode code points. Must be >= 8. Default: 8.
+    pub password_min_len: usize,
+    /// Password maximum length in Unicode code points. Must be <= 128. Default: 128.
+    pub password_max_len: usize,
+    /// Email verification token TTL in seconds. Range: 900–3600. Default: 1800 (30 min).
+    pub verification_token_ttl_secs: u64,
+    /// Password reset token TTL in seconds. Range: 900–3600. Default: 900 (15 min).
+    pub reset_token_ttl_secs: u64,
+    /// Controls whether login is blocked for unverified email addresses. Default: true.
+    pub require_email_verification: bool,
+}
+
+impl AppConfig {
+    /// Validates all configuration bounds per OWASP ASVS 5.0 L1 minimums.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.argon2_m_cost < 19456 {
+            return Err(ConfigError::InvalidValue {
+                field: "argon2_m_cost",
+                reason: "must be at least 19456 KiB",
+            });
+        }
+        if self.argon2_t_cost < 2 {
+            return Err(ConfigError::InvalidValue {
+                field: "argon2_t_cost",
+                reason: "must be at least 2 iterations",
+            });
+        }
+        if self.argon2_p_cost < 1 {
+            return Err(ConfigError::InvalidValue {
+                field: "argon2_p_cost",
+                reason: "must be at least 1 lane",
+            });
+        }
+        if self.password_min_len < 8 {
+            return Err(ConfigError::InvalidValue {
+                field: "password_min_len",
+                reason: "must be at least 8 characters",
+            });
+        }
+        if self.password_max_len > 128 {
+            return Err(ConfigError::InvalidValue {
+                field: "password_max_len",
+                reason: "must not exceed 128 characters",
+            });
+        }
+        if self.password_min_len > self.password_max_len {
+            return Err(ConfigError::InvalidValue {
+                field: "password_min_len",
+                reason: "must not exceed password_max_len",
+            });
+        }
+        if !(900..=3600).contains(&self.verification_token_ttl_secs) {
+            return Err(ConfigError::InvalidValue {
+                field: "verification_token_ttl_secs",
+                reason: "must be between 900 and 3600 seconds",
+            });
+        }
+        if !(900..=3600).contains(&self.reset_token_ttl_secs) {
+            return Err(ConfigError::InvalidValue {
+                field: "reset_token_ttl_secs",
+                reason: "must be between 900 and 3600 seconds",
+            });
+        }
+        Ok(())
+    }
+
+    /// Fallible constructor — validates all fields per OWASP ASVS 5.0 L1 minimums.
+    ///
+    /// Returns typed `ConfigError::InvalidValue` on any out-of-range value.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        argon2_m_cost: u32,
+        argon2_t_cost: u32,
+        argon2_p_cost: u32,
+        password_min_len: usize,
+        password_max_len: usize,
+        verification_token_ttl_secs: u64,
+        reset_token_ttl_secs: u64,
+        require_email_verification: bool,
+    ) -> Result<Self, ConfigError> {
+        let config = Self {
+            argon2_m_cost,
+            argon2_t_cost,
+            argon2_p_cost,
+            password_min_len,
+            password_max_len,
+            verification_token_ttl_secs,
+            reset_token_ttl_secs,
+            require_email_verification,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Load `AppConfig` from a custom key-value lookup function.
+    pub fn from_lookup<F>(lookup: F) -> Result<Self, ConfigError>
+    where
+        F: Fn(&str) -> Result<String, std::env::VarError>,
+    {
+        let defaults = Self::default();
+
+        let argon2_m_cost = parse_env_u32(&lookup, "ARGON2_M_COST", defaults.argon2_m_cost)?;
+        let argon2_t_cost = parse_env_u32(&lookup, "ARGON2_T_COST", defaults.argon2_t_cost)?;
+        let argon2_p_cost = parse_env_u32(&lookup, "ARGON2_P_COST", defaults.argon2_p_cost)?;
+        let password_min_len =
+            parse_env_usize(&lookup, "PASSWORD_MIN_LEN", defaults.password_min_len)?;
+        let password_max_len =
+            parse_env_usize(&lookup, "PASSWORD_MAX_LEN", defaults.password_max_len)?;
+        let verification_token_ttl_secs = parse_env_u64(
+            &lookup,
+            "VERIFICATION_TOKEN_TTL_SECS",
+            defaults.verification_token_ttl_secs,
+        )?;
+        let reset_token_ttl_secs = parse_env_u64(
+            &lookup,
+            "RESET_TOKEN_TTL_SECS",
+            defaults.reset_token_ttl_secs,
+        )?;
+        let require_email_verification = parse_env_bool(
+            &lookup,
+            "REQUIRE_EMAIL_VERIFICATION",
+            defaults.require_email_verification,
+        )?;
+
+        Self::new(
+            argon2_m_cost,
+            argon2_t_cost,
+            argon2_p_cost,
+            password_min_len,
+            password_max_len,
+            verification_token_ttl_secs,
+            reset_token_ttl_secs,
+            require_email_verification,
+        )
+    }
+
+    /// Load `AppConfig` from environment variables, falling back to defaults.
+    pub fn from_env() -> Result<Self, ConfigError> {
+        dotenvy::dotenv().ok();
+        Self::from_lookup(|k| std::env::var(k))
+    }
+}
+
+fn parse_env_u32(
+    lookup: &impl Fn(&str) -> Result<String, std::env::VarError>,
+    key: &'static str,
+    default: u32,
+) -> Result<u32, ConfigError> {
+    match lookup(key) {
+        Ok(val) => val.parse::<u32>().map_err(|_| ConfigError::InvalidValue {
+            field: key,
+            reason: "must be a valid integer",
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::NonUnicodeEnvVar(key)),
+    }
+}
+
+fn parse_env_usize(
+    lookup: &impl Fn(&str) -> Result<String, std::env::VarError>,
+    key: &'static str,
+    default: usize,
+) -> Result<usize, ConfigError> {
+    match lookup(key) {
+        Ok(val) => val.parse::<usize>().map_err(|_| ConfigError::InvalidValue {
+            field: key,
+            reason: "must be a valid integer",
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::NonUnicodeEnvVar(key)),
+    }
+}
+
+fn parse_env_u64(
+    lookup: &impl Fn(&str) -> Result<String, std::env::VarError>,
+    key: &'static str,
+    default: u64,
+) -> Result<u64, ConfigError> {
+    match lookup(key) {
+        Ok(val) => val.parse::<u64>().map_err(|_| ConfigError::InvalidValue {
+            field: key,
+            reason: "must be a valid integer",
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::NonUnicodeEnvVar(key)),
+    }
+}
+
+fn parse_env_bool(
+    lookup: &impl Fn(&str) -> Result<String, std::env::VarError>,
+    key: &'static str,
+    default: bool,
+) -> Result<bool, ConfigError> {
+    match lookup(key) {
+        Ok(val) => match val.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => Ok(true),
+            "false" | "0" | "no" => Ok(false),
+            _ => Err(ConfigError::InvalidValue {
+                field: key,
+                reason: "must be a boolean (true/false/1/0)",
+            }),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::NonUnicodeEnvVar(key)),
+    }
+}
+
+impl Default for AppConfig {
+    /// Skips validation — for tests only.
+    ///
+    /// Default parameters meet RFC 9106 §4 second option and OWASP ASVS 5.0 L1 minimums:
+    /// m=65536 KiB (64 MiB), t=3, p=4.
+    fn default() -> Self {
+        Self {
+            argon2_m_cost: 65536,
+            argon2_t_cost: 3,
+            argon2_p_cost: 4,
+            password_min_len: 8,
+            password_max_len: 128,
+            verification_token_ttl_secs: 1800,
+            reset_token_ttl_secs: 900,
+            require_email_verification: true,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Phase 1 Config tests ──────────────────────────────────────────────────
 
     #[test]
     fn test_config_defaults() {
@@ -214,7 +463,6 @@ mod tests {
             email_dispatch_timeout: Duration::from_secs(10),
             async_email_dispatch: true,
         };
-
         assert_eq!(cfg.port, 3000);
         assert_eq!(cfg.max_connections, 25);
         assert_eq!(cfg.min_connections, 2);
@@ -234,7 +482,6 @@ mod tests {
             email_dispatch_timeout: Duration::from_secs(10),
             async_email_dispatch: true,
         };
-
         let debug_output = format!("{cfg:?}");
         assert!(debug_output.contains("[REDACTED]"));
         assert!(!debug_output.contains("super_secret_password"));
@@ -334,6 +581,205 @@ mod tests {
         assert!(matches!(
             cfg.validate(),
             Err(ConfigError::InvalidHeader { ref value, .. }) if value == "Bad Header"
+        ));
+    }
+
+    // ── Phase 3 AppConfig tests ───────────────────────────────────────────────
+
+    /// OWASP ASVS 5.0 L1 doc-check: default params meet or exceed minimums.
+    /// RFC 9106 §4 second option: m=65536, t=3, p=4.
+    #[test]
+    fn default_argon2_params_meet_asvs_l1_minimums() {
+        let cfg = AppConfig::default();
+        assert!(
+            cfg.argon2_m_cost >= 19456,
+            "m_cost must be >= 19456 KiB (ASVS L1)"
+        );
+        assert!(cfg.argon2_t_cost >= 2, "t_cost must be >= 2 (ASVS L1)");
+        assert!(cfg.argon2_p_cost >= 1, "p_cost must be >= 1");
+        assert_eq!(cfg.argon2_m_cost, 65536, "RFC 9106 §4 second option");
+        assert_eq!(cfg.argon2_t_cost, 3, "RFC 9106 §4 second option");
+        assert_eq!(cfg.argon2_p_cost, 4, "RFC 9106 §4 second option");
+        assert_eq!(cfg.reset_token_ttl_secs, 900);
+        assert!(cfg.require_email_verification);
+    }
+
+    #[test]
+    fn app_config_new_accepts_valid_config() {
+        assert!(AppConfig::new(65536, 3, 4, 8, 128, 1800, 900, true).is_ok());
+    }
+
+    #[test]
+    fn app_config_new_rejects_m_cost_below_minimum() {
+        assert!(matches!(
+            AppConfig::new(19455, 2, 1, 8, 128, 900, 900, false),
+            Err(ConfigError::InvalidValue {
+                field: "argon2_m_cost",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn app_config_new_rejects_t_cost_below_2() {
+        assert!(matches!(
+            AppConfig::new(65536, 1, 4, 8, 128, 1800, 900, false),
+            Err(ConfigError::InvalidValue {
+                field: "argon2_t_cost",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn app_config_new_accepts_t_cost_exactly_2() {
+        assert!(AppConfig::new(65536, 2, 4, 8, 128, 1800, 900, false).is_ok());
+    }
+
+    #[test]
+    fn app_config_new_rejects_p_cost_below_1() {
+        assert!(matches!(
+            AppConfig::new(65536, 2, 0, 8, 128, 1800, 900, false),
+            Err(ConfigError::InvalidValue {
+                field: "argon2_p_cost",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn app_config_new_rejects_password_min_below_8() {
+        assert!(matches!(
+            AppConfig::new(65536, 3, 4, 7, 128, 1800, 900, false),
+            Err(ConfigError::InvalidValue {
+                field: "password_min_len",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn app_config_new_rejects_password_max_above_128() {
+        assert!(matches!(
+            AppConfig::new(65536, 3, 4, 8, 129, 1800, 900, false),
+            Err(ConfigError::InvalidValue {
+                field: "password_max_len",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn app_config_new_rejects_min_greater_than_max() {
+        assert!(matches!(
+            AppConfig::new(65536, 3, 4, 20, 10, 1800, 900, false),
+            Err(ConfigError::InvalidValue {
+                field: "password_min_len",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn app_config_new_rejects_verification_ttl_out_of_range() {
+        assert!(matches!(
+            AppConfig::new(65536, 3, 4, 8, 128, 899, 900, false),
+            Err(ConfigError::InvalidValue {
+                field: "verification_token_ttl_secs",
+                ..
+            })
+        ));
+        assert!(matches!(
+            AppConfig::new(65536, 3, 4, 8, 128, 3601, 900, false),
+            Err(ConfigError::InvalidValue {
+                field: "verification_token_ttl_secs",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn app_config_new_rejects_reset_ttl_out_of_range() {
+        assert!(matches!(
+            AppConfig::new(65536, 3, 4, 8, 128, 1800, 899, false),
+            Err(ConfigError::InvalidValue {
+                field: "reset_token_ttl_secs",
+                ..
+            })
+        ));
+        assert!(matches!(
+            AppConfig::new(65536, 3, 4, 8, 128, 1800, 3601, false),
+            Err(ConfigError::InvalidValue {
+                field: "reset_token_ttl_secs",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn app_config_new_accepts_boundary_ttl_values() {
+        assert!(AppConfig::new(65536, 3, 4, 8, 128, 900, 3600, false).is_ok());
+        assert!(AppConfig::new(65536, 3, 4, 8, 128, 3600, 900, false).is_ok());
+    }
+
+    #[test]
+    fn app_config_from_env_defaults() {
+        let cfg = AppConfig::from_lookup(|_| Err(std::env::VarError::NotPresent))
+            .expect("load default env config");
+        let expected = AppConfig::default();
+        assert_eq!(cfg, expected);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn app_config_from_lookup_overrides() {
+        let lookup = |key: &str| match key {
+            "ARGON2_M_COST" => Ok("32768".to_string()),
+            "ARGON2_T_COST" => Ok("4".to_string()),
+            "ARGON2_P_COST" => Ok("2".to_string()),
+            "PASSWORD_MIN_LEN" => Ok("10".to_string()),
+            "PASSWORD_MAX_LEN" => Ok("64".to_string()),
+            "VERIFICATION_TOKEN_TTL_SECS" => Ok("1200".to_string()),
+            "RESET_TOKEN_TTL_SECS" => Ok("1000".to_string()),
+            "REQUIRE_EMAIL_VERIFICATION" => Ok("false".to_string()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+
+        let cfg = AppConfig::from_lookup(lookup).expect("load overridden config");
+        assert_eq!(cfg.argon2_m_cost, 32768);
+        assert_eq!(cfg.argon2_t_cost, 4);
+        assert_eq!(cfg.argon2_p_cost, 2);
+        assert_eq!(cfg.password_min_len, 10);
+        assert_eq!(cfg.password_max_len, 64);
+        assert_eq!(cfg.verification_token_ttl_secs, 1200);
+        assert_eq!(cfg.reset_token_ttl_secs, 1000);
+        assert!(!cfg.require_email_verification);
+    }
+
+    #[test]
+    fn app_config_validate_rejects_invalid_bounds() {
+        let cfg = AppConfig {
+            argon2_m_cost: 1000,
+            ..Default::default()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "argon2_m_cost",
+                ..
+            })
+        ));
+
+        let cfg = AppConfig {
+            password_min_len: 5,
+            ..Default::default()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "password_min_len",
+                ..
+            })
         ));
     }
 }

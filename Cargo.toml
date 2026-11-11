@@ -13,6 +13,15 @@ categories = ["authentication", "web-programming"]
 # async runtime
 tokio = { version = "1", features = ["macros", "rt", "time", "sync"] }
 
+# crypto (Phase 3)
+argon2 = { version = "0.5", features = ["std"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+sha2 = "0.10"
+hex = "0.4"
+
+# async trait (dyn-compatible email hook)
+async-trait = "0.1"
+
 # web framework
 axum = "0.7"
 
@@ -28,7 +37,6 @@ sqlx = { version = "0.8", features = [
 ] }
 
 # middleware
-tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 
 # serialization
@@ -48,9 +56,11 @@ dotenvy = "0.15"
 # tracing
 tracing = "0.1"
 
-# async trait (dyn-compatible email hook)
-async-trait = "0.1"
+[features]
+default = []
+test-utils = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread"] }
+tower = { version = "0.4", features = ["util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

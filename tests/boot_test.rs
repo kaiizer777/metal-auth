@@ -6,8 +6,8 @@ use axum::{
 };
 use chrono::Utc;
 use metal_auth::{
-    AppError, AppState, Auth, Config, ConfigError, ErrorCode, ErrorResponse, PasswordResetToken,
-    Session, User, UserResponse, VerificationToken,
+    AppConfig, AppError, AppState, Auth, Config, ConfigError, EmailDispatcher, ErrorCode,
+    ErrorResponse, PasswordResetToken, Session, User, UserResponse, VerificationToken,
 };
 use sqlx::PgPool;
 use tower::Service;
@@ -29,7 +29,7 @@ async fn test_auth_facade_and_router_boot() {
     };
 
     let pool = PgPool::connect_lazy(&cfg.database_url).expect("lazy pool creation");
-    let state = AppState::new(pool, cfg);
+    let state = AppState::new(pool, cfg).unwrap();
     let mut auth = Auth::from_state(state).unwrap();
 
     // 1. Unknown route returns 404 with standardized error response envelope
@@ -141,24 +141,22 @@ fn test_facade_re_exported_models_contract() {
     assert_eq!(session.user_id, uid);
 
     let v_token = VerificationToken {
-        id: Uuid::new_v4(),
+        token_hash: vec![0u8; 32],
         user_id: uid,
-        token_hash: "v_token_hash".into(),
         expires_at: now,
-        used: false,
         created_at: now,
     };
-    assert!(!v_token.used);
+    assert_eq!(v_token.user_id, uid);
+    assert_eq!(v_token.token_hash.len(), 32);
 
     let r_token = PasswordResetToken {
-        id: Uuid::new_v4(),
+        token_hash: vec![1u8; 32],
         user_id: uid,
-        token_hash: "r_token_hash".into(),
         expires_at: now,
-        used: false,
         created_at: now,
     };
-    assert!(!r_token.used);
+    assert_eq!(r_token.user_id, uid);
+    assert_eq!(r_token.token_hash.len(), 32);
 }
 
 #[test]
@@ -245,7 +243,7 @@ async fn test_auth_boot_fails_fast_on_invalid_cors() {
     };
 
     let pool = PgPool::connect_lazy(&cfg.database_url).expect("lazy pool creation");
-    let state = AppState::new(pool, cfg);
+    let state = AppState::new(pool, cfg).unwrap();
     let result = Auth::from_state(state);
     assert!(matches!(
         result,
@@ -292,4 +290,69 @@ async fn test_auth_new_fails_with_database_error_on_malformed_url() {
 
     let result = Auth::new(cfg).await;
     assert!(matches!(result, Err(AppError::Database(_))));
+}
+
+#[tokio::test]
+async fn test_state_with_auth_config_propagates_error() {
+    let pool = PgPool::connect_lazy("postgres://localhost/test").expect("lazy pool");
+    let cfg = Config {
+        database_url: "postgres://localhost/test".into(),
+        port: 3000,
+        allowed_origins: vec![],
+        allowed_methods: vec![],
+        allowed_headers: vec![],
+        max_connections: 2,
+        min_connections: 1,
+        base_url: "https://example.com".into(),
+        email_dispatch_timeout: std::time::Duration::from_secs(10),
+        async_email_dispatch: true,
+    };
+    let state = AppState::new(pool.clone(), cfg.clone()).unwrap();
+
+    let valid_config = std::sync::Arc::new(AppConfig::default());
+    assert!(state.clone().with_auth_config(valid_config.clone()).is_ok());
+
+    let invalid_config = std::sync::Arc::new(AppConfig {
+        argon2_m_cost: 100,
+        ..Default::default()
+    });
+    let err = state.with_auth_config(invalid_config.clone());
+    assert!(matches!(err, Err(AppError::Config(_))));
+
+    let dispatcher = std::sync::Arc::new(EmailDispatcher::new(
+        None,
+        cfg.email_dispatch_timeout,
+        cfg.async_email_dispatch,
+    ));
+
+    // Test with_dispatcher fallibility
+    assert!(
+        AppState::with_dispatcher(
+            pool.clone(),
+            cfg.clone(),
+            valid_config.clone(),
+            dispatcher.clone()
+        )
+        .is_ok()
+    );
+    let err_disp = AppState::with_dispatcher(
+        pool.clone(),
+        cfg.clone(),
+        invalid_config.clone(),
+        dispatcher.clone(),
+    );
+    assert!(matches!(err_disp, Err(AppError::Config(_))));
+
+    // Test with_configs_and_dispatcher fallibility
+    assert!(
+        AppState::with_configs_and_dispatcher(
+            pool.clone(),
+            cfg.clone(),
+            valid_config,
+            Some(dispatcher),
+        )
+        .is_ok()
+    );
+    let err_cfgs = AppState::with_configs_and_dispatcher(pool, cfg, invalid_config, None);
+    assert!(matches!(err_cfgs, Err(AppError::Config(_))));
 }

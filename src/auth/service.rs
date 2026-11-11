@@ -6,7 +6,7 @@
 //! Security invariants enforced here (non-exhaustive):
 //! - `password.chars().count()` for all length checks (not `.len()`)
 //! - Argon2 dummy verify on login miss (anti-enumeration timing)
-//! - signup returns Ok(()) on duplicate email; dispatcher always spawned
+//! - signup returns Ok(()) on duplicate email (anti-enumeration)
 //! - request_password_reset always queries DB; always returns Ok(())
 //! - token tables are DELETE-on-consume within a transaction (no TOCTOU)
 //! - reset_password deletes ALL reset tokens for user on success
@@ -79,9 +79,8 @@ impl AuthServiceImpl {
 
     /// Register a new account.
     ///
-    /// Anti-enumeration: always returns `Ok(())` and always spawns a dispatcher
-    /// task, even on duplicate email. Duplicate emails roll back the transaction
-    /// cleanly without leaking account existence.
+    /// Anti-enumeration: always returns `Ok(())` even on duplicate email. Duplicate
+    /// emails roll back the transaction cleanly without leaking account existence.
     pub async fn signup(&self, email: &str, password: &str) -> AppResult<()> {
         validate_email(email)?;
         validate_password(password, &self.config)?;
@@ -271,7 +270,7 @@ impl AuthServiceImpl {
     /// Initiate a password reset flow.
     ///
     /// Anti-enumeration: always queries DB and always returns `Ok(())` regardless
-    /// of whether the email exists. Spawns timing-parity dummy task if not found.
+    /// of whether the email exists.
     pub async fn request_password_reset(&self, email: &str) -> AppResult<()> {
         validate_email(email)?;
         let normalized_email = email.trim().to_lowercase();
@@ -314,8 +313,6 @@ impl AuthServiceImpl {
                     })
                     .await;
             });
-        } else {
-            tokio::spawn(async move {});
         }
 
         Ok(())

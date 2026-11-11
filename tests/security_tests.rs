@@ -778,6 +778,12 @@ async fn test_method_not_allowed_json_envelope() {
         .unwrap();
 
     let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.headers()
+            .get(header::ALLOW)
+            .and_then(|v| v.to_str().ok()),
+        Some("POST")
+    );
     let (status, _, body_str) = response_json(resp).await;
 
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
@@ -826,6 +832,13 @@ async fn test_expired_verification_token() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
     assert_eq!(err.code, ErrorCode::TokenExpired);
+
+    let verified: bool = sqlx::query_scalar("SELECT email_verified FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+    assert!(!verified);
 }
 
 #[tokio::test]
@@ -867,9 +880,27 @@ async fn test_expired_password_reset_token() {
         "/auth/password/reset",
         json!({"token": raw_token, "new_password": "NewValidPassword123!"}),
     );
-    let resp = ctx.router.oneshot(req).await.unwrap();
+    let resp = ctx.router.clone().oneshot(req).await.unwrap();
     let (status, _, body_str) = response_json(resp).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
     assert_eq!(err.code, ErrorCode::TokenExpired);
+
+    let current_hash: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+    assert_eq!(current_hash, password_hash);
+
+    let login_req = json_request(
+        Method::POST,
+        "/auth/login",
+        json!({"email": email, "password": "NewValidPassword123!"}),
+    );
+    let login_resp = ctx.router.oneshot(login_req).await.unwrap();
+    let (login_status, _, login_body) = response_json(login_resp).await;
+    assert_eq!(login_status, StatusCode::UNAUTHORIZED);
+    let login_err: ErrorResponse = serde_json::from_str(&login_body).unwrap();
+    assert_eq!(login_err.code, ErrorCode::InvalidCredentials);
 }

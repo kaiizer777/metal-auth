@@ -274,12 +274,18 @@ impl IntoResponse for AppError {
         }
 
         let status = self.status_code();
-        let payload = ErrorResponse {
-            code: self.error_code(),
-            message: self.response_message().to_string(),
-        };
+        let payload = ErrorResponse::from(&self);
 
         (status, Json(payload)).into_response()
+    }
+}
+
+impl From<&AppError> for ErrorResponse {
+    fn from(err: &AppError) -> Self {
+        Self {
+            code: err.error_code(),
+            message: err.response_message().to_string(),
+        }
     }
 }
 

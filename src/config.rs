@@ -321,12 +321,16 @@ impl AppConfig {
         let argon2_p_cost = parse_env_u32("ARGON2_P_COST", defaults.argon2_p_cost)?;
         let password_min_len = parse_env_usize("PASSWORD_MIN_LEN", defaults.password_min_len)?;
         let password_max_len = parse_env_usize("PASSWORD_MAX_LEN", defaults.password_max_len)?;
-        let verification_token_ttl_secs =
-            parse_env_u64("VERIFICATION_TOKEN_TTL_SECS", defaults.verification_token_ttl_secs)?;
+        let verification_token_ttl_secs = parse_env_u64(
+            "VERIFICATION_TOKEN_TTL_SECS",
+            defaults.verification_token_ttl_secs,
+        )?;
         let reset_token_ttl_secs =
             parse_env_u64("RESET_TOKEN_TTL_SECS", defaults.reset_token_ttl_secs)?;
-        let require_email_verification =
-            parse_env_bool("REQUIRE_EMAIL_VERIFICATION", defaults.require_email_verification)?;
+        let require_email_verification = parse_env_bool(
+            "REQUIRE_EMAIL_VERIFICATION",
+            defaults.require_email_verification,
+        )?;
 
         Self::new(
             argon2_m_cost,

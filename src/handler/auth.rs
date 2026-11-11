@@ -9,7 +9,7 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},
-    http::StatusCode,
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
 
@@ -29,8 +29,12 @@ pub struct AuthHandlerState {
     pub service: Arc<AuthServiceImpl>,
 }
 
-async fn method_not_allowed() -> AppError {
-    AppError::MethodNotAllowed
+async fn method_not_allowed() -> impl IntoResponse {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        [(header::ALLOW, "POST")],
+        Json(ErrorResponse::from(&AppError::MethodNotAllowed)),
+    )
 }
 
 pub fn routes(service: Arc<AuthServiceImpl>) -> Router {
@@ -85,7 +89,6 @@ fn service_error_response(err: AppError) -> Response {
 /// POST /auth/signup
 ///
 /// Anti-enumeration: always returns 200 regardless of duplicate email.
-/// Handler MUST still spawn dispatcher on duplicate path — service handles this.
 pub async fn signup(
     State(state): State<AuthHandlerState>,
     body: Result<Json<SignupRequest>, JsonRejection>,
@@ -351,6 +354,12 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            resp.headers()
+                .get(header::ALLOW)
+                .and_then(|v| v.to_str().ok()),
+            Some("POST")
+        );
 
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
         let err: ErrorResponse = serde_json::from_slice(&body).unwrap();

@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use sqlx::FromRow;
 use uuid::Uuid;
 
+pub use crate::auth::models::UserResponse;
+
 /// Internal user database entity.
 ///
 /// Intentionally does NOT derive `Serialize` to prevent `password_hash`
@@ -58,7 +60,6 @@ pub struct PasswordResetToken {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::models::UserResponse;
 
     #[test]
     fn test_user_to_user_response_conversion() {

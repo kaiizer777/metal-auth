@@ -3,7 +3,10 @@ use std::time::Duration;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use tracing::{error, info, warn};
 
-use crate::{config::Config, error::AppError};
+use crate::{
+    config::Config,
+    error::{AppError, ConfigError},
+};
 
 pub mod models;
 
@@ -61,17 +64,19 @@ pub async fn init_pool_with_options(
     database_url: &str,
     options: DbPoolOptions,
 ) -> Result<PgPool, AppError> {
-    let mut pool_options = PgPoolOptions::new()
+    if options.max_connections == 0 {
+        return Err(AppError::Config(ConfigError::InvalidValue {
+            field: "max_connections",
+            reason: "must be greater than 0",
+        }));
+    }
+
+    let pool_options = PgPoolOptions::new()
         .max_connections(options.max_connections)
         .min_connections(options.min_connections)
-        .acquire_timeout(options.acquire_timeout);
-
-    if let Some(idle) = options.idle_timeout {
-        pool_options = pool_options.idle_timeout(idle);
-    }
-    if let Some(lifetime) = options.max_lifetime {
-        pool_options = pool_options.max_lifetime(lifetime);
-    }
+        .acquire_timeout(options.acquire_timeout)
+        .idle_timeout(options.idle_timeout)
+        .max_lifetime(options.max_lifetime);
 
     let mut attempts = 0;
     let mut backoff = options.initial_backoff;
@@ -167,5 +172,23 @@ mod tests {
         let opts = DbPoolOptions::from(&cfg);
         assert_eq!(opts.max_connections, 50);
         assert_eq!(opts.min_connections, 10);
+    }
+
+    #[tokio::test]
+    async fn test_init_pool_with_options_zero_max_connections() {
+        let options = DbPoolOptions {
+            max_connections: 0,
+            ..Default::default()
+        };
+        let err = init_pool_with_options("postgres://localhost/test", options)
+            .await
+            .unwrap_err();
+        match err {
+            AppError::Config(ConfigError::InvalidValue { field, reason }) => {
+                assert_eq!(field, "max_connections");
+                assert_eq!(reason, "must be greater than 0");
+            }
+            other => panic!("expected ConfigError::InvalidValue, got {:?}", other),
+        }
     }
 }

@@ -1,6 +1,6 @@
 //! # metal-auth
 //!
-//! A modular, production-ready authentication and identity library for Rust built on Axum and SQLx.
+//! A modular authentication and identity library for Rust built on Axum and SQLx.
 //!
 //! ## Architectural Layers
 //!
@@ -10,7 +10,7 @@
 //! - **Security & Cryptography** ([`crypto`]): Argon2id password hashing with timing-parity verification,
 //!   cryptographically secure token generation, and password blocklist validation.
 //! - **State & Services** ([`AppState`], [`Auth`], [`AuthService`], [`AuthServiceImpl`]): Centralized application
-//!   state and transactional authentication business logic with timing-safe anti-enumeration safeguards.
+//!   state and transactional authentication business logic with anti-enumeration safeguards.
 //! - **Email Dispatch** ([`EmailDispatcher`], [`EmailSender`], [`NoopEmailSender`]): Configurable email hooks
 //!   for asynchronous and synchronous verification and password reset workflows.
 //! - **Persistence Models** ([`User`], [`Session`], [`VerificationToken`], [`PasswordResetToken`]): Strongly-typed
@@ -18,7 +18,7 @@
 //!   DTOs ([`UserResponse`]).
 //! - **Error Handling** ([`AppError`], [`ConfigError`], [`ErrorCode`], [`ErrorResponse`]): Standardized typed
 //!   error codes, field-level configuration failures, and unified JSON response envelopes.
-//! - **HTTP Routing** ([`auth_routes`]): Preconfigured Axum routing with CORS enforcement and standardized error envelopes.
+//! - **HTTP Routing** ([`auth_routes`]): Preconfigured Axum authentication route definitions (callers must attach [`cors_layer`](handler::cors_layer) if not using [`handler::create_router`]).
 //!
 //! ## Extension Boundaries
 //!

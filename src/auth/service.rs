@@ -137,21 +137,29 @@ impl AuthServiceImpl {
 
         tx.commit().await.map_err(AppError::Database)?;
 
-        // Email dispatch — respects dispatcher.async_dispatch without double tokio::spawn
+        // Email dispatch is spawned onto an independent task and awaited for cancellation safety.
+        // If client cancels/disconnects during dispatch, task ownership ensures delivery completes
+        // and is not dropped after DB commit. When async_dispatch is true (production default),
+        // dispatch returns immediately, decoupling HTTP latency from external delivery and
+        // preventing timing enumeration. In synchronous mode (testing), the handle is awaited to
+        // ensure completion before returning.
+        let dispatcher = Arc::clone(&self.dispatcher);
         let url = EmailDispatcher::build_verification_url(
-            self.dispatcher.base_url().unwrap_or(""),
+            dispatcher.base_url().unwrap_or(""),
             &raw_token,
         );
-        let _ = self
-            .dispatcher
-            .dispatch_verification(VerificationEmailPayload {
-                user_id,
-                to: normalized_email,
-                token: raw_token,
-                url,
-                expires_at,
-            })
-            .await;
+        let handle = tokio::spawn(async move {
+            let _ = dispatcher
+                .dispatch_verification(VerificationEmailPayload {
+                    user_id,
+                    to: normalized_email,
+                    token: raw_token,
+                    url,
+                    expires_at,
+                })
+                .await;
+        });
+        let _ = handle.await;
 
         Ok(())
     }
@@ -302,20 +310,25 @@ impl AuthServiceImpl {
             .await
             .map_err(AppError::Database)?;
 
-            let url = EmailDispatcher::build_reset_url(
-                self.dispatcher.base_url().unwrap_or(""),
-                &raw_token,
-            );
-            let _ = self
-                .dispatcher
-                .dispatch_password_reset(PasswordResetEmailPayload {
-                    user_id,
-                    to: normalized_email,
-                    token: raw_token,
-                    url,
-                    expires_at,
-                })
-                .await;
+            // Email dispatch is spawned onto an independent task and awaited for cancellation safety.
+            // When async_dispatch is true (production default), dispatch returns immediately without
+            // awaiting external email delivery, ensuring response timing cannot be used to distinguish
+            // existing from non-existent accounts. In synchronous mode (testing), the handle is awaited.
+            let dispatcher = Arc::clone(&self.dispatcher);
+            let url =
+                EmailDispatcher::build_reset_url(dispatcher.base_url().unwrap_or(""), &raw_token);
+            let handle = tokio::spawn(async move {
+                let _ = dispatcher
+                    .dispatch_password_reset(PasswordResetEmailPayload {
+                        user_id,
+                        to: normalized_email,
+                        token: raw_token,
+                        url,
+                        expires_at,
+                    })
+                    .await;
+            });
+            let _ = handle.await;
         }
 
         Ok(())
@@ -849,7 +862,22 @@ mod tests {
             return;
         };
 
-        let non_existent_user_id = Uuid::new_v4();
+        let email = format!("missing_user_{}@example.com", Uuid::new_v4());
+        let password = "SecurePassword123!";
+        let config = Arc::clone(&ctx.service.config);
+        let password_hash = hash_password(password, &config).unwrap();
+
+        // Insert real user first to satisfy foreign key constraint (user_id REFERENCES users(id) ON DELETE CASCADE)
+        let row = sqlx::query(
+            "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, false) RETURNING id",
+        )
+        .bind(&email)
+        .bind(&password_hash)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+        let user_id: Uuid = row.get("id");
+
         let (raw_token, token_hash) = generate_token();
         let future_time = Utc::now() + chrono::Duration::hours(1);
 
@@ -857,16 +885,25 @@ mod tests {
             "INSERT INTO verification_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
         )
         .bind(&token_hash[..])
-        .bind(non_existent_user_id)
+        .bind(user_id)
         .bind(future_time)
         .execute(&ctx.pool)
         .await
         .unwrap();
 
+        // In PostgreSQL, verification_tokens.user_id enforces ON DELETE CASCADE.
+        // Deleting the user triggers cascade, testing that verify_email cleanly rejects
+        // missing/invalidated tokens with InvalidToken without violating DB FK constraints.
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&ctx.pool)
+            .await
+            .unwrap();
+
         let res = ctx.service.verify_email(&raw_token).await;
         assert!(
             matches!(res, Err(AppError::InvalidToken)),
-            "verify_email must return InvalidToken when user does not exist: {:?}",
+            "verify_email must return InvalidToken when user/token does not exist: {:?}",
             res
         );
     }
@@ -877,7 +914,22 @@ mod tests {
             return;
         };
 
-        let non_existent_user_id = Uuid::new_v4();
+        let email = format!("reset_missing_{}@example.com", Uuid::new_v4());
+        let password = "SecurePassword123!";
+        let config = Arc::clone(&ctx.service.config);
+        let password_hash = hash_password(password, &config).unwrap();
+
+        // Insert real user first to satisfy foreign key constraint (user_id REFERENCES users(id) ON DELETE CASCADE)
+        let row = sqlx::query(
+            "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true) RETURNING id",
+        )
+        .bind(&email)
+        .bind(&password_hash)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+        let user_id: Uuid = row.get("id");
+
         let (raw_token, token_hash) = generate_token();
         let future_time = Utc::now() + chrono::Duration::hours(1);
 
@@ -885,11 +937,20 @@ mod tests {
             "INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
         )
         .bind(&token_hash[..])
-        .bind(non_existent_user_id)
+        .bind(user_id)
         .bind(future_time)
         .execute(&ctx.pool)
         .await
         .unwrap();
+
+        // In PostgreSQL, password_reset_tokens.user_id enforces ON DELETE CASCADE.
+        // Deleting the user triggers cascade, testing that reset_password cleanly rejects
+        // missing/invalidated tokens with InvalidToken without violating DB FK constraints.
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&ctx.pool)
+            .await
+            .unwrap();
 
         let res = ctx
             .service
@@ -897,7 +958,7 @@ mod tests {
             .await;
         assert!(
             matches!(res, Err(AppError::InvalidToken)),
-            "reset_password must return InvalidToken when user does not exist: {:?}",
+            "reset_password must return InvalidToken when user/token does not exist: {:?}",
             res
         );
     }

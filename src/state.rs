@@ -110,3 +110,70 @@ impl AppState {
         &self.pool
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn valid_config() -> Config {
+        Config {
+            database_url: "postgres://localhost/test".into(),
+            port: 3000,
+            allowed_origins: vec![],
+            allowed_methods: vec!["GET".into()],
+            allowed_headers: vec!["Content-Type".into()],
+            max_connections: 5,
+            min_connections: 1,
+            base_url: "https://example.com".into(),
+            email_dispatch_timeout: Duration::from_secs(10),
+            async_email_dispatch: true,
+        }
+    }
+
+    #[test]
+    fn create_email_dispatcher_propagates_base_url() {
+        let config = valid_config();
+        let dispatcher = create_email_dispatcher(&config, None);
+        assert_eq!(dispatcher.base_url(), Some("https://example.com"));
+    }
+
+    #[tokio::test]
+    async fn default_email_dispatcher_has_no_sender() {
+        let config = valid_config();
+        let dispatcher = default_email_dispatcher(&config);
+        // A dispatcher with no sender returns None on dispatch (warns, never panics).
+        let payload = crate::email::VerificationEmailPayload {
+            user_id: uuid::Uuid::new_v4(),
+            to: "user@example.com".into(),
+            token: "tok".into(),
+            url: "https://example.com/auth/verify/email?token=tok".into(),
+            expires_at: chrono::Utc::now(),
+        };
+        let handle = dispatcher.dispatch_verification(payload).await;
+        assert!(handle.is_none(), "no sender → dispatch returns None");
+    }
+
+    #[tokio::test]
+    async fn with_configs_and_dispatcher_rejects_invalid_config() {
+        let bad_config = Config {
+            database_url: "".into(), // fails validate()
+            port: 3000,
+            allowed_origins: vec![],
+            allowed_methods: vec!["GET".into()],
+            allowed_headers: vec!["Content-Type".into()],
+            max_connections: 5,
+            min_connections: 1,
+            base_url: "https://example.com".into(),
+            email_dispatch_timeout: Duration::from_secs(10),
+            async_email_dispatch: true,
+        };
+        let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
+        let auth_config = Arc::new(AppConfig::default());
+        let result = AppState::with_configs_and_dispatcher(pool, bad_config, auth_config, None);
+        assert!(
+            matches!(result, Err(AppError::Config(_))),
+            "invalid config must be rejected"
+        );
+    }
+}

@@ -1031,12 +1031,15 @@ mod tests {
     #[test]
     fn from_lookup_rejects_non_unicode_env_var() {
         let cfg = AppConfig::from_lookup(|key| match key {
-            "ARGON2_M_COST" => Err(std::env::VarError::NotUnicode(
-                std::ffi::OsString::from("bad"),
-            )),
+            "ARGON2_M_COST" => Err(std::env::VarError::NotUnicode(std::ffi::OsString::from(
+                "bad",
+            ))),
             _ => Err(std::env::VarError::NotPresent),
         });
-        assert!(matches!(cfg, Err(ConfigError::NonUnicodeEnvVar("ARGON2_M_COST"))));
+        assert!(matches!(
+            cfg,
+            Err(ConfigError::NonUnicodeEnvVar("ARGON2_M_COST"))
+        ));
     }
 
     #[test]

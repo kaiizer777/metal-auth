@@ -358,7 +358,10 @@ mod tests {
         let sender = Arc::new(RecordingSender::default());
         let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_secs(1));
         let handle = dispatcher.dispatch_password_reset(reset_payload()).await;
-        assert!(handle.is_some(), "Some sender → dispatch returns a JoinHandle");
+        assert!(
+            handle.is_some(),
+            "Some sender → dispatch returns a JoinHandle"
+        );
         handle.unwrap().await.unwrap();
     }
 

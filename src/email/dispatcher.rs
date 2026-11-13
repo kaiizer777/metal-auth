@@ -352,4 +352,23 @@ mod tests {
         let encoded = percent_encode_token(input);
         assert_eq!(encoded, input);
     }
+
+    #[tokio::test]
+    async fn dispatch_password_reset_returns_some_handle_when_sender_present() {
+        let sender = Arc::new(RecordingSender::default());
+        let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_secs(1));
+        let handle = dispatcher.dispatch_password_reset(reset_payload()).await;
+        assert!(
+            handle.is_some(),
+            "Some sender → dispatch returns a JoinHandle"
+        );
+        handle.unwrap().await.unwrap();
+    }
+
+    #[test]
+    fn base_url_returns_configured_value() {
+        let dispatcher = EmailDispatcher::new(None, Duration::from_secs(1))
+            .with_base_url("https://auth.example.com");
+        assert_eq!(dispatcher.base_url(), Some("https://auth.example.com"));
+    }
 }

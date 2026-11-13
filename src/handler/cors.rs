@@ -271,6 +271,119 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn test_cors_layer_multiple_origins_each_echoed() {
+        let cfg = Config {
+            database_url: "postgres://localhost/test".into(),
+            port: 3000,
+            allowed_origins: vec![
+                "https://app.example.com".into(),
+                "https://admin.example.com".into(),
+            ],
+            allowed_methods: vec!["GET".into()],
+            allowed_headers: vec!["Content-Type".into()],
+            max_connections: 5,
+            min_connections: 1,
+            base_url: "https://example.com".into(),
+            email_dispatch_timeout: std::time::Duration::from_secs(10),
+            async_email_dispatch: true,
+        };
+
+        for origin in &["https://app.example.com", "https://admin.example.com"] {
+            let mut app = Router::new()
+                .route("/test", get(|| async { "ok" }))
+                .layer(cors_layer(&cfg).unwrap());
+
+            let req = Request::builder()
+                .uri("/test")
+                .method(Method::GET)
+                .header(header::ORIGIN, *origin)
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = app.call(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .unwrap(),
+                *origin
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cors_layer_disallowed_origin_no_allow_header() {
+        let cfg = Config {
+            database_url: "postgres://localhost/test".into(),
+            port: 3000,
+            allowed_origins: vec!["https://app.example.com".into()],
+            allowed_methods: vec!["GET".into()],
+            allowed_headers: vec!["Content-Type".into()],
+            max_connections: 5,
+            min_connections: 1,
+            base_url: "https://example.com".into(),
+            email_dispatch_timeout: std::time::Duration::from_secs(10),
+            async_email_dispatch: true,
+        };
+
+        let mut app = Router::new()
+            .route("/test", get(|| async { "ok" }))
+            .layer(cors_layer(&cfg).unwrap());
+
+        let req = Request::builder()
+            .uri("/test")
+            .method(Method::GET)
+            .header(header::ORIGIN, "https://evil.com")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cors_layer_whitespace_trimmed_origin_matches() {
+        let cfg = Config {
+            database_url: "postgres://localhost/test".into(),
+            port: 3000,
+            // leading/trailing spaces around the origin value
+            allowed_origins: vec!["  https://app.example.com  ".into()],
+            allowed_methods: vec!["GET".into()],
+            allowed_headers: vec!["Content-Type".into()],
+            max_connections: 5,
+            min_connections: 1,
+            base_url: "https://example.com".into(),
+            email_dispatch_timeout: std::time::Duration::from_secs(10),
+            async_email_dispatch: true,
+        };
+
+        let mut app = Router::new()
+            .route("/test", get(|| async { "ok" }))
+            .layer(cors_layer(&cfg).unwrap());
+
+        let req = Request::builder()
+            .uri("/test")
+            .method(Method::GET)
+            .header(header::ORIGIN, "https://app.example.com")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "https://app.example.com"
+        );
+    }
+
     #[test]
     fn test_cors_layer_rejects_malformed_header() {
         let cfg = Config {

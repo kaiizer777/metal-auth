@@ -430,6 +430,67 @@ mod tests {
                 ErrorCode::InternalError,
                 "Internal error",
             ),
+            // Phase 3 — missing variant coverage
+            (
+                AppError::InvalidCredentials,
+                StatusCode::UNAUTHORIZED,
+                ErrorCode::InvalidCredentials,
+                "Invalid email or password",
+            ),
+            (
+                AppError::Unauthenticated,
+                StatusCode::UNAUTHORIZED,
+                ErrorCode::Unauthenticated,
+                "Authentication required",
+            ),
+            (
+                AppError::EmailNotVerified,
+                StatusCode::FORBIDDEN,
+                ErrorCode::EmailNotVerified,
+                "Email address has not been verified",
+            ),
+            (
+                AppError::PasswordTooCommon,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::PasswordTooCommon,
+                "Password is too common, please choose a stronger password",
+            ),
+            (
+                AppError::InvalidEmail,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidEmail,
+                "Invalid email address",
+            ),
+            (
+                AppError::ValidationError("field required".into()),
+                StatusCode::BAD_REQUEST,
+                ErrorCode::ValidationError,
+                "Invalid request body",
+            ),
+            (
+                AppError::InvalidToken,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidToken,
+                "Invalid or already used token",
+            ),
+            (
+                AppError::TokenExpired,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::TokenExpired,
+                "Token has expired",
+            ),
+            (
+                AppError::Migration(sqlx::migrate::MigrateError::VersionMissing(1)),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::MigrationFailed,
+                "Migration failed",
+            ),
+            (
+                AppError::Config(ConfigError::NonUnicodeEnvVar("TEST_VAR")),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::InvalidConfig,
+                "Invalid configuration",
+            ),
         ];
 
         for (err, expected_status, expected_code, expected_msg) in test_cases {

@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex, OnceLock};
+
 use axum::{
     body::Body,
     http::{Method, Request, StatusCode, header},
@@ -1301,6 +1303,85 @@ async fn test_cors_preflight_on_auth_endpoints() {
     );
 }
 
+#[tokio::test]
+async fn test_cors_disallowed_origin_no_acao_on_actual_post() {
+    let router = create_test_router();
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/auth/signup")
+        .header(header::ORIGIN, "https://evil.com")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"email":"user@example.com","password":"ValidPassword123!"}"#))
+        .unwrap();
+
+    let resp = router.oneshot(req).await.unwrap();
+    assert!(
+        resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+        "Disallowed origin https://evil.com must not receive Access-Control-Allow-Origin header"
+    );
+}
+
+#[tokio::test]
+async fn test_cors_null_origin_rejected() {
+    let router = create_test_router();
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/auth/login")
+        .header(header::ORIGIN, "null")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"email":"user@example.com","password":"ValidPassword123!"}"#))
+        .unwrap();
+
+    let resp = router.oneshot(req).await.unwrap();
+    assert!(
+        resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+        "Origin: null must not receive Access-Control-Allow-Origin header"
+    );
+}
+
+#[tokio::test]
+async fn test_csrf_state_changing_request_requires_allowed_origin() {
+    let router = create_test_router();
+
+    // Allowed origin receives CORS approval header
+    let allowed_req = Request::builder()
+        .method(Method::POST)
+        .uri("/auth/signup")
+        .header(header::ORIGIN, "https://app.example.com")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"email":"bad-email","password":"ValidPassword123!"}"#))
+        .unwrap();
+
+    let allowed_resp = router.clone().oneshot(allowed_req).await.unwrap();
+    assert_eq!(
+        allowed_resp
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|v| v.to_str().ok()),
+        Some("https://app.example.com")
+    );
+
+    // Cross-origin untrusted origin has no CORS approval header (CSRF containment)
+    let untrusted_req = Request::builder()
+        .method(Method::POST)
+        .uri("/auth/signup")
+        .header(header::ORIGIN, "https://attacker.com")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"email":"bad-email","password":"ValidPassword123!"}"#))
+        .unwrap();
+
+    let untrusted_resp = router.oneshot(untrusted_req).await.unwrap();
+    assert!(
+        untrusted_resp
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none(),
+        "Untrusted cross-origin request must not be granted CORS origin access"
+    );
+}
+
 // ─── Scenario 13: Zero secret leakage in error responses ────────────────────
 
 #[tokio::test]
@@ -1376,6 +1457,152 @@ async fn test_zero_secret_leakage_in_error_responses() {
             );
         }
     }
+}
+
+// ─── Log secret leakage audit & DB error leak tests ──────────────────────────
+
+#[derive(Clone)]
+struct LogBuf(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+    type Writer = LogBuf;
+    fn make_writer(&self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+static LOG_BUF: OnceLock<LogBuf> = OnceLock::new();
+static LOG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn init_security_test_logs() {
+    let buf = LOG_BUF.get_or_init(|| LogBuf(Arc::new(Mutex::new(Vec::new()))));
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(buf.clone())
+        .with_ansi(false)
+        .try_init();
+}
+
+fn clear_security_test_logs() {
+    if let Some(buf) = LOG_BUF.get() {
+        buf.0.lock().unwrap().clear();
+    }
+}
+
+fn security_log_text() -> String {
+    if let Some(buf) = LOG_BUF.get() {
+        String::from_utf8(buf.0.lock().unwrap().clone()).unwrap_or_default()
+    } else {
+        String::new()
+    }
+}
+
+#[tokio::test]
+async fn test_no_secrets_in_tracing_logs() {
+    init_security_test_logs();
+    let _guard = LOG_LOCK.lock().await;
+    clear_security_test_logs();
+
+    let router = create_test_router();
+
+    let secret_pw = "SuperSecret_P@ssw0rd!_9876";
+    let test_email = "secret_audit@example.com";
+
+    // 1. Signup request with secret password
+    let req1 = json_request(
+        Method::POST,
+        "/auth/signup",
+        json!({"email": test_email, "password": secret_pw}),
+    );
+    let _ = router.clone().oneshot(req1).await.unwrap();
+
+    // 2. Login request with secret password
+    let req2 = json_request(
+        Method::POST,
+        "/auth/login",
+        json!({"email": test_email, "password": secret_pw}),
+    );
+    let _ = router.clone().oneshot(req2).await.unwrap();
+
+    // 3. Password reset request
+    let req3 = json_request(
+        Method::POST,
+        "/auth/password/reset-request",
+        json!({"email": test_email}),
+    );
+    let _ = router.clone().oneshot(req3).await.unwrap();
+
+    // 4. Password reset confirm with secret new password and hex token
+    let secret_token = "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234";
+    let req4 = json_request(
+        Method::POST,
+        "/auth/password/reset",
+        json!({"token": secret_token, "new_password": secret_pw}),
+    );
+    let _ = router.oneshot(req4).await.unwrap();
+
+    let logs = security_log_text();
+    assert!(
+        !logs.contains(secret_pw),
+        "Secret plaintext password leaked in tracing logs: {}",
+        logs
+    );
+    assert!(
+        !logs.contains(secret_token),
+        "Secret raw token leaked in tracing logs: {}",
+        logs
+    );
+    assert!(
+        !logs.contains("$argon2id$"),
+        "Argon2 password hash string leaked in tracing logs: {}",
+        logs
+    );
+    assert!(
+        !logs.to_lowercase().contains("syntax error"),
+        "Raw SQL syntax error leaked in tracing logs: {}",
+        logs
+    );
+}
+
+#[tokio::test]
+async fn test_db_error_does_not_leak_sql_text() {
+    let router = create_test_router();
+
+    let req = json_request(
+        Method::POST,
+        "/auth/signup",
+        json!({
+            "email": "db_error_test@example.com",
+            "password": "ValidPassword123!"
+        }),
+    );
+
+    let resp = router.oneshot(req).await.unwrap();
+    let (status, body, raw_body) = response_json(resp).await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let err: ErrorResponse = serde_json::from_str(&raw_body).unwrap();
+    assert_eq!(err.code, ErrorCode::DatabaseError);
+    assert_eq!(err.message, "Database error");
+
+    let lower = raw_body.to_lowercase();
+    assert!(!lower.contains("select "));
+    assert!(!lower.contains("insert "));
+    assert!(!lower.contains("users"));
+    assert!(!lower.contains("postgres"));
+    assert!(!lower.contains("sqlx"));
+    assert!(!lower.contains("connection refused"));
+    assert_eq!(body.as_object().unwrap().len(), 2);
 }
 
 // ─── Scenario 14: Conditional DB Integration Tests ──────────────────────────

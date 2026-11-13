@@ -15,3 +15,28 @@ highlight = "all"
 unknown-registry = "warn"
 unknown-git = "warn"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[[licenses.clarify]]
+crate = "flume"
+expression = "Apache-2.0 OR MIT"
+license-files = [{ path = "LICENSE-MIT", hash = 0x0 }, { path = "LICENSE-APACHE", hash = 0x0 }]
+
+[[licenses.clarify]]
+crate = "serde_urlencoded"
+expression = "MIT OR Apache-2.0"
+license-files = [{ path = "LICENSE-MIT", hash = 0x0 }, { path = "LICENSE-APACHE", hash = 0x0 }]
+
+[[licenses.clarify]]
+crate = "stringprep"
+expression = "MIT OR Apache-2.0"
+license-files = [{ path = "LICENSE-MIT", hash = 0x0 }, { path = "LICENSE-APACHE", hash = 0x0 }]
+
+[[licenses.clarify]]
+crate = "vcpkg"
+expression = "MIT OR Apache-2.0"
+license-files = [{ path = "LICENSE-MIT", hash = 0x0 }, { path = "LICENSE-APACHE", hash = 0x0 }]
+
+[[licenses.clarify]]
+crate = "version_check"
+expression = "MIT OR Apache-2.0"
+license-files = [{ path = "LICENSE-MIT", hash = 0x0 }, { path = "LICENSE-APACHE", hash = 0x0 }]

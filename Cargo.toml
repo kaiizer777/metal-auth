@@ -26,7 +26,7 @@ async-trait = "0.1"
 axum = "0.7"
 
 # DB
-sqlx = { version = "0.8", features = [
+sqlx = { version = "0.9", features = [
     "postgres",
     "runtime-tokio",
     "tls-rustls",

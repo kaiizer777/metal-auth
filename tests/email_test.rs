@@ -197,7 +197,7 @@ async fn full_payload_assertion() {
         captured_r: Arc::new(Mutex::new(None)),
     };
     let sender: SharedEmailSender = Arc::new(mock);
-    let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_secs(10), true);
+    let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_secs(10));
 
     let payload = sample_verification();
     let handle = dispatcher
@@ -227,7 +227,7 @@ async fn full_reset_payload_assertion() {
         captured_r: captured.clone(),
     };
     let sender: SharedEmailSender = Arc::new(mock);
-    let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_secs(10), true);
+    let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_secs(10));
 
     let payload = sample_reset();
     let handle = dispatcher
@@ -245,37 +245,11 @@ async fn full_reset_payload_assertion() {
 }
 
 #[tokio::test]
-async fn sync_dispatch_awaits_and_logs_error() {
-    let _guard = LOG_LOCK.lock().await;
-    init_logs();
-    clear_logs();
-    let captured = Arc::new(Mutex::new(None));
-    let mock = MockSender {
-        delay_ms: 20,
-        fail: true,
-        captured_v: captured.clone(),
-        captured_r: Arc::new(Mutex::new(None)),
-    };
-    let sender: SharedEmailSender = Arc::new(mock);
-    let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_secs(10), false);
-
-    let handle = dispatcher
-        .dispatch_verification(sample_verification())
-        .await;
-    assert!(handle.is_none(), "synchronous dispatch returns None");
-    assert!(
-        captured.lock().unwrap().is_some(),
-        "sync dispatch must have completed before returning"
-    );
-    assert!(log_text().contains("email dispatch failed"));
-}
-
-#[tokio::test]
 async fn none_sender_warns_no_panic() {
     let _guard = LOG_LOCK.lock().await;
     init_logs();
     clear_logs();
-    let dispatcher = EmailDispatcher::new(None, Duration::from_secs(10), true);
+    let dispatcher = EmailDispatcher::new(None, Duration::from_secs(10));
     let h1 = dispatcher
         .dispatch_verification(sample_verification())
         .await;
@@ -298,7 +272,7 @@ async fn hook_returns_err_is_logged() {
         captured_r: Arc::new(Mutex::new(None)),
     };
     let sender: SharedEmailSender = Arc::new(mock);
-    let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_secs(10), true);
+    let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_secs(10));
     let handle = dispatcher
         .dispatch_verification(sample_verification())
         .await
@@ -322,7 +296,7 @@ async fn async_dispatch_non_blocking() {
         release: release.clone(),
         captured: captured.clone(),
     });
-    let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_secs(10), true);
+    let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_secs(10));
 
     let handle = dispatcher
         .dispatch_verification(sample_verification())
@@ -356,27 +330,12 @@ async fn timeout_does_not_panic() {
     clear_logs();
 
     let sender: SharedEmailSender = Arc::new(HangingSender);
-    let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_millis(20), true);
+    let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_millis(20));
     let handle = dispatcher
         .dispatch_verification(sample_verification())
         .await
         .expect("should return handle");
     handle.await.unwrap();
-    assert!(log_text().contains("timed out"));
-}
-
-#[tokio::test]
-async fn sync_timeout_does_not_panic() {
-    let _guard = LOG_LOCK.lock().await;
-    init_logs();
-    clear_logs();
-
-    let sender: SharedEmailSender = Arc::new(HangingSender);
-    let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_millis(20), false);
-    let handle = dispatcher
-        .dispatch_verification(sample_verification())
-        .await;
-    assert!(handle.is_none(), "sync dispatch returns None");
     assert!(log_text().contains("timed out"));
 }
 
@@ -524,7 +483,7 @@ fn base_url_validation_rejects_userinfo() {
 
 #[test]
 fn dispatcher_with_base_url_builder() {
-    let dispatcher = EmailDispatcher::new(None, Duration::from_secs(5), true)
+    let dispatcher = EmailDispatcher::new(None, Duration::from_secs(5))
         .with_base_url("https://auth.example.com");
     assert_eq!(dispatcher.base_url(), Some("https://auth.example.com"));
 }

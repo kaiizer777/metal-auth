@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use tracing::{Instrument, error, info_span, warn};
 
-use crate::email::hook::SharedEmailSender;
+use crate::email::hook::{DynError, SharedEmailSender};
 use crate::email::payload::{PasswordResetEmailPayload, VerificationEmailPayload};
 
 fn percent_encode_token(input: &str) -> String {
@@ -53,21 +53,34 @@ pub fn build_reset_url(base_url: &str, token: &str) -> String {
 pub struct EmailDispatcher {
     sender: Option<SharedEmailSender>,
     timeout: Duration,
-    async_dispatch: bool,
     base_url: Option<String>,
+    /// Inline (caller-blocking) delivery — test-only, absent from default builds.
+    #[cfg(any(test, feature = "test-utils"))]
+    block_on_delivery: bool,
 }
 
 impl EmailDispatcher {
-    /// Creates a new `EmailDispatcher` with an optional sender, timeout, and dispatch mode.
-    ///
-    /// `async_dispatch` must be `true` outside tests: `false` blocks the calling task
-    /// until delivery finishes, which exposes account existence through response timing.
-    pub fn new(sender: Option<SharedEmailSender>, timeout: Duration, async_dispatch: bool) -> Self {
+    /// Creates a dispatcher that always delivers on a detached Tokio task.
+    pub fn new(sender: Option<SharedEmailSender>, timeout: Duration) -> Self {
         Self {
             sender,
             timeout,
-            async_dispatch,
             base_url: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            block_on_delivery: false,
+        }
+    }
+
+    /// Creates a dispatcher that delivers inline, blocking the caller until the sender
+    /// finishes or the timeout elapses.
+    ///
+    /// Test-only: production request paths must never wait for mailer latency, so this
+    /// constructor does not exist in a default build.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn new_blocking(sender: Option<SharedEmailSender>, timeout: Duration) -> Self {
+        Self {
+            block_on_delivery: true,
+            ..Self::new(sender, timeout)
         }
     }
 
@@ -94,11 +107,13 @@ impl EmailDispatcher {
 
     /// Dispatches a verification email payload.
     ///
-    /// In async mode (`async_dispatch == true`, production), spawns a Tokio task with the configured timeout
-    /// and returns `Some(JoinHandle<()>)`.
+    /// Delivery runs on a detached Tokio task bounded by the configured timeout, so the
+    /// caller never observes mailer latency. Send failures are logged, never returned.
     ///
-    /// In sync mode (`async_dispatch == false`), awaits the sender inline with timeout and returns `None`.
-    /// Blocks the caller, so it is test-only — request paths must never await it.
+    /// Returns the task handle; dropping it detaches the task.
+    ///
+    /// Test builds may use `EmailDispatcher::new_blocking` to await delivery inline
+    /// instead; that mode returns `None`.
     pub async fn dispatch_verification(
         &self,
         payload: VerificationEmailPayload,
@@ -109,46 +124,31 @@ impl EmailDispatcher {
         };
         let timeout = self.timeout;
 
-        if self.async_dispatch {
-            let span = info_span!("dispatch_verification", user_id = %payload.user_id);
-            let handle = tokio::spawn(
-                async move {
-                    match tokio::time::timeout(timeout, sender.send_verification_email(payload))
-                        .await
-                    {
-                        Err(_elapsed) => {
-                            error!(op = "verification", "email dispatch timed out");
-                        }
-                        Ok(Err(e)) => {
-                            error!(op = "verification", err = %e, "email dispatch failed");
-                        }
-                        Ok(Ok(())) => {}
-                    }
-                }
-                .instrument(span),
+        #[cfg(any(test, feature = "test-utils"))]
+        if self.block_on_delivery {
+            log_send_result(
+                "verification",
+                tokio::time::timeout(timeout, sender.send_verification_email(payload)).await,
             );
-            Some(handle)
-        } else {
-            match tokio::time::timeout(timeout, sender.send_verification_email(payload)).await {
-                Err(_elapsed) => {
-                    error!(op = "verification", "email dispatch timed out");
-                }
-                Ok(Err(e)) => {
-                    error!(op = "verification", err = %e, "email dispatch failed");
-                }
-                Ok(Ok(())) => {}
-            }
-            None
+            return None;
         }
+
+        let span = info_span!("dispatch_verification", user_id = %payload.user_id);
+        let handle = tokio::spawn(
+            async move {
+                log_send_result(
+                    "verification",
+                    tokio::time::timeout(timeout, sender.send_verification_email(payload)).await,
+                );
+            }
+            .instrument(span),
+        );
+        Some(handle)
     }
 
     /// Dispatches a password reset email payload.
     ///
-    /// In async mode (`async_dispatch == true`, production), spawns a Tokio task with the configured timeout
-    /// and returns `Some(JoinHandle<()>)`.
-    ///
-    /// In sync mode (`async_dispatch == false`), awaits the sender inline with timeout and returns `None`.
-    /// Blocks the caller, so it is test-only — request paths must never await it.
+    /// Detached and bounded exactly like [`EmailDispatcher::dispatch_verification`].
     pub async fn dispatch_password_reset(
         &self,
         payload: PasswordResetEmailPayload,
@@ -159,54 +159,153 @@ impl EmailDispatcher {
         };
         let timeout = self.timeout;
 
-        if self.async_dispatch {
-            let span = info_span!("dispatch_password_reset", user_id = %payload.user_id);
-            let handle = tokio::spawn(
-                async move {
-                    match tokio::time::timeout(timeout, sender.send_password_reset_email(payload))
-                        .await
-                    {
-                        Err(_elapsed) => {
-                            error!(op = "password_reset", "email dispatch timed out");
-                        }
-                        Ok(Err(e)) => {
-                            error!(op = "password_reset", err = %e, "email dispatch failed");
-                        }
-                        Ok(Ok(())) => {}
-                    }
-                }
-                .instrument(span),
+        #[cfg(any(test, feature = "test-utils"))]
+        if self.block_on_delivery {
+            log_send_result(
+                "password_reset",
+                tokio::time::timeout(timeout, sender.send_password_reset_email(payload)).await,
             );
-            Some(handle)
-        } else {
-            match tokio::time::timeout(timeout, sender.send_password_reset_email(payload)).await {
-                Err(_elapsed) => {
-                    error!(op = "password_reset", "email dispatch timed out");
-                }
-                Ok(Err(e)) => {
-                    error!(op = "password_reset", err = %e, "email dispatch failed");
-                }
-                Ok(Ok(())) => {}
-            }
-            None
+            return None;
         }
+
+        let span = info_span!("dispatch_password_reset", user_id = %payload.user_id);
+        let handle = tokio::spawn(
+            async move {
+                log_send_result(
+                    "password_reset",
+                    tokio::time::timeout(timeout, sender.send_password_reset_email(payload)).await,
+                );
+            }
+            .instrument(span),
+        );
+        Some(handle)
+    }
+}
+
+fn log_send_result(
+    op: &'static str,
+    result: Result<Result<(), DynError>, tokio::time::error::Elapsed>,
+) {
+    match result {
+        Err(_elapsed) => error!(op, "email dispatch timed out"),
+        Ok(Err(e)) => error!(op, err = %e, "email dispatch failed"),
+        Ok(Ok(())) => {}
     }
 }
 
 impl fmt::Debug for EmailDispatcher {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("EmailDispatcher")
+        let mut debug = f.debug_struct("EmailDispatcher");
+        debug
             .field("timeout", &self.timeout)
-            .field("async_dispatch", &self.async_dispatch)
             .field("sender", &self.sender.is_some())
-            .field("base_url", &self.base_url)
-            .finish()
+            .field("base_url", &self.base_url);
+        #[cfg(any(test, feature = "test-utils"))]
+        debug.field("block_on_delivery", &self.block_on_delivery);
+        debug.finish()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::email::hook::EmailSender;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct RecordingSender {
+        verification: Mutex<Vec<VerificationEmailPayload>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EmailSender for RecordingSender {
+        async fn send_verification_email(
+            &self,
+            payload: VerificationEmailPayload,
+        ) -> Result<(), DynError> {
+            self.verification.lock().unwrap().push(payload);
+            Ok(())
+        }
+
+        async fn send_password_reset_email(
+            &self,
+            _payload: PasswordResetEmailPayload,
+        ) -> Result<(), DynError> {
+            Ok(())
+        }
+    }
+
+    struct HangingSender;
+
+    #[async_trait::async_trait]
+    impl EmailSender for HangingSender {
+        async fn send_verification_email(
+            &self,
+            _payload: VerificationEmailPayload,
+        ) -> Result<(), DynError> {
+            std::future::pending().await
+        }
+
+        async fn send_password_reset_email(
+            &self,
+            _payload: PasswordResetEmailPayload,
+        ) -> Result<(), DynError> {
+            std::future::pending().await
+        }
+    }
+
+    fn verification_payload() -> VerificationEmailPayload {
+        VerificationEmailPayload {
+            user_id: uuid::Uuid::new_v4(),
+            to: "user@example.com".into(),
+            token: "token".into(),
+            url: "https://example.com/auth/verify/email?token=token".into(),
+            expires_at: chrono::Utc::now(),
+        }
+    }
+
+    fn reset_payload() -> PasswordResetEmailPayload {
+        PasswordResetEmailPayload {
+            user_id: uuid::Uuid::new_v4(),
+            to: "user@example.com".into(),
+            token: "token".into(),
+            url: "https://example.com/auth/password/reset?token=token".into(),
+            expires_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn blocking_dispatch_delivers_before_returning() {
+        let sender = Arc::new(RecordingSender::default());
+        let dispatcher =
+            EmailDispatcher::new_blocking(Some(sender.clone()), Duration::from_secs(1));
+
+        let handle = dispatcher
+            .dispatch_verification(verification_payload())
+            .await;
+
+        assert!(handle.is_none(), "blocking dispatch returns no task handle");
+        assert_eq!(sender.verification.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn blocking_dispatch_times_out_without_panicking() {
+        let dispatcher =
+            EmailDispatcher::new_blocking(Some(Arc::new(HangingSender)), Duration::from_millis(10));
+
+        assert!(
+            dispatcher
+                .dispatch_verification(verification_payload())
+                .await
+                .is_none()
+        );
+        assert!(
+            dispatcher
+                .dispatch_password_reset(reset_payload())
+                .await
+                .is_none()
+        );
+    }
 
     #[test]
     fn test_build_verification_url() {

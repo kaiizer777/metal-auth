@@ -345,11 +345,7 @@ async fn test_state_with_auth_config_propagates_error() {
     let err = state.with_auth_config(invalid_config.clone());
     assert!(matches!(err, Err(AppError::Config(_))));
 
-    let dispatcher = std::sync::Arc::new(EmailDispatcher::new(
-        None,
-        cfg.email_dispatch_timeout,
-        cfg.async_email_dispatch,
-    ));
+    let dispatcher = std::sync::Arc::new(EmailDispatcher::new(None, cfg.email_dispatch_timeout));
 
     // Test with_dispatcher fallibility
     assert!(

@@ -247,7 +247,6 @@ mod tests {
         let dispatcher = Arc::new(EmailDispatcher::new(
             None,
             std::time::Duration::from_secs(10),
-            true,
         ));
         let service =
             Arc::new(AuthServiceImpl::new(pool, config, dispatcher).expect("test service"));

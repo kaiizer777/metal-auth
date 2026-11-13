@@ -41,12 +41,28 @@ async fn setup_live_db() -> Option<LiveDbTestContext> {
     dotenvy::dotenv().ok();
     let url = match std::env::var("DATABASE_URL") {
         Ok(val) => val,
-        Err(std::env::VarError::NotPresent) => return None,
+        Err(std::env::VarError::NotPresent) => {
+            // Never let CI report green on a suite that did not run.
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "DATABASE_URL must be set in CI: DB-backed tests must never skip silently"
+            );
+            eprintln!("SKIP: live-DB security tests need DATABASE_URL");
+            return None;
+        }
         Err(e) => panic!("invalid DATABASE_URL environment variable: {e}"),
     };
-    let pool = PgPool::connect(&url)
-        .await
-        .expect("failed to connect to DATABASE_URL in live DB test setup");
+    // Runs the embedded migrations, so a bare Postgres (CI service container) is enough.
+    let pool = metal_auth::db::init_pool_with_options(
+        &url,
+        metal_auth::db::DbPoolOptions {
+            max_connections: 5,
+            min_connections: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("DATABASE_URL is set, so the DB-backed test must connect");
     let cfg = Config {
         database_url: url.clone(),
         port: 8080,

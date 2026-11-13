@@ -59,6 +59,9 @@ pub struct EmailDispatcher {
 
 impl EmailDispatcher {
     /// Creates a new `EmailDispatcher` with an optional sender, timeout, and dispatch mode.
+    ///
+    /// `async_dispatch` must be `true` outside tests: `false` blocks the calling task
+    /// until delivery finishes, which exposes account existence through response timing.
     pub fn new(sender: Option<SharedEmailSender>, timeout: Duration, async_dispatch: bool) -> Self {
         Self {
             sender,
@@ -91,10 +94,11 @@ impl EmailDispatcher {
 
     /// Dispatches a verification email payload.
     ///
-    /// In async mode (`async_dispatch == true`), spawns a Tokio task with the configured timeout
+    /// In async mode (`async_dispatch == true`, production), spawns a Tokio task with the configured timeout
     /// and returns `Some(JoinHandle<()>)`.
     ///
     /// In sync mode (`async_dispatch == false`), awaits the sender inline with timeout and returns `None`.
+    /// Blocks the caller, so it is test-only — request paths must never await it.
     pub async fn dispatch_verification(
         &self,
         payload: VerificationEmailPayload,
@@ -140,10 +144,11 @@ impl EmailDispatcher {
 
     /// Dispatches a password reset email payload.
     ///
-    /// In async mode (`async_dispatch == true`), spawns a Tokio task with the configured timeout
+    /// In async mode (`async_dispatch == true`, production), spawns a Tokio task with the configured timeout
     /// and returns `Some(JoinHandle<()>)`.
     ///
     /// In sync mode (`async_dispatch == false`), awaits the sender inline with timeout and returns `None`.
+    /// Blocks the caller, so it is test-only — request paths must never await it.
     pub async fn dispatch_password_reset(
         &self,
         payload: PasswordResetEmailPayload,

@@ -12,7 +12,7 @@
 //! - **State & Services** ([`AppState`], [`Auth`], [`AuthService`], [`AuthServiceImpl`]): Centralized application
 //!   state and transactional authentication business logic with anti-enumeration safeguards.
 //! - **Email Dispatch** ([`EmailDispatcher`], [`EmailSender`], [`NoopEmailSender`]): Configurable email hooks
-//!   for asynchronous and synchronous verification and password reset workflows.
+//!   for verification and password reset workflows; delivery is always detached from the request path.
 //! - **Persistence Models** ([`User`], [`Session`], [`VerificationToken`], [`PasswordResetToken`]): Strongly-typed
 //!   PostgreSQL entities preventing credential leaks across serialization boundaries, paired with client-facing
 //!   DTOs ([`UserResponse`]).

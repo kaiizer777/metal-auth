@@ -1132,6 +1132,49 @@ mod tests {
         wait_mailer_delivered(&sender).await;
     }
 
+    // ─── Group B: no-DB early-return guard tests ─────────────────────────────
+
+    #[tokio::test]
+    async fn signup_invalid_email_returns_before_db() {
+        let service = create_test_service();
+        let res = service.signup("not-an-email", "ValidPassword1!").await;
+        assert!(matches!(res, Err(AppError::InvalidEmail)));
+    }
+
+    #[tokio::test]
+    async fn signup_short_password_returns_before_db() {
+        let service = create_test_service();
+        // default password_min_len == 8; "short" has 5 chars
+        let res = service.signup("user@example.com", "short").await;
+        assert!(matches!(res, Err(AppError::PasswordTooShort)));
+    }
+
+    #[tokio::test]
+    async fn request_password_reset_invalid_email_returns_before_db() {
+        let service = create_test_service();
+        let res = service.request_password_reset("not-an-email").await;
+        assert!(matches!(res, Err(AppError::InvalidEmail)));
+    }
+
+    #[tokio::test]
+    async fn reset_password_short_new_password_returns_before_db() {
+        let service = create_test_service();
+        // validate_password fires before hash_token; short pw → early return
+        let valid_token = "a".repeat(64);
+        let res = service.reset_password(&valid_token, "tiny").await;
+        assert!(matches!(res, Err(AppError::PasswordTooShort)));
+    }
+
+    #[tokio::test]
+    async fn reset_password_malformed_token_returns_before_db() {
+        let service = create_test_service();
+        // validate_password passes; hash_token rejects malformed token → InvalidToken
+        let res = service
+            .reset_password("not-valid-hex-token", "ValidPassword1!")
+            .await;
+        assert!(matches!(res, Err(AppError::InvalidToken)));
+    }
+
     /// Delivery must complete even when the request future is dropped mid-flight.
     #[tokio::test]
     async fn dispatch_survives_cancelled_request_future() {

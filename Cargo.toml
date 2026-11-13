@@ -23,7 +23,7 @@ hex = "0.4"
 async-trait = "0.1"
 
 # web framework
-axum = "0.7"
+axum = "0.8"
 
 # DB
 sqlx = { version = "0.9", features = [

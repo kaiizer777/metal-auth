@@ -9,7 +9,6 @@
 
 > [!WARNING]
 > **Status: Early development — not yet usable in production.**
-> APIs and internal structures are subject to breaking changes.
 
 ---
 

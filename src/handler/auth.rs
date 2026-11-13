@@ -339,6 +339,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_json_body_returns_400_validation_error() {
+        use tower::ServiceExt;
+        let app = routes(create_test_state().service);
+        let req = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/signup")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from("{not valid json"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err.code, ErrorCode::ValidationError);
+        assert_eq!(err.message, "Invalid request body");
+    }
+
+    #[tokio::test]
     async fn route_method_not_allowed_returns_405_json_envelope() {
         use tower::ServiceExt;
         let app = routes(create_test_state().service);

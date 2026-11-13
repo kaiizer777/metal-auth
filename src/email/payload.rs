@@ -139,4 +139,28 @@ mod tests {
         );
         assert_eq!(redact_url_token(""), "");
     }
+
+    #[test]
+    fn verification_payload_eq_identical_fields() {
+        let p = VerificationEmailPayload {
+            user_id: Uuid::nil(),
+            to: "user@example.com".into(),
+            token: "tok".into(),
+            url: "https://example.com/verify?token=tok".into(),
+            expires_at: DateTime::from_timestamp(0, 0).unwrap(),
+        };
+        assert_eq!(p.clone(), p);
+    }
+
+    #[test]
+    fn password_reset_payload_eq_identical_fields() {
+        let p = PasswordResetEmailPayload {
+            user_id: Uuid::nil(),
+            to: "user@example.com".into(),
+            token: "tok".into(),
+            url: "https://example.com/reset?token=tok".into(),
+            expires_at: DateTime::from_timestamp(0, 0).unwrap(),
+        };
+        assert_eq!(p.clone(), p);
+    }
 }

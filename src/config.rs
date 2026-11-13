@@ -27,6 +27,12 @@ pub struct Config {
     // Phase 2: email hook dispatch
     pub base_url: String,
     pub email_dispatch_timeout: Duration,
+    /// Whether email dispatch blocks the caller until delivery completes.
+    ///
+    /// Test-only knob: `false` makes dispatch wait for delivery in the calling task,
+    /// which re-introduces the account-existence timing signal. Production request paths
+    /// detach dispatch, and [`Config::validate`] rejects `false`, so it is unreachable
+    /// outside tests. Never enable it in production.
     pub async_email_dispatch: bool,
 }
 
@@ -83,6 +89,12 @@ impl Config {
         }
         if self.email_dispatch_timeout == Duration::ZERO {
             return Err(ConfigError::InvalidEnvVar("EMAIL_DISPATCH_TIMEOUT_SECS"));
+        }
+        if !self.async_email_dispatch {
+            return Err(ConfigError::InvalidValue {
+                field: "async_email_dispatch",
+                reason: "sync dispatch waits for delivery and reveals account existence; test-only, never enable in production",
+            });
         }
         for origin in &self.allowed_origins {
             let trimmed = origin.trim();
@@ -715,6 +727,29 @@ mod tests {
             async_email_dispatch: true,
         };
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn config_validate_rejects_sync_email_dispatch() {
+        let cfg = Config {
+            database_url: "postgres://localhost/test".into(),
+            port: 3000,
+            allowed_origins: vec![],
+            allowed_methods: vec!["GET".into()],
+            allowed_headers: vec!["Content-Type".into()],
+            max_connections: 5,
+            min_connections: 1,
+            base_url: "https://app.example.com".into(),
+            email_dispatch_timeout: Duration::from_secs(10),
+            async_email_dispatch: false,
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "async_email_dispatch",
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -722,6 +722,63 @@ async fn test_logout_returns_no_content() {
     assert!(bytes.is_empty(), "Logout body must be completely empty");
 }
 
+#[tokio::test]
+async fn test_logout_invalid_bearer_does_not_panic() {
+    let router = create_test_router();
+
+    let invalid_auth_headers = [
+        None,
+        Some(""),
+        Some("Bearer "),
+        Some("Bearer !@#$%^&*()_+"),
+        Some("Basic dXNlcjpwYXNz"),
+        Some("InvalidPrefix token123"),
+    ];
+
+    for auth_val in invalid_auth_headers {
+        let mut builder = Request::builder().method(Method::POST).uri("/auth/logout");
+        if let Some(val) = auth_val {
+            builder = builder.header(header::AUTHORIZATION, val);
+        }
+        let req = builder.body(Body::empty()).unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NO_CONTENT,
+            "Logout should return 204 even with invalid/missing bearer: {:?}",
+            auth_val
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_logout_method_not_allowed() {
+    let router = create_test_router();
+
+    for method in [Method::GET, Method::PUT, Method::DELETE, Method::PATCH] {
+        let req = Request::builder()
+            .method(method.clone())
+            .uri("/auth/logout")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.headers()
+                .get(header::ALLOW)
+                .and_then(|v| v.to_str().ok()),
+            Some("POST"),
+            "Method {:?} must return Allow: POST",
+            method
+        );
+        let (status, _, body_str) = response_json(resp).await;
+
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(err.code, ErrorCode::MethodNotAllowed);
+    }
+}
+
 // ─── Scenario 10: Verify invalid token format ────────────────────────────────
 
 #[tokio::test]
@@ -748,6 +805,214 @@ async fn test_verify_invalid_token_format() {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
         assert_eq!(err.code, ErrorCode::InvalidToken);
+    }
+}
+
+#[tokio::test]
+async fn test_verify_valid_format_nonexistent_token_rejected() {
+    let Some(ctx) = setup_live_db().await else {
+        return;
+    };
+    let nonexistent_token = "f".repeat(64);
+
+    let req = json_request(
+        Method::POST,
+        "/auth/verify",
+        json!({"token": nonexistent_token}),
+    );
+    let resp = ctx.router.oneshot(req).await.unwrap();
+    let (status, _, body_str) = response_json(resp).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+    assert_eq!(err.code, ErrorCode::InvalidToken);
+}
+
+#[tokio::test]
+async fn test_verify_tampered_token_rejected() {
+    let Some(ctx) = setup_live_db().await else {
+        return;
+    };
+
+    let email = format!("tamper_{}@example.com", Uuid::new_v4());
+    let password = "ValidPassword123!";
+    let config = ctx.state.auth_service.config.clone();
+    let password_hash = hash_password(password, &config).unwrap();
+
+    let user_row = sqlx::query(
+        "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, false) RETURNING id",
+    )
+    .bind(&email)
+    .bind(&password_hash)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    let user_id: Uuid = user_row.get("id");
+
+    let (raw_token, stored_hash) = generate_token();
+    let expires_at = Utc::now() + Duration::hours(24);
+
+    sqlx::query(
+        "INSERT INTO verification_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
+    )
+    .bind(stored_hash.as_slice())
+    .bind(user_id)
+    .bind(expires_at)
+    .execute(&ctx.pool)
+    .await
+    .unwrap();
+
+    let tampered_char = if raw_token.starts_with('a') { 'b' } else { 'a' };
+    let tampered_token = format!("{}{}", tampered_char, &raw_token[1..]);
+
+    let req = json_request(
+        Method::POST,
+        "/auth/verify",
+        json!({"token": tampered_token}),
+    );
+    let resp = ctx.router.oneshot(req).await.unwrap();
+    let (status, _, body_str) = response_json(resp).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+    assert_eq!(err.code, ErrorCode::InvalidToken);
+}
+
+#[tokio::test]
+async fn test_verify_uppercase_hex_accepted() {
+    let Some(ctx) = setup_live_db().await else {
+        return;
+    };
+
+    let email = format!("upper_hex_{}@example.com", Uuid::new_v4());
+    let password = "ValidPassword123!";
+    let config = ctx.state.auth_service.config.clone();
+    let password_hash = hash_password(password, &config).unwrap();
+
+    let user_row = sqlx::query(
+        "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, false) RETURNING id",
+    )
+    .bind(&email)
+    .bind(&password_hash)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    let user_id: Uuid = user_row.get("id");
+
+    let (raw_token, stored_hash) = generate_token();
+    let expires_at = Utc::now() + Duration::hours(24);
+
+    sqlx::query(
+        "INSERT INTO verification_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
+    )
+    .bind(stored_hash.as_slice())
+    .bind(user_id)
+    .bind(expires_at)
+    .execute(&ctx.pool)
+    .await
+    .unwrap();
+
+    let upper_token = raw_token.to_uppercase();
+    assert_ne!(upper_token, raw_token);
+
+    let req = json_request(
+        Method::POST,
+        "/auth/verify",
+        json!({"token": upper_token}),
+    );
+    let resp = ctx.router.oneshot(req).await.unwrap();
+    let (status, body, _) = response_json(resp).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["message"], "email verified");
+
+    let verified: bool = sqlx::query_scalar("SELECT email_verified FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+    assert!(verified);
+}
+
+#[tokio::test]
+async fn test_verify_token_from_reset_flow_rejected() {
+    let Some(ctx) = setup_live_db().await else {
+        return;
+    };
+
+    let email = format!("cross_verify_{}@example.com", Uuid::new_v4());
+    let password = "ValidPassword123!";
+    let config = ctx.state.auth_service.config.clone();
+    let password_hash = hash_password(password, &config).unwrap();
+
+    let user_row = sqlx::query(
+        "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, false) RETURNING id",
+    )
+    .bind(&email)
+    .bind(&password_hash)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    let user_id: Uuid = user_row.get("id");
+
+    let (reset_token, reset_hash) = generate_token();
+    let expires_at = Utc::now() + Duration::hours(1);
+
+    sqlx::query(
+        "INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
+    )
+    .bind(reset_hash.as_slice())
+    .bind(user_id)
+    .bind(expires_at)
+    .execute(&ctx.pool)
+    .await
+    .unwrap();
+
+    let req = json_request(
+        Method::POST,
+        "/auth/verify",
+        json!({"token": reset_token}),
+    );
+    let resp = ctx.router.oneshot(req).await.unwrap();
+    let (status, _, body_str) = response_json(resp).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+    assert_eq!(err.code, ErrorCode::InvalidToken);
+
+    let verified: bool = sqlx::query_scalar("SELECT email_verified FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+    assert!(!verified);
+}
+
+#[tokio::test]
+async fn test_verify_method_not_allowed() {
+    let router = create_test_router();
+
+    for method in [Method::GET, Method::PUT, Method::DELETE, Method::PATCH] {
+        let req = Request::builder()
+            .method(method.clone())
+            .uri("/auth/verify")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.headers()
+                .get(header::ALLOW)
+                .and_then(|v| v.to_str().ok()),
+            Some("POST"),
+            "Method {:?} must return Allow: POST",
+            method
+        );
+        let (status, _, body_str) = response_json(resp).await;
+
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(err.code, ErrorCode::MethodNotAllowed);
     }
 }
 

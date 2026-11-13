@@ -32,12 +32,24 @@ pub(crate) fn hash_password_with_params(
     t_cost: u32,
     p_cost: u32,
 ) -> Result<String, AppError> {
-    let params = Params::new(m_cost, t_cost, p_cost, Some(32)).map_err(|_| AppError::Internal)?;
+    let params = Params::new(m_cost, t_cost, p_cost, Some(32)).map_err(|err| {
+        tracing::error!(
+            error = %err,
+            m_cost,
+            t_cost,
+            p_cost,
+            "invalid Argon2 parameters"
+        );
+        AppError::Internal
+    })?;
     let argon2 = Argon2::new(argon2::Algorithm::Argon2id, Version::V0x13, params);
     let salt = SaltString::generate(&mut OsRng);
     let hash = argon2
         .hash_password(password.as_bytes(), &salt)
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|err| {
+            tracing::error!(error = %err, "failed to hash password with Argon2");
+            AppError::Internal
+        })?;
     Ok(hash.to_string())
 }
 
@@ -47,19 +59,33 @@ pub(crate) fn hash_password_with_params(
 /// Returns `Ok(true)` on match, `Ok(false)` on mismatch, and `Err(AppError::Internal)`
 /// on a malformed PHC string.
 pub fn verify_password(password: &str, phc_hash: &str) -> Result<bool, AppError> {
-    let parsed = PasswordHash::new(phc_hash).map_err(|_| AppError::Internal)?;
+    let parsed = PasswordHash::new(phc_hash).map_err(|err| {
+        tracing::error!(error = %err, "failed to parse PHC password hash");
+        AppError::Internal
+    })?;
     let result = Argon2::default().verify_password(password.as_bytes(), &parsed);
     match result {
         Ok(()) => Ok(true),
         Err(argon2::password_hash::Error::Password) => Ok(false),
-        Err(_) => Err(AppError::Internal),
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                "Argon2 password verification failed with internal error"
+            );
+            Err(AppError::Internal)
+        }
     }
 }
 
 /// Pre-compute a dummy PHC hash for constant-time anti-enumeration on login miss.
 ///
-/// Generates a 32-byte random dummy secret using `OsRng`, and hashes it using
-/// the exact `AppConfig` parameters to ensure timing parity with real verification attempts.
+/// # Security Invariants
+/// - **Parameter Parity**: Must strictly match the `m_cost`, `t_cost`, and `p_cost` parameters
+///   from `AppConfig`. Delegates directly to [`hash_password`] to ensure identical memory, time,
+///   and parallelism costs so verification timing is indistinguishable from real password hashes.
+/// - **Entropy**: Uses a 32-byte CSPRNG random secret (`OsRng`) and a fresh random 16-byte salt
+///   per call, preventing precomputation or rainbow table shortcuts.
+/// - **Lifecycle**: Must be regenerated whenever `AppConfig` Argon2 parameters are updated.
 pub fn generate_dummy_hash(config: &AppConfig) -> Result<String, AppError> {
     let mut dummy_bytes = [0u8; 32];
     OsRng.fill_bytes(&mut dummy_bytes);
@@ -150,5 +176,55 @@ mod tests {
         let pw = "🔐🔑🗝️🔒🔓🛡️⚔️🏰";
         let hash = hash_password(pw, &config).unwrap();
         assert!(verify_password(pw, &hash).unwrap());
+    }
+
+    #[test]
+    fn hash_password_with_invalid_params_fails() {
+        assert!(matches!(
+            hash_password_with_params("pw", 1, 3, 4),
+            Err(AppError::Internal)
+        ));
+        assert!(matches!(
+            hash_password_with_params("pw", 65536, 0, 4),
+            Err(AppError::Internal)
+        ));
+        assert!(matches!(
+            hash_password_with_params("pw", 65536, 3, 0),
+            Err(AppError::Internal)
+        ));
+    }
+
+    #[test]
+    fn verify_password_with_empty_or_unsupported_phc_fails() {
+        assert!(matches!(verify_password("pw", ""), Err(AppError::Internal)));
+        assert!(matches!(
+            verify_password("pw", "$unknown$v=19$foo"),
+            Err(AppError::Internal)
+        ));
+    }
+
+    #[test]
+    fn empty_password_hashes_and_verifies_correctly() {
+        let config = AppConfig {
+            argon2_m_cost: 19456,
+            argon2_t_cost: 1,
+            argon2_p_cost: 1,
+            ..Default::default()
+        };
+        let hash = hash_password("", &config).unwrap();
+        assert!(verify_password("", &hash).unwrap());
+        assert!(!verify_password("non-empty", &hash).unwrap());
+    }
+
+    #[test]
+    fn dummy_hash_mismatch_returns_false() {
+        let config = AppConfig {
+            argon2_m_cost: 19456,
+            argon2_t_cost: 1,
+            argon2_p_cost: 1,
+            ..Default::default()
+        };
+        let dummy = generate_dummy_hash(&config).unwrap();
+        assert!(!verify_password("wrong-password", &dummy).unwrap());
     }
 }

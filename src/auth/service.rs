@@ -10,6 +10,7 @@
 //! - request_password_reset always queries DB; always returns Ok(())
 //! - token tables are DELETE-on-consume within a transaction (no TOCTOU)
 //! - reset_password deletes ALL reset tokens for user on success
+//! - email dispatch is detached from the response path (mailer latency is never observable)
 
 use std::sync::Arc;
 
@@ -137,23 +138,23 @@ impl AuthServiceImpl {
 
         tx.commit().await.map_err(AppError::Database)?;
 
-        // Fire-and-forget email dispatch — never await on HTTP path
-        let dispatcher = Arc::clone(&self.dispatcher);
+        // Detached after commit: response latency must not depend on mailer latency, and
+        // the delivery task must outlive a client disconnect. The returned handle is
+        // dropped on purpose — awaiting it would reintroduce the dependency.
         let url = EmailDispatcher::build_verification_url(
-            dispatcher.base_url().unwrap_or(""),
+            self.dispatcher.base_url().unwrap_or(""),
             &raw_token,
         );
-        tokio::spawn(async move {
-            let _ = dispatcher
-                .dispatch_verification(VerificationEmailPayload {
-                    user_id,
-                    to: normalized_email,
-                    token: raw_token,
-                    url,
-                    expires_at,
-                })
-                .await;
-        });
+        let _ = self
+            .dispatcher
+            .dispatch_verification(VerificationEmailPayload {
+                user_id,
+                to: normalized_email,
+                token: raw_token,
+                url,
+                expires_at,
+            })
+            .await;
 
         Ok(())
     }
@@ -255,11 +256,17 @@ impl AuthServiceImpl {
             return Err(AppError::TokenExpired);
         }
 
-        sqlx::query("UPDATE users SET email_verified = true, updated_at = NOW() WHERE id = $1")
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(AppError::Database)?;
+        let update_res =
+            sqlx::query("UPDATE users SET email_verified = true, updated_at = NOW() WHERE id = $1")
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(AppError::Database)?;
+
+        if update_res.rows_affected() != 1 {
+            let _ = tx.rollback().await;
+            return Err(AppError::InvalidToken);
+        }
 
         tx.commit().await.map_err(AppError::Database)?;
         Ok(())
@@ -298,21 +305,21 @@ impl AuthServiceImpl {
             .await
             .map_err(AppError::Database)?;
 
-            let dispatcher = Arc::clone(&self.dispatcher);
-            let uid = user_id;
-            let url =
-                EmailDispatcher::build_reset_url(dispatcher.base_url().unwrap_or(""), &raw_token);
-            tokio::spawn(async move {
-                let _ = dispatcher
-                    .dispatch_password_reset(PasswordResetEmailPayload {
-                        user_id: uid,
-                        to: normalized_email,
-                        token: raw_token,
-                        url,
-                        expires_at,
-                    })
-                    .await;
-            });
+            // Detached, see the comment on signup.
+            let url = EmailDispatcher::build_reset_url(
+                self.dispatcher.base_url().unwrap_or(""),
+                &raw_token,
+            );
+            let _ = self
+                .dispatcher
+                .dispatch_password_reset(PasswordResetEmailPayload {
+                    user_id,
+                    to: normalized_email,
+                    token: raw_token,
+                    url,
+                    expires_at,
+                })
+                .await;
         }
 
         Ok(())
@@ -359,12 +366,18 @@ impl AuthServiceImpl {
 
         let mut tx = self.pool.begin().await.map_err(AppError::Database)?;
 
-        sqlx::query("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2")
-            .bind(&new_hash)
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(AppError::Database)?;
+        let update_res =
+            sqlx::query("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2")
+                .bind(&new_hash)
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(AppError::Database)?;
+
+        if update_res.rows_affected() != 1 {
+            let _ = tx.rollback().await;
+            return Err(AppError::InvalidToken);
+        }
 
         // Invalidate ALL remaining reset tokens for this user
         sqlx::query("DELETE FROM password_reset_tokens WHERE user_id = $1")
@@ -421,7 +434,6 @@ mod tests {
         let dispatcher = Arc::new(EmailDispatcher::new(
             None,
             std::time::Duration::from_secs(10),
-            true,
         ));
         AuthServiceImpl::new(pool, config, dispatcher).expect("test service")
     }
@@ -436,7 +448,6 @@ mod tests {
         let dispatcher = Arc::new(EmailDispatcher::new(
             None,
             std::time::Duration::from_secs(10),
-            true,
         ));
         let res = AuthServiceImpl::new(pool, invalid_config, dispatcher);
         assert!(matches!(res, Err(AppError::Config(_))));
@@ -446,6 +457,8 @@ mod tests {
     struct ArcCapturingSender {
         verification_calls: Arc<Mutex<Vec<VerificationEmailPayload>>>,
         reset_calls: Arc<Mutex<Vec<PasswordResetEmailPayload>>>,
+        /// Notified after each send, so tests never poll or sleep for detached dispatch.
+        sent: Arc<tokio::sync::Notify>,
     }
 
     #[async_trait::async_trait]
@@ -455,6 +468,7 @@ mod tests {
             payload: VerificationEmailPayload,
         ) -> Result<(), crate::email::hook::DynError> {
             self.verification_calls.lock().unwrap().push(payload);
+            self.sent.notify_one();
             Ok(())
         }
 
@@ -463,6 +477,55 @@ mod tests {
             payload: PasswordResetEmailPayload,
         ) -> Result<(), crate::email::hook::DynError> {
             self.reset_calls.lock().unwrap().push(payload);
+            self.sent.notify_one();
+            Ok(())
+        }
+    }
+
+    /// Mailer that blocks until `release` is notified — a slow mailer the request path
+    /// must never wait for.
+    #[derive(Clone)]
+    struct GatedSender {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        completed: Arc<tokio::sync::Notify>,
+        delivered: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl GatedSender {
+        fn new() -> Self {
+            Self {
+                entered: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Notify::new()),
+                completed: Arc::new(tokio::sync::Notify::new()),
+                delivered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+        }
+
+        async fn send_gated(&self) {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.delivered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.completed.notify_one();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EmailSender for GatedSender {
+        async fn send_verification_email(
+            &self,
+            _payload: VerificationEmailPayload,
+        ) -> Result<(), crate::email::hook::DynError> {
+            self.send_gated().await;
+            Ok(())
+        }
+
+        async fn send_password_reset_email(
+            &self,
+            _payload: PasswordResetEmailPayload,
+        ) -> Result<(), crate::email::hook::DynError> {
+            self.send_gated().await;
             Ok(())
         }
     }
@@ -475,8 +538,18 @@ mod tests {
 
     async fn setup_db_context() -> Option<DbTestContext> {
         dotenvy::dotenv().ok();
-        let url = std::env::var("DATABASE_URL").ok()?;
-        let pool = PgPool::connect(&url).await.ok()?;
+        let url = db_test_url()?;
+        // Runs the embedded migrations, so a bare Postgres (CI service container) is enough.
+        let pool = crate::db::init_pool_with_options(
+            &url,
+            crate::db::DbPoolOptions {
+                max_connections: 5,
+                min_connections: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("DATABASE_URL is set, so the DB-backed test must connect");
         let config = Arc::new(AppConfig {
             argon2_m_cost: 19456,
             argon2_t_cost: 2,
@@ -487,7 +560,6 @@ mod tests {
         let dispatcher = Arc::new(EmailDispatcher::new(
             Some(Arc::new(sender.clone())),
             std::time::Duration::from_secs(10),
-            true,
         ));
         let service = AuthServiceImpl::new(pool.clone(), config, dispatcher).ok()?;
         Some(DbTestContext {
@@ -495,6 +567,22 @@ mod tests {
             pool,
             sender,
         })
+    }
+
+    /// Returns `DATABASE_URL`, or skips loudly. In CI the variable is mandatory, so a
+    /// missing value fails the run instead of silently reporting green.
+    fn db_test_url() -> Option<String> {
+        match std::env::var("DATABASE_URL") {
+            Ok(url) => Some(url),
+            Err(_) => {
+                assert!(
+                    std::env::var_os("CI").is_none(),
+                    "DATABASE_URL must be set in CI: DB-backed tests must never skip silently"
+                );
+                eprintln!("SKIP: DB-backed auth tests need DATABASE_URL");
+                None
+            }
+        }
     }
 
     #[test]
@@ -617,8 +705,13 @@ mod tests {
         // Sign up user
         ctx.service.signup(&email, password).await.unwrap();
 
-        // Give async spawn time to dispatch
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Delivery is detached: wait for the sender signal instead of racing a sleep.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ctx.sender.sent.notified(),
+        )
+        .await
+        .expect("verification email must be dispatched");
 
         let token = {
             let calls = ctx.sender.verification_calls.lock().unwrap();
@@ -832,5 +925,244 @@ mod tests {
         // Login with new password succeeds
         let new_login = ctx.service.login(&email, new_password).await;
         assert_eq!(new_login.unwrap(), user_id);
+    }
+
+    #[tokio::test]
+    async fn test_verify_email_rejects_missing_user() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+
+        let email = format!("missing_user_{}@example.com", Uuid::new_v4());
+        let password = "SecurePassword123!";
+        let config = Arc::clone(&ctx.service.config);
+        let password_hash = hash_password(password, &config).unwrap();
+
+        // Insert real user first to satisfy foreign key constraint (user_id REFERENCES users(id) ON DELETE CASCADE)
+        let row = sqlx::query(
+            "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, false) RETURNING id",
+        )
+        .bind(&email)
+        .bind(&password_hash)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+        let user_id: Uuid = row.get("id");
+
+        let (raw_token, token_hash) = generate_token();
+        let future_time = Utc::now() + chrono::Duration::hours(1);
+
+        sqlx::query(
+            "INSERT INTO verification_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
+        )
+        .bind(&token_hash[..])
+        .bind(user_id)
+        .bind(future_time)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+
+        // In PostgreSQL, verification_tokens.user_id enforces ON DELETE CASCADE.
+        // Deleting the user triggers cascade, testing that verify_email cleanly rejects
+        // missing/invalidated tokens with InvalidToken without violating DB FK constraints.
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&ctx.pool)
+            .await
+            .unwrap();
+
+        let res = ctx.service.verify_email(&raw_token).await;
+        assert!(
+            matches!(res, Err(AppError::InvalidToken)),
+            "verify_email must return InvalidToken when user/token does not exist: {:?}",
+            res
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reset_password_rejects_missing_user() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+
+        let email = format!("reset_missing_{}@example.com", Uuid::new_v4());
+        let password = "SecurePassword123!";
+        let config = Arc::clone(&ctx.service.config);
+        let password_hash = hash_password(password, &config).unwrap();
+
+        // Insert real user first to satisfy foreign key constraint (user_id REFERENCES users(id) ON DELETE CASCADE)
+        let row = sqlx::query(
+            "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true) RETURNING id",
+        )
+        .bind(&email)
+        .bind(&password_hash)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+        let user_id: Uuid = row.get("id");
+
+        let (raw_token, token_hash) = generate_token();
+        let future_time = Utc::now() + chrono::Duration::hours(1);
+
+        sqlx::query(
+            "INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
+        )
+        .bind(&token_hash[..])
+        .bind(user_id)
+        .bind(future_time)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+
+        // In PostgreSQL, password_reset_tokens.user_id enforces ON DELETE CASCADE.
+        // Deleting the user triggers cascade, testing that reset_password cleanly rejects
+        // missing/invalidated tokens with InvalidToken without violating DB FK constraints.
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&ctx.pool)
+            .await
+            .unwrap();
+
+        let res = ctx
+            .service
+            .reset_password(&raw_token, "NewPassword123!")
+            .await;
+        assert!(
+            matches!(res, Err(AppError::InvalidToken)),
+            "reset_password must return InvalidToken when user/token does not exist: {:?}",
+            res
+        );
+    }
+
+    /// Builds a service whose dispatcher blocks inside the mailer until released.
+    fn gated_service(ctx: &DbTestContext, sender: &GatedSender) -> AuthServiceImpl {
+        let dispatcher = Arc::new(EmailDispatcher::new(
+            Some(Arc::new(sender.clone())),
+            std::time::Duration::from_secs(10),
+        ));
+        AuthServiceImpl::new(
+            ctx.pool.clone(),
+            Arc::clone(&ctx.service.config),
+            dispatcher,
+        )
+        .unwrap()
+    }
+
+    /// Waits for the detached delivery task to reach the mailer.
+    async fn wait_mailer_entered(sender: &GatedSender) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), sender.entered.notified())
+            .await
+            .expect("email must be dispatched");
+    }
+
+    async fn wait_mailer_delivered(sender: &GatedSender) {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sender.completed.notified(),
+        )
+        .await
+        .expect("detached delivery must complete once released");
+        assert!(sender.delivered.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// Regression guard for the signup request path: returning before the mailer does is
+    /// the whole point. Re-awaiting the dispatch handle blocks past the 5 s guard.
+    #[tokio::test]
+    async fn signup_returns_before_delivery() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let sender = GatedSender::new();
+        let service = gated_service(&ctx, &sender);
+        let email = format!("detached_signup_{}@example.com", Uuid::new_v4());
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            service.signup(&email, "SecurePassword123!"),
+        )
+        .await
+        .expect("signup must not wait for the mailer")
+        .unwrap();
+
+        wait_mailer_entered(&sender).await;
+        assert!(
+            !sender.delivered.load(std::sync::atomic::Ordering::SeqCst),
+            "signup must return before delivery"
+        );
+
+        sender.release.notify_one();
+        wait_mailer_delivered(&sender).await;
+    }
+
+    /// Same guard for the password-reset request path.
+    #[tokio::test]
+    async fn request_password_reset_returns_before_delivery() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let sender = GatedSender::new();
+        let service = gated_service(&ctx, &sender);
+        let email = format!("detached_reset_{}@example.com", Uuid::new_v4());
+        let password_hash = hash_password("SecurePassword123!", &ctx.service.config).unwrap();
+
+        sqlx::query(
+            "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true)",
+        )
+        .bind(&email)
+        .bind(&password_hash)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            service.request_password_reset(&email),
+        )
+        .await
+        .expect("reset request must not wait for the mailer")
+        .unwrap();
+
+        wait_mailer_entered(&sender).await;
+        assert!(
+            !sender.delivered.load(std::sync::atomic::Ordering::SeqCst),
+            "reset request must return before delivery"
+        );
+
+        sender.release.notify_one();
+        wait_mailer_delivered(&sender).await;
+    }
+
+    /// Delivery must complete even when the request future is dropped mid-flight.
+    #[tokio::test]
+    async fn dispatch_survives_cancelled_request_future() {
+        let sender = GatedSender::new();
+        let dispatcher = Arc::new(EmailDispatcher::new(
+            Some(Arc::new(sender.clone())),
+            std::time::Duration::from_secs(10),
+        ));
+        let payload = VerificationEmailPayload {
+            user_id: Uuid::new_v4(),
+            to: "user@example.com".into(),
+            token: "token".into(),
+            url: "https://example.com/auth/verify/email?token=token".into(),
+            expires_at: Utc::now(),
+        };
+
+        // Mirrors the service call site: the delivery task is spawned before the
+        // request future can be dropped.
+        let request = tokio::spawn(async move {
+            let _ = dispatcher.dispatch_verification(payload).await;
+            std::future::pending::<()>().await;
+        });
+
+        wait_mailer_entered(&sender).await;
+        request.abort();
+        assert!(
+            request.await.is_err(),
+            "request future must have been cancelled"
+        );
+
+        sender.release.notify_one();
+        wait_mailer_delivered(&sender).await;
     }
 }

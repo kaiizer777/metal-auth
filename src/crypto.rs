@@ -6,4 +6,4 @@ pub mod token;
 
 pub use argon2::{generate_dummy_hash, hash_password, verify_password};
 pub use blocklist::is_common_password;
-pub use token::{generate_token, hash_token, sha256_of_hex_token};
+pub use token::{generate_token, hash_token, is_valid_token_format, sha256_of_hex_token};

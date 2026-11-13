@@ -103,16 +103,13 @@ pub async fn signup(
     }
 
     match state.service.signup(&req.email, &req.password).await {
-        Ok(()) | Err(AppError::EmailAlreadyExists) => {
-            // Anti-enum: both paths return identical 200
-            (
-                StatusCode::OK,
-                Json(MessageResponse::new(
-                    "if this email is new, a verification link has been sent",
-                )),
-            )
-                .into_response()
-        }
+        Ok(()) => (
+            StatusCode::OK,
+            Json(MessageResponse::new(
+                "if this email is new, a verification link has been sent",
+            )),
+        )
+            .into_response(),
         Err(e) => service_error_response(e),
     }
 }
@@ -250,7 +247,6 @@ mod tests {
         let dispatcher = Arc::new(EmailDispatcher::new(
             None,
             std::time::Duration::from_secs(10),
-            true,
         ));
         let service =
             Arc::new(AuthServiceImpl::new(pool, config, dispatcher).expect("test service"));

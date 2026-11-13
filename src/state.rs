@@ -5,9 +5,24 @@ use sqlx::PgPool;
 use crate::{
     auth::service::AuthServiceImpl,
     config::{AppConfig, Config},
-    email::dispatcher::EmailDispatcher,
+    email::{dispatcher::EmailDispatcher, hook::SharedEmailSender},
     error::AppError,
 };
+
+/// Constructs an [`EmailDispatcher`] from application config and optional email sender.
+pub fn create_email_dispatcher(
+    config: &Config,
+    sender: Option<SharedEmailSender>,
+) -> Arc<EmailDispatcher> {
+    Arc::new(
+        EmailDispatcher::new(sender, config.email_dispatch_timeout).with_base_url(&config.base_url),
+    )
+}
+
+/// Constructs a default [`EmailDispatcher`] with no sender from application config.
+pub fn default_email_dispatcher(config: &Config) -> Arc<EmailDispatcher> {
+    create_email_dispatcher(config, None)
+}
 
 #[derive(Clone, Debug)]
 pub struct AppState {
@@ -25,16 +40,10 @@ impl AppState {
     }
 
     pub fn with_auth_config(mut self, auth_config: Arc<AppConfig>) -> Result<Self, AppError> {
-        let dispatcher = self.email_dispatcher.clone().unwrap_or_else(|| {
-            Arc::new(
-                EmailDispatcher::new(
-                    None,
-                    self.config.email_dispatch_timeout,
-                    self.config.async_email_dispatch,
-                )
-                .with_base_url(&self.config.base_url),
-            )
-        });
+        let dispatcher = self
+            .email_dispatcher
+            .clone()
+            .unwrap_or_else(|| default_email_dispatcher(&self.config));
         self.auth_service = Arc::new(AuthServiceImpl::new(
             self.pool.clone(),
             Arc::clone(&auth_config),
@@ -56,19 +65,7 @@ impl AppState {
         auth_config: Arc<AppConfig>,
         email_dispatcher: Arc<EmailDispatcher>,
     ) -> Result<Self, AppError> {
-        let auth_service = Arc::new(AuthServiceImpl::new(
-            pool.clone(),
-            Arc::clone(&auth_config),
-            Arc::clone(&email_dispatcher),
-        )?);
-
-        Ok(Self {
-            pool,
-            config,
-            auth_config,
-            auth_service,
-            email_dispatcher: Some(email_dispatcher),
-        })
+        Self::with_configs_and_dispatcher(pool, config, auth_config, Some(email_dispatcher))
     }
 
     pub fn with_configs_and_dispatcher(
@@ -77,16 +74,13 @@ impl AppState {
         auth_config: Arc<AppConfig>,
         email_dispatcher: Option<Arc<EmailDispatcher>>,
     ) -> Result<Self, AppError> {
-        let dispatcher = email_dispatcher.clone().unwrap_or_else(|| {
-            Arc::new(
-                EmailDispatcher::new(
-                    None,
-                    config.email_dispatch_timeout,
-                    config.async_email_dispatch,
-                )
-                .with_base_url(&config.base_url),
-            )
-        });
+        // Single construction choke point for every `AppState` constructor: a router can
+        // never be built from a config the dispatcher mode or CORS rules reject.
+        config.validate().map_err(AppError::Config)?;
+
+        let dispatcher = email_dispatcher
+            .clone()
+            .unwrap_or_else(|| default_email_dispatcher(&config));
 
         let auth_service = Arc::new(AuthServiceImpl::new(
             pool.clone(),

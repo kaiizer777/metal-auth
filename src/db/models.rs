@@ -8,7 +8,7 @@ pub use crate::auth::models::UserResponse;
 ///
 /// Intentionally does NOT derive `Serialize` to prevent `password_hash`
 /// from ever leaking across API responses. Outbound serialization must
-/// use [`UserResponse`].
+/// use [`UserResponse`](crate::auth::models::UserResponse).
 #[derive(Debug, Clone, FromRow, PartialEq, Eq)]
 pub struct User {
     pub id: Uuid,
@@ -57,26 +57,31 @@ pub struct PasswordResetToken {
     pub created_at: DateTime<Utc>,
 }
 
-#[test]
-fn test_user_to_user_response_conversion() {
-    let now = Utc::now();
-    let user_id = Uuid::new_v4();
-    let user = User {
-        id: user_id,
-        email: "alice@example.com".to_string(),
-        password_hash: "argon2id$hashedpassword".to_string(),
-        email_verified: true,
-        created_at: now,
-        updated_at: now,
-    };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let response = UserResponse::from(&user);
-    assert_eq!(response.id, user_id);
-    assert_eq!(response.email, "alice@example.com");
-    assert!(response.email_verified);
-    assert_eq!(response.created_at, now);
+    #[test]
+    fn test_user_to_user_response_conversion() {
+        let now = Utc::now();
+        let user_id = Uuid::new_v4();
+        let user = User {
+            id: user_id,
+            email: "alice@example.com".to_string(),
+            password_hash: "argon2id$hashedpassword".to_string(),
+            email_verified: true,
+            created_at: now,
+            updated_at: now,
+        };
 
-    let json = serde_json::to_string(&response).expect("serialize response");
-    assert!(!json.contains("password_hash"));
-    assert!(!json.contains("argon2id"));
+        let response = UserResponse::from(&user);
+        assert_eq!(response.id, user_id);
+        assert_eq!(response.email, "alice@example.com");
+        assert!(response.email_verified);
+        assert_eq!(response.created_at, now);
+
+        let json = serde_json::to_string(&response).expect("serialize response");
+        assert!(!json.contains("password_hash"));
+        assert!(!json.contains("argon2id"));
+    }
 }

@@ -8,7 +8,7 @@ use crate::{
     email::{dispatcher::EmailDispatcher, hook::SharedEmailSender},
     error::AppError,
     handler,
-    state::AppState,
+    state::{self, AppState},
 };
 
 pub mod models;
@@ -53,26 +53,8 @@ impl Auth {
         auth_cfg: Arc<AppConfig>,
         sender: Option<SharedEmailSender>,
     ) -> Result<Self, AppError> {
-        cfg.validate()?;
-        let pool = db::init_pool(&cfg).await?;
-        let dispatcher = Arc::new(
-            EmailDispatcher::new(sender, cfg.email_dispatch_timeout, cfg.async_email_dispatch)
-                .with_base_url(&cfg.base_url),
-        );
-        let auth_service = Arc::new(AuthServiceImpl::new(
-            pool.clone(),
-            Arc::clone(&auth_cfg),
-            Arc::clone(&dispatcher),
-        )?);
-        let state = AppState {
-            pool,
-            config: cfg,
-            auth_config: auth_cfg,
-            auth_service,
-            email_dispatcher: Some(dispatcher),
-        };
-        let router = handler::create_router(state)?;
-        Ok(Self { router })
+        let dispatcher = state::create_email_dispatcher(&cfg, sender);
+        Self::with_dispatcher(cfg, auth_cfg, dispatcher).await
     }
 
     /// Constructs an `Auth` instance with explicit [`AppConfig`] and [`EmailDispatcher`].
@@ -83,20 +65,8 @@ impl Auth {
     ) -> Result<Self, AppError> {
         cfg.validate()?;
         let pool = db::init_pool(&cfg).await?;
-        let auth_service = Arc::new(AuthServiceImpl::new(
-            pool.clone(),
-            Arc::clone(&auth_cfg),
-            Arc::clone(&dispatcher),
-        )?);
-        let state = AppState {
-            pool,
-            config: cfg,
-            auth_config: auth_cfg,
-            auth_service,
-            email_dispatcher: Some(dispatcher),
-        };
-        let router = handler::create_router(state)?;
-        Ok(Self { router })
+        let state = AppState::with_dispatcher(pool, cfg, auth_cfg, dispatcher)?;
+        Self::from_state(state)
     }
 
     /// Constructs an `Auth` instance from an existing [`AppState`].
@@ -104,5 +74,28 @@ impl Auth {
         state.config.validate()?;
         let router = handler::create_router(state)?;
         Ok(Self { router })
+    }
+
+    /// Consumes the `Auth` instance and returns the inner [`Router`].
+    pub fn into_router(self) -> Router {
+        self.router
+    }
+
+    /// Returns a clone of the inner [`Router`].
+    pub fn router(&self) -> Router {
+        self.router.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_auth_router_accessors() {
+        let router = Router::new();
+        let auth = Auth { router };
+        let _cloned: Router = auth.router();
+        let _consumed: Router = auth.into_router();
     }
 }

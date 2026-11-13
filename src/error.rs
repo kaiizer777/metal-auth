@@ -109,12 +109,15 @@ pub enum AppError {
     Internal,
 
     // Phase 2 — email dispatch
+    /// Email sender hook was not configured when email dispatch was attempted.
     #[error("email sender not configured")]
     EmailHookNotConfigured,
 
+    /// Email dispatch failed during external delivery via the email hook.
     #[error("email dispatch failed")]
     EmailDispatchFailed(#[source] DynError),
 
+    /// Email dispatch exceeded configured timeout duration.
     #[error("email dispatch timed out")]
     EmailDispatchTimeout,
 
@@ -149,7 +152,9 @@ pub enum AppError {
     #[error("token expired")]
     TokenExpired,
 
-    /// Internal-only — never returned to clients. Used for server-side logging of dup-email signups.
+    /// Internal-only sentinel indicating a signup attempt for an already registered email.
+    ///
+    /// Preserves anti-enumeration guarantees without revealing account existence to clients.
     #[error("email already exists")]
     EmailAlreadyExists,
 }
@@ -251,13 +256,11 @@ impl IntoResponse for AppError {
             Self::NotFound => tracing::debug!("resource not found"),
             Self::MethodNotAllowed => tracing::debug!("method not allowed"),
             Self::Internal => tracing::error!("internal error"),
-            // Email variants must never reach wire mapping; return a non-wire sentinel.
-            Self::EmailHookNotConfigured
-            | Self::EmailDispatchFailed(_)
-            | Self::EmailDispatchTimeout => {
-                tracing::error!("email variant unexpectedly reached IntoResponse");
-                return (StatusCode::INTERNAL_SERVER_ERROR).into_response();
+            Self::EmailHookNotConfigured => tracing::error!("email hook not configured"),
+            Self::EmailDispatchFailed(err) => {
+                tracing::error!(error = %err, "email dispatch failed")
             }
+            Self::EmailDispatchTimeout => tracing::error!("email dispatch timed out"),
             // Phase 3 — log at appropriate levels; never log credentials
             Self::InvalidCredentials => tracing::debug!("invalid credentials attempt"),
             Self::Unauthenticated => tracing::debug!("unauthenticated request"),
@@ -402,6 +405,30 @@ mod tests {
                 StatusCode::BAD_REQUEST,
                 ErrorCode::PasswordTooLong,
                 "Password exceeds the maximum length requirement",
+            ),
+            (
+                AppError::EmailHookNotConfigured,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::InternalError,
+                "Internal error",
+            ),
+            (
+                AppError::EmailDispatchFailed(Box::new(std::io::Error::other("mock failure"))),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::InternalError,
+                "Internal error",
+            ),
+            (
+                AppError::EmailDispatchTimeout,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::InternalError,
+                "Internal error",
+            ),
+            (
+                AppError::EmailAlreadyExists,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::InternalError,
+                "Internal error",
             ),
         ];
 

@@ -1,0 +1,2 @@
+[advisories]
+ignore = ["RUSTSEC-2026-0459"]  # libsqlite3-sys via sqlx-sqlite; SQLite unused (Postgres only)

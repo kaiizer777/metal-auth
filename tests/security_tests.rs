@@ -1016,6 +1016,101 @@ async fn test_verify_method_not_allowed() {
     }
 }
 
+// ─── Scenario 10f: Password reset request negative tests ────────────────────
+
+#[tokio::test]
+async fn test_password_reset_request_invalid_email_http() {
+    let router = create_test_router();
+
+    for bad_email in ["not-an-email", "@missing.com", "user@", "", "   "] {
+        let req = json_request(
+            Method::POST,
+            "/auth/password/reset-request",
+            json!({"email": bad_email}),
+        );
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let (status, _, body_str) = response_json(resp).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(err.code, ErrorCode::InvalidEmail);
+    }
+}
+
+#[tokio::test]
+async fn test_password_reset_request_sql_injection_no_leak() {
+    let router = create_test_router();
+
+    for sqli in [
+        "' OR '1'='1",
+        "admin'--",
+        "' UNION SELECT * FROM users--",
+        "'; DROP TABLE users; --",
+    ] {
+        let req = json_request(
+            Method::POST,
+            "/auth/password/reset-request",
+            json!({"email": sqli}),
+        );
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let (status, _, body_str) = response_json(resp).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(err.code, ErrorCode::InvalidEmail);
+
+        let lower = body_str.to_lowercase();
+        assert!(!lower.contains("syntax error"));
+        assert!(!lower.contains("postgres"));
+        assert!(!lower.contains("sqlx"));
+    }
+}
+
+#[tokio::test]
+async fn test_password_reset_request_malformed_json_rejected() {
+    let router = create_test_router();
+
+    let req = raw_json_request(
+        Method::POST,
+        "/auth/password/reset-request",
+        "{ invalid json",
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    let (status, _, body_str) = response_json(resp).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+    assert_eq!(err.code, ErrorCode::ValidationError);
+}
+
+#[tokio::test]
+async fn test_password_reset_request_method_not_allowed() {
+    let router = create_test_router();
+
+    for method in [Method::GET, Method::PUT, Method::DELETE, Method::PATCH] {
+        let req = Request::builder()
+            .method(method.clone())
+            .uri("/auth/password/reset-request")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.headers()
+                .get(header::ALLOW)
+                .and_then(|v| v.to_str().ok()),
+            Some("POST"),
+            "Method {:?} must return Allow: POST",
+            method
+        );
+        let (status, _, body_str) = response_json(resp).await;
+
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(err.code, ErrorCode::MethodNotAllowed);
+    }
+}
+
 // ─── Scenario 11: Password reset confirm invalid token ───────────────────────
 
 #[tokio::test]

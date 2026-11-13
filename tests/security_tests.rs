@@ -294,6 +294,155 @@ async fn test_signup_invalid_email_format() {
     }
 }
 
+// ─── Scenario 6a: Empty / whitespace email rejected ─────────────────────────
+
+#[tokio::test]
+async fn test_signup_empty_email_rejected() {
+    let router = create_test_router();
+
+    for bad_email in ["", "   ", "\t", "\n  \t"] {
+        let req = json_request(
+            Method::POST,
+            "/auth/signup",
+            json!({
+                "email": bad_email,
+                "password": "ValidPassword123!"
+            }),
+        );
+
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let (status, _, body_str) = response_json(resp).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(
+            err.code,
+            ErrorCode::InvalidEmail,
+            "empty/whitespace email should return INVALID_EMAIL"
+        );
+    }
+}
+
+// ─── Scenario 6b: Email too long rejected ────────────────────────────────────
+
+#[tokio::test]
+async fn test_signup_email_too_long_rejected() {
+    let router = create_test_router();
+    let long_email = format!("{}@example.com", "a".repeat(250)); // > 255 chars
+
+    let req = json_request(
+        Method::POST,
+        "/auth/signup",
+        json!({
+            "email": long_email,
+            "password": "ValidPassword123!"
+        }),
+    );
+
+    let resp = router.oneshot(req).await.unwrap();
+    let (status, _, body_str) = response_json(resp).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+    assert_eq!(err.code, ErrorCode::InvalidEmail);
+}
+
+// ─── Scenario 6c: Common password uppercase variant rejected ────────────────
+
+#[tokio::test]
+async fn test_signup_common_password_uppercase_rejected() {
+    let router = create_test_router();
+
+    for uppercase_pw in ["PASSWORD", "12345678", "QWERTY123", "ADMIN1234"] {
+        let req = json_request(
+            Method::POST,
+            "/auth/signup",
+            json!({
+                "email": "user@example.com",
+                "password": uppercase_pw
+            }),
+        );
+
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let (status, _, body_str) = response_json(resp).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(
+            err.code,
+            ErrorCode::PasswordTooCommon,
+            "uppercase common password '{}' should be rejected",
+            uppercase_pw
+        );
+    }
+}
+
+// ─── Scenario 6d: SQL injection payload in email ─────────────────────────────
+
+#[tokio::test]
+async fn test_signup_sql_injection_email_no_leak() {
+    let router = create_test_router();
+
+    for sqli_payload in [
+        "' OR '1'='1",
+        "admin'--",
+        "' UNION SELECT * FROM users--",
+        "'; DROP TABLE users; --",
+        "' OR 1=1; --",
+    ] {
+        let req = json_request(
+            Method::POST,
+            "/auth/signup",
+            json!({
+                "email": sqli_payload,
+                "password": "ValidPassword123!"
+            }),
+        );
+
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let (status, _, body_str) = response_json(resp).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(err.code, ErrorCode::InvalidEmail);
+
+        let lower = body_str.to_lowercase();
+        assert!(!lower.contains("syntax error"));
+        assert!(!lower.contains("postgres"));
+        assert!(!lower.contains("sqlx"));
+    }
+}
+
+// ─── Scenario 6e: XSS payload in email rejected ──────────────────────────────
+
+#[tokio::test]
+async fn test_signup_xss_email_rejected() {
+    let router = create_test_router();
+
+    for xss_payload in [
+        "<script>alert(1)</script>",
+        "\"><svg/onload=alert(1)>",
+        "<img src=x onerror=alert('xss')>",
+        "javascript:alert(1)",
+    ] {
+        let req = json_request(
+            Method::POST,
+            "/auth/signup",
+            json!({
+                "email": xss_payload,
+                "password": "ValidPassword123!"
+            }),
+        );
+
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let (status, _, body_str) = response_json(resp).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(err.code, ErrorCode::InvalidEmail);
+    }
+}
+
 // ─── Scenario 7: Empty login credentials rejected ────────────────────────────
 
 #[tokio::test]

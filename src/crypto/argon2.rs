@@ -227,4 +227,32 @@ mod tests {
         let dummy = generate_dummy_hash(&config).unwrap();
         assert!(!verify_password("wrong-password", &dummy).unwrap());
     }
+
+    #[test]
+    fn dummy_hash_successive_calls_differ() {
+        let config = AppConfig {
+            argon2_m_cost: 19456,
+            argon2_t_cost: 1,
+            argon2_p_cost: 1,
+            ..Default::default()
+        };
+        let h1 = generate_dummy_hash(&config).unwrap();
+        let h2 = generate_dummy_hash(&config).unwrap();
+        assert_ne!(h1, h2, "each call uses a fresh random secret and salt");
+    }
+
+    #[test]
+    fn dummy_hash_invalid_params_returns_internal_error() {
+        // m_cost=1 is below Argon2's minimum → Params::new fails → AppError::Internal
+        let config = AppConfig {
+            argon2_m_cost: 1,
+            argon2_t_cost: 1,
+            argon2_p_cost: 1,
+            ..Default::default()
+        };
+        assert!(matches!(
+            generate_dummy_hash(&config),
+            Err(AppError::Internal)
+        ));
+    }
 }

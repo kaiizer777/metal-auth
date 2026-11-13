@@ -10,6 +10,7 @@
 //! - request_password_reset always queries DB; always returns Ok(())
 //! - token tables are DELETE-on-consume within a transaction (no TOCTOU)
 //! - reset_password deletes ALL reset tokens for user on success
+//! - email dispatch is detached from the response path (mailer latency is never observable)
 
 use std::sync::Arc;
 
@@ -137,29 +138,23 @@ impl AuthServiceImpl {
 
         tx.commit().await.map_err(AppError::Database)?;
 
-        // Email dispatch is spawned onto an independent task and awaited for cancellation safety.
-        // If client cancels/disconnects during dispatch, task ownership ensures delivery completes
-        // and is not dropped after DB commit. When async_dispatch is true (production default),
-        // dispatch returns immediately, decoupling HTTP latency from external delivery and
-        // preventing timing enumeration. In synchronous mode (testing), the handle is awaited to
-        // ensure completion before returning.
+        // Detached after commit: response latency must not depend on mailer latency,
+        // and the task must outlive a client disconnect.
         let dispatcher = Arc::clone(&self.dispatcher);
         let url = EmailDispatcher::build_verification_url(
             dispatcher.base_url().unwrap_or(""),
             &raw_token,
         );
-        let handle = tokio::spawn(async move {
-            let _ = dispatcher
-                .dispatch_verification(VerificationEmailPayload {
-                    user_id,
-                    to: normalized_email,
-                    token: raw_token,
-                    url,
-                    expires_at,
-                })
-                .await;
-        });
-        let _ = handle.await;
+        spawn_verification_dispatch(
+            dispatcher,
+            VerificationEmailPayload {
+                user_id,
+                to: normalized_email,
+                token: raw_token,
+                url,
+                expires_at,
+            },
+        );
 
         Ok(())
     }
@@ -310,25 +305,20 @@ impl AuthServiceImpl {
             .await
             .map_err(AppError::Database)?;
 
-            // Email dispatch is spawned onto an independent task and awaited for cancellation safety.
-            // When async_dispatch is true (production default), dispatch returns immediately without
-            // awaiting external email delivery, ensuring response timing cannot be used to distinguish
-            // existing from non-existent accounts. In synchronous mode (testing), the handle is awaited.
+            // Detached: see `spawn_password_reset_dispatch`.
             let dispatcher = Arc::clone(&self.dispatcher);
             let url =
                 EmailDispatcher::build_reset_url(dispatcher.base_url().unwrap_or(""), &raw_token);
-            let handle = tokio::spawn(async move {
-                let _ = dispatcher
-                    .dispatch_password_reset(PasswordResetEmailPayload {
-                        user_id,
-                        to: normalized_email,
-                        token: raw_token,
-                        url,
-                        expires_at,
-                    })
-                    .await;
-            });
-            let _ = handle.await;
+            spawn_password_reset_dispatch(
+                dispatcher,
+                PasswordResetEmailPayload {
+                    user_id,
+                    to: normalized_email,
+                    token: raw_token,
+                    url,
+                    expires_at,
+                },
+            );
         }
 
         Ok(())
@@ -426,6 +416,31 @@ impl AuthService for AuthServiceImpl {
     }
 }
 
+/// Spawns verification email dispatch onto a detached task.
+///
+/// Never awaited: response latency must not depend on mailer latency, and the task must
+/// survive a dropped request future so delivery still happens after the DB commit.
+/// [`EmailDispatcher`] logs send failures; they never reach the caller.
+fn spawn_verification_dispatch(
+    dispatcher: Arc<EmailDispatcher>,
+    payload: VerificationEmailPayload,
+) {
+    drop(tokio::spawn(async move {
+        let _ = dispatcher.dispatch_verification(payload).await;
+    }));
+}
+
+/// Spawns password reset email dispatch onto a detached task. See
+/// [`spawn_verification_dispatch`].
+fn spawn_password_reset_dispatch(
+    dispatcher: Arc<EmailDispatcher>,
+    payload: PasswordResetEmailPayload,
+) {
+    drop(tokio::spawn(async move {
+        let _ = dispatcher.dispatch_password_reset(payload).await;
+    }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,6 +500,54 @@ mod tests {
             payload: PasswordResetEmailPayload,
         ) -> Result<(), crate::email::hook::DynError> {
             self.reset_calls.lock().unwrap().push(payload);
+            Ok(())
+        }
+    }
+
+    /// Mailer that blocks until `release` is notified — a slow mailer the request path
+    /// must never wait for.
+    #[derive(Clone)]
+    struct GatedSender {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        completed: Arc<tokio::sync::Notify>,
+        delivered: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl GatedSender {
+        fn new() -> Self {
+            Self {
+                entered: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Notify::new()),
+                completed: Arc::new(tokio::sync::Notify::new()),
+                delivered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+        }
+
+        async fn send_gated(&self) {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.delivered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.completed.notify_one();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EmailSender for GatedSender {
+        async fn send_verification_email(
+            &self,
+            _payload: VerificationEmailPayload,
+        ) -> Result<(), crate::email::hook::DynError> {
+            self.send_gated().await;
+            Ok(())
+        }
+
+        async fn send_password_reset_email(
+            &self,
+            _payload: PasswordResetEmailPayload,
+        ) -> Result<(), crate::email::hook::DynError> {
+            self.send_gated().await;
             Ok(())
         }
     }
@@ -963,14 +1026,134 @@ mod tests {
         );
     }
 
+    /// Request-path sites must return while the mailer is still blocked, in the loudest
+    /// dispatch mode (`async_dispatch == false`).
     #[tokio::test]
-    async fn test_sync_email_dispatch_on_signup() {
+    async fn signup_dispatch_does_not_wait_for_slow_mailer() {
+        let sender = GatedSender::new();
+        let dispatcher = Arc::new(EmailDispatcher::new(
+            Some(Arc::new(sender.clone())),
+            std::time::Duration::from_secs(10),
+            false,
+        ));
+        let payload = VerificationEmailPayload {
+            user_id: Uuid::new_v4(),
+            to: "user@example.com".into(),
+            token: "token".into(),
+            url: "https://example.com/auth/verify/email?token=token".into(),
+            expires_at: Utc::now(),
+        };
+
+        // Stands in for the signup handler future; dispatch is its last step before the 200.
+        let request = tokio::spawn(async move {
+            spawn_verification_dispatch(dispatcher, payload);
+        });
+
+        sender.entered.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), request)
+            .await
+            .expect("request path must not await mailer")
+            .expect("dispatch task must not panic");
+        assert!(
+            !sender.delivered.load(std::sync::atomic::Ordering::SeqCst),
+            "mailer must still be blocked when the request path returns"
+        );
+
+        sender.release.notify_one();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sender.completed.notified(),
+        )
+        .await
+        .expect("detached dispatch must deliver once released");
+    }
+
+    #[tokio::test]
+    async fn reset_dispatch_does_not_wait_for_slow_mailer() {
+        let sender = GatedSender::new();
+        let dispatcher = Arc::new(EmailDispatcher::new(
+            Some(Arc::new(sender.clone())),
+            std::time::Duration::from_secs(10),
+            false,
+        ));
+        let payload = PasswordResetEmailPayload {
+            user_id: Uuid::new_v4(),
+            to: "user@example.com".into(),
+            token: "token".into(),
+            url: "https://example.com/auth/password/reset?token=token".into(),
+            expires_at: Utc::now(),
+        };
+
+        let request = tokio::spawn(async move {
+            spawn_password_reset_dispatch(dispatcher, payload);
+        });
+
+        sender.entered.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), request)
+            .await
+            .expect("request path must not await mailer")
+            .expect("dispatch task must not panic");
+        assert!(
+            !sender.delivered.load(std::sync::atomic::Ordering::SeqCst),
+            "mailer must still be blocked when the request path returns"
+        );
+
+        sender.release.notify_one();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sender.completed.notified(),
+        )
+        .await
+        .expect("detached dispatch must deliver once released");
+    }
+
+    /// Delivery must complete even when the request future is dropped mid-flight.
+    #[tokio::test]
+    async fn dispatch_survives_cancelled_request_future() {
+        let sender = GatedSender::new();
+        let dispatcher = Arc::new(EmailDispatcher::new(
+            Some(Arc::new(sender.clone())),
+            std::time::Duration::from_secs(10),
+            false,
+        ));
+        let payload = VerificationEmailPayload {
+            user_id: Uuid::new_v4(),
+            to: "user@example.com".into(),
+            token: "token".into(),
+            url: "https://example.com/auth/verify/email?token=token".into(),
+            expires_at: Utc::now(),
+        };
+
+        let request = tokio::spawn(async move {
+            spawn_verification_dispatch(dispatcher, payload);
+            std::future::pending::<()>().await;
+        });
+
+        sender.entered.notified().await;
+        request.abort();
+        assert!(
+            request.await.is_err(),
+            "request future must have been cancelled"
+        );
+
+        sender.release.notify_one();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sender.completed.notified(),
+        )
+        .await
+        .expect("delivery must survive a cancelled request");
+        assert!(sender.delivered.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// DB-backed guard: signup returns before a sync-dispatched mail is delivered.
+    #[tokio::test]
+    async fn signup_does_not_wait_for_sync_dispatch() {
         let Some(ctx) = setup_db_context().await else {
             return;
         };
 
-        // Create service with async_dispatch = false
-        let sender = ArcCapturingSender::default();
+        let sender = GatedSender::new();
         let dispatcher = Arc::new(EmailDispatcher::new(
             Some(Arc::new(sender.clone())),
             std::time::Duration::from_secs(10),
@@ -986,15 +1169,25 @@ mod tests {
         let email = format!("sync_dispatch_{}@example.com", Uuid::new_v4());
         let password = "SecurePassword123!";
 
-        service.signup(&email, password).await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            service.signup(&email, password),
+        )
+        .await
+        .expect("signup must not await mailer")
+        .unwrap();
 
-        // With async_dispatch = false, email must be delivered inline before signup returns
-        let calls = sender.verification_calls.lock().unwrap();
-        assert_eq!(
-            calls.len(),
-            1,
-            "synchronous dispatch must have completed without sleep"
+        assert!(
+            !sender.delivered.load(std::sync::atomic::Ordering::SeqCst),
+            "signup must not wait for synchronous dispatch"
         );
-        assert_eq!(calls[0].to, email);
+
+        sender.release.notify_one();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sender.completed.notified(),
+        )
+        .await
+        .expect("verification email must still be delivered");
     }
 }

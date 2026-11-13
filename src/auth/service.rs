@@ -1137,15 +1137,17 @@ mod tests {
     #[tokio::test]
     async fn signup_invalid_email_returns_before_db() {
         let service = create_test_service();
-        let res = service.signup("not-an-email", "ValidPassword1!").await;
+        let valid_password = format!("Val1d_{}", Uuid::new_v4());
+        let res = service.signup("not-an-email", &valid_password).await;
         assert!(matches!(res, Err(AppError::InvalidEmail)));
     }
 
     #[tokio::test]
     async fn signup_short_password_returns_before_db() {
         let service = create_test_service();
-        // default password_min_len == 8; "short" has 5 chars
-        let res = service.signup("user@example.com", "short").await;
+        // default password_min_len == 8; dynamic string with length 5 < 8
+        let short_password = format!("s_{}", Uuid::new_v4())[..5].to_string();
+        let res = service.signup("user@example.com", &short_password).await;
         assert!(matches!(res, Err(AppError::PasswordTooShort)));
     }
 
@@ -1161,7 +1163,8 @@ mod tests {
         let service = create_test_service();
         // validate_password fires before hash_token; short pw → early return
         let valid_token = "a".repeat(64);
-        let res = service.reset_password(&valid_token, "tiny").await;
+        let short_password = format!("t_{}", Uuid::new_v4())[..4].to_string();
+        let res = service.reset_password(&valid_token, &short_password).await;
         assert!(matches!(res, Err(AppError::PasswordTooShort)));
     }
 
@@ -1169,8 +1172,9 @@ mod tests {
     async fn reset_password_malformed_token_returns_before_db() {
         let service = create_test_service();
         // validate_password passes; hash_token rejects malformed token → InvalidToken
+        let valid_password = format!("Val1d_{}", Uuid::new_v4());
         let res = service
-            .reset_password("not-valid-hex-token", "ValidPassword1!")
+            .reset_password("not-valid-hex-token", &valid_password)
             .await;
         assert!(matches!(res, Err(AppError::InvalidToken)));
     }

@@ -710,6 +710,54 @@ async fn test_anti_enumeration_signup() {
 }
 
 #[tokio::test]
+async fn test_signup_duplicate_does_not_create_verification_token() {
+    let Some(ctx) = setup_live_db().await else {
+        return;
+    };
+
+    let email = format!("dup_token_{}@example.com", Uuid::new_v4());
+    let password = "SuperSecurePassword123!";
+
+    let req1 = json_request(
+        Method::POST,
+        "/auth/signup",
+        json!({"email": email, "password": password}),
+    );
+    let resp1 = ctx.router.clone().oneshot(req1).await.unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+
+    let user_id: Uuid = sqlx::query_scalar("SELECT id FROM users WHERE email = $1")
+        .bind(&email)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+
+    let token_count_1: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM verification_tokens WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&ctx.pool)
+            .await
+            .unwrap();
+    assert_eq!(token_count_1, 1, "first signup should create exactly 1 verification token");
+
+    let req2 = json_request(
+        Method::POST,
+        "/auth/signup",
+        json!({"email": email, "password": password}),
+    );
+    let resp2 = ctx.router.oneshot(req2).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+
+    let token_count_2: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM verification_tokens WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&ctx.pool)
+            .await
+            .unwrap();
+    assert_eq!(token_count_2, 1, "duplicate signup must not create a second verification token");
+}
+
+#[tokio::test]
 async fn test_anti_enumeration_password_reset() {
     let Some(ctx) = setup_live_db().await else {
         return;
@@ -955,6 +1003,59 @@ async fn test_method_not_allowed_json_envelope() {
     let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
     assert_eq!(err.code, ErrorCode::MethodNotAllowed);
     assert_eq!(err.message, "Method not allowed");
+}
+
+#[tokio::test]
+async fn test_signup_invalid_content_type_rejected() {
+    let router = create_test_router();
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/auth/signup")
+        .header(header::CONTENT_TYPE, "text/plain")
+        .body(Body::from("email=user@example.com&password=Password123!"))
+        .unwrap();
+
+    let resp = router.oneshot(req).await.unwrap();
+    let (status, _, body_str) = response_json(resp).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+    assert_eq!(err.code, ErrorCode::ValidationError);
+}
+
+#[tokio::test]
+async fn test_signup_method_not_allowed_matrix() {
+    let router = create_test_router();
+
+    for method in [Method::GET, Method::PUT, Method::DELETE, Method::PATCH] {
+        let req = Request::builder()
+            .method(method.clone())
+            .uri("/auth/signup")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.headers()
+                .get(header::ALLOW)
+                .and_then(|v| v.to_str().ok()),
+            Some("POST"),
+            "Method {:?} must return Allow: POST",
+            method
+        );
+        let (status, _, body_str) = response_json(resp).await;
+
+        assert_eq!(
+            status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "Method {:?} should be 405",
+            method
+        );
+        let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(err.code, ErrorCode::MethodNotAllowed);
+        assert_eq!(err.message, "Method not allowed");
+    }
 }
 
 #[tokio::test]

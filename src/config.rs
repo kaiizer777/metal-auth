@@ -946,6 +946,114 @@ mod tests {
         assert!(!cfg.require_email_verification);
     }
 
+    // ── Config::validate base_url rejection tests ─────────────────────────────
+
+    fn valid_config_base() -> Config {
+        Config {
+            database_url: "postgres://localhost/test".into(),
+            port: 3000,
+            allowed_origins: vec![],
+            allowed_methods: vec!["GET".into()],
+            allowed_headers: vec!["Content-Type".into()],
+            max_connections: 5,
+            min_connections: 1,
+            base_url: "https://app.example.com".into(),
+            email_dispatch_timeout: Duration::from_secs(10),
+            async_email_dispatch: true,
+        }
+    }
+
+    #[test]
+    fn config_validate_rejects_base_url_with_query_string() {
+        let cfg = Config {
+            base_url: "https://app.example.com?foo=bar".into(),
+            ..valid_config_base()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidEnvVar("BASE_URL"))
+        ));
+    }
+
+    #[test]
+    fn config_validate_rejects_base_url_with_userinfo() {
+        let cfg = Config {
+            base_url: "https://user:pass@app.example.com".into(),
+            ..valid_config_base()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidEnvVar("BASE_URL"))
+        ));
+    }
+
+    #[test]
+    fn config_validate_rejects_base_url_non_http_scheme() {
+        let cfg = Config {
+            base_url: "ftp://app.example.com".into(),
+            ..valid_config_base()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidEnvVar("BASE_URL"))
+        ));
+    }
+
+    #[test]
+    fn config_validate_rejects_zero_email_dispatch_timeout() {
+        let cfg = Config {
+            email_dispatch_timeout: Duration::ZERO,
+            ..valid_config_base()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidEnvVar("EMAIL_DISPATCH_TIMEOUT_SECS"))
+        ));
+    }
+
+    // ── AppConfig::from_lookup parse error tests ──────────────────────────────
+
+    #[test]
+    fn from_lookup_rejects_non_numeric_u32() {
+        let cfg = AppConfig::from_lookup(|key| match key {
+            "ARGON2_M_COST" => Ok("not_a_number".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        });
+        assert!(matches!(
+            cfg,
+            Err(ConfigError::InvalidValue {
+                field: "ARGON2_M_COST",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn from_lookup_rejects_non_unicode_env_var() {
+        let cfg = AppConfig::from_lookup(|key| match key {
+            "ARGON2_M_COST" => Err(std::env::VarError::NotUnicode(
+                std::ffi::OsString::from("bad"),
+            )),
+            _ => Err(std::env::VarError::NotPresent),
+        });
+        assert!(matches!(cfg, Err(ConfigError::NonUnicodeEnvVar("ARGON2_M_COST"))));
+    }
+
+    #[test]
+    fn from_lookup_rejects_invalid_bool_string() {
+        let cfg = AppConfig::from_lookup(|key| match key {
+            "REQUIRE_EMAIL_VERIFICATION" => Ok("maybe".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        });
+        assert!(matches!(
+            cfg,
+            Err(ConfigError::InvalidValue {
+                field: "REQUIRE_EMAIL_VERIFICATION",
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn app_config_validate_rejects_invalid_bounds() {
         let cfg = AppConfig {

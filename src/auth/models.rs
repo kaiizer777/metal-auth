@@ -458,9 +458,9 @@ mod tests {
         // local(1) + '@'(1) + domain needs a dot: build to exactly 255 total
         // "a@" = 2 chars; remaining = 253 for domain "b<dot>c…"
         // Use pattern: local + '@' + label + '.' + tld, total == 255
-        let local = "a".repeat(1);           // 1
-        let label = "b".repeat(249);         // 249
-        let tld = "com";                     // 3
+        let local = "a".to_string(); // 1
+        let label = "b".repeat(249); // 249
+        let tld = "com"; // 3
         // total: 1 + 1('@') + 249 + 1('.') + 3 = 255
         let email = format!("{local}@{label}.{tld}");
         assert_eq!(email.len(), 255);

@@ -1134,6 +1134,141 @@ async fn test_password_reset_confirm_invalid_token() {
     assert_eq!(err.code, ErrorCode::InvalidToken);
 }
 
+#[tokio::test]
+async fn test_password_reset_confirm_short_password_rejected() {
+    let router = create_test_router();
+    let valid_token_format = "a".repeat(64);
+
+    let req = json_request(
+        Method::POST,
+        "/auth/password/reset",
+        json!({
+            "token": valid_token_format,
+            "new_password": "short"
+        }),
+    );
+
+    let resp = router.oneshot(req).await.unwrap();
+    let (status, _, body_str) = response_json(resp).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+    assert_eq!(err.code, ErrorCode::PasswordTooShort);
+}
+
+#[tokio::test]
+async fn test_password_reset_confirm_common_password_rejected() {
+    let router = create_test_router();
+    let valid_token_format = "a".repeat(64);
+
+    for common_pw in ["password", "12345678", "qwerty123", "PASSWORD", "ADMIN1234"] {
+        let req = json_request(
+            Method::POST,
+            "/auth/password/reset",
+            json!({
+                "token": valid_token_format.clone(),
+                "new_password": common_pw
+            }),
+        );
+
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let (status, _, body_str) = response_json(resp).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(
+            err.code,
+            ErrorCode::PasswordTooCommon,
+            "common password '{}' should be rejected on reset confirm",
+            common_pw
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_password_reset_confirm_long_password_rejected() {
+    let router = create_test_router();
+    let valid_token_format = "a".repeat(64);
+    let long_pw = "a".repeat(129);
+
+    let req = json_request(
+        Method::POST,
+        "/auth/password/reset",
+        json!({
+            "token": valid_token_format,
+            "new_password": long_pw
+        }),
+    );
+
+    let resp = router.oneshot(req).await.unwrap();
+    let (status, _, body_str) = response_json(resp).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+    assert_eq!(err.code, ErrorCode::PasswordTooLong);
+}
+
+#[tokio::test]
+async fn test_password_reset_confirm_sql_injection_no_leak() {
+    let router = create_test_router();
+
+    for sqli in [
+        "' OR '1'='1",
+        "admin'--",
+        "' UNION SELECT * FROM users--",
+        "'; DROP TABLE users; --",
+    ] {
+        let req = json_request(
+            Method::POST,
+            "/auth/password/reset",
+            json!({
+                "token": sqli,
+                "new_password": "NewSecurePassword123!"
+            }),
+        );
+
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let (status, _, body_str) = response_json(resp).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(err.code, ErrorCode::InvalidToken);
+
+        let lower = body_str.to_lowercase();
+        assert!(!lower.contains("syntax error"));
+        assert!(!lower.contains("postgres"));
+        assert!(!lower.contains("sqlx"));
+    }
+}
+
+#[tokio::test]
+async fn test_password_reset_confirm_method_not_allowed() {
+    let router = create_test_router();
+
+    for method in [Method::GET, Method::PUT, Method::DELETE, Method::PATCH] {
+        let req = Request::builder()
+            .method(method.clone())
+            .uri("/auth/password/reset")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.headers()
+                .get(header::ALLOW)
+                .and_then(|v| v.to_str().ok()),
+            Some("POST"),
+            "Method {:?} must return Allow: POST",
+            method
+        );
+        let (status, _, body_str) = response_json(resp).await;
+
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(err.code, ErrorCode::MethodNotAllowed);
+    }
+}
+
 // ─── Scenario 12: CORS preflight on auth endpoints ───────────────────────────
 
 #[tokio::test]
@@ -1550,6 +1685,170 @@ async fn test_reset_password_revokes_all_tokens() {
     assert_eq!(status2, StatusCode::BAD_REQUEST);
     let err: ErrorResponse = serde_json::from_str(&body_str2).unwrap();
     assert_eq!(err.code, ErrorCode::InvalidToken);
+}
+
+#[tokio::test]
+async fn test_password_reset_confirm_same_token_replay_rejected() {
+    let Some(ctx) = setup_live_db().await else {
+        return;
+    };
+
+    let email = format!("reset_replay_{}@example.com", Uuid::new_v4());
+    let password = "OldPassword123!";
+    let config = ctx.state.auth_service.config.clone();
+    let password_hash = hash_password(password, &config).unwrap();
+
+    let user_row = sqlx::query(
+        "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true) RETURNING id",
+    )
+    .bind(&email)
+    .bind(&password_hash)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    let user_id: Uuid = user_row.get("id");
+
+    let (raw_token, stored_hash) = generate_token();
+    let expires_at = Utc::now() + Duration::hours(1);
+
+    sqlx::query(
+        "INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
+    )
+    .bind(stored_hash.as_slice())
+    .bind(user_id)
+    .bind(expires_at)
+    .execute(&ctx.pool)
+    .await
+    .unwrap();
+
+    let req1 = json_request(
+        Method::POST,
+        "/auth/password/reset",
+        json!({
+            "token": raw_token,
+            "new_password": "NewValidPassword123!"
+        }),
+    );
+    let resp1 = ctx.router.clone().oneshot(req1).await.unwrap();
+    let (status1, body1, _) = response_json(resp1).await;
+    assert_eq!(status1, StatusCode::OK);
+    assert_eq!(body1["message"], "password reset successful");
+
+    let req2 = json_request(
+        Method::POST,
+        "/auth/password/reset",
+        json!({
+            "token": raw_token,
+            "new_password": "YetAnotherPassword123!"
+        }),
+    );
+    let resp2 = ctx.router.oneshot(req2).await.unwrap();
+    let (status2, _, body_str2) = response_json(resp2).await;
+    assert_eq!(status2, StatusCode::BAD_REQUEST);
+    let err: ErrorResponse = serde_json::from_str(&body_str2).unwrap();
+    assert_eq!(err.code, ErrorCode::InvalidToken);
+}
+
+#[tokio::test]
+async fn test_password_reset_confirm_token_from_verify_flow_rejected() {
+    let Some(ctx) = setup_live_db().await else {
+        return;
+    };
+
+    let email = format!("cross_reset_{}@example.com", Uuid::new_v4());
+    let password = "OldPassword123!";
+    let config = ctx.state.auth_service.config.clone();
+    let password_hash = hash_password(password, &config).unwrap();
+
+    let user_row = sqlx::query(
+        "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true) RETURNING id",
+    )
+    .bind(&email)
+    .bind(&password_hash)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    let user_id: Uuid = user_row.get("id");
+
+    let (verify_token, verify_hash) = generate_token();
+    let expires_at = Utc::now() + Duration::hours(24);
+
+    sqlx::query(
+        "INSERT INTO verification_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
+    )
+    .bind(verify_hash.as_slice())
+    .bind(user_id)
+    .bind(expires_at)
+    .execute(&ctx.pool)
+    .await
+    .unwrap();
+
+    let req = json_request(
+        Method::POST,
+        "/auth/password/reset",
+        json!({
+            "token": verify_token,
+            "new_password": "NewValidPassword123!"
+        }),
+    );
+    let resp = ctx.router.oneshot(req).await.unwrap();
+    let (status, _, body_str) = response_json(resp).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+    assert_eq!(err.code, ErrorCode::InvalidToken);
+
+    let current_hash: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+    assert_eq!(current_hash, password_hash);
+}
+
+#[tokio::test]
+async fn test_password_reset_confirm_invalid_token_does_not_change_password() {
+    let Some(ctx) = setup_live_db().await else {
+        return;
+    };
+
+    let email = format!("untouched_pw_{}@example.com", Uuid::new_v4());
+    let password = "OriginalPassword123!";
+    let config = ctx.state.auth_service.config.clone();
+    let original_hash = hash_password(password, &config).unwrap();
+
+    let user_row = sqlx::query(
+        "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true) RETURNING id",
+    )
+    .bind(&email)
+    .bind(&original_hash)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    let user_id: Uuid = user_row.get("id");
+
+    let fake_token = "0".repeat(64);
+    let req = json_request(
+        Method::POST,
+        "/auth/password/reset",
+        json!({
+            "token": fake_token,
+            "new_password": "AttemptedNewPassword123!"
+        }),
+    );
+    let resp = ctx.router.oneshot(req).await.unwrap();
+    let (status, _, body_str) = response_json(resp).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+    assert_eq!(err.code, ErrorCode::InvalidToken);
+
+    let current_hash: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+    assert_eq!(current_hash, original_hash, "password hash must remain unchanged on invalid token reset");
 }
 
 #[tokio::test]

@@ -37,7 +37,7 @@ sqlx = { version = "0.8", features = [
 ] }
 
 # middleware
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
 
 # serialization
 serde = { version = "1", features = ["derive"] }

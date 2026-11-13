@@ -454,6 +454,31 @@ mod tests {
     }
 
     #[test]
+    fn validate_email_accepts_exactly_255_chars() {
+        // local(1) + '@'(1) + domain needs a dot: build to exactly 255 total
+        // "a@" = 2 chars; remaining = 253 for domain "b<dot>c…"
+        // Use pattern: local + '@' + label + '.' + tld, total == 255
+        let local = "a".repeat(1);           // 1
+        let label = "b".repeat(249);         // 249
+        let tld = "com";                     // 3
+        // total: 1 + 1('@') + 249 + 1('.') + 3 = 255
+        let email = format!("{local}@{label}.{tld}");
+        assert_eq!(email.len(), 255);
+        assert!(
+            validate_email(&email).is_ok(),
+            "255-char email must be accepted"
+        );
+    }
+
+    #[test]
+    fn validate_email_rejects_consecutive_dots_in_domain() {
+        assert!(matches!(
+            validate_email("a@b..com"),
+            Err(AppError::InvalidEmail)
+        ));
+    }
+
+    #[test]
     fn test_unicode_password_code_point_counting() {
         let mut config = test_config();
         config.password_min_len = 8;

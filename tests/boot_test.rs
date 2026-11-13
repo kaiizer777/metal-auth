@@ -243,11 +243,37 @@ async fn test_auth_boot_fails_fast_on_invalid_cors() {
     };
 
     let pool = PgPool::connect_lazy(&cfg.database_url).expect("lazy pool creation");
-    let state = AppState::new(pool, cfg).unwrap();
-    let result = Auth::from_state(state);
+    // Bootstrap rejects the config before a router or pool can be used.
+    let result = AppState::new(pool, cfg);
     assert!(matches!(
         result,
         Err(AppError::Config(ConfigError::InvalidOrigin { ref value, .. })) if value == "invalid\norigin"
+    ));
+}
+
+#[tokio::test]
+async fn test_auth_boot_rejects_sync_email_dispatch() {
+    let cfg = Config {
+        database_url: "postgres://user:pass@localhost:5432/metal_auth_test".into(),
+        port: 8080,
+        allowed_origins: vec![],
+        allowed_methods: vec!["GET".into()],
+        allowed_headers: vec!["Content-Type".into()],
+        max_connections: 10,
+        min_connections: 2,
+        base_url: "https://example.com".into(),
+        email_dispatch_timeout: std::time::Duration::from_secs(10),
+        async_email_dispatch: false,
+    };
+
+    let pool = PgPool::connect_lazy(&cfg.database_url).expect("lazy pool creation");
+    let result = AppState::new(pool, cfg);
+    assert!(matches!(
+        result,
+        Err(AppError::Config(ConfigError::InvalidValue {
+            field: "ASYNC_EMAIL_DISPATCH",
+            ..
+        }))
     ));
 }
 

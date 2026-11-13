@@ -29,10 +29,9 @@ pub struct Config {
     pub email_dispatch_timeout: Duration,
     /// Whether email dispatch blocks the caller until delivery completes.
     ///
-    /// Test-only knob: `false` makes dispatch wait for delivery in the calling task,
-    /// which re-introduces the account-existence timing signal. Production request paths
-    /// detach dispatch, and [`Config::validate`] rejects `false`, so it is unreachable
-    /// outside tests. Never enable it in production.
+    /// Inert: delivery is always detached, so this flag cannot change request latency.
+    /// [`Config::validate`] rejects `false` so a deployment still setting it fails at boot
+    /// instead of silently keeping a dead knob.
     pub async_email_dispatch: bool,
 }
 
@@ -92,8 +91,8 @@ impl Config {
         }
         if !self.async_email_dispatch {
             return Err(ConfigError::InvalidValue {
-                field: "async_email_dispatch",
-                reason: "sync dispatch waits for delivery and reveals account existence; test-only, never enable in production",
+                field: "ASYNC_EMAIL_DISPATCH",
+                reason: "must be true: the inline dispatch path no longer exists, unset ASYNC_EMAIL_DISPATCH or set it to true",
             });
         }
         for origin in &self.allowed_origins {
@@ -746,7 +745,7 @@ mod tests {
         assert!(matches!(
             cfg.validate(),
             Err(ConfigError::InvalidValue {
-                field: "async_email_dispatch",
+                field: "ASYNC_EMAIL_DISPATCH",
                 ..
             })
         ));

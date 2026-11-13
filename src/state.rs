@@ -79,6 +79,10 @@ impl AppState {
         auth_config: Arc<AppConfig>,
         email_dispatcher: Option<Arc<EmailDispatcher>>,
     ) -> Result<Self, AppError> {
+        // Single construction choke point for every `AppState` constructor: a router can
+        // never be built from a config the dispatcher mode or CORS rules reject.
+        config.validate().map_err(AppError::Config)?;
+
         let dispatcher = email_dispatcher
             .clone()
             .unwrap_or_else(|| default_email_dispatcher(&config));

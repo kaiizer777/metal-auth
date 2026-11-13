@@ -475,6 +475,217 @@ async fn test_login_empty_credentials_rejected() {
     }
 }
 
+// ─── Scenario 7a: Login unknown email returns 401 ────────────────────────────
+
+#[tokio::test]
+async fn test_login_unknown_email_returns_invalid_credentials() {
+    let Some(ctx) = setup_live_db().await else {
+        return;
+    };
+    let unknown_email = format!("unknown_{}@example.com", Uuid::new_v4());
+    let req = json_request(
+        Method::POST,
+        "/auth/login",
+        json!({
+            "email": unknown_email,
+            "password": "SomePassword123!"
+        }),
+    );
+    let resp = ctx.router.oneshot(req).await.unwrap();
+    let (status, _, body_str) = response_json(resp).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+    assert_eq!(err.code, ErrorCode::InvalidCredentials);
+}
+
+// ─── Scenario 7b: Login wrong password returns 401 ───────────────────────────
+
+#[tokio::test]
+async fn test_login_wrong_password_returns_invalid_credentials() {
+    let Some(ctx) = setup_live_db().await else {
+        return;
+    };
+    let email = format!("wrong_pw_{}@example.com", Uuid::new_v4());
+    let password = "CorrectPassword123!";
+    let config = ctx.state.auth_service.config.clone();
+    let password_hash = hash_password(password, &config).unwrap();
+
+    sqlx::query(
+        "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true)",
+    )
+    .bind(&email)
+    .bind(&password_hash)
+    .execute(&ctx.pool)
+    .await
+    .unwrap();
+
+    let req = json_request(
+        Method::POST,
+        "/auth/login",
+        json!({
+            "email": email,
+            "password": "WrongPassword123!"
+        }),
+    );
+    let resp = ctx.router.oneshot(req).await.unwrap();
+    let (status, _, body_str) = response_json(resp).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+    assert_eq!(err.code, ErrorCode::InvalidCredentials);
+}
+
+// ─── Scenario 7c: Login anti-enumeration response equality ───────────────────
+
+#[tokio::test]
+async fn test_login_anti_enumeration_response_equality() {
+    let Some(ctx) = setup_live_db().await else {
+        return;
+    };
+    let email = format!("enum_user_{}@example.com", Uuid::new_v4());
+    let password = "CorrectPassword123!";
+    let config = ctx.state.auth_service.config.clone();
+    let password_hash = hash_password(password, &config).unwrap();
+
+    sqlx::query(
+        "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true)",
+    )
+    .bind(&email)
+    .bind(&password_hash)
+    .execute(&ctx.pool)
+    .await
+    .unwrap();
+
+    let req1 = json_request(
+        Method::POST,
+        "/auth/login",
+        json!({"email": email, "password": "WrongPassword123!"}),
+    );
+    let resp1 = ctx.router.clone().oneshot(req1).await.unwrap();
+    let (status1, body1, _) = response_json(resp1).await;
+
+    let unknown_email = format!("unknown_{}@example.com", Uuid::new_v4());
+    let req2 = json_request(
+        Method::POST,
+        "/auth/login",
+        json!({"email": unknown_email, "password": "WrongPassword123!"}),
+    );
+    let resp2 = ctx.router.oneshot(req2).await.unwrap();
+    let (status2, body2, _) = response_json(resp2).await;
+
+    assert_eq!(status1, StatusCode::UNAUTHORIZED);
+    assert_eq!(status2, StatusCode::UNAUTHORIZED);
+    assert_eq!(body1, body2);
+    assert_eq!(body1["code"], "INVALID_CREDENTIALS");
+    assert_eq!(body1["message"], "Invalid email or password");
+}
+
+// ─── Scenario 7d: Login password over 1024 DoS guard ─────────────────────────
+
+#[tokio::test]
+async fn test_login_password_over_1024_rejected() {
+    let router = create_test_router();
+    let long_pw = "a".repeat(1025);
+
+    let req = json_request(
+        Method::POST,
+        "/auth/login",
+        json!({
+            "email": "user@example.com",
+            "password": long_pw
+        }),
+    );
+
+    let resp = router.oneshot(req).await.unwrap();
+    let (status, _, body_str) = response_json(resp).await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+    assert_eq!(err.code, ErrorCode::InvalidCredentials);
+}
+
+// ─── Scenario 7e: Login SQL injection payload in email ───────────────────────
+
+#[tokio::test]
+async fn test_login_sql_injection_email_no_leak() {
+    let Some(ctx) = setup_live_db().await else {
+        return;
+    };
+
+    for sqli in [
+        "' OR '1'='1",
+        "admin'--",
+        "' UNION SELECT * FROM users--",
+        "'; DROP TABLE users; --",
+    ] {
+        let req = json_request(
+            Method::POST,
+            "/auth/login",
+            json!({
+                "email": sqli,
+                "password": "AnyPassword123!"
+            }),
+        );
+
+        let resp = ctx.router.clone().oneshot(req).await.unwrap();
+        let (status, _, body_str) = response_json(resp).await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(err.code, ErrorCode::InvalidCredentials);
+
+        let lower = body_str.to_lowercase();
+        assert!(!lower.contains("syntax error"));
+        assert!(!lower.contains("postgres"));
+        assert!(!lower.contains("sqlx"));
+    }
+}
+
+// ─── Scenario 7f: Login malformed JSON rejected ──────────────────────────────
+
+#[tokio::test]
+async fn test_login_malformed_json_rejected() {
+    let router = create_test_router();
+
+    let req = raw_json_request(Method::POST, "/auth/login", "{ malformed json");
+
+    let resp = router.oneshot(req).await.unwrap();
+    let (status, _, body_str) = response_json(resp).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+    assert_eq!(err.code, ErrorCode::ValidationError);
+}
+
+// ─── Scenario 7g: Login method not allowed ───────────────────────────────────
+
+#[tokio::test]
+async fn test_login_method_not_allowed() {
+    let router = create_test_router();
+
+    for method in [Method::GET, Method::PUT, Method::DELETE, Method::PATCH] {
+        let req = Request::builder()
+            .method(method.clone())
+            .uri("/auth/login")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.headers()
+                .get(header::ALLOW)
+                .and_then(|v| v.to_str().ok()),
+            Some("POST"),
+            "Method {:?} must return Allow: POST",
+            method
+        );
+        let (status, _, body_str) = response_json(resp).await;
+
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        let err: ErrorResponse = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(err.code, ErrorCode::MethodNotAllowed);
+    }
+}
+
 // ─── Scenario 8: Malformed JSON body rejection ───────────────────────────────
 
 #[tokio::test]

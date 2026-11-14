@@ -402,10 +402,12 @@ async fn test_migration_applies_on_fresh_db_schema() {
     let schema_name = format!("test_schema_{}", Uuid::new_v4().simple());
 
     // Create fresh isolated schema
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA \"{schema_name}\"")))
-        .execute(&base_pool)
-        .await
-        .expect("create isolated test schema");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE SCHEMA \"{schema_name}\""
+    )))
+    .execute(&base_pool)
+    .await
+    .expect("create isolated test schema");
 
     // Connect with a pool whose connections have search_path set to the fresh schema
     let test_schema = schema_name.clone();
@@ -456,10 +458,9 @@ async fn test_migration_applies_on_fresh_db_schema() {
         }
 
         // 3. Idempotency assertion: re-running migrations on the same schema must succeed without error
-        migrator
-            .run(&test_schema_pool)
-            .await
-            .map_err(|e| format!("re-running migrations must be idempotent and succeed without error: {e}"))?;
+        migrator.run(&test_schema_pool).await.map_err(|e| {
+            format!("re-running migrations must be idempotent and succeed without error: {e}")
+        })?;
 
         Ok::<(), String>(())
     });

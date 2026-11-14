@@ -39,11 +39,17 @@ async fn test_journey_duplicate_registration_anti_enumeration() {
     );
 
     // Initial email dispatch check
+    let verification_calls = app.email_sender.verification_calls();
     assert_eq!(
-        app.email_sender.verification_calls().len(),
+        verification_calls.len(),
         1,
         "first registration must dispatch exactly one verification email"
     );
+    assert_eq!(
+        verification_calls[0].to, email,
+        "captured verification email recipient must match registered email"
+    );
+    let user_id = verification_calls[0].user_id;
 
     // Initial database count check
     let count_after_first = count_users_by_email(&app.pool, &email)
@@ -52,6 +58,14 @@ async fn test_journey_duplicate_registration_anti_enumeration() {
     assert_eq!(
         count_after_first, 1,
         "exactly 1 user row must exist after first signup"
+    );
+
+    let token_count_first = count_verification_tokens_for_user(&app.pool, user_id)
+        .await
+        .expect("count verification tokens query");
+    assert_eq!(
+        token_count_first, 1,
+        "exactly 1 verification token must exist in DB after first signup"
     );
 
     // 2. Duplicate registration with identical email
@@ -87,6 +101,15 @@ async fn test_journey_duplicate_registration_anti_enumeration() {
     assert_eq!(
         count_after_second, 1,
         "database must strictly contain 1 row for the email"
+    );
+
+    // Database verification tokens table must strictly maintain 1 token
+    let token_count_second = count_verification_tokens_for_user(&app.pool, user_id)
+        .await
+        .expect("count verification tokens query");
+    assert_eq!(
+        token_count_second, 1,
+        "database must strictly contain 1 verification token after duplicate registration"
     );
 }
 
@@ -175,6 +198,11 @@ async fn test_journey_cors_headers_on_all_responses() {
         Some(allowed_origin),
         "CORS allow-origin header must be preserved on 400 Bad Request"
     );
+    assert_eq!(
+        bad_req_res.header("access-control-allow-credentials"),
+        Some("true"),
+        "CORS allow-credentials header must be preserved on 400 Bad Request"
+    );
 
     // 4. Disallowed origin verification (no CORS origin granted on actual POST)
     let disallowed_res = app
@@ -193,6 +221,12 @@ async fn test_journey_cors_headers_on_all_responses() {
             .header("access-control-allow-origin")
             .is_none(),
         "Disallowed origin must not receive Access-Control-Allow-Origin header"
+    );
+    assert!(
+        disallowed_res
+            .header("access-control-allow-credentials")
+            .is_none(),
+        "Disallowed origin must not receive Access-Control-Allow-Credentials header"
     );
 }
 
@@ -266,9 +300,24 @@ async fn test_journey_concurrent_registration_race_condition() {
     );
 
     // Exactly 1 verification email must be dispatched despite concurrency
+    let verification_calls = app.email_sender.verification_calls();
     assert_eq!(
-        app.email_sender.verification_calls().len(),
+        verification_calls.len(),
         1,
         "exactly 1 verification email should be dispatched across concurrent signups"
+    );
+    assert_eq!(
+        verification_calls[0].to, target_email,
+        "captured verification email recipient must match target email"
+    );
+    let user_id = verification_calls[0].user_id;
+
+    // Exactly 1 verification token must be persisted in database
+    let token_count = count_verification_tokens_for_user(&app.pool, user_id)
+        .await
+        .expect("count verification tokens query");
+    assert_eq!(
+        token_count, 1,
+        "concurrent registrations must create exactly 1 verification token in database"
     );
 }

@@ -2302,12 +2302,13 @@ async fn setup_rate_limit_router() -> axum::Router {
 /// ASVS L1 V2.2: Rate limiting / brute-force protection on /auth/login.
 ///
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
-/// In Phase 3, rapid repeated login attempts execute deterministically without server panic.
 #[tokio::test]
+#[ignore = "Phase 4: Rate limiting middleware not yet implemented"]
 async fn test_rate_limit_login() {
     let router = setup_rate_limit_router().await;
 
-    for _ in 0..5 {
+    let mut rate_limited = false;
+    for _ in 0..10 {
         let req = json_request(
             Method::POST,
             "/auth/login",
@@ -2317,24 +2318,27 @@ async fn test_rate_limit_login() {
             }),
         );
         let resp = router.clone().oneshot(req).await.unwrap();
-        assert!(
-            resp.status() == StatusCode::UNAUTHORIZED
-                || resp.status() == StatusCode::TOO_MANY_REQUESTS
-                || resp.status() == StatusCode::INTERNAL_SERVER_ERROR,
-            "Login should return 401, 429, or 500 under burst attempts without server panic (status: {})",
-            resp.status()
-        );
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+            rate_limited = true;
+            break;
+        }
     }
+    assert!(
+        rate_limited,
+        "Expected StatusCode::TOO_MANY_REQUESTS under burst attempts"
+    );
 }
 
 /// ASVS L1: Rate limiting / registration flood guard on /auth/signup.
 ///
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
+#[ignore = "Phase 4: Rate limiting middleware not yet implemented"]
 async fn test_rate_limit_signup() {
     let router = setup_rate_limit_router().await;
 
-    for i in 0..3 {
+    let mut rate_limited = false;
+    for i in 0..10 {
         let req = json_request(
             Method::POST,
             "/auth/signup",
@@ -2344,65 +2348,77 @@ async fn test_rate_limit_signup() {
             }),
         );
         let resp = router.clone().oneshot(req).await.unwrap();
-        assert!(
-            resp.status() == StatusCode::INTERNAL_SERVER_ERROR
-                || resp.status() == StatusCode::TOO_MANY_REQUESTS
-                || resp.status() == StatusCode::OK,
-            "Signup under burst should be handled safely (status: {})",
-            resp.status()
-        );
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+            rate_limited = true;
+            break;
+        }
     }
+    assert!(
+        rate_limited,
+        "Expected StatusCode::TOO_MANY_REQUESTS under burst attempts"
+    );
 }
 
 /// ASVS L1: Rate limiting on /auth/password/reset-request to prevent email spam / enumeration.
 ///
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
+#[ignore = "Phase 4: Rate limiting middleware not yet implemented"]
 async fn test_rate_limit_password_reset_request() {
     let router = setup_rate_limit_router().await;
 
-    for _ in 0..5 {
+    let mut rate_limited = false;
+    for _ in 0..10 {
         let req = json_request(
             Method::POST,
             "/auth/password/reset-request",
             json!({"email": "target@example.com"}),
         );
         let resp = router.clone().oneshot(req).await.unwrap();
-        assert!(
-            resp.status() == StatusCode::INTERNAL_SERVER_ERROR
-                || resp.status() == StatusCode::TOO_MANY_REQUESTS
-                || resp.status() == StatusCode::OK,
-            "Reset request burst handled deterministically"
-        );
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+            rate_limited = true;
+            break;
+        }
     }
+    assert!(
+        rate_limited,
+        "Expected StatusCode::TOO_MANY_REQUESTS under burst attempts"
+    );
 }
 
 /// ASVS L1: Rate limiting on /auth/verify token submissions.
 ///
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
+#[ignore = "Phase 4: Rate limiting middleware not yet implemented"]
 async fn test_rate_limit_verify_token() {
     let router = setup_rate_limit_router().await;
 
-    for _ in 0..5 {
+    let mut rate_limited = false;
+    for _ in 0..10 {
         let req = json_request(Method::POST, "/auth/verify", json!({"token": "12345"}));
         let resp = router.clone().oneshot(req).await.unwrap();
-        assert!(
-            resp.status() == StatusCode::BAD_REQUEST
-                || resp.status() == StatusCode::TOO_MANY_REQUESTS,
-            "Verify token attempts handled deterministically"
-        );
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+            rate_limited = true;
+            break;
+        }
     }
+    assert!(
+        rate_limited,
+        "Expected StatusCode::TOO_MANY_REQUESTS under burst attempts"
+    );
 }
 
 /// ASVS L1: Rate limiting on /auth/password/reset confirmation attempts.
 ///
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
+#[ignore = "Phase 4: Rate limiting middleware not yet implemented"]
 async fn test_rate_limit_reset_confirm() {
     let router = setup_rate_limit_router().await;
 
-    for _ in 0..5 {
+    let mut rate_limited = false;
+    for _ in 0..10 {
         let req = json_request(
             Method::POST,
             "/auth/password/reset",
@@ -2412,12 +2428,15 @@ async fn test_rate_limit_reset_confirm() {
             }),
         );
         let resp = router.clone().oneshot(req).await.unwrap();
-        assert!(
-            resp.status() == StatusCode::BAD_REQUEST
-                || resp.status() == StatusCode::TOO_MANY_REQUESTS,
-            "Reset confirm attempts handled deterministically"
-        );
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+            rate_limited = true;
+            break;
+        }
     }
+    assert!(
+        rate_limited,
+        "Expected StatusCode::TOO_MANY_REQUESTS under burst attempts"
+    );
 }
 
 /// ASVS L1 V2.2: Timing parity between existing-user/wrong-password and unknown-user.

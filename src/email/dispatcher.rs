@@ -101,6 +101,16 @@ impl EmailDispatcher {
 
     /// Spawns the background outbox worker loop once if not already running.
     pub fn ensure_worker_started(&self, pool: &sqlx::PgPool) {
+        #[cfg(any(test, feature = "test-utils"))]
+        if self.block_on_delivery {
+            return;
+        }
+
+        if tokio::runtime::Handle::try_current().is_err() {
+            warn!("no active tokio runtime; skipping background outbox worker spawn");
+            return;
+        }
+
         if !self.worker_started.swap(true, Ordering::SeqCst) {
             let pool = pool.clone();
             let sender = self.sender.clone();
@@ -438,5 +448,24 @@ mod tests {
         let dispatcher = EmailDispatcher::new(None, Duration::from_secs(1))
             .with_base_url("https://auth.example.com");
         assert_eq!(dispatcher.base_url(), Some("https://auth.example.com"));
+    }
+
+    #[tokio::test]
+    async fn ensure_worker_started_outside_tokio_does_not_panic() {
+        let dispatcher = EmailDispatcher::new(None, Duration::from_secs(1));
+        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/dummy").unwrap();
+        let handle = std::thread::spawn(move || {
+            dispatcher.ensure_worker_started(&pool);
+            assert!(!dispatcher.worker_started.load(Ordering::SeqCst));
+        });
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocking_dispatcher_skips_worker_spawn() {
+        let dispatcher = EmailDispatcher::new_blocking(None, Duration::from_secs(1));
+        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/dummy").unwrap();
+        dispatcher.ensure_worker_started(&pool);
+        assert!(!dispatcher.worker_started.load(Ordering::SeqCst));
     }
 }

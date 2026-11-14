@@ -33,7 +33,14 @@ impl EmailSender for NoopEmailSender {
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, MutexGuard};
+
+    fn lock_guard<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        match mutex.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
 
     #[derive(Default)]
     pub struct CapturingEmailSender {
@@ -47,32 +54,28 @@ pub mod test_utils {
         }
 
         pub fn verification_calls(&self) -> Vec<VerificationEmailPayload> {
-            self.verification_calls.lock().unwrap().clone()
+            lock_guard(&self.verification_calls).clone()
         }
 
         pub fn reset_calls(&self) -> Vec<PasswordResetEmailPayload> {
-            self.reset_calls.lock().unwrap().clone()
+            lock_guard(&self.reset_calls).clone()
         }
 
         pub fn last_verification_token(&self) -> Option<String> {
-            self.verification_calls
-                .lock()
-                .unwrap()
+            lock_guard(&self.verification_calls)
                 .last()
                 .map(|p| p.token.clone())
         }
 
         pub fn last_reset_token(&self) -> Option<String> {
-            self.reset_calls
-                .lock()
-                .unwrap()
+            lock_guard(&self.reset_calls)
                 .last()
                 .map(|p| p.token.clone())
         }
 
         pub fn clear(&self) {
-            self.verification_calls.lock().unwrap().clear();
-            self.reset_calls.lock().unwrap().clear();
+            lock_guard(&self.verification_calls).clear();
+            lock_guard(&self.reset_calls).clear();
         }
     }
 
@@ -82,7 +85,7 @@ pub mod test_utils {
             &self,
             payload: VerificationEmailPayload,
         ) -> Result<(), DynError> {
-            self.verification_calls.lock().unwrap().push(payload);
+            lock_guard(&self.verification_calls).push(payload);
             Ok(())
         }
 
@@ -90,7 +93,7 @@ pub mod test_utils {
             &self,
             payload: PasswordResetEmailPayload,
         ) -> Result<(), DynError> {
-            self.reset_calls.lock().unwrap().push(payload);
+            lock_guard(&self.reset_calls).push(payload);
             Ok(())
         }
     }

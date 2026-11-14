@@ -36,6 +36,31 @@ fn create_test_router() -> axum::Router {
     create_router(state).expect("failed to create router")
 }
 
+/// Router wired to a guaranteed-invalid DB so every query fails deterministically.
+/// Port 1 is reserved/closed on all platforms; the 50 ms acquire timeout ensures
+/// the connection attempt fails fast rather than waiting on the OS default.
+fn create_failing_db_router() -> axum::Router {
+    let cfg = Config {
+        database_url: "postgres://invalid:invalid@127.0.0.1:1/nonexistent".into(),
+        port: 8080,
+        allowed_origins: vec!["https://app.example.com".into()],
+        allowed_methods: vec!["GET".into(), "POST".into(), "OPTIONS".into()],
+        allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
+        max_connections: 5,
+        min_connections: 0,
+        base_url: "https://example.com".into(),
+        email_dispatch_timeout: std::time::Duration::from_secs(10),
+        async_email_dispatch: true,
+    };
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .acquire_timeout(std::time::Duration::from_millis(50))
+        .connect_lazy(&cfg.database_url)
+        .expect("lazy pool");
+    let state = AppState::new(pool, cfg).expect("failed to create app state");
+    create_router(state).expect("failed to create router")
+}
+
 struct LiveDbTestContext {
     router: axum::Router,
     pool: PgPool,
@@ -1594,7 +1619,7 @@ async fn test_no_secrets_in_tracing_logs() {
 
 #[tokio::test]
 async fn test_db_error_does_not_leak_sql_text() {
-    let router = create_test_router();
+    let router = create_failing_db_router();
 
     let req = json_request(
         Method::POST,

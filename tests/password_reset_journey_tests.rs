@@ -75,6 +75,20 @@ async fn test_journey_password_reset_full_lifecycle() {
     let reset_payload = &reset_calls[0];
     assert_eq!(reset_payload.to, email);
     assert_eq!(reset_payload.user_id.to_string(), user_id);
+    let user_uuid = reset_payload.user_id;
+
+    // Assert exactly 1 password reset token exists in database for this user
+    assert_eq!(
+        count_reset_tokens_for_user(&app.pool, user_uuid)
+            .await
+            .expect("fetch reset token count post-request"),
+        1,
+        "database must contain exactly 1 reset token row after reset request"
+    );
+
+    let user_before_reset = get_user_by_id(&app.pool, user_uuid)
+        .await
+        .expect("fetch user before password reset");
 
     let reset_token_from_url = reset_payload
         .url
@@ -83,6 +97,9 @@ async fn test_journey_password_reset_full_lifecycle() {
         .expect("token query param present in email reset url");
     assert_eq!(reset_token_from_url, reset_payload.token);
     assert_eq!(reset_token_from_url.len(), 64);
+
+    // Sleep buffer ensures clock advancement beyond PostgreSQL microsecond/tick boundary
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
     // 4. Submit new password via POST /auth/password/reset
     let reset_res = app
@@ -96,6 +113,32 @@ async fn test_journey_password_reset_full_lifecycle() {
         .await;
     assert_eq!(reset_res.status(), StatusCode::OK);
     assert_eq!(reset_res.json()["message"], "password reset successful");
+
+    // Assert reset token row was consumed/purged from database
+    assert_eq!(
+        count_reset_tokens_for_user(&app.pool, user_uuid)
+            .await
+            .expect("fetch reset token count post-reset"),
+        0,
+        "consumed password reset token must be deleted from database"
+    );
+
+    // Assert password_hash was mutated and updated_at was updated
+    let user_after_reset = get_user_by_id(&app.pool, user_uuid)
+        .await
+        .expect("fetch user after password reset");
+    assert_ne!(
+        user_after_reset.password_hash, user_before_reset.password_hash,
+        "password hash must mutate in database upon reset"
+    );
+    assert!(
+        user_after_reset.updated_at > user_before_reset.created_at,
+        "updated_at must be strictly greater than created_at upon password reset"
+    );
+    assert!(
+        user_after_reset.updated_at > user_before_reset.updated_at,
+        "updated_at must advance upon password reset"
+    );
 
     // 5. Attempt login with old password -> 401 Unauthorized (INVALID_CREDENTIALS)
     let old_login_res = app

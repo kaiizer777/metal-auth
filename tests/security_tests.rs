@@ -2474,6 +2474,7 @@ async fn test_rate_limit_reset_confirm() {
 /// ASVS L1 V2.2: Timing parity between existing-user/wrong-password and unknown-user.
 ///
 /// Asserts that dummy Argon2 verification is invoked on unknown email, preventing timing-based enumeration.
+/// Uses interleaved multi-sample median comparison to eliminate single-sample scheduler-pause flakiness.
 #[tokio::test]
 async fn test_login_timing_parity_unknown_vs_wrong() {
     let Some(ctx) = setup_live_db().await else {
@@ -2493,41 +2494,73 @@ async fn test_login_timing_parity_unknown_vs_wrong() {
         .unwrap();
 
     let wrong_password = dynamic_test_password();
-
-    // Measure existing user + wrong password
-    let start_wrong = std::time::Instant::now();
-    let req1 = json_request(
-        Method::POST,
-        "/auth/login",
-        json!({"email": email, "password": wrong_password.clone()}),
-    );
-    let resp1 = ctx.router.clone().oneshot(req1).await.unwrap();
-    let duration_wrong = start_wrong.elapsed();
-    assert_eq!(resp1.status(), StatusCode::UNAUTHORIZED);
-
-    // Measure non-existent user
     let unknown_email = format!("unknown_timing_{}@example.com", Uuid::new_v4());
-    let start_unknown = std::time::Instant::now();
-    let req2 = json_request(
-        Method::POST,
-        "/auth/login",
-        json!({"email": unknown_email, "password": wrong_password}),
-    );
-    let resp2 = ctx.router.oneshot(req2).await.unwrap();
-    let duration_unknown = start_unknown.elapsed();
-    assert_eq!(resp2.status(), StatusCode::UNAUTHORIZED);
+
+    const WARMUP: usize = 5;
+    const MEASURED: usize = 10;
+
+    // Warmup both paths to stabilise Argon2 state and OS scheduler.
+    for _ in 0..WARMUP {
+        let req = json_request(
+            Method::POST,
+            "/auth/login",
+            json!({"email": email, "password": wrong_password.clone()}),
+        );
+        let _ = ctx.router.clone().oneshot(req).await.unwrap();
+
+        let req = json_request(
+            Method::POST,
+            "/auth/login",
+            json!({"email": unknown_email.clone(), "password": wrong_password.clone()}),
+        );
+        let _ = ctx.router.clone().oneshot(req).await.unwrap();
+    }
+
+    // Interleaved measured rounds to cancel out scheduler drift.
+    let mut durations_wrong: Vec<std::time::Duration> = Vec::with_capacity(MEASURED);
+    let mut durations_unknown: Vec<std::time::Duration> = Vec::with_capacity(MEASURED);
+
+    for _ in 0..MEASURED {
+        let t = std::time::Instant::now();
+        let req = json_request(
+            Method::POST,
+            "/auth/login",
+            json!({"email": email, "password": wrong_password.clone()}),
+        );
+        let resp = ctx.router.clone().oneshot(req).await.unwrap();
+        durations_wrong.push(t.elapsed());
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let t = std::time::Instant::now();
+        let req = json_request(
+            Method::POST,
+            "/auth/login",
+            json!({"email": unknown_email.clone(), "password": wrong_password.clone()}),
+        );
+        let resp = ctx.router.clone().oneshot(req).await.unwrap();
+        durations_unknown.push(t.elapsed());
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let median = |mut v: Vec<std::time::Duration>| -> std::time::Duration {
+        v.sort_unstable();
+        v[v.len() / 2]
+    };
+
+    let median_wrong = median(durations_wrong);
+    let median_unknown = median(durations_unknown);
 
     assert!(
-        duration_wrong >= std::time::Duration::from_millis(10),
-        "Existing user wrong password should execute Argon2 verification (took {duration_wrong:?})"
+        median_wrong >= std::time::Duration::from_millis(10),
+        "Existing user wrong password should execute Argon2 verification (median={median_wrong:?})"
     );
     assert!(
-        duration_unknown >= std::time::Duration::from_millis(10),
-        "Unknown user should execute dummy Argon2 verification (took {duration_unknown:?})"
+        median_unknown >= std::time::Duration::from_millis(10),
+        "Unknown user should execute dummy Argon2 verification (median={median_unknown:?})"
     );
     assert!(
-        duration_unknown >= duration_wrong / 3 && duration_wrong >= duration_unknown / 3,
-        "Timing parity violation: duration_wrong={duration_wrong:?}, duration_unknown={duration_unknown:?}"
+        median_unknown >= median_wrong / 3 && median_wrong >= median_unknown / 3,
+        "Timing parity violation: median_wrong={median_wrong:?}, median_unknown={median_unknown:?}"
     );
 }
 

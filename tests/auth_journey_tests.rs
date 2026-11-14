@@ -37,7 +37,11 @@ async fn test_journey_full_registration_and_login() {
 
     // 2. Capture verification email and extract token from link
     let captured = app.email_sender.verification_calls();
-    assert_eq!(captured.len(), 1, "exactly one verification email dispatched");
+    assert_eq!(
+        captured.len(),
+        1,
+        "exactly one verification email dispatched"
+    );
     let email_payload = &captured[0];
     assert_eq!(email_payload.to, email);
 
@@ -172,3 +176,194 @@ async fn test_journey_login_unverified_account_forbidden() {
     assert_eq!(login_success_res.json()["user_id"], user_id.to_string());
 }
 
+#[tokio::test]
+async fn test_journey_verify_email_idempotency_or_tampered() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let email = dynamic_email();
+    let password = dynamic_password();
+
+    // 1. Register new user
+    let signup_res = app
+        .post_json(
+            ENDPOINT_SIGNUP,
+            json!({
+                "email": email,
+                "password": password
+            }),
+        )
+        .await;
+    assert_eq!(signup_res.status(), StatusCode::OK);
+
+    let captured = app.email_sender.verification_calls();
+    assert_eq!(captured.len(), 1, "verification email dispatched");
+    let valid_token = &captured[0].token;
+    let user_id = captured[0].user_id;
+
+    // 2. Tampered / malformed token submission -> 400 INVALID_TOKEN
+    let malformed_res = app
+        .post_json(
+            ENDPOINT_VERIFY,
+            json!({
+                "token": "malformed_tampered_non_hex_token"
+            }),
+        )
+        .await;
+    assert_eq!(malformed_res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(malformed_res.error_code(), Some(ErrorCode::InvalidToken));
+
+    // Non-existent 64-char hex token -> 400 INVALID_TOKEN
+    let non_existent_token = "0".repeat(64);
+    let unknown_res = app
+        .post_json(
+            ENDPOINT_VERIFY,
+            json!({
+                "token": non_existent_token
+            }),
+        )
+        .await;
+    assert_eq!(unknown_res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(unknown_res.error_code(), Some(ErrorCode::InvalidToken));
+
+    // Pre-verification: user remains unverified
+    assert!(
+        !is_email_verified(&app.pool, user_id)
+            .await
+            .expect("fetch verification status")
+    );
+
+    // 3. First consumption of valid token -> 200 OK
+    let verify_res = app
+        .post_json(
+            ENDPOINT_VERIFY,
+            json!({
+                "token": valid_token
+            }),
+        )
+        .await;
+    assert_eq!(verify_res.status(), StatusCode::OK);
+    assert_eq!(verify_res.json()["message"], "email verified");
+    assert!(
+        is_email_verified(&app.pool, user_id)
+            .await
+            .expect("fetch verification status")
+    );
+
+    // 4. Second consumption of the same token (replay attack) -> 400 INVALID_TOKEN
+    let replay_res = app
+        .post_json(
+            ENDPOINT_VERIFY,
+            json!({
+                "token": valid_token
+            }),
+        )
+        .await;
+    assert_eq!(replay_res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(replay_res.error_code(), Some(ErrorCode::InvalidToken));
+
+    // User remains verified
+    assert!(
+        is_email_verified(&app.pool, user_id)
+            .await
+            .expect("fetch verification status")
+    );
+}
+
+#[tokio::test]
+async fn test_journey_login_invalid_credentials() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let non_existent_email = dynamic_email();
+    let password = dynamic_password();
+
+    // 1. Login with unknown email -> 401 Unauthorized
+    let unknown_email_res = app
+        .post_json(
+            ENDPOINT_LOGIN,
+            json!({
+                "email": non_existent_email,
+                "password": password
+            }),
+        )
+        .await;
+    assert_eq!(unknown_email_res.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        unknown_email_res.error_code(),
+        Some(ErrorCode::InvalidCredentials)
+    );
+
+    // 2. Register and verify a real user
+    let email = dynamic_email();
+    let signup_res = app
+        .post_json(
+            ENDPOINT_SIGNUP,
+            json!({
+                "email": email,
+                "password": password
+            }),
+        )
+        .await;
+    assert_eq!(signup_res.status(), StatusCode::OK);
+
+    let token = app
+        .email_sender
+        .last_verification_token()
+        .expect("captured verification token");
+    let verify_res = app
+        .post_json(
+            ENDPOINT_VERIFY,
+            json!({
+                "token": token
+            }),
+        )
+        .await;
+    assert_eq!(verify_res.status(), StatusCode::OK);
+
+    // 3. Login with registered email but wrong password -> 401 Unauthorized
+    let wrong_password = dynamic_password();
+    let wrong_pw_res = app
+        .post_json(
+            ENDPOINT_LOGIN,
+            json!({
+                "email": email,
+                "password": wrong_password
+            }),
+        )
+        .await;
+    assert_eq!(wrong_pw_res.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        wrong_pw_res.error_code(),
+        Some(ErrorCode::InvalidCredentials)
+    );
+
+    // 4. Anti-enumeration verification: response envelope parity
+    assert_eq!(unknown_email_res.status(), wrong_pw_res.status());
+    assert_eq!(
+        unknown_email_res.json()["code"],
+        wrong_pw_res.json()["code"]
+    );
+    assert_eq!(
+        unknown_email_res.json()["message"],
+        wrong_pw_res.json()["message"]
+    );
+    assert_eq!(wrong_pw_res.json()["message"], "Invalid email or password");
+
+    // 5. Correct credentials succeed -> 200 OK
+    let success_res = app
+        .post_json(
+            ENDPOINT_LOGIN,
+            json!({
+                "email": email,
+                "password": password
+            }),
+        )
+        .await;
+    assert_eq!(success_res.status(), StatusCode::OK);
+    assert!(success_res.json().get("user_id").is_some());
+}

@@ -54,8 +54,8 @@ jobs:
       - run: cargo test --locked --lib
       - run: cargo test --locked --doc
 
-  test:
-    name: Tests
+  integration-tests:
+    name: Integration Tests
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:

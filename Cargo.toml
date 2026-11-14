@@ -62,6 +62,7 @@ default = []
 test-utils = []
 
 [dev-dependencies]
+metal-auth = { path = ".", features = ["test-utils"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -41,6 +41,41 @@ pub mod test_utils {
         pub reset_calls: Mutex<Vec<PasswordResetEmailPayload>>,
     }
 
+    impl CapturingEmailSender {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        pub fn verification_calls(&self) -> Vec<VerificationEmailPayload> {
+            self.verification_calls.lock().unwrap().clone()
+        }
+
+        pub fn reset_calls(&self) -> Vec<PasswordResetEmailPayload> {
+            self.reset_calls.lock().unwrap().clone()
+        }
+
+        pub fn last_verification_token(&self) -> Option<String> {
+            self.verification_calls
+                .lock()
+                .unwrap()
+                .last()
+                .map(|p| p.token.clone())
+        }
+
+        pub fn last_reset_token(&self) -> Option<String> {
+            self.reset_calls
+                .lock()
+                .unwrap()
+                .last()
+                .map(|p| p.token.clone())
+        }
+
+        pub fn clear(&self) {
+            self.verification_calls.lock().unwrap().clear();
+            self.reset_calls.lock().unwrap().clear();
+        }
+    }
+
     #[async_trait::async_trait]
     impl EmailSender for CapturingEmailSender {
         async fn send_verification_email(

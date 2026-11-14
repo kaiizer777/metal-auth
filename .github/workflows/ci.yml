@@ -43,8 +43,38 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
-  test:
-    name: Tests
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: metal_auth_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d metal_auth_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/metal_auth_test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Wait for Postgres
+        run: |
+          for i in $(seq 1 30); do
+            (echo > /dev/tcp/localhost/5432) 2>/dev/null && exit 0
+            sleep 2
+          done
+          exit 1
+      - run: cargo test --locked --lib
+      - run: cargo test --locked --doc
+
+  integration-tests:
+    name: Integration Tests
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -70,7 +100,6 @@ jobs:
             sleep 2
           done
           exit 1
-      - run: cargo test --locked --lib
       - run: cargo test --locked --test auth_journey_tests -- --test-threads=1
       - run: cargo test --locked --test password_reset_journey_tests -- --test-threads=1
       - run: cargo test --locked --test security_edge_journey_tests -- --test-threads=1
@@ -78,7 +107,6 @@ jobs:
       - run: cargo test --locked --test email_test -- --test-threads=1
       - run: cargo test --locked --test env_config_test -- --test-threads=1
       - run: cargo test --locked --test security_tests -- --test-threads=1
-      - run: cargo test --locked --doc
 
   msrv:
     name: MSRV (1.94)

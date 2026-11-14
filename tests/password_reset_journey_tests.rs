@@ -283,3 +283,50 @@ async fn test_journey_password_reset_invalid_or_expired_token() {
     assert_eq!(login_replacement_1.status(), StatusCode::OK);
 }
 
+#[tokio::test]
+async fn test_journey_password_reset_nonexistent_email_enumeration() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let nonexistent_email = dynamic_email();
+
+    // 1. Assert user does not exist in DB prior to request
+    let user_count = count_users_by_email(&app.pool, &nonexistent_email)
+        .await
+        .expect("count users by email");
+    assert_eq!(user_count, 0, "email must not exist in DB");
+
+    // Clear any prior captured emails to ensure clean slate
+    app.email_sender.clear();
+
+    // 2. Request forgot-password for nonexistent email
+    let reset_req_res = app
+        .post_json(
+            ENDPOINT_FORGOT_PASSWORD,
+            json!({ "email": nonexistent_email }),
+        )
+        .await;
+
+    // 3. Assert response returns 200 with identical anti-enumeration message
+    assert_eq!(reset_req_res.status(), StatusCode::OK);
+    assert_eq!(
+        reset_req_res.json()["message"],
+        "if an account with that email exists, a password reset link has been sent"
+    );
+
+    // 4. Assert zero emails were dispatched via app.email_sender
+    assert_eq!(
+        app.email_sender.reset_calls().len(),
+        0,
+        "zero reset emails dispatched for nonexistent email"
+    );
+    assert_eq!(
+        app.email_sender.verification_calls().len(),
+        0,
+        "zero verification emails dispatched for nonexistent email"
+    );
+}
+
+

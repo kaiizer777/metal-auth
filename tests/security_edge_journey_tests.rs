@@ -195,3 +195,80 @@ async fn test_journey_cors_headers_on_all_responses() {
         "Disallowed origin must not receive Access-Control-Allow-Origin header"
     );
 }
+
+/// Scenario 3: Concurrent Registration Race Condition Journey
+///
+/// Simulates multiple concurrent clients (e.g. 8 tasks) submitting signup requests
+/// for the exact same email address simultaneously. Ensures no 500 internal errors,
+/// no database constraint panics or pool corruption occur, and exactly 1 user row
+/// is persisted in PostgreSQL.
+#[tokio::test]
+async fn test_journey_concurrent_registration_race_condition() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let target_email = dynamic_email();
+    let password = dynamic_password();
+    let concurrency_count = 8;
+
+    let mut handles = Vec::with_capacity(concurrency_count);
+
+    for _ in 0..concurrency_count {
+        let app_clone = app.clone();
+        let email_clone = target_email.clone();
+        let password_clone = password.clone();
+
+        handles.push(tokio::spawn(async move {
+            app_clone
+                .post_json(
+                    ENDPOINT_SIGNUP,
+                    json!({
+                        "email": email_clone,
+                        "password": password_clone
+                    }),
+                )
+                .await
+        }));
+    }
+
+    let mut results = Vec::with_capacity(concurrency_count);
+    for handle in handles {
+        let resp = handle
+            .await
+            .expect("tokio task panicked during concurrent signup");
+        results.push(resp);
+    }
+
+    assert_eq!(results.len(), concurrency_count);
+
+    for resp in results {
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "every concurrent registration request must succeed with 200 OK without crashing"
+        );
+        assert_eq!(
+            resp.json()["message"],
+            "if this email is new, a verification link has been sent",
+            "every response must return standard anti-enumeration envelope"
+        );
+    }
+
+    // Exactly 1 user row must be in the database for that email
+    let user_count = count_users_by_email(&app.pool, &target_email)
+        .await
+        .expect("count users by email query");
+    assert_eq!(
+        user_count, 1,
+        "concurrent registrations must result in exactly 1 user record in database"
+    );
+
+    // Exactly 1 verification email must be dispatched despite concurrency
+    assert_eq!(
+        app.email_sender.verification_calls().len(),
+        1,
+        "exactly 1 verification email should be dispatched across concurrent signups"
+    );
+}

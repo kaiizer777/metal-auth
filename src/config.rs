@@ -12,6 +12,7 @@ pub const DEFAULT_OUTBOX_BATCH_SIZE: u32 = 50;
 pub const DEFAULT_OUTBOX_MAX_RETRIES: u32 = 5;
 pub const DEFAULT_OUTBOX_INITIAL_BACKOFF_SECS: u64 = 1;
 pub const DEFAULT_OUTBOX_MAX_BACKOFF_SECS: u64 = 300;
+pub const DEFAULT_OUTBOX_SENT_RETENTION_SECS: u64 = 7 * 24 * 3600; // 7 days (604,800 s)
 
 // ─── Phase 1 — Infra Config ──────────────────────────────────────────────────
 
@@ -45,6 +46,7 @@ pub struct Config {
     pub outbox_max_retries: u32,
     pub outbox_initial_backoff: Duration,
     pub outbox_max_backoff: Duration,
+    pub outbox_sent_retention: Duration,
 }
 
 impl std::fmt::Debug for Config {
@@ -65,6 +67,7 @@ impl std::fmt::Debug for Config {
             .field("outbox_max_retries", &self.outbox_max_retries)
             .field("outbox_initial_backoff", &self.outbox_initial_backoff)
             .field("outbox_max_backoff", &self.outbox_max_backoff)
+            .field("outbox_sent_retention", &self.outbox_sent_retention)
             .finish()
     }
 }
@@ -142,6 +145,12 @@ impl Config {
                 reason: "must be greater than or equal to outbox_initial_backoff",
             });
         }
+        if self.outbox_sent_retention == Duration::ZERO {
+            return Err(ConfigError::InvalidValue {
+                field: "outbox_sent_retention",
+                reason: "must be greater than 0",
+            });
+        }
         for origin in &self.allowed_origins {
             let trimmed = origin.trim();
             if trimmed.ends_with('/') {
@@ -180,8 +189,14 @@ impl Config {
 
     pub fn from_env() -> Result<Self, ConfigError> {
         dotenvy::dotenv().ok();
+        Self::from_lookup(|k| std::env::var(k))
+    }
 
-        let database_url = match std::env::var("DATABASE_URL") {
+    pub fn from_lookup<F>(lookup: F) -> Result<Self, ConfigError>
+    where
+        F: Fn(&str) -> Result<String, std::env::VarError>,
+    {
+        let database_url = match lookup("DATABASE_URL") {
             Ok(val) => val,
             Err(std::env::VarError::NotPresent) => {
                 return Err(ConfigError::MissingEnvVar("DATABASE_URL"));
@@ -190,7 +205,7 @@ impl Config {
                 return Err(ConfigError::NonUnicodeEnvVar("DATABASE_URL"));
             }
         };
-        let port = match std::env::var("PORT") {
+        let port = match lookup("PORT") {
             Ok(val) => val.parse::<u16>().map_err(ConfigError::InvalidPort)?,
             Err(std::env::VarError::NotPresent) => DEFAULT_PORT,
             Err(std::env::VarError::NotUnicode(_)) => {
@@ -198,9 +213,15 @@ impl Config {
             }
         };
 
-        let allowed_origins = parse_allowed_origins()?;
+        let allowed_origins = match lookup("ALLOWED_ORIGINS") {
+            Ok(val) => parse_allowed_origins_str(&val),
+            Err(std::env::VarError::NotPresent) => Vec::new(),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar("ALLOWED_ORIGINS"));
+            }
+        };
 
-        let base_url = match std::env::var("BASE_URL") {
+        let base_url = match lookup("BASE_URL") {
             Ok(val) => val,
             Err(std::env::VarError::NotPresent) => {
                 return Err(ConfigError::MissingEnvVar("BASE_URL"));
@@ -210,7 +231,7 @@ impl Config {
             }
         };
 
-        let email_dispatch_timeout = match std::env::var("EMAIL_DISPATCH_TIMEOUT_SECS") {
+        let email_dispatch_timeout = match lookup("EMAIL_DISPATCH_TIMEOUT_SECS") {
             Ok(val) => {
                 let secs: u64 = val
                     .parse()
@@ -228,7 +249,7 @@ impl Config {
             }
         };
 
-        let async_email_dispatch = match std::env::var("ASYNC_EMAIL_DISPATCH") {
+        let async_email_dispatch = match lookup("ASYNC_EMAIL_DISPATCH") {
             Ok(val) => val
                 .parse::<bool>()
                 .map_err(|_| ConfigError::InvalidEnvVar("ASYNC_EMAIL_DISPATCH"))?,
@@ -238,7 +259,7 @@ impl Config {
             }
         };
 
-        let outbox_poll_interval = match std::env::var("OUTBOX_POLL_INTERVAL_MS") {
+        let outbox_poll_interval = match lookup("OUTBOX_POLL_INTERVAL_MS") {
             Ok(val) => {
                 let ms: u64 = val
                     .parse()
@@ -256,7 +277,7 @@ impl Config {
             }
         };
 
-        let outbox_batch_size = match std::env::var("OUTBOX_BATCH_SIZE") {
+        let outbox_batch_size = match lookup("OUTBOX_BATCH_SIZE") {
             Ok(val) => {
                 let size: u32 = val
                     .parse()
@@ -272,7 +293,7 @@ impl Config {
             }
         };
 
-        let outbox_max_retries = match std::env::var("OUTBOX_MAX_RETRIES") {
+        let outbox_max_retries = match lookup("OUTBOX_MAX_RETRIES") {
             Ok(val) => {
                 let retries: u32 = val
                     .parse()
@@ -288,7 +309,7 @@ impl Config {
             }
         };
 
-        let outbox_initial_backoff = match std::env::var("OUTBOX_INITIAL_BACKOFF_SECS") {
+        let outbox_initial_backoff = match lookup("OUTBOX_INITIAL_BACKOFF_SECS") {
             Ok(val) => {
                 let secs: u64 = val
                     .parse()
@@ -306,7 +327,7 @@ impl Config {
             }
         };
 
-        let outbox_max_backoff = match std::env::var("OUTBOX_MAX_BACKOFF_SECS") {
+        let outbox_max_backoff = match lookup("OUTBOX_MAX_BACKOFF_SECS") {
             Ok(val) => {
                 let secs: u64 = val
                     .parse()
@@ -321,6 +342,24 @@ impl Config {
             }
             Err(std::env::VarError::NotUnicode(_)) => {
                 return Err(ConfigError::NonUnicodeEnvVar("OUTBOX_MAX_BACKOFF_SECS"));
+            }
+        };
+
+        let outbox_sent_retention = match lookup("OUTBOX_SENT_RETENTION_SECS") {
+            Ok(val) => {
+                let secs: u64 = val
+                    .parse()
+                    .map_err(|_| ConfigError::InvalidEnvVar("OUTBOX_SENT_RETENTION_SECS"))?;
+                if secs == 0 {
+                    return Err(ConfigError::InvalidEnvVar("OUTBOX_SENT_RETENTION_SECS"));
+                }
+                Duration::from_secs(secs)
+            }
+            Err(std::env::VarError::NotPresent) => {
+                Duration::from_secs(DEFAULT_OUTBOX_SENT_RETENTION_SECS)
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar("OUTBOX_SENT_RETENTION_SECS"));
             }
         };
 
@@ -346,20 +385,11 @@ impl Config {
             outbox_max_retries,
             outbox_initial_backoff,
             outbox_max_backoff,
+            outbox_sent_retention,
         };
 
         cfg.validate()?;
         Ok(cfg)
-    }
-}
-
-fn parse_allowed_origins() -> Result<Vec<String>, ConfigError> {
-    match std::env::var("ALLOWED_ORIGINS") {
-        Ok(val) => Ok(parse_allowed_origins_str(&val)),
-        Err(std::env::VarError::NotPresent) => Ok(Vec::new()),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            Err(ConfigError::NonUnicodeEnvVar("ALLOWED_ORIGINS"))
-        }
     }
 }
 
@@ -597,6 +627,35 @@ fn parse_env_bool(
     }
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            database_url: "postgres://localhost/test".into(),
+            port: DEFAULT_PORT,
+            allowed_origins: vec!["https://app.example.com".into()],
+            allowed_methods: vec![
+                "GET".into(),
+                "POST".into(),
+                "PUT".into(),
+                "DELETE".into(),
+                "OPTIONS".into(),
+            ],
+            allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            min_connections: DEFAULT_MIN_CONNECTIONS,
+            base_url: "https://app.example.com".into(),
+            email_dispatch_timeout: Duration::from_secs(DEFAULT_EMAIL_DISPATCH_TIMEOUT_SECS),
+            async_email_dispatch: true,
+            outbox_poll_interval: Duration::from_millis(DEFAULT_OUTBOX_POLL_INTERVAL_MS),
+            outbox_batch_size: DEFAULT_OUTBOX_BATCH_SIZE,
+            outbox_max_retries: DEFAULT_OUTBOX_MAX_RETRIES,
+            outbox_initial_backoff: Duration::from_secs(DEFAULT_OUTBOX_INITIAL_BACKOFF_SECS),
+            outbox_max_backoff: Duration::from_secs(DEFAULT_OUTBOX_MAX_BACKOFF_SECS),
+            outbox_sent_retention: Duration::from_secs(DEFAULT_OUTBOX_SENT_RETENTION_SECS),
+        }
+    }
+}
+
 impl Default for AppConfig {
     /// Skips validation — for tests only.
     ///
@@ -652,6 +711,7 @@ mod tests {
             outbox_max_retries: DEFAULT_OUTBOX_MAX_RETRIES,
             outbox_initial_backoff: Duration::from_secs(DEFAULT_OUTBOX_INITIAL_BACKOFF_SECS),
             outbox_max_backoff: Duration::from_secs(DEFAULT_OUTBOX_MAX_BACKOFF_SECS),
+            outbox_sent_retention: Duration::from_secs(DEFAULT_OUTBOX_SENT_RETENTION_SECS),
         }
     }
 
@@ -894,6 +954,62 @@ mod tests {
                 field: "outbox_max_backoff",
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn outbox_sent_retention_defaults_to_7_days() {
+        let lookup = |k: &str| match k {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://example.com".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        let cfg = Config::from_lookup(lookup).expect("load default config");
+        assert_eq!(
+            cfg.outbox_sent_retention,
+            Duration::from_secs(DEFAULT_OUTBOX_SENT_RETENTION_SECS)
+        );
+        assert_eq!(
+            cfg.outbox_sent_retention,
+            Duration::from_secs(7 * 24 * 3600)
+        );
+    }
+
+    #[test]
+    fn outbox_sent_retention_override_from_lookup() {
+        let lookup = |k: &str| match k {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://example.com".into()),
+            "OUTBOX_SENT_RETENTION_SECS" => Ok("86400".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        let cfg = Config::from_lookup(lookup).expect("load overridden retention");
+        assert_eq!(cfg.outbox_sent_retention, Duration::from_secs(86400));
+    }
+
+    #[test]
+    fn outbox_sent_retention_rejects_zero() {
+        let cfg_zero = Config {
+            outbox_sent_retention: Duration::ZERO,
+            ..test_infra_config()
+        };
+        assert!(matches!(
+            cfg_zero.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "outbox_sent_retention",
+                ..
+            })
+        ));
+
+        let lookup_zero = |k: &str| match k {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://example.com".into()),
+            "OUTBOX_SENT_RETENTION_SECS" => Ok("0".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        assert!(matches!(
+            Config::from_lookup(lookup_zero),
+            Err(ConfigError::InvalidEnvVar("OUTBOX_SENT_RETENTION_SECS"))
         ));
     }
 

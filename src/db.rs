@@ -174,6 +174,9 @@ mod tests {
             outbox_max_retries: 5,
             outbox_initial_backoff: Duration::from_secs(1),
             outbox_max_backoff: Duration::from_secs(300),
+            outbox_sent_retention: Duration::from_secs(
+                crate::config::DEFAULT_OUTBOX_SENT_RETENTION_SECS,
+            ),
         };
         let opts = DbPoolOptions::from(&cfg);
         assert_eq!(opts.max_connections, 50);

@@ -139,6 +139,9 @@ mod tests {
                 crate::config::DEFAULT_OUTBOX_INITIAL_BACKOFF_SECS,
             ),
             outbox_max_backoff: Duration::from_secs(crate::config::DEFAULT_OUTBOX_MAX_BACKOFF_SECS),
+            outbox_sent_retention: Duration::from_secs(
+                crate::config::DEFAULT_OUTBOX_SENT_RETENTION_SECS,
+            ),
         }
     }
 

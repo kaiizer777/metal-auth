@@ -30,6 +30,7 @@ fn test_config() -> Config {
         outbox_max_retries: 5,
         outbox_initial_backoff: std::time::Duration::from_secs(1),
         outbox_max_backoff: std::time::Duration::from_secs(300),
+        outbox_sent_retention: std::time::Duration::from_secs(7 * 24 * 3600),
     }
 }
 

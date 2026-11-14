@@ -62,6 +62,9 @@ mod tests {
             outbox_max_backoff: std::time::Duration::from_secs(
                 crate::config::DEFAULT_OUTBOX_MAX_BACKOFF_SECS,
             ),
+            outbox_sent_retention: std::time::Duration::from_secs(
+                crate::config::DEFAULT_OUTBOX_SENT_RETENTION_SECS,
+            ),
         }
     }
 

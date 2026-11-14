@@ -32,6 +32,7 @@ fn create_test_router() -> axum::Router {
         outbox_max_retries: 5,
         outbox_initial_backoff: std::time::Duration::from_secs(1),
         outbox_max_backoff: std::time::Duration::from_secs(300),
+        outbox_sent_retention: std::time::Duration::from_secs(7 * 24 * 3600),
     };
     let pool = sqlx::postgres::PgPoolOptions::new()
         .acquire_timeout(std::time::Duration::from_millis(500))
@@ -61,6 +62,7 @@ fn create_failing_db_router() -> axum::Router {
         outbox_max_retries: 5,
         outbox_initial_backoff: std::time::Duration::from_secs(1),
         outbox_max_backoff: std::time::Duration::from_secs(300),
+        outbox_sent_retention: std::time::Duration::from_secs(7 * 24 * 3600),
     };
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
@@ -119,6 +121,7 @@ async fn setup_live_db() -> Option<LiveDbTestContext> {
         outbox_max_retries: 5,
         outbox_initial_backoff: std::time::Duration::from_secs(1),
         outbox_max_backoff: std::time::Duration::from_secs(300),
+        outbox_sent_retention: std::time::Duration::from_secs(7 * 24 * 3600),
     };
     let state = AppState::new(pool.clone(), cfg).expect("failed to create app state with live DB");
     let router = create_router(state.clone()).expect("failed to create router for live DB test");

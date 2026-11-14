@@ -378,3 +378,86 @@ async fn test_state_with_auth_config_propagates_error() {
     let err_cfgs = AppState::with_configs_and_dispatcher(pool, cfg, invalid_config, None);
     assert!(matches!(err_cfgs, Err(AppError::Config(_))));
 }
+
+#[tokio::test]
+async fn test_migration_applies_on_fresh_db_schema() {
+    dotenvy::dotenv().ok();
+    let url = match std::env::var("DATABASE_URL") {
+        Ok(val) => val,
+        Err(std::env::VarError::NotPresent) => {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "DATABASE_URL must be set in CI: migration smoke test must never skip silently"
+            );
+            eprintln!("SKIP: test_migration_applies_on_fresh_db_schema needs DATABASE_URL");
+            return;
+        }
+        Err(e) => panic!("invalid DATABASE_URL environment variable: {e}"),
+    };
+
+    let base_pool = sqlx::PgPool::connect(&url)
+        .await
+        .expect("connect to base database");
+
+    let schema_name = format!("test_schema_{}", Uuid::new_v4().simple());
+
+    // Create fresh isolated schema
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema_name}")))
+        .execute(&base_pool)
+        .await
+        .expect("create isolated test schema");
+
+    // Connect with a pool whose connections have search_path set to the fresh schema
+    let test_schema = schema_name.clone();
+    let schema_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(move |conn, _meta| {
+            let s = test_schema.clone();
+            Box::pin(async move {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "SET search_path TO {s}, public"
+                )))
+                .execute(conn)
+                .await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await
+        .expect("connect to isolated test schema pool");
+
+    // 1. Initial migration run from scratch on fresh schema
+    let migrator = sqlx::migrate!("./migrations");
+    migrator
+        .run(&schema_pool)
+        .await
+        .expect("migrations must apply cleanly on fresh schema");
+
+    // 2. Assert core domain tables were created in the fresh schema
+    let table_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = $1 AND table_name IN ('users', 'sessions', 'verification_tokens', 'password_reset_tokens', '_sqlx_migrations')",
+    )
+    .bind(&schema_name)
+    .fetch_one(&base_pool)
+    .await
+    .expect("query tables in test schema");
+    assert_eq!(
+        table_count, 5,
+        "all migrated tables must exist in the fresh schema"
+    );
+
+    // 3. Idempotency assertion: re-running migrations on the same schema must succeed without error
+    migrator
+        .run(&schema_pool)
+        .await
+        .expect("re-running migrations must be idempotent and succeed without error");
+
+    // Cleanup: drop pool and isolated schema
+    drop(schema_pool);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP SCHEMA {schema_name} CASCADE"
+    )))
+    .execute(&base_pool)
+    .await
+    .expect("clean up test schema");
+}

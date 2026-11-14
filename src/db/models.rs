@@ -57,6 +57,32 @@ pub struct PasswordResetToken {
     pub created_at: DateTime<Utc>,
 }
 
+pub const OUTBOX_STATUS_PENDING: &str = "pending";
+pub const OUTBOX_STATUS_PROCESSING: &str = "processing";
+pub const OUTBOX_STATUS_SENT: &str = "sent";
+pub const OUTBOX_STATUS_FAILED: &str = "failed";
+
+pub const EMAIL_TYPE_VERIFICATION: &str = "verification";
+pub const EMAIL_TYPE_PASSWORD_RESET: &str = "password_reset";
+
+/// Transactional email outbox entity.
+///
+/// Guarantees at-least-once email delivery across application crashes
+/// and transient network failures by capturing dispatches inside the database transaction.
+#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
+pub struct EmailOutbox {
+    pub id: Uuid,
+    pub recipient: String,
+    pub email_type: String,
+    pub payload: serde_json::Value,
+    pub status: String,
+    pub retry_count: i32,
+    pub next_retry_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub sent_at: Option<DateTime<Utc>>,
+    pub error_log: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,5 +109,30 @@ mod tests {
         let json = serde_json::to_string(&response).expect("serialize response");
         assert!(!json.contains("password_hash"));
         assert!(!json.contains("argon2id"));
+    }
+
+    #[test]
+    fn test_email_outbox_model_and_constants() {
+        let now = Utc::now();
+        let id = Uuid::new_v4();
+        let outbox = EmailOutbox {
+            id,
+            recipient: "user@example.com".to_string(),
+            email_type: EMAIL_TYPE_VERIFICATION.to_string(),
+            payload: serde_json::json!({"test": "data"}),
+            status: OUTBOX_STATUS_PENDING.to_string(),
+            retry_count: 0,
+            next_retry_at: now,
+            created_at: now,
+            sent_at: None,
+            error_log: None,
+        };
+
+        assert_eq!(outbox.id, id);
+        assert_eq!(outbox.status, OUTBOX_STATUS_PENDING);
+        assert_eq!(outbox.email_type, EMAIL_TYPE_VERIFICATION);
+        assert_eq!(outbox.retry_count, 0);
+        assert_eq!(outbox.sent_at, None);
+        assert_eq!(outbox.error_log, None);
     }
 }

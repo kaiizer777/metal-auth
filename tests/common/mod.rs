@@ -25,7 +25,7 @@ pub static DB_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// Truncates all authentication and session domain tables with CASCADE.
 pub async fn truncate_tables(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "TRUNCATE TABLE users, sessions, verification_tokens, password_reset_tokens CASCADE",
+        "TRUNCATE TABLE users, sessions, verification_tokens, password_reset_tokens, email_outbox CASCADE",
     )
     .execute(pool)
     .await?;
@@ -284,6 +284,27 @@ pub async fn expire_verification_tokens_for_user(
     Ok(())
 }
 
+/// DB query helper: returns total count of outbox records.
+pub async fn count_outbox_rows(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM email_outbox")
+        .fetch_one(pool)
+        .await?;
+    Ok(row.0)
+}
+
+/// DB query helper: returns all outbox records for a given recipient.
+pub async fn get_outbox_rows_for_recipient(
+    pool: &PgPool,
+    recipient: &str,
+) -> Result<Vec<metal_auth::EmailOutbox>, sqlx::Error> {
+    sqlx::query_as::<sqlx::Postgres, metal_auth::EmailOutbox>(
+        "SELECT id, recipient, email_type, payload, status, retry_count, next_retry_at, created_at, sent_at, error_log FROM email_outbox WHERE recipient = $1 ORDER BY created_at ASC",
+    )
+    .bind(recipient)
+    .fetch_all(pool)
+    .await
+}
+
 /// Initializes a live-DB test app with default `AppConfig` and blocking email dispatcher.
 pub async fn setup_test_app() -> Option<TestApp> {
     setup_test_app_with_auth_config(Arc::new(AppConfig::default())).await
@@ -336,6 +357,12 @@ pub async fn setup_test_app_with_auth_config(auth_config: Arc<AppConfig>) -> Opt
         base_url: "https://example.com".into(),
         email_dispatch_timeout: Duration::from_secs(10),
         async_email_dispatch: true,
+        outbox_poll_interval: Duration::from_millis(50),
+        outbox_batch_size: 50,
+        outbox_max_retries: 5,
+        outbox_initial_backoff: Duration::from_secs(1),
+        outbox_max_backoff: Duration::from_secs(300),
+        outbox_sent_retention: Duration::from_secs(7 * 24 * 3600),
     };
 
     let state = AppState::with_dispatcher(pool.clone(), cfg, auth_config, dispatcher)

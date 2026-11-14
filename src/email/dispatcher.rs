@@ -1,9 +1,12 @@
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tracing::{Instrument, error, info_span, warn};
 
 use crate::email::hook::{DynError, SharedEmailSender};
+use crate::email::outbox::OutboxWorkerConfig;
 use crate::email::payload::{PasswordResetEmailPayload, VerificationEmailPayload};
 
 fn percent_encode_token(input: &str) -> String {
@@ -54,6 +57,9 @@ pub struct EmailDispatcher {
     sender: Option<SharedEmailSender>,
     timeout: Duration,
     base_url: Option<String>,
+    notify: Arc<tokio::sync::Notify>,
+    worker_started: Arc<AtomicBool>,
+    outbox_config: OutboxWorkerConfig,
     /// Inline (caller-blocking) delivery — test-only, absent from default builds.
     #[cfg(any(test, feature = "test-utils"))]
     block_on_delivery: bool,
@@ -66,6 +72,9 @@ impl EmailDispatcher {
             sender,
             timeout,
             base_url: None,
+            notify: Arc::new(tokio::sync::Notify::new()),
+            worker_started: Arc::new(AtomicBool::new(false)),
+            outbox_config: OutboxWorkerConfig::default(),
             #[cfg(any(test, feature = "test-utils"))]
             block_on_delivery: false,
         }
@@ -82,6 +91,74 @@ impl EmailDispatcher {
             block_on_delivery: true,
             ..Self::new(sender, timeout)
         }
+    }
+
+    /// Configures outbox worker settings from application configuration.
+    pub fn with_outbox_config(mut self, config: &crate::config::Config) -> Self {
+        self.outbox_config = OutboxWorkerConfig::from(config);
+        self
+    }
+
+    /// Spawns the background outbox worker loop once if not already running.
+    pub fn ensure_worker_started(&self, pool: &sqlx::PgPool) {
+        #[cfg(any(test, feature = "test-utils"))]
+        if self.block_on_delivery {
+            return;
+        }
+
+        if tokio::runtime::Handle::try_current().is_err() {
+            warn!("no active tokio runtime; skipping background outbox worker spawn");
+            return;
+        }
+
+        if !self.worker_started.swap(true, Ordering::SeqCst) {
+            let pool = pool.clone();
+            let sender = self.sender.clone();
+            let timeout = self.timeout;
+            let config = self.outbox_config.clone();
+            let notify = Arc::clone(&self.notify);
+
+            tokio::spawn(async move {
+                crate::email::outbox::run_outbox_worker(pool, sender, timeout, config, notify)
+                    .await;
+            });
+        }
+    }
+
+    /// Called immediately after committing an outbox row to wake up the processor.
+    ///
+    /// Under blocking test mode (`new_blocking`), delivers pending messages inline so
+    /// assertions can verify delivery synchronously without polling.
+    pub async fn on_outbox_committed(&self, _pool: &sqlx::PgPool) {
+        #[cfg(any(test, feature = "test-utils"))]
+        if self.block_on_delivery {
+            let _ = crate::email::outbox::process_outbox_batch(
+                _pool,
+                &self.sender,
+                self.timeout,
+                &self.outbox_config,
+            )
+            .await;
+            return;
+        }
+
+        self.notify.notify_one();
+    }
+
+    /// Test helper to synchronously drain and process all due outbox messages.
+    pub async fn flush_outbox(&self, pool: &sqlx::PgPool) -> Result<usize, sqlx::Error> {
+        crate::email::outbox::process_outbox_batch(
+            pool,
+            &self.sender,
+            self.timeout,
+            &self.outbox_config,
+        )
+        .await
+    }
+
+    /// Returns a reference to the configured email sender, if any.
+    pub fn sender(&self) -> Option<&SharedEmailSender> {
+        self.sender.as_ref()
     }
 
     /// Configures a base URL on the dispatcher.
@@ -199,7 +276,8 @@ impl fmt::Debug for EmailDispatcher {
         debug
             .field("timeout", &self.timeout)
             .field("sender", &self.sender.is_some())
-            .field("base_url", &self.base_url);
+            .field("base_url", &self.base_url)
+            .field("outbox_config", &self.outbox_config);
         #[cfg(any(test, feature = "test-utils"))]
         debug.field("block_on_delivery", &self.block_on_delivery);
         debug.finish()
@@ -370,5 +448,86 @@ mod tests {
         let dispatcher = EmailDispatcher::new(None, Duration::from_secs(1))
             .with_base_url("https://auth.example.com");
         assert_eq!(dispatcher.base_url(), Some("https://auth.example.com"));
+    }
+
+    #[tokio::test]
+    async fn ensure_worker_started_outside_tokio_does_not_panic() {
+        let dispatcher = EmailDispatcher::new(None, Duration::from_secs(1));
+        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/dummy").unwrap();
+        let handle = std::thread::spawn(move || {
+            dispatcher.ensure_worker_started(&pool);
+            assert!(!dispatcher.worker_started.load(Ordering::SeqCst));
+        });
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocking_dispatcher_skips_worker_spawn() {
+        let dispatcher = EmailDispatcher::new_blocking(None, Duration::from_secs(1));
+        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/dummy").unwrap();
+        dispatcher.ensure_worker_started(&pool);
+        assert!(!dispatcher.worker_started.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn with_outbox_config_attaches_config_properly() {
+        let cfg = crate::config::Config {
+            outbox_poll_interval: Duration::from_millis(750),
+            outbox_batch_size: 42,
+            outbox_max_retries: 7,
+            outbox_initial_backoff: Duration::from_secs(4),
+            outbox_max_backoff: Duration::from_secs(120),
+            outbox_sent_retention: Duration::from_secs(86400 * 3),
+            ..Default::default()
+        };
+        let dispatcher =
+            EmailDispatcher::new(None, Duration::from_secs(1)).with_outbox_config(&cfg);
+        assert_eq!(
+            dispatcher.outbox_config.poll_interval,
+            Duration::from_millis(750)
+        );
+        assert_eq!(dispatcher.outbox_config.batch_size, 42);
+        assert_eq!(dispatcher.outbox_config.max_retries, 7);
+        assert_eq!(
+            dispatcher.outbox_config.initial_backoff,
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            dispatcher.outbox_config.max_backoff,
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            dispatcher.outbox_config.sent_retention,
+            Duration::from_secs(86400 * 3)
+        );
+    }
+
+    #[tokio::test]
+    async fn on_outbox_committed_non_blocking_notifies_worker() {
+        let dispatcher = EmailDispatcher::new(None, Duration::from_secs(1));
+        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/dummy").unwrap();
+
+        let notify = Arc::clone(&dispatcher.notify);
+        let notified_future = notify.notified();
+
+        dispatcher.on_outbox_committed(&pool).await;
+
+        tokio::time::timeout(Duration::from_millis(100), notified_future)
+            .await
+            .expect("notify_one must wake the notify subscriber");
+    }
+
+    #[tokio::test]
+    async fn ensure_worker_started_in_tokio_runtime_spawns_worker_once() {
+        let dispatcher = EmailDispatcher::new(None, Duration::from_secs(1));
+        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/dummy").unwrap();
+
+        assert!(!dispatcher.worker_started.load(Ordering::SeqCst));
+        dispatcher.ensure_worker_started(&pool);
+        assert!(dispatcher.worker_started.load(Ordering::SeqCst));
+
+        // Subsequent call is a no-op and preserves true
+        dispatcher.ensure_worker_started(&pool);
+        assert!(dispatcher.worker_started.load(Ordering::SeqCst));
     }
 }

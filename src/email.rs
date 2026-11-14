@@ -2,10 +2,12 @@
 
 pub mod dispatcher;
 pub mod hook;
+pub mod outbox;
 pub mod payload;
 
 pub use dispatcher::{EmailDispatcher, build_reset_url, build_verification_url};
 pub use hook::{DynError, EmailSender, SharedEmailSender};
+pub use outbox::{OutboxWorkerConfig, process_outbox_batch, run_outbox_worker};
 pub use payload::{PasswordResetEmailPayload, VerificationEmailPayload};
 
 /// No-op email sender — drops all payloads without sending.
@@ -67,9 +69,23 @@ pub mod test_utils {
                 .map(|p| p.token.clone())
         }
 
+        pub fn verification_token_for(&self, recipient: &str) -> Option<String> {
+            lock_guard(&self.verification_calls)
+                .iter()
+                .rfind(|p| p.to == recipient)
+                .map(|p| p.token.clone())
+        }
+
         pub fn last_reset_token(&self) -> Option<String> {
             lock_guard(&self.reset_calls)
                 .last()
+                .map(|p| p.token.clone())
+        }
+
+        pub fn reset_token_for(&self, recipient: &str) -> Option<String> {
+            lock_guard(&self.reset_calls)
+                .iter()
+                .rfind(|p| p.to == recipient)
                 .map(|p| p.token.clone())
         }
 
@@ -95,6 +111,56 @@ pub mod test_utils {
         ) -> Result<(), DynError> {
             lock_guard(&self.reset_calls).push(payload);
             Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_capturing_email_sender_scoped_tokens() {
+            let sender = CapturingEmailSender::new();
+            let p1 = VerificationEmailPayload {
+                to: "user1@example.com".into(),
+                token: "token-user1".into(),
+                url: "https://example.com/v1".into(),
+                expires_at: chrono::Utc::now(),
+                user_id: uuid::Uuid::new_v4(),
+            };
+            let p2 = VerificationEmailPayload {
+                to: "user2@example.com".into(),
+                token: "token-user2".into(),
+                url: "https://example.com/v2".into(),
+                expires_at: chrono::Utc::now(),
+                user_id: uuid::Uuid::new_v4(),
+            };
+            sender.send_verification_email(p1).await.unwrap();
+            sender.send_verification_email(p2).await.unwrap();
+
+            assert_eq!(
+                sender.verification_token_for("user1@example.com"),
+                Some("token-user1".into())
+            );
+            assert_eq!(
+                sender.verification_token_for("user2@example.com"),
+                Some("token-user2".into())
+            );
+            assert_eq!(sender.verification_token_for("unknown@example.com"), None);
+
+            let r1 = PasswordResetEmailPayload {
+                to: "reset1@example.com".into(),
+                token: "reset-tok-1".into(),
+                url: "https://example.com/r1".into(),
+                expires_at: chrono::Utc::now(),
+                user_id: uuid::Uuid::new_v4(),
+            };
+            sender.send_password_reset_email(r1).await.unwrap();
+            assert_eq!(
+                sender.reset_token_for("reset1@example.com"),
+                Some("reset-tok-1".into())
+            );
+            assert_eq!(sender.reset_token_for("unknown@example.com"), None);
         }
     }
 }

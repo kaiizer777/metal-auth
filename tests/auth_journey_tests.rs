@@ -351,7 +351,7 @@ async fn test_journey_login_invalid_credentials() {
 
     let token = app
         .email_sender
-        .last_verification_token()
+        .verification_token_for(&email)
         .expect("captured verification token");
     let verify_res = app
         .post_json(

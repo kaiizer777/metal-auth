@@ -68,6 +68,7 @@ impl AuthServiceImpl {
     ) -> Result<Self, AppError> {
         config.validate().map_err(AppError::Config)?;
         let dummy_hash = generate_dummy_hash(&config)?;
+        dispatcher.ensure_worker_started(&pool);
         Ok(Self {
             pool,
             config,
@@ -136,25 +137,38 @@ impl AuthServiceImpl {
             return Err(AppError::Database(e));
         }
 
-        tx.commit().await.map_err(AppError::Database)?;
-
-        // Detached after commit: response latency must not depend on mailer latency, and
-        // the delivery task must outlive a client disconnect. The returned handle is
-        // dropped on purpose — awaiting it would reintroduce the dependency.
         let url = EmailDispatcher::build_verification_url(
             self.dispatcher.base_url().unwrap_or(""),
             &raw_token,
         );
-        let _ = self
-            .dispatcher
-            .dispatch_verification(VerificationEmailPayload {
-                user_id,
-                to: normalized_email,
-                token: raw_token,
-                url,
-                expires_at,
-            })
-            .await;
+        let payload = VerificationEmailPayload {
+            user_id,
+            to: normalized_email.clone(),
+            token: raw_token,
+            url,
+            expires_at,
+        };
+        let payload_json = serde_json::to_value(&payload).map_err(|e| {
+            tracing::error!(err = %e, "failed to serialize verification payload");
+            AppError::Internal
+        })?;
+
+        let outbox_res = crate::db::outbox::insert_outbox(
+            &mut *tx,
+            &normalized_email,
+            crate::db::models::EMAIL_TYPE_VERIFICATION,
+            payload_json,
+        )
+        .await;
+
+        if let Err(e) = outbox_res {
+            let _ = tx.rollback().await;
+            return Err(AppError::Database(e));
+        }
+
+        tx.commit().await.map_err(AppError::Database)?;
+
+        self.dispatcher.on_outbox_committed(&self.pool).await;
 
         Ok(())
     }
@@ -295,31 +309,54 @@ impl AuthServiceImpl {
             let ttl = self.config.reset_token_ttl_secs as i64;
             let expires_at = Utc::now() + chrono::Duration::seconds(ttl);
 
-            sqlx::query(
+            let url = EmailDispatcher::build_reset_url(
+                self.dispatcher.base_url().unwrap_or(""),
+                &raw_token,
+            );
+            let payload = PasswordResetEmailPayload {
+                user_id,
+                to: normalized_email.clone(),
+                token: raw_token,
+                url,
+                expires_at,
+            };
+            let payload_json = serde_json::to_value(&payload).map_err(|e| {
+                tracing::error!(err = %e, "failed to serialize password reset payload");
+                AppError::Internal
+            })?;
+
+            let mut tx = self.pool.begin().await.map_err(AppError::Database)?;
+
+            let insert_res = sqlx::query(
                 "INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
             )
             .bind(&token_hash[..])
             .bind(user_id)
             .bind(expires_at)
-            .execute(&self.pool)
-            .await
-            .map_err(AppError::Database)?;
+            .execute(&mut *tx)
+            .await;
 
-            // Detached, see the comment on signup.
-            let url = EmailDispatcher::build_reset_url(
-                self.dispatcher.base_url().unwrap_or(""),
-                &raw_token,
-            );
-            let _ = self
-                .dispatcher
-                .dispatch_password_reset(PasswordResetEmailPayload {
-                    user_id,
-                    to: normalized_email,
-                    token: raw_token,
-                    url,
-                    expires_at,
-                })
-                .await;
+            if let Err(e) = insert_res {
+                let _ = tx.rollback().await;
+                return Err(AppError::Database(e));
+            }
+
+            let outbox_res = crate::db::outbox::insert_outbox(
+                &mut *tx,
+                &normalized_email,
+                crate::db::models::EMAIL_TYPE_PASSWORD_RESET,
+                payload_json,
+            )
+            .await;
+
+            if let Err(e) = outbox_res {
+                let _ = tx.rollback().await;
+                return Err(AppError::Database(e));
+            }
+
+            tx.commit().await.map_err(AppError::Database)?;
+
+            self.dispatcher.on_outbox_committed(&self.pool).await;
         }
 
         Ok(())
@@ -530,13 +567,17 @@ mod tests {
         }
     }
 
+    static DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     struct DbTestContext {
         service: AuthServiceImpl,
         pool: PgPool,
         sender: ArcCapturingSender,
+        _guard: tokio::sync::MutexGuard<'static, ()>,
     }
 
     async fn setup_db_context() -> Option<DbTestContext> {
+        let guard = DB_TEST_LOCK.lock().await;
         dotenvy::dotenv().ok();
         let url = db_test_url()?;
         // Runs the embedded migrations, so a bare Postgres (CI service container) is enough.
@@ -557,7 +598,7 @@ mod tests {
             ..Default::default()
         });
         let sender = ArcCapturingSender::default();
-        let dispatcher = Arc::new(EmailDispatcher::new(
+        let dispatcher = Arc::new(EmailDispatcher::new_blocking(
             Some(Arc::new(sender.clone())),
             std::time::Duration::from_secs(10),
         ));
@@ -566,6 +607,7 @@ mod tests {
             service,
             pool,
             sender,
+            _guard: guard,
         })
     }
 

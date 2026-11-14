@@ -9,6 +9,7 @@ use crate::{
 };
 
 pub mod models;
+pub mod outbox;
 
 pub const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
@@ -168,6 +169,14 @@ mod tests {
             base_url: "https://example.com".into(),
             email_dispatch_timeout: Duration::from_secs(5),
             async_email_dispatch: true,
+            outbox_poll_interval: Duration::from_millis(50),
+            outbox_batch_size: 50,
+            outbox_max_retries: 5,
+            outbox_initial_backoff: Duration::from_secs(1),
+            outbox_max_backoff: Duration::from_secs(300),
+            outbox_sent_retention: Duration::from_secs(
+                crate::config::DEFAULT_OUTBOX_SENT_RETENTION_SECS,
+            ),
         };
         let opts = DbPoolOptions::from(&cfg);
         assert_eq!(opts.max_connections, 50);

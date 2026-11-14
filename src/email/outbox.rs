@@ -22,6 +22,7 @@ pub struct OutboxWorkerConfig {
     pub initial_backoff: Duration,
     pub max_backoff: Duration,
     pub lease_duration: Duration,
+    pub sent_retention: Duration,
 }
 
 impl Default for OutboxWorkerConfig {
@@ -35,6 +36,9 @@ impl Default for OutboxWorkerConfig {
             ),
             max_backoff: Duration::from_secs(crate::config::DEFAULT_OUTBOX_MAX_BACKOFF_SECS),
             lease_duration: Duration::from_secs(300),
+            sent_retention: Duration::from_secs(
+                crate::config::DEFAULT_OUTBOX_SENT_RETENTION_SECS,
+            ),
         }
     }
 }
@@ -48,6 +52,7 @@ impl From<&Config> for OutboxWorkerConfig {
             initial_backoff: cfg.outbox_initial_backoff,
             max_backoff: cfg.outbox_max_backoff,
             lease_duration: Duration::from_secs(300),
+            sent_retention: cfg.outbox_sent_retention,
         }
     }
 }
@@ -55,6 +60,11 @@ impl From<&Config> for OutboxWorkerConfig {
 impl OutboxWorkerConfig {
     pub fn with_lease_duration(mut self, lease_duration: Duration) -> Self {
         self.lease_duration = lease_duration;
+        self
+    }
+
+    pub fn with_sent_retention(mut self, sent_retention: Duration) -> Self {
+        self.sent_retention = sent_retention;
         self
     }
 }
@@ -112,7 +122,11 @@ async fn deliver_single_message(
                 Err(e) => {
                     let err_msg = format!("corrupt verification payload: {e}");
                     error!(op = "outbox_delivery", id = %msg.id, err = %err_msg);
-                    let _ = mark_outbox_failed(pool, msg.id, &err_msg).await;
+                    match mark_outbox_failed(pool, msg.id, &err_msg).await {
+                        Ok(true) => {}
+                        Ok(false) => warn!(op = "outbox_delivery", id = %msg.id, "outbox lease expired; claim lost before marking failed"),
+                        Err(e) => error!(op = "outbox_delivery", id = %msg.id, err = %e, "database error marking outbox as failed"),
+                    }
                     return;
                 }
             }
@@ -125,7 +139,11 @@ async fn deliver_single_message(
                 Err(e) => {
                     let err_msg = format!("corrupt password reset payload: {e}");
                     error!(op = "outbox_delivery", id = %msg.id, err = %err_msg);
-                    let _ = mark_outbox_failed(pool, msg.id, &err_msg).await;
+                    match mark_outbox_failed(pool, msg.id, &err_msg).await {
+                        Ok(true) => {}
+                        Ok(false) => warn!(op = "outbox_delivery", id = %msg.id, "outbox lease expired; claim lost before marking failed"),
+                        Err(e) => error!(op = "outbox_delivery", id = %msg.id, err = %e, "database error marking outbox as failed"),
+                    }
                     return;
                 }
             }
@@ -133,19 +151,21 @@ async fn deliver_single_message(
         unknown => {
             let err_msg = format!("unknown email type: {unknown}");
             error!(op = "outbox_delivery", id = %msg.id, err = %err_msg);
-            let _ = mark_outbox_failed(pool, msg.id, &err_msg).await;
+            match mark_outbox_failed(pool, msg.id, &err_msg).await {
+                Ok(true) => {}
+                Ok(false) => warn!(op = "outbox_delivery", id = %msg.id, "outbox lease expired; claim lost before marking failed"),
+                Err(e) => error!(op = "outbox_delivery", id = %msg.id, err = %e, "database error marking outbox as failed"),
+            }
             return;
         }
     };
 
     match result {
-        Ok(Ok(())) => {
-            if let Err(e) = mark_outbox_sent(pool, msg.id).await {
-                error!(op = "outbox_delivery", id = %msg.id, err = %e, "failed to mark outbox as sent");
-            } else {
-                info!(op = "outbox_delivery", id = %msg.id, email_type = %msg.email_type, "outbox email sent");
-            }
-        }
+        Ok(Ok(())) => match mark_outbox_sent(pool, msg.id).await {
+            Ok(true) => info!(op = "outbox_delivery", id = %msg.id, email_type = %msg.email_type, "outbox email sent"),
+            Ok(false) => warn!(op = "outbox_delivery", id = %msg.id, "outbox lease expired; claim lost before completion"),
+            Err(e) => error!(op = "outbox_delivery", id = %msg.id, err = %e, "database error marking sent"),
+        },
         Ok(Err(send_err)) => {
             let err_msg = format!("send error: {send_err}");
             handle_delivery_failure(pool, msg, &err_msg, config).await;
@@ -172,7 +192,20 @@ async fn handle_delivery_failure(
             err = %err_msg,
             "outbox delivery exhausted max retries; marked failed"
         );
-        let _ = mark_outbox_failed(pool, msg.id, err_msg).await;
+        match mark_outbox_failed(pool, msg.id, err_msg).await {
+            Ok(true) => {}
+            Ok(false) => warn!(
+                op = "outbox_delivery",
+                id = %msg.id,
+                "outbox lease expired; claim lost before marking failed"
+            ),
+            Err(e) => error!(
+                op = "outbox_delivery",
+                id = %msg.id,
+                err = %e,
+                "database error marking outbox as failed"
+            ),
+        }
     } else {
         let backoff =
             calculate_backoff(msg.retry_count, config.initial_backoff, config.max_backoff);
@@ -186,7 +219,20 @@ async fn handle_delivery_failure(
             err = %err_msg,
             "outbox delivery failed; scheduled retry with exponential backoff"
         );
-        let _ = record_outbox_retry(pool, msg.id, next_retry_at, err_msg).await;
+        match record_outbox_retry(pool, msg.id, next_retry_at, err_msg).await {
+            Ok(true) => {}
+            Ok(false) => warn!(
+                op = "outbox_delivery",
+                id = %msg.id,
+                "outbox lease expired; claim lost before recording retry"
+            ),
+            Err(e) => error!(
+                op = "outbox_delivery",
+                id = %msg.id,
+                err = %e,
+                "database error recording outbox retry"
+            ),
+        }
     }
 }
 
@@ -221,6 +267,9 @@ pub async fn run_outbox_worker(
     if let Err(e) = crate::db::outbox::recover_stale_processing(&pool).await {
         error!(err = %e, "failed to recover stale outbox processing records on startup");
     }
+    if let Err(e) = crate::db::outbox::cleanup_sent_outbox(&pool, config.sent_retention).await {
+        error!(err = %e, "failed to cleanup sent outbox records on startup");
+    }
 
     // Drain existing pending records immediately on startup before sleeping
     drain_outbox_batches(&pool, &sender, timeout, &config).await;
@@ -232,6 +281,9 @@ pub async fn run_outbox_worker(
         }
 
         drain_outbox_batches(&pool, &sender, timeout, &config).await;
+        if let Err(e) = crate::db::outbox::cleanup_sent_outbox(&pool, config.sent_retention).await {
+            error!(err = %e, "failed to cleanup sent outbox records");
+        }
     }
 }
 
@@ -261,5 +313,17 @@ mod tests {
         assert_eq!(calculate_backoff(1, initial, max), Duration::from_millis(1000));
         assert_eq!(calculate_backoff(2, initial, max), Duration::from_millis(2000));
         assert_eq!(calculate_backoff(3, initial, max), Duration::from_millis(4000));
+    }
+
+    #[test]
+    fn test_outbox_worker_config_retention_defaults_and_builder() {
+        let config = OutboxWorkerConfig::default();
+        assert_eq!(
+            config.sent_retention,
+            Duration::from_secs(crate::config::DEFAULT_OUTBOX_SENT_RETENTION_SECS)
+        );
+
+        let custom = config.with_sent_retention(Duration::from_secs(86400));
+        assert_eq!(custom.sent_retention, Duration::from_secs(86400));
     }
 }

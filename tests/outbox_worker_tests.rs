@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use common::*;
 use metal_auth::db::models::{OUTBOX_STATUS_FAILED, OUTBOX_STATUS_PENDING, OUTBOX_STATUS_SENT};
 use metal_auth::db::outbox::{
-    claim_pending_outbox, get_outbox_by_id, insert_outbox, mark_outbox_failed, record_outbox_retry,
+    claim_pending_outbox, cleanup_sent_outbox, get_outbox_by_id, insert_outbox,
     recover_stale_processing,
 };
 use metal_auth::email::outbox::{OutboxWorkerConfig, process_outbox_batch};
@@ -172,6 +172,26 @@ async fn test_outbox_concurrent_claiming_skip_locked() {
     assert_eq!(claimed1.len() + claimed2.len(), 10, "all 10 rows claimed");
 }
 
+#[derive(Clone, Default)]
+struct FailingEmailSender;
+
+#[async_trait::async_trait]
+impl metal_auth::email::hook::EmailSender for FailingEmailSender {
+    async fn send_verification_email(
+        &self,
+        _payload: metal_auth::email::payload::VerificationEmailPayload,
+    ) -> Result<(), metal_auth::email::hook::DynError> {
+        Err("simulated transport failure".into())
+    }
+
+    async fn send_password_reset_email(
+        &self,
+        _payload: metal_auth::email::payload::PasswordResetEmailPayload,
+    ) -> Result<(), metal_auth::email::hook::DynError> {
+        Err("simulated transport failure".into())
+    }
+}
+
 #[tokio::test]
 async fn test_outbox_retry_and_exhaustion_to_failed() {
     let _guard = DB_LOCK.lock().await;
@@ -191,11 +211,20 @@ async fn test_outbox_retry_and_exhaustion_to_failed() {
         .await
         .expect("insert outbox");
 
-    // Simulate transient retry attempts
-    let next_retry = chrono::Utc::now() + chrono::Duration::seconds(10);
-    record_outbox_retry(&app.pool, row.id, next_retry, "network timeout")
+    let failing_sender: Option<SharedEmailSender> = Some(Arc::new(FailingEmailSender));
+    let config = OutboxWorkerConfig {
+        batch_size: 10,
+        max_retries: 3,
+        initial_backoff: Duration::from_millis(1),
+        max_backoff: Duration::from_millis(10),
+        ..OutboxWorkerConfig::default()
+    };
+
+    // Attempt 1: failure schedules retry with backoff, retry_count becomes 1
+    let p1 = process_outbox_batch(&app.pool, &failing_sender, Duration::from_secs(1), &config)
         .await
-        .expect("record retry");
+        .expect("batch attempt 1");
+    assert!(p1 >= 1);
 
     let updated = get_outbox_by_id(&app.pool, row.id)
         .await
@@ -203,20 +232,47 @@ async fn test_outbox_retry_and_exhaustion_to_failed() {
         .unwrap();
     assert_eq!(updated.status, OUTBOX_STATUS_PENDING);
     assert_eq!(updated.retry_count, 1);
-    assert_eq!(updated.error_log.as_deref(), Some("network timeout"));
+    assert!(updated.error_log.as_deref().unwrap_or("").contains("simulated transport failure"));
 
-    // Simulate exhaustion
-    mark_outbox_failed(&app.pool, row.id, "exhausted max retries")
+    // Advance next_retry_at to NOW() so attempt 2 is eligible
+    sqlx::query("UPDATE email_outbox SET next_retry_at = NOW() WHERE id = $1")
+        .bind(row.id)
+        .execute(&app.pool)
         .await
-        .expect("mark failed");
+        .expect("reset next_retry_at");
+
+    // Attempt 2: retry_count becomes 2
+    let p2 = process_outbox_batch(&app.pool, &failing_sender, Duration::from_secs(1), &config)
+        .await
+        .expect("batch attempt 2");
+    assert!(p2 >= 1);
+
+    let updated2 = get_outbox_by_id(&app.pool, row.id)
+        .await
+        .expect("get outbox")
+        .unwrap();
+    assert_eq!(updated2.status, OUTBOX_STATUS_PENDING);
+    assert_eq!(updated2.retry_count, 2);
+
+    // Advance next_retry_at to NOW() so attempt 3 is eligible
+    sqlx::query("UPDATE email_outbox SET next_retry_at = NOW() WHERE id = $1")
+        .bind(row.id)
+        .execute(&app.pool)
+        .await
+        .expect("reset next_retry_at");
+
+    // Attempt 3: next_retry_count reaches max_retries (3), row marked failed
+    let p3 = process_outbox_batch(&app.pool, &failing_sender, Duration::from_secs(1), &config)
+        .await
+        .expect("batch attempt 3");
+    assert!(p3 >= 1);
 
     let failed = get_outbox_by_id(&app.pool, row.id)
         .await
         .expect("get outbox")
         .unwrap();
     assert_eq!(failed.status, OUTBOX_STATUS_FAILED);
-    assert_eq!(failed.retry_count, 2);
-    assert_eq!(failed.error_log.as_deref(), Some("exhausted max retries"));
+    assert!(failed.error_log.as_deref().unwrap_or("").contains("simulated transport failure"));
 }
 
 #[tokio::test]
@@ -266,8 +322,9 @@ async fn test_outbox_durability_across_process_restart() {
     assert!(sent_row.sent_at.is_some());
 
     let calls = sender.verification_calls();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].to, recipient);
+    let own_calls: Vec<_> = calls.iter().filter(|c| c.to == recipient).collect();
+    assert_eq!(own_calls.len(), 1);
+    assert_eq!(own_calls[0].to, recipient);
 }
 
 #[tokio::test]
@@ -387,4 +444,71 @@ async fn test_outbox_unconfigured_sender_does_not_burn_retries() {
         row_in_db.retry_count, 0,
         "retry count must not be incremented"
     );
+}
+
+#[tokio::test]
+async fn test_outbox_retention_cleanup() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let old_recipient = format!("old_sent_{}@example.com", uuid::Uuid::new_v4());
+    let fresh_recipient = format!("fresh_sent_{}@example.com", uuid::Uuid::new_v4());
+    let pending_recipient = format!("pending_{}@example.com", uuid::Uuid::new_v4());
+
+    let payload = json!({
+        "to": "test@example.com"
+    });
+
+    // 1. Insert old sent row with sent_at = NOW() - INTERVAL '8 days'
+    let old_row = insert_outbox(&app.pool, &old_recipient, "verification", payload.clone())
+        .await
+        .expect("insert old row");
+    sqlx::query("UPDATE email_outbox SET status = $1, sent_at = NOW() - INTERVAL '8 days' WHERE id = $2")
+        .bind(OUTBOX_STATUS_SENT)
+        .bind(old_row.id)
+        .execute(&app.pool)
+        .await
+        .expect("update old row to sent");
+
+    // 2. Insert fresh sent row with sent_at = NOW()
+    let fresh_row = insert_outbox(&app.pool, &fresh_recipient, "verification", payload.clone())
+        .await
+        .expect("insert fresh row");
+    sqlx::query("UPDATE email_outbox SET status = $1, sent_at = NOW() WHERE id = $2")
+        .bind(OUTBOX_STATUS_SENT)
+        .bind(fresh_row.id)
+        .execute(&app.pool)
+        .await
+        .expect("update fresh row to sent");
+
+    // 3. Insert pending row
+    let pending_row = insert_outbox(&app.pool, &pending_recipient, "verification", payload)
+        .await
+        .expect("insert pending row");
+
+    // 4. Run cleanup_sent_outbox with 7-day retention window
+    let purged = cleanup_sent_outbox(&app.pool, Duration::from_secs(7 * 24 * 3600))
+        .await
+        .expect("cleanup sent outbox");
+    assert!(purged >= 1, "at least the old sent row must be purged");
+
+    // 5. Assert old sent row is deleted
+    let old_check = get_outbox_by_id(&app.pool, old_row.id)
+        .await
+        .expect("query old row");
+    assert!(old_check.is_none(), "old sent row must be purged");
+
+    // 6. Assert fresh sent row remains
+    let fresh_check = get_outbox_by_id(&app.pool, fresh_row.id)
+        .await
+        .expect("query fresh row");
+    assert!(fresh_check.is_some(), "fresh sent row must remain");
+
+    // 7. Assert pending row remains
+    let pending_check = get_outbox_by_id(&app.pool, pending_row.id)
+        .await
+        .expect("query pending row");
+    assert!(pending_check.is_some(), "pending row must remain");
 }

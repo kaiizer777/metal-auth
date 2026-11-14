@@ -9,6 +9,7 @@ license = "MIT"
 readme = "README.md"
 keywords = ["auth", "authentication", "session", "oauth2", "security"]
 categories = ["authentication", "web-programming"]
+autotests = true
 
 [dependencies]
 # async runtime
@@ -62,6 +63,7 @@ default = []
 test-utils = []
 
 [dev-dependencies]
+metal-auth = { path = ".", version = "0.1.0", features = ["test-utils"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

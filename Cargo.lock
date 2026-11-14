@@ -910,6 +910,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "hex",
+ "metal-auth",
  "rand_core 0.6.4",
  "serde",
  "serde_json",

@@ -46,3 +46,6 @@ pub use email::{
 pub use error::{AppError, AppResult, ConfigError, ErrorCode, ErrorResponse};
 pub use handler::auth_routes;
 pub use state::AppState;
+
+#[cfg(any(test, feature = "test-utils"))]
+pub use email::test_utils;

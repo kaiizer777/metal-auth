@@ -126,11 +126,7 @@ impl EmailDispatcher {
                 _pool,
                 &self.sender,
                 self.timeout,
-                self.outbox_config.batch_size,
-                self.outbox_config.max_retries,
-                self.outbox_config.initial_backoff,
-                self.outbox_config.max_backoff,
-                self.outbox_config.lease_duration,
+                &self.outbox_config,
             )
             .await;
             return;
@@ -145,11 +141,7 @@ impl EmailDispatcher {
             pool,
             &self.sender,
             self.timeout,
-            self.outbox_config.batch_size,
-            self.outbox_config.max_retries,
-            self.outbox_config.initial_backoff,
-            self.outbox_config.max_backoff,
-            self.outbox_config.lease_duration,
+            &self.outbox_config,
         )
         .await
     }

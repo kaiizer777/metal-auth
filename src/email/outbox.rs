@@ -77,33 +77,21 @@ pub async fn process_outbox_batch(
     pool: &PgPool,
     sender: &Option<SharedEmailSender>,
     timeout: Duration,
-    batch_size: u32,
-    max_retries: u32,
-    initial_backoff: Duration,
-    max_backoff: Duration,
-    lease_duration: Duration,
+    config: &OutboxWorkerConfig,
 ) -> Result<usize, sqlx::Error> {
     let Some(sender) = sender.as_ref() else {
         return Ok(0);
     };
 
-    let messages = claim_pending_outbox(pool, batch_size as i64, lease_duration).await?;
+    let messages =
+        claim_pending_outbox(pool, config.batch_size as i64, config.lease_duration).await?;
     if messages.is_empty() {
         return Ok(0);
     }
 
     let count = messages.len();
     for msg in messages {
-        deliver_single_message(
-            pool,
-            sender,
-            msg,
-            timeout,
-            max_retries,
-            initial_backoff,
-            max_backoff,
-        )
-        .await;
+        deliver_single_message(pool, sender, msg, timeout, config).await;
     }
 
     Ok(count)
@@ -114,9 +102,7 @@ async fn deliver_single_message(
     sender: &SharedEmailSender,
     msg: EmailOutbox,
     timeout: Duration,
-    max_retries: u32,
-    initial_backoff: Duration,
-    max_backoff: Duration,
+    config: &OutboxWorkerConfig,
 ) {
     let result = match msg.email_type.as_str() {
         EMAIL_TYPE_VERIFICATION => {
@@ -163,27 +149,11 @@ async fn deliver_single_message(
         }
         Ok(Err(send_err)) => {
             let err_msg = format!("send error: {send_err}");
-            handle_delivery_failure(
-                pool,
-                msg,
-                &err_msg,
-                max_retries,
-                initial_backoff,
-                max_backoff,
-            )
-            .await;
+            handle_delivery_failure(pool, msg, &err_msg, config).await;
         }
         Err(_elapsed) => {
             let err_msg = "send timed out".to_string();
-            handle_delivery_failure(
-                pool,
-                msg,
-                &err_msg,
-                max_retries,
-                initial_backoff,
-                max_backoff,
-            )
-            .await;
+            handle_delivery_failure(pool, msg, &err_msg, config).await;
         }
     }
 }
@@ -192,12 +162,10 @@ async fn handle_delivery_failure(
     pool: &PgPool,
     msg: EmailOutbox,
     err_msg: &str,
-    max_retries: u32,
-    initial_backoff: Duration,
-    max_backoff: Duration,
+    config: &OutboxWorkerConfig,
 ) {
     let next_retry_count = msg.retry_count + 1;
-    if next_retry_count >= max_retries as i32 {
+    if next_retry_count >= config.max_retries as i32 {
         error!(
             op = "outbox_delivery",
             id = %msg.id,
@@ -207,7 +175,8 @@ async fn handle_delivery_failure(
         );
         let _ = mark_outbox_failed(pool, msg.id, err_msg).await;
     } else {
-        let backoff = calculate_backoff(msg.retry_count, initial_backoff, max_backoff);
+        let backoff =
+            calculate_backoff(msg.retry_count, config.initial_backoff, config.max_backoff);
         let next_retry_at =
             Utc::now() + ChronoDuration::from_std(backoff).unwrap_or(ChronoDuration::seconds(300));
         warn!(
@@ -229,18 +198,7 @@ async fn drain_outbox_batches(
     config: &OutboxWorkerConfig,
 ) {
     loop {
-        match process_outbox_batch(
-            pool,
-            sender,
-            timeout,
-            config.batch_size,
-            config.max_retries,
-            config.initial_backoff,
-            config.max_backoff,
-            config.lease_duration,
-        )
-        .await
-        {
+        match process_outbox_batch(pool, sender, timeout, config).await {
             Ok(count) if count >= config.batch_size as usize => {
                 continue;
             }

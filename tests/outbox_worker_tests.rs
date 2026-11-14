@@ -10,7 +10,7 @@ use metal_auth::db::outbox::{
     claim_pending_outbox, get_outbox_by_id, insert_outbox, mark_outbox_failed, record_outbox_retry,
     recover_stale_processing,
 };
-use metal_auth::email::outbox::process_outbox_batch;
+use metal_auth::email::outbox::{OutboxWorkerConfig, process_outbox_batch};
 use metal_auth::email::test_utils::CapturingEmailSender;
 use metal_auth::{EmailDispatcher, SharedEmailSender};
 use serde_json::json;
@@ -364,11 +364,7 @@ async fn test_outbox_unconfigured_sender_does_not_burn_retries() {
         &app.pool,
         &None,
         Duration::from_secs(5),
-        50,
-        5,
-        Duration::from_secs(1),
-        Duration::from_secs(300),
-        Duration::from_secs(300),
+        &OutboxWorkerConfig::default(),
     )
     .await
     .expect("process outbox batch");

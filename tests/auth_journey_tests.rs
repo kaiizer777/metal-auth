@@ -55,10 +55,15 @@ async fn test_journey_full_registration_and_login() {
     assert_eq!(token_from_url.len(), 64, "token must be 64-character hex");
 
     // Pre-verification: user must not be marked verified in database
-    assert!(
-        !is_email_verified(&app.pool, email_payload.user_id)
+    let initial_user = get_user_by_id(&app.pool, email_payload.user_id)
+        .await
+        .expect("fetch initial user");
+    assert!(!initial_user.email_verified);
+    assert_eq!(
+        count_verification_tokens_for_user(&app.pool, email_payload.user_id)
             .await
-            .expect("fetch verification status")
+            .expect("fetch token count"),
+        1
     );
 
     // 3. Consume verification token
@@ -78,6 +83,28 @@ async fn test_journey_full_registration_and_login() {
         is_email_verified(&app.pool, email_payload.user_id)
             .await
             .expect("fetch verification status")
+    );
+
+    // Consumed token row must be deleted from verification_tokens table
+    assert_eq!(
+        count_verification_tokens_for_user(&app.pool, email_payload.user_id)
+            .await
+            .expect("fetch verification token count post-verify"),
+        0,
+        "consumed verification token row must be purged from database"
+    );
+
+    // updated_at must be mutated to a timestamp strictly after created_at
+    let verified_user = get_user_by_id(&app.pool, email_payload.user_id)
+        .await
+        .expect("fetch verified user");
+    assert!(
+        verified_user.updated_at > initial_user.created_at,
+        "updated_at must be strictly after created_at upon verification"
+    );
+    assert!(
+        verified_user.updated_at >= initial_user.updated_at,
+        "updated_at must advance upon verification"
     );
 
     // 4. Login with verified account
@@ -437,6 +464,15 @@ async fn test_journey_verify_email_expired_token() {
             .await
             .expect("fetch verification status"),
         "user must remain unverified after expired token rejection"
+    );
+
+    // Expired token row must be purged from database upon rejection
+    assert_eq!(
+        count_verification_tokens_for_user(&app.pool, user_id)
+            .await
+            .expect("fetch verification token count post-expired-verify"),
+        0,
+        "expired verification token row must be purged from database upon rejection"
     );
 
     // 5. Attempt login -> 403 Forbidden (EMAIL_NOT_VERIFIED)

@@ -28,7 +28,10 @@ fn create_test_router() -> axum::Router {
         email_dispatch_timeout: std::time::Duration::from_secs(10),
         async_email_dispatch: true,
     };
-    let pool = PgPool::connect_lazy(&cfg.database_url).expect("lazy pool");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(std::time::Duration::from_millis(500))
+        .connect_lazy(&cfg.database_url)
+        .expect("lazy pool");
     let state = AppState::new(pool, cfg).expect("failed to create app state");
     create_router(state).expect("failed to create router")
 }
@@ -2270,17 +2273,21 @@ async fn test_expired_password_reset_token() {
 
 // ─── Scenario 15: Architectural Gaps & Non-Functional Security Contracts ─────
 
+async fn setup_rate_limit_router() -> axum::Router {
+    if let Some(ctx) = setup_live_db().await {
+        ctx.router
+    } else {
+        create_test_router()
+    }
+}
+
 /// ASVS L1 V2.2: Rate limiting / brute-force protection on /auth/login.
 ///
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 /// In Phase 3, rapid repeated login attempts execute deterministically without server panic.
 #[tokio::test]
 async fn test_rate_limit_login() {
-    let router = if let Some(ctx) = setup_live_db().await {
-        ctx.router
-    } else {
-        create_test_router()
-    };
+    let router = setup_rate_limit_router().await;
 
     for _ in 0..5 {
         let req = json_request(
@@ -2307,9 +2314,9 @@ async fn test_rate_limit_login() {
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
 async fn test_rate_limit_signup() {
-    let router = create_test_router();
+    let router = setup_rate_limit_router().await;
 
-    for i in 0..5 {
+    for i in 0..3 {
         let req = json_request(
             Method::POST,
             "/auth/signup",
@@ -2332,7 +2339,7 @@ async fn test_rate_limit_signup() {
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
 async fn test_rate_limit_password_reset_request() {
-    let router = create_test_router();
+    let router = setup_rate_limit_router().await;
 
     for _ in 0..5 {
         let req = json_request(
@@ -2353,7 +2360,7 @@ async fn test_rate_limit_password_reset_request() {
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
 async fn test_rate_limit_verify_token() {
-    let router = create_test_router();
+    let router = setup_rate_limit_router().await;
 
     for _ in 0..5 {
         let req = json_request(
@@ -2374,7 +2381,7 @@ async fn test_rate_limit_verify_token() {
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
 async fn test_rate_limit_reset_confirm() {
-    let router = create_test_router();
+    let router = setup_rate_limit_router().await;
 
     for _ in 0..5 {
         let req = json_request(

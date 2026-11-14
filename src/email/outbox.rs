@@ -67,8 +67,7 @@ pub fn calculate_backoff(
 ) -> Duration {
     let exponent = (retry_count.max(0) as u32).min(31);
     let factor = 2u32.saturating_pow(exponent);
-    let backoff_secs = initial_backoff.as_secs().saturating_mul(factor as u64);
-    let backoff = Duration::from_secs(backoff_secs);
+    let backoff = initial_backoff.saturating_mul(factor);
     backoff.min(max_backoff)
 }
 
@@ -252,5 +251,15 @@ mod tests {
         assert_eq!(calculate_backoff(4, initial, max), Duration::from_secs(16));
         assert_eq!(calculate_backoff(5, initial, max), Duration::from_secs(32));
         assert_eq!(calculate_backoff(6, initial, max), Duration::from_secs(60)); // capped at max
+    }
+
+    #[test]
+    fn test_calculate_backoff_fractional_seconds() {
+        let initial = Duration::from_millis(500);
+        let max = Duration::from_secs(10);
+        assert_eq!(calculate_backoff(0, initial, max), Duration::from_millis(500));
+        assert_eq!(calculate_backoff(1, initial, max), Duration::from_millis(1000));
+        assert_eq!(calculate_backoff(2, initial, max), Duration::from_millis(2000));
+        assert_eq!(calculate_backoff(3, initial, max), Duration::from_millis(4000));
     }
 }

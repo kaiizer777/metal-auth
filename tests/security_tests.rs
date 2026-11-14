@@ -1340,51 +1340,6 @@ async fn test_cors_null_origin_rejected() {
     );
 }
 
-#[tokio::test]
-async fn test_csrf_state_changing_request_requires_allowed_origin() {
-    let router = create_test_router();
-
-    // Allowed origin receives CORS approval header
-    let allowed_req = Request::builder()
-        .method(Method::POST)
-        .uri("/auth/signup")
-        .header(header::ORIGIN, "https://app.example.com")
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            r#"{"email":"bad-email","password":"ValidPassword123!"}"#,
-        ))
-        .unwrap();
-
-    let allowed_resp = router.clone().oneshot(allowed_req).await.unwrap();
-    assert_eq!(
-        allowed_resp
-            .headers()
-            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-            .and_then(|v| v.to_str().ok()),
-        Some("https://app.example.com")
-    );
-
-    // Cross-origin untrusted origin has no CORS approval header (CSRF containment)
-    let untrusted_req = Request::builder()
-        .method(Method::POST)
-        .uri("/auth/signup")
-        .header(header::ORIGIN, "https://attacker.com")
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            r#"{"email":"bad-email","password":"ValidPassword123!"}"#,
-        ))
-        .unwrap();
-
-    let untrusted_resp = router.oneshot(untrusted_req).await.unwrap();
-    assert!(
-        untrusted_resp
-            .headers()
-            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-            .is_none(),
-        "Untrusted cross-origin request must not be granted CORS origin access"
-    );
-}
-
 // ─── Scenario 13: Zero secret leakage in error responses ────────────────────
 
 #[tokio::test]
@@ -1860,7 +1815,7 @@ async fn test_require_email_verification_block() {
 }
 
 #[tokio::test]
-async fn test_token_replay_and_expiry() {
+async fn test_verification_token_replay_rejected() {
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -2271,7 +2226,7 @@ async fn test_expired_verification_token() {
 }
 
 #[tokio::test]
-async fn test_expired_password_reset_token() {
+async fn test_expired_password_reset_token_rejected() {
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -2292,7 +2247,7 @@ async fn test_expired_password_reset_token() {
     let user_id: Uuid = user_row.get("id");
 
     let (raw_token, stored_hash) = generate_token();
-    let expires_at = Utc::now() - Duration::minutes(5);
+    let expires_at = Utc::now() - Duration::hours(1);
 
     sqlx::query(
         "INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
@@ -2510,12 +2465,16 @@ async fn test_login_timing_parity_unknown_vs_wrong() {
     assert_eq!(resp2.status(), StatusCode::UNAUTHORIZED);
 
     assert!(
-        duration_wrong.as_millis() >= 1,
-        "Existing user wrong password should execute Argon2 verification"
+        duration_wrong >= std::time::Duration::from_millis(10),
+        "Existing user wrong password should execute Argon2 verification (took {duration_wrong:?})"
     );
     assert!(
-        duration_unknown.as_millis() >= 1,
-        "Unknown user should execute dummy Argon2 verification"
+        duration_unknown >= std::time::Duration::from_millis(10),
+        "Unknown user should execute dummy Argon2 verification (took {duration_unknown:?})"
+    );
+    assert!(
+        duration_unknown >= duration_wrong / 3 && duration_wrong >= duration_unknown / 3,
+        "Timing parity violation: duration_wrong={duration_wrong:?}, duration_unknown={duration_unknown:?}"
     );
 }
 
@@ -2553,4 +2512,56 @@ async fn test_session_fixation_login_issues_fresh_session() {
     let (status, body, _) = response_json(resp).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["user_id"], user_id.to_string());
+}
+
+/// ASVS L1 / OWASP: CSRF protection on state-changing endpoints.
+///
+/// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
+/// CORS origin restriction prevents client scripts from reading responses across origins,
+/// but cross-origin state-changing POST requests are not rejected with 403 Forbidden
+/// without anti-CSRF tokens or strict Origin/Referer enforcement middleware.
+#[tokio::test]
+async fn test_csrf_state_changing_request_requires_allowed_origin() {
+    let router = create_test_router();
+
+    // Allowed origin receives CORS approval header
+    let allowed_req = Request::builder()
+        .method(Method::POST)
+        .uri("/auth/signup")
+        .header(header::ORIGIN, "https://app.example.com")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"email":"bad-email","password":"ValidPassword123!"}"#,
+        ))
+        .unwrap();
+
+    let allowed_resp = router.clone().oneshot(allowed_req).await.unwrap();
+    assert_eq!(
+        allowed_resp
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|v| v.to_str().ok()),
+        Some("https://app.example.com")
+    );
+
+    // Tracked architectural gap: Untrusted origin is denied CORS approval header.
+    // In Phase 4, dedicated CSRF middleware will reject untrusted POST requests with 403 Forbidden.
+    let untrusted_req = Request::builder()
+        .method(Method::POST)
+        .uri("/auth/signup")
+        .header(header::ORIGIN, "https://attacker.com")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"email":"bad-email","password":"ValidPassword123!"}"#,
+        ))
+        .unwrap();
+
+    let untrusted_resp = router.oneshot(untrusted_req).await.unwrap();
+    assert!(
+        untrusted_resp
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none(),
+        "Untrusted cross-origin request must not be granted CORS origin access"
+    );
 }

@@ -66,6 +66,11 @@ async fn test_outbox_atomic_rollback_on_duplicate_signup() {
         1,
         "rolled back duplicate signup must never commit an outbox row"
     );
+
+    let _ = sqlx::query("DELETE FROM email_outbox WHERE recipient = $1")
+        .bind(&email)
+        .execute(&app.pool)
+        .await;
 }
 
 #[tokio::test]
@@ -92,7 +97,7 @@ async fn test_outbox_record_inserted_for_password_reset() {
 
     let verify_token = app
         .email_sender
-        .last_verification_token()
+        .verification_token_for(&email)
         .expect("verification token dispatched");
     let verify_res = app
         .post_json(ENDPOINT_VERIFY, json!({ "token": verify_token }))
@@ -119,6 +124,11 @@ async fn test_outbox_record_inserted_for_password_reset() {
     );
     assert_eq!(reset_rows[0].email_type, "password_reset");
     assert_eq!(reset_rows[0].status, OUTBOX_STATUS_SENT); // blocking dispatcher in test marks sent
+
+    let _ = sqlx::query("DELETE FROM email_outbox WHERE recipient = $1")
+        .bind(&email)
+        .execute(&app.pool)
+        .await;
 }
 
 #[tokio::test]
@@ -170,6 +180,11 @@ async fn test_outbox_concurrent_claiming_skip_locked() {
         "concurrent workers with FOR UPDATE SKIP LOCKED must never claim duplicate rows"
     );
     assert_eq!(claimed1.len() + claimed2.len(), 10, "all 10 rows claimed");
+
+    let _ = sqlx::query("DELETE FROM email_outbox WHERE id = ANY($1)")
+        .bind(&ids)
+        .execute(&app.pool)
+        .await;
 }
 
 #[derive(Clone, Default)]
@@ -285,6 +300,11 @@ async fn test_outbox_retry_and_exhaustion_to_failed() {
             .unwrap_or("")
             .contains("simulated transport failure")
     );
+
+    let _ = sqlx::query("DELETE FROM email_outbox WHERE id = $1")
+        .bind(row.id)
+        .execute(&app.pool)
+        .await;
 }
 
 #[tokio::test]
@@ -337,6 +357,11 @@ async fn test_outbox_durability_across_process_restart() {
     let own_calls: Vec<_> = calls.iter().filter(|c| c.to == recipient).collect();
     assert_eq!(own_calls.len(), 1);
     assert_eq!(own_calls[0].to, recipient);
+
+    let _ = sqlx::query("DELETE FROM email_outbox WHERE id = $1")
+        .bind(row.id)
+        .execute(&app.pool)
+        .await;
 }
 
 #[tokio::test]
@@ -408,6 +433,11 @@ async fn test_outbox_stale_processing_lease_recovery() {
         .expect("get outbox")
         .unwrap();
     assert_eq!(recovered_row.status, OUTBOX_STATUS_PENDING);
+
+    let _ = sqlx::query("DELETE FROM email_outbox WHERE id = $1")
+        .bind(row.id)
+        .execute(&app.pool)
+        .await;
 }
 
 #[tokio::test]
@@ -456,6 +486,11 @@ async fn test_outbox_unconfigured_sender_does_not_burn_retries() {
         row_in_db.retry_count, 0,
         "retry count must not be incremented"
     );
+
+    let _ = sqlx::query("DELETE FROM email_outbox WHERE id = $1")
+        .bind(row.id)
+        .execute(&app.pool)
+        .await;
 }
 
 #[tokio::test]
@@ -525,4 +560,10 @@ async fn test_outbox_retention_cleanup() {
         .await
         .expect("query pending row");
     assert!(pending_check.is_some(), "pending row must remain");
+
+    let _ = sqlx::query("DELETE FROM email_outbox WHERE id IN ($1, $2)")
+        .bind(fresh_row.id)
+        .bind(pending_row.id)
+        .execute(&app.pool)
+        .await;
 }

@@ -223,6 +223,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    static DB_OUTBOX_TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     async fn test_pool() -> Option<PgPool> {
         dotenvy::dotenv().ok();
         let url = match std::env::var("DATABASE_URL") {
@@ -235,16 +237,19 @@ mod tests {
                 return None;
             }
         };
-        crate::db::init_pool(&crate::Config {
-            database_url: url,
-            ..Default::default()
-        })
-        .await
-        .ok()
+        Some(
+            crate::db::init_pool(&crate::Config {
+                database_url: url,
+                ..Default::default()
+            })
+            .await
+            .expect("failed to initialize test database pool"),
+        )
     }
 
     #[tokio::test]
     async fn cleanup_sent_outbox_deletes_only_sent_rows_older_than_cutoff() {
+        let _guard = DB_OUTBOX_TEST_MUTEX.lock().await;
         let Some(pool) = test_pool().await else {
             return;
         };
@@ -329,6 +334,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_outbox_sent_enforces_processing_status_claim() {
+        let _guard = DB_OUTBOX_TEST_MUTEX.lock().await;
         let Some(pool) = test_pool().await else {
             return;
         };
@@ -384,6 +390,7 @@ mod tests {
 
     #[tokio::test]
     async fn record_outbox_retry_and_failed_enforce_processing_status() {
+        let _guard = DB_OUTBOX_TEST_MUTEX.lock().await;
         let Some(pool) = test_pool().await else {
             return;
         };
@@ -456,6 +463,83 @@ mod tests {
         // Cleanup
         let _ = sqlx::query("DELETE FROM email_outbox WHERE id = $1")
             .bind(row.id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn recover_stale_processing_resets_expired_processing_to_pending() {
+        let _guard = DB_OUTBOX_TEST_MUTEX.lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+
+        let row_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO email_outbox (id, recipient, email_type, payload, status, retry_count, next_retry_at)
+            VALUES ($1, $2, 'verification', '{}'::jsonb, $3, 0, NOW() - INTERVAL '10 seconds')
+            "#,
+        )
+        .bind(row_id)
+        .bind(format!("stale_proc_{}@example.com", row_id))
+        .bind(OUTBOX_STATUS_PROCESSING)
+        .execute(&pool)
+        .await
+        .expect("insert stale processing row");
+
+        let recovered = recover_stale_processing(&pool)
+            .await
+            .expect("recover stale processing");
+        assert!(recovered >= 1);
+
+        let row = get_outbox_by_id(&pool, row_id)
+            .await
+            .expect("fetch row")
+            .expect("row exists");
+        assert_eq!(row.status, OUTBOX_STATUS_PENDING);
+
+        let _ = sqlx::query("DELETE FROM email_outbox WHERE id = $1")
+            .bind(row_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn claim_pending_outbox_reclaims_expired_processing_lease() {
+        let _guard = DB_OUTBOX_TEST_MUTEX.lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+
+        let row_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO email_outbox (id, recipient, email_type, payload, status, retry_count, next_retry_at)
+            VALUES ($1, $2, 'verification', '{}'::jsonb, $3, 0, NOW() - INTERVAL '10 seconds')
+            "#,
+        )
+        .bind(row_id)
+        .bind(format!("claim_stale_{}@example.com", row_id))
+        .bind(OUTBOX_STATUS_PROCESSING)
+        .execute(&pool)
+        .await
+        .expect("insert stale processing row for claim");
+
+        let claimed = claim_pending_outbox(&pool, 50, Duration::from_secs(60))
+            .await
+            .expect("claim outbox");
+        assert!(claimed.iter().any(|r| r.id == row_id));
+
+        let row = get_outbox_by_id(&pool, row_id)
+            .await
+            .expect("fetch row")
+            .expect("row exists");
+        assert_eq!(row.status, OUTBOX_STATUS_PROCESSING);
+        assert!(row.next_retry_at > Utc::now());
+
+        let _ = sqlx::query("DELETE FROM email_outbox WHERE id = $1")
+            .bind(row_id)
             .execute(&pool)
             .await;
     }

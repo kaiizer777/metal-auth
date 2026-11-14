@@ -36,7 +36,7 @@ async fn test_journey_password_reset_full_lifecycle() {
 
     let verify_token = app
         .email_sender
-        .last_verification_token()
+        .verification_token_for(&email)
         .expect("verification token dispatched");
     let verify_res = app
         .post_json(ENDPOINT_VERIFY, json!({ "token": verify_token }))
@@ -196,7 +196,7 @@ async fn test_journey_password_reset_invalid_or_expired_token() {
 
     let verify_token = app
         .email_sender
-        .last_verification_token()
+        .verification_token_for(&email)
         .expect("verification token dispatched");
     let verify_res = app
         .post_json(ENDPOINT_VERIFY, json!({ "token": verify_token }))
@@ -254,7 +254,7 @@ async fn test_journey_password_reset_invalid_or_expired_token() {
 
     let token_1 = app
         .email_sender
-        .last_reset_token()
+        .reset_token_for(&email)
         .expect("reset token dispatched");
 
     expire_reset_tokens_for_user(&app.pool, user_uuid)
@@ -297,7 +297,7 @@ async fn test_journey_password_reset_invalid_or_expired_token() {
 
     let token_2 = app
         .email_sender
-        .last_reset_token()
+        .reset_token_for(&email)
         .expect("reset token 2 dispatched");
 
     // First consumption succeeds
@@ -420,7 +420,7 @@ async fn test_journey_password_reset_multi_token_invalidation() {
 
     let verify_token = app
         .email_sender
-        .last_verification_token()
+        .verification_token_for(&email)
         .expect("verification token dispatched");
     let verify_res = app
         .post_json(ENDPOINT_VERIFY, json!({ "token": verify_token }))

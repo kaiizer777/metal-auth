@@ -108,7 +108,10 @@ async fn test_journey_password_reset_full_lifecycle() {
         )
         .await;
     assert_eq!(old_login_res.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(old_login_res.error_code(), Some(ErrorCode::InvalidCredentials));
+    assert_eq!(
+        old_login_res.error_code(),
+        Some(ErrorCode::InvalidCredentials)
+    );
 
     // 6. Attempt login with new password -> 200 OK with user_id
     let new_login_res = app
@@ -249,7 +252,10 @@ async fn test_journey_password_reset_invalid_or_expired_token() {
         )
         .await;
     assert_eq!(valid_reset_res.status(), StatusCode::OK);
-    assert_eq!(valid_reset_res.json()["message"], "password reset successful");
+    assert_eq!(
+        valid_reset_res.json()["message"],
+        "password reset successful"
+    );
 
     // Replay attempt with the exact same consumed token -> 400 Bad Request (INVALID_TOKEN)
     let replay_res = app
@@ -328,5 +334,3 @@ async fn test_journey_password_reset_nonexistent_email_enumeration() {
         "zero verification emails dispatched for nonexistent email"
     );
 }
-
-

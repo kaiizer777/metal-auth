@@ -70,8 +70,14 @@ jobs:
             sleep 2
           done
           exit 1
-      - run: cargo test --locked --all-targets
-      - run: cargo test --locked --all-targets --all-features
+      - run: cargo test --locked --lib
+      - run: cargo test --locked --test auth_journey_tests -- --test-threads=1
+      - run: cargo test --locked --test password_reset_journey_tests -- --test-threads=1
+      - run: cargo test --locked --test security_edge_journey_tests -- --test-threads=1
+      - run: cargo test --locked --test boot_test -- --test-threads=1
+      - run: cargo test --locked --test email_test -- --test-threads=1
+      - run: cargo test --locked --test env_config_test -- --test-threads=1
+      - run: cargo test --locked --test security_tests -- --test-threads=1
       - run: cargo test --locked --doc
 
   msrv:
@@ -105,7 +111,14 @@ jobs:
           exit 1
       - run: cargo check --locked --all-targets
       - run: cargo check --locked --all-targets --all-features
-      - run: cargo test --locked --all-targets
+      - run: cargo test --locked --lib
+      - run: cargo test --locked --test auth_journey_tests -- --test-threads=1
+      - run: cargo test --locked --test password_reset_journey_tests -- --test-threads=1
+      - run: cargo test --locked --test security_edge_journey_tests -- --test-threads=1
+      - run: cargo test --locked --test boot_test -- --test-threads=1
+      - run: cargo test --locked --test email_test -- --test-threads=1
+      - run: cargo test --locked --test env_config_test -- --test-threads=1
+      - run: cargo test --locked --test security_tests -- --test-threads=1
 
   coverage:
     name: Coverage
@@ -137,7 +150,7 @@ jobs:
             sleep 2
           done
           exit 1
-      - run: cargo llvm-cov --locked --all-targets --all-features --lcov --output-path lcov.info --fail-under-lines 70
+      - run: cargo llvm-cov --locked --tests --all-features --lcov --output-path lcov.info --fail-under-lines 70 -- --test-threads 1
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: lcov-report

@@ -5,6 +5,9 @@ use common::*;
 use serde_json::json;
 
 const ENDPOINT_SIGNUP: &str = "/auth/signup";
+const ENDPOINT_VERIFY: &str = "/auth/verify";
+const ENDPOINT_FORGOT_PASSWORD: &str = "/auth/password/reset-request";
+const ENDPOINT_RESET_PASSWORD: &str = "/auth/password/reset";
 
 /// Scenario 1: Duplicate Registration Anti-Enumeration Journey
 ///
@@ -314,4 +317,164 @@ async fn test_journey_concurrent_registration_race_condition() {
         token_count, 1,
         "concurrent registrations must create exactly 1 verification token in database"
     );
+}
+
+/// Scenario 4: Case-Insensitive Email Uniqueness and Cross-Variant Authentication
+///
+/// Ensures normalized case-insensitivity: registration under mixed-case email suppresses
+/// duplicate registration under lowercase/uppercase variants, maintains identical anti-enumeration
+/// response envelopes, stores normalized email in the database, and allows verified authentication
+/// and password resets seamlessly across any casing variation.
+#[tokio::test]
+async fn test_journey_case_insensitive_email_uniqueness() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let base_uuid = uuid::Uuid::new_v4();
+    let mixed_email = format!("User_{}@Example.COM", base_uuid);
+    let lower_email = format!("user_{}@example.com", base_uuid);
+    let upper_email = format!("USER_{}@EXAMPLE.COM", base_uuid);
+    let password = dynamic_password();
+
+    // 1. Initial registration with mixed-case email
+    let signup_1 = app
+        .post_json(
+            ENDPOINT_SIGNUP,
+            json!({
+                "email": mixed_email,
+                "password": password
+            }),
+        )
+        .await;
+    assert_eq!(signup_1.status(), StatusCode::OK);
+    assert_eq!(
+        signup_1.json()["message"],
+        "if this email is new, a verification link has been sent"
+    );
+
+    // Verify 1 verification email was sent to lower_email
+    let verification_calls = app.email_sender.verification_calls();
+    assert_eq!(verification_calls.len(), 1);
+    assert_eq!(verification_calls[0].to, lower_email);
+    let user_id = verification_calls[0].user_id;
+    let token = verification_calls[0].token.clone();
+
+    // Verify DB stored normalized lowercase email and exactly 1 user exists
+    assert_eq!(
+        count_users_by_email(&app.pool, &lower_email).await.unwrap(),
+        1
+    );
+
+    // 2. Duplicate registration with all-lowercase variant
+    let signup_2 = app
+        .post_json(
+            ENDPOINT_SIGNUP,
+            json!({
+                "email": lower_email,
+                "password": password
+            }),
+        )
+        .await;
+    // Preserves identical envelope to prevent email enumeration
+    assert_eq!(signup_2.status(), StatusCode::OK);
+    assert_eq!(signup_2.json(), signup_1.json());
+
+    // 3. Duplicate registration with all-uppercase variant
+    let signup_3 = app
+        .post_json(
+            ENDPOINT_SIGNUP,
+            json!({
+                "email": upper_email,
+                "password": password
+            }),
+        )
+        .await;
+    assert_eq!(signup_3.status(), StatusCode::OK);
+    assert_eq!(signup_3.json(), signup_1.json());
+
+    // Verification emails must not have been sent again
+    assert_eq!(
+        app.email_sender.verification_calls().len(),
+        1,
+        "duplicate registrations under casing variants must suppress email dispatch"
+    );
+
+    // Database must still have only 1 user
+    assert_eq!(
+        count_users_by_email(&app.pool, &lower_email).await.unwrap(),
+        1
+    );
+
+    // 4. Verify email using token from first signup
+    let verify_res = app
+        .post_json(ENDPOINT_VERIFY, json!({ "token": token }))
+        .await;
+    assert_eq!(verify_res.status(), StatusCode::OK);
+    assert_eq!(verify_res.json()["message"], "email verified");
+
+    // 5. Login works using lowercase email
+    let login_lower = app
+        .post_json(
+            ENDPOINT_LOGIN,
+            json!({
+                "email": lower_email,
+                "password": password
+            }),
+        )
+        .await;
+    assert_eq!(login_lower.status(), StatusCode::OK);
+    assert_eq!(login_lower.json()["user_id"], user_id.to_string());
+
+    // 6. Login works using uppercase email
+    let login_upper = app
+        .post_json(
+            ENDPOINT_LOGIN,
+            json!({
+                "email": upper_email,
+                "password": password
+            }),
+        )
+        .await;
+    assert_eq!(login_upper.status(), StatusCode::OK);
+    assert_eq!(login_upper.json()["user_id"], user_id.to_string());
+
+    // 7. Password reset requested using mixed-case email
+    let reset_req = app
+        .post_json(ENDPOINT_FORGOT_PASSWORD, json!({ "email": mixed_email }))
+        .await;
+    assert_eq!(reset_req.status(), StatusCode::OK);
+
+    let reset_calls = app.email_sender.reset_calls();
+    assert_eq!(reset_calls.len(), 1);
+    assert_eq!(reset_calls[0].to, lower_email);
+    assert_eq!(reset_calls[0].user_id, user_id);
+    let reset_token = reset_calls[0].token.clone();
+
+    // 8. Consume reset token with new password
+    let new_password = format!("NewPass_{}", dynamic_password());
+    let reset_res = app
+        .post_json(
+            ENDPOINT_RESET_PASSWORD,
+            json!({
+                "token": reset_token,
+                "new_password": new_password
+            }),
+        )
+        .await;
+    assert_eq!(reset_res.status(), StatusCode::OK);
+
+    // 9. Login with new password works with uppercase email
+    let login_new = app
+        .post_json(
+            ENDPOINT_LOGIN,
+            json!({
+                "email": upper_email,
+                "password": new_password
+            }),
+        )
+        .await;
+    assert_eq!(login_new.status(), StatusCode::OK);
+    assert_eq!(login_new.json()["user_id"], user_id.to_string());
 }

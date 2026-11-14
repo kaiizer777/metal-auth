@@ -9,6 +9,7 @@ use crate::{
 };
 
 pub mod models;
+pub mod outbox;
 
 pub const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);

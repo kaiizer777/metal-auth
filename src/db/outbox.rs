@@ -160,7 +160,10 @@ where
 }
 
 /// Fetches an outbox record by ID for testing and state verification.
-pub async fn get_outbox_by_id<'e, E>(executor: E, id: Uuid) -> Result<Option<EmailOutbox>, sqlx::Error>
+pub async fn get_outbox_by_id<'e, E>(
+    executor: E,
+    id: Uuid,
+) -> Result<Option<EmailOutbox>, sqlx::Error>
 where
     E: Executor<'e, Database = Postgres>,
 {

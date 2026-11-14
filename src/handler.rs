@@ -51,11 +51,17 @@ mod tests {
             base_url: "https://example.com".into(),
             email_dispatch_timeout: std::time::Duration::from_secs(10),
             async_email_dispatch: true,
-            outbox_poll_interval: std::time::Duration::from_millis(crate::config::DEFAULT_OUTBOX_POLL_INTERVAL_MS),
+            outbox_poll_interval: std::time::Duration::from_millis(
+                crate::config::DEFAULT_OUTBOX_POLL_INTERVAL_MS,
+            ),
             outbox_batch_size: crate::config::DEFAULT_OUTBOX_BATCH_SIZE,
             outbox_max_retries: crate::config::DEFAULT_OUTBOX_MAX_RETRIES,
-            outbox_initial_backoff: std::time::Duration::from_secs(crate::config::DEFAULT_OUTBOX_INITIAL_BACKOFF_SECS),
-            outbox_max_backoff: std::time::Duration::from_secs(crate::config::DEFAULT_OUTBOX_MAX_BACKOFF_SECS),
+            outbox_initial_backoff: std::time::Duration::from_secs(
+                crate::config::DEFAULT_OUTBOX_INITIAL_BACKOFF_SECS,
+            ),
+            outbox_max_backoff: std::time::Duration::from_secs(
+                crate::config::DEFAULT_OUTBOX_MAX_BACKOFF_SECS,
+            ),
         }
     }
 

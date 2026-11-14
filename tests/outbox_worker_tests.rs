@@ -5,12 +5,10 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use common::*;
-use metal_auth::db::models::{
-    OUTBOX_STATUS_FAILED, OUTBOX_STATUS_PENDING, OUTBOX_STATUS_SENT,
-};
+use metal_auth::db::models::{OUTBOX_STATUS_FAILED, OUTBOX_STATUS_PENDING, OUTBOX_STATUS_SENT};
 use metal_auth::db::outbox::{
-    claim_pending_outbox, get_outbox_by_id, insert_outbox, mark_outbox_failed,
-    record_outbox_retry, recover_stale_processing,
+    claim_pending_outbox, get_outbox_by_id, insert_outbox, mark_outbox_failed, record_outbox_retry,
+    recover_stale_processing,
 };
 use metal_auth::email::outbox::process_outbox_batch;
 use metal_auth::email::test_utils::CapturingEmailSender;
@@ -103,10 +101,7 @@ async fn test_outbox_record_inserted_for_password_reset() {
 
     // 2. Request password reset
     let reset_res = app
-        .post_json(
-            ENDPOINT_PASSWORD_RESET_REQUEST,
-            json!({ "email": email }),
-        )
+        .post_json(ENDPOINT_PASSWORD_RESET_REQUEST, json!({ "email": email }))
         .await;
     assert_eq!(reset_res.status(), StatusCode::OK);
 
@@ -117,7 +112,11 @@ async fn test_outbox_record_inserted_for_password_reset() {
         .into_iter()
         .filter(|r| r.email_type == "password_reset")
         .collect();
-    assert_eq!(reset_rows.len(), 1, "password reset commits an outbox record");
+    assert_eq!(
+        reset_rows.len(),
+        1,
+        "password reset commits an outbox record"
+    );
     assert_eq!(reset_rows[0].email_type, "password_reset");
     assert_eq!(reset_rows[0].status, OUTBOX_STATUS_SENT); // blocking dispatcher in test marks sent
 }
@@ -151,8 +150,12 @@ async fn test_outbox_concurrent_claiming_skip_locked() {
     let pool2 = app.pool.clone();
 
     let (batch1, batch2) = tokio::join!(
-        tokio::spawn(async move { claim_pending_outbox(&pool1, 5, Duration::from_secs(300)).await }),
-        tokio::spawn(async move { claim_pending_outbox(&pool2, 5, Duration::from_secs(300)).await }),
+        tokio::spawn(
+            async move { claim_pending_outbox(&pool1, 5, Duration::from_secs(300)).await }
+        ),
+        tokio::spawn(
+            async move { claim_pending_outbox(&pool2, 5, Duration::from_secs(300)).await }
+        ),
     );
 
     let claimed1 = batch1.unwrap().expect("claim 1");
@@ -250,7 +253,10 @@ async fn test_outbox_durability_across_process_restart() {
         .flush_outbox(&app.pool)
         .await
         .expect("flush outbox");
-    assert!(delivered >= 1, "pending outbox row from prior run delivered");
+    assert!(
+        delivered >= 1,
+        "pending outbox row from prior run delivered"
+    );
 
     let sent_row = get_outbox_by_id(&app.pool, row.id)
         .await
@@ -315,11 +321,13 @@ async fn test_outbox_stale_processing_lease_recovery() {
     assert_eq!(reclaimed[0].id, row.id);
 
     // 5. Verify recover_stale_processing resets expired processing records to pending
-    sqlx::query("UPDATE email_outbox SET next_retry_at = NOW() - INTERVAL '10 seconds' WHERE id = $1")
-        .bind(row.id)
-        .execute(&app.pool)
-        .await
-        .expect("expire next_retry_at");
+    sqlx::query(
+        "UPDATE email_outbox SET next_retry_at = NOW() - INTERVAL '10 seconds' WHERE id = $1",
+    )
+    .bind(row.id)
+    .execute(&app.pool)
+    .await
+    .expect("expire next_retry_at");
 
     let recovered_count = recover_stale_processing(&app.pool)
         .await
@@ -365,13 +373,22 @@ async fn test_outbox_unconfigured_sender_does_not_burn_retries() {
     .await
     .expect("process outbox batch");
 
-    assert_eq!(processed, 0, "no messages claimed or processed when sender is None");
+    assert_eq!(
+        processed, 0,
+        "no messages claimed or processed when sender is None"
+    );
 
     let row_in_db = get_outbox_by_id(&app.pool, row.id)
         .await
         .expect("get outbox")
         .unwrap();
 
-    assert_eq!(row_in_db.status, OUTBOX_STATUS_PENDING, "status must remain pending");
-    assert_eq!(row_in_db.retry_count, 0, "retry count must not be incremented");
+    assert_eq!(
+        row_in_db.status, OUTBOX_STATUS_PENDING,
+        "status must remain pending"
+    );
+    assert_eq!(
+        row_in_db.retry_count, 0,
+        "retry count must not be incremented"
+    );
 }

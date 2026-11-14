@@ -6,9 +6,7 @@ use sqlx::PgPool;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
-use crate::db::models::{
-    EmailOutbox, EMAIL_TYPE_PASSWORD_RESET, EMAIL_TYPE_VERIFICATION,
-};
+use crate::db::models::{EMAIL_TYPE_PASSWORD_RESET, EMAIL_TYPE_VERIFICATION, EmailOutbox};
 use crate::db::outbox::{
     claim_pending_outbox, mark_outbox_failed, mark_outbox_sent, record_outbox_retry,
 };
@@ -32,7 +30,9 @@ impl Default for OutboxWorkerConfig {
             poll_interval: Duration::from_millis(crate::config::DEFAULT_OUTBOX_POLL_INTERVAL_MS),
             batch_size: crate::config::DEFAULT_OUTBOX_BATCH_SIZE,
             max_retries: crate::config::DEFAULT_OUTBOX_MAX_RETRIES,
-            initial_backoff: Duration::from_secs(crate::config::DEFAULT_OUTBOX_INITIAL_BACKOFF_SECS),
+            initial_backoff: Duration::from_secs(
+                crate::config::DEFAULT_OUTBOX_INITIAL_BACKOFF_SECS,
+            ),
             max_backoff: Duration::from_secs(crate::config::DEFAULT_OUTBOX_MAX_BACKOFF_SECS),
             lease_duration: Duration::from_secs(300),
         }
@@ -208,8 +208,8 @@ async fn handle_delivery_failure(
         let _ = mark_outbox_failed(pool, msg.id, err_msg).await;
     } else {
         let backoff = calculate_backoff(msg.retry_count, initial_backoff, max_backoff);
-        let next_retry_at = Utc::now()
-            + ChronoDuration::from_std(backoff).unwrap_or(ChronoDuration::seconds(300));
+        let next_retry_at =
+            Utc::now() + ChronoDuration::from_std(backoff).unwrap_or(ChronoDuration::seconds(300));
         warn!(
             op = "outbox_delivery",
             id = %msg.id,

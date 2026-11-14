@@ -109,7 +109,8 @@ impl EmailDispatcher {
             let notify = Arc::clone(&self.notify);
 
             tokio::spawn(async move {
-                crate::email::outbox::run_outbox_worker(pool, sender, timeout, config, notify).await;
+                crate::email::outbox::run_outbox_worker(pool, sender, timeout, config, notify)
+                    .await;
             });
         }
     }

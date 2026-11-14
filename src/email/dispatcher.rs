@@ -468,4 +468,66 @@ mod tests {
         dispatcher.ensure_worker_started(&pool);
         assert!(!dispatcher.worker_started.load(Ordering::SeqCst));
     }
+
+    #[test]
+    fn with_outbox_config_attaches_config_properly() {
+        let cfg = crate::config::Config {
+            outbox_poll_interval: Duration::from_millis(750),
+            outbox_batch_size: 42,
+            outbox_max_retries: 7,
+            outbox_initial_backoff: Duration::from_secs(4),
+            outbox_max_backoff: Duration::from_secs(120),
+            outbox_sent_retention: Duration::from_secs(86400 * 3),
+            ..Default::default()
+        };
+        let dispatcher =
+            EmailDispatcher::new(None, Duration::from_secs(1)).with_outbox_config(&cfg);
+        assert_eq!(
+            dispatcher.outbox_config.poll_interval,
+            Duration::from_millis(750)
+        );
+        assert_eq!(dispatcher.outbox_config.batch_size, 42);
+        assert_eq!(dispatcher.outbox_config.max_retries, 7);
+        assert_eq!(
+            dispatcher.outbox_config.initial_backoff,
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            dispatcher.outbox_config.max_backoff,
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            dispatcher.outbox_config.sent_retention,
+            Duration::from_secs(86400 * 3)
+        );
+    }
+
+    #[tokio::test]
+    async fn on_outbox_committed_non_blocking_notifies_worker() {
+        let dispatcher = EmailDispatcher::new(None, Duration::from_secs(1));
+        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/dummy").unwrap();
+
+        let notify = Arc::clone(&dispatcher.notify);
+        let notified_future = notify.notified();
+
+        dispatcher.on_outbox_committed(&pool).await;
+
+        tokio::time::timeout(Duration::from_millis(100), notified_future)
+            .await
+            .expect("notify_one must wake the notify subscriber");
+    }
+
+    #[tokio::test]
+    async fn ensure_worker_started_in_tokio_runtime_spawns_worker_once() {
+        let dispatcher = EmailDispatcher::new(None, Duration::from_secs(1));
+        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/dummy").unwrap();
+
+        assert!(!dispatcher.worker_started.load(Ordering::SeqCst));
+        dispatcher.ensure_worker_started(&pool);
+        assert!(dispatcher.worker_started.load(Ordering::SeqCst));
+
+        // Subsequent call is a no-op and preserves true
+        dispatcher.ensure_worker_started(&pool);
+        assert!(dispatcher.worker_started.load(Ordering::SeqCst));
+    }
 }

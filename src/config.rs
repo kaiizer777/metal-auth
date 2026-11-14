@@ -1013,6 +1013,104 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn outbox_config_env_var_overrides_from_lookup() {
+        let lookup = |k: &str| match k {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://example.com".into()),
+            "OUTBOX_POLL_INTERVAL_MS" => Ok("250".into()),
+            "OUTBOX_BATCH_SIZE" => Ok("100".into()),
+            "OUTBOX_MAX_RETRIES" => Ok("10".into()),
+            "OUTBOX_INITIAL_BACKOFF_SECS" => Ok("3".into()),
+            "OUTBOX_MAX_BACKOFF_SECS" => Ok("60".into()),
+            "OUTBOX_SENT_RETENTION_SECS" => Ok("86400".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        let cfg = Config::from_lookup(lookup).expect("load outbox overrides");
+        assert_eq!(cfg.outbox_poll_interval, Duration::from_millis(250));
+        assert_eq!(cfg.outbox_batch_size, 100);
+        assert_eq!(cfg.outbox_max_retries, 10);
+        assert_eq!(cfg.outbox_initial_backoff, Duration::from_secs(3));
+        assert_eq!(cfg.outbox_max_backoff, Duration::from_secs(60));
+        assert_eq!(cfg.outbox_sent_retention, Duration::from_secs(86400));
+    }
+
+    #[test]
+    fn outbox_config_rejects_invalid_and_zero_env_vars() {
+        let vars = [
+            "OUTBOX_POLL_INTERVAL_MS",
+            "OUTBOX_BATCH_SIZE",
+            "OUTBOX_MAX_RETRIES",
+            "OUTBOX_INITIAL_BACKOFF_SECS",
+            "OUTBOX_MAX_BACKOFF_SECS",
+            "OUTBOX_SENT_RETENTION_SECS",
+        ];
+
+        for var in vars {
+            // Non-numeric
+            let lookup_invalid = |k: &str| {
+                if k == var {
+                    Ok("invalid_number".into())
+                } else if k == "DATABASE_URL" {
+                    Ok("postgres://localhost/test".into())
+                } else if k == "BASE_URL" {
+                    Ok("https://example.com".into())
+                } else {
+                    Err(std::env::VarError::NotPresent)
+                }
+            };
+            assert!(
+                matches!(
+                    Config::from_lookup(lookup_invalid),
+                    Err(ConfigError::InvalidEnvVar(v)) if v == var
+                ),
+                "expected InvalidEnvVar for {var} on non-numeric value"
+            );
+
+            // Zero
+            let lookup_zero = |k: &str| {
+                if k == var {
+                    Ok("0".into())
+                } else if k == "DATABASE_URL" {
+                    Ok("postgres://localhost/test".into())
+                } else if k == "BASE_URL" {
+                    Ok("https://example.com".into())
+                } else {
+                    Err(std::env::VarError::NotPresent)
+                }
+            };
+            assert!(
+                matches!(
+                    Config::from_lookup(lookup_zero),
+                    Err(ConfigError::InvalidEnvVar(v)) if v == var
+                ),
+                "expected InvalidEnvVar for {var} on zero value"
+            );
+
+            // Non-unicode
+            let lookup_non_unicode = |k: &str| {
+                if k == var {
+                    Err(std::env::VarError::NotUnicode(std::ffi::OsString::from(
+                        "bad",
+                    )))
+                } else if k == "DATABASE_URL" {
+                    Ok("postgres://localhost/test".into())
+                } else if k == "BASE_URL" {
+                    Ok("https://example.com".into())
+                } else {
+                    Err(std::env::VarError::NotPresent)
+                }
+            };
+            assert!(
+                matches!(
+                    Config::from_lookup(lookup_non_unicode),
+                    Err(ConfigError::NonUnicodeEnvVar(v)) if v == var
+                ),
+                "expected NonUnicodeEnvVar for {var}"
+            );
+        }
+    }
+
     // ── Phase 3 AppConfig tests ───────────────────────────────────────────────
 
     /// OWASP ASVS 5.0 L1 doc-check: default params meet or exceed minimums.

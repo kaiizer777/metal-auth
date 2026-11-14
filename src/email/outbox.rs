@@ -354,4 +354,401 @@ mod tests {
         let custom = config.with_sent_retention(Duration::from_secs(86400));
         assert_eq!(custom.sent_retention, Duration::from_secs(86400));
     }
+
+    #[test]
+    fn test_outbox_worker_config_lease_duration_builder() {
+        let config = OutboxWorkerConfig::default();
+        assert_eq!(config.lease_duration, Duration::from_secs(300));
+        let custom = config.with_lease_duration(Duration::from_secs(45));
+        assert_eq!(custom.lease_duration, Duration::from_secs(45));
+    }
+
+    static DB_OUTBOX_TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn test_pool() -> Option<PgPool> {
+        dotenvy::dotenv().ok();
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(u) => u,
+            Err(_) => {
+                assert!(
+                    std::env::var_os("CI").is_none(),
+                    "DATABASE_URL must be set in CI"
+                );
+                return None;
+            }
+        };
+        Some(
+            crate::db::init_pool(&crate::Config {
+                database_url: url,
+                ..Default::default()
+            })
+            .await
+            .expect("failed to initialize test database pool"),
+        )
+    }
+
+    #[tokio::test]
+    async fn deliver_single_message_handles_corrupt_verification_payload() {
+        let _guard = DB_OUTBOX_TEST_MUTEX.lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+
+        let row_id = uuid::Uuid::new_v4();
+        let recipient = format!("corrupt_v_{}@example.com", row_id);
+        sqlx::query(
+            r#"
+            INSERT INTO email_outbox (id, recipient, email_type, payload, status, retry_count, next_retry_at)
+            VALUES ($1, $2, 'verification', '{"corrupt": true}'::jsonb, $3, 0, NOW() + INTERVAL '60 seconds')
+            "#,
+        )
+        .bind(row_id)
+        .bind(&recipient)
+        .bind(crate::db::models::OUTBOX_STATUS_PROCESSING)
+        .execute(&pool)
+        .await
+        .expect("insert corrupt verification outbox row");
+
+        let msg = crate::db::outbox::get_outbox_by_id(&pool, row_id)
+            .await
+            .expect("fetch row")
+            .unwrap();
+
+        let sender: SharedEmailSender = Arc::new(crate::email::NoopEmailSender);
+        deliver_single_message(
+            &pool,
+            &sender,
+            msg,
+            Duration::from_secs(1),
+            &OutboxWorkerConfig::default(),
+        )
+        .await;
+
+        let updated = crate::db::outbox::get_outbox_by_id(&pool, row_id)
+            .await
+            .expect("fetch row")
+            .unwrap();
+        assert_eq!(updated.status, crate::db::models::OUTBOX_STATUS_FAILED);
+        assert!(
+            updated
+                .error_log
+                .as_deref()
+                .unwrap_or("")
+                .contains("corrupt verification payload")
+        );
+
+        let _ = sqlx::query("DELETE FROM email_outbox WHERE id = $1")
+            .bind(row_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn deliver_single_message_handles_corrupt_password_reset_payload() {
+        let _guard = DB_OUTBOX_TEST_MUTEX.lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+
+        let row_id = uuid::Uuid::new_v4();
+        let recipient = format!("corrupt_pr_{}@example.com", row_id);
+        sqlx::query(
+            r#"
+            INSERT INTO email_outbox (id, recipient, email_type, payload, status, retry_count, next_retry_at)
+            VALUES ($1, $2, 'password_reset', '{"corrupt": true}'::jsonb, $3, 0, NOW() + INTERVAL '60 seconds')
+            "#,
+        )
+        .bind(row_id)
+        .bind(&recipient)
+        .bind(crate::db::models::OUTBOX_STATUS_PROCESSING)
+        .execute(&pool)
+        .await
+        .expect("insert corrupt password reset outbox row");
+
+        let msg = crate::db::outbox::get_outbox_by_id(&pool, row_id)
+            .await
+            .expect("fetch row")
+            .unwrap();
+
+        let sender: SharedEmailSender = Arc::new(crate::email::NoopEmailSender);
+        deliver_single_message(
+            &pool,
+            &sender,
+            msg,
+            Duration::from_secs(1),
+            &OutboxWorkerConfig::default(),
+        )
+        .await;
+
+        let updated = crate::db::outbox::get_outbox_by_id(&pool, row_id)
+            .await
+            .expect("fetch row")
+            .unwrap();
+        assert_eq!(updated.status, crate::db::models::OUTBOX_STATUS_FAILED);
+        assert!(
+            updated
+                .error_log
+                .as_deref()
+                .unwrap_or("")
+                .contains("corrupt password reset payload")
+        );
+
+        let _ = sqlx::query("DELETE FROM email_outbox WHERE id = $1")
+            .bind(row_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn deliver_single_message_handles_unknown_email_type() {
+        let _guard = DB_OUTBOX_TEST_MUTEX.lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+
+        let row_id = uuid::Uuid::new_v4();
+        let recipient = format!("unknown_type_{}@example.com", row_id);
+        sqlx::query(
+            r#"
+            INSERT INTO email_outbox (id, recipient, email_type, payload, status, retry_count, next_retry_at)
+            VALUES ($1, $2, 'unknown_notification', '{}'::jsonb, $3, 0, NOW() + INTERVAL '60 seconds')
+            "#,
+        )
+        .bind(row_id)
+        .bind(&recipient)
+        .bind(crate::db::models::OUTBOX_STATUS_PROCESSING)
+        .execute(&pool)
+        .await
+        .expect("insert unknown email type outbox row");
+
+        let msg = crate::db::outbox::get_outbox_by_id(&pool, row_id)
+            .await
+            .expect("fetch row")
+            .unwrap();
+
+        let sender: SharedEmailSender = Arc::new(crate::email::NoopEmailSender);
+        deliver_single_message(
+            &pool,
+            &sender,
+            msg,
+            Duration::from_secs(1),
+            &OutboxWorkerConfig::default(),
+        )
+        .await;
+
+        let updated = crate::db::outbox::get_outbox_by_id(&pool, row_id)
+            .await
+            .expect("fetch row")
+            .unwrap();
+        assert_eq!(updated.status, crate::db::models::OUTBOX_STATUS_FAILED);
+        assert!(
+            updated
+                .error_log
+                .as_deref()
+                .unwrap_or("")
+                .contains("unknown email type: unknown_notification")
+        );
+
+        let _ = sqlx::query("DELETE FROM email_outbox WHERE id = $1")
+            .bind(row_id)
+            .execute(&pool)
+            .await;
+    }
+
+    struct HangingEmailSender;
+    #[async_trait::async_trait]
+    impl crate::email::hook::EmailSender for HangingEmailSender {
+        async fn send_verification_email(
+            &self,
+            _payload: VerificationEmailPayload,
+        ) -> Result<(), crate::email::hook::DynError> {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok(())
+        }
+        async fn send_password_reset_email(
+            &self,
+            _payload: PasswordResetEmailPayload,
+        ) -> Result<(), crate::email::hook::DynError> {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn deliver_single_message_handles_timeout() {
+        let _guard = DB_OUTBOX_TEST_MUTEX.lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+
+        let row_id = uuid::Uuid::new_v4();
+        let recipient = format!("timeout_{}@example.com", row_id);
+        let payload = serde_json::json!({
+            "user_id": uuid::Uuid::new_v4(),
+            "to": recipient,
+            "token": "tok123",
+            "url": "https://example.com",
+            "expires_at": chrono::Utc::now()
+        });
+        sqlx::query(
+            r#"
+            INSERT INTO email_outbox (id, recipient, email_type, payload, status, retry_count, next_retry_at)
+            VALUES ($1, $2, 'verification', $3, $4, 0, NOW() + INTERVAL '60 seconds')
+            "#,
+        )
+        .bind(row_id)
+        .bind(&recipient)
+        .bind(payload)
+        .bind(crate::db::models::OUTBOX_STATUS_PROCESSING)
+        .execute(&pool)
+        .await
+        .expect("insert outbox row for timeout test");
+
+        let msg = crate::db::outbox::get_outbox_by_id(&pool, row_id)
+            .await
+            .expect("fetch row")
+            .unwrap();
+
+        let sender: SharedEmailSender = Arc::new(HangingEmailSender);
+        deliver_single_message(
+            &pool,
+            &sender,
+            msg,
+            Duration::from_millis(10),
+            &OutboxWorkerConfig::default(),
+        )
+        .await;
+
+        let updated = crate::db::outbox::get_outbox_by_id(&pool, row_id)
+            .await
+            .expect("fetch row")
+            .unwrap();
+        assert_eq!(updated.status, crate::db::models::OUTBOX_STATUS_PENDING);
+        assert_eq!(updated.retry_count, 1);
+        assert!(
+            updated
+                .error_log
+                .as_deref()
+                .unwrap_or("")
+                .contains("send timed out")
+        );
+
+        let _ = sqlx::query("DELETE FROM email_outbox WHERE id = $1")
+            .bind(row_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn deliver_single_message_lost_lease_logs_warning_and_does_not_panic() {
+        let _guard = DB_OUTBOX_TEST_MUTEX.lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+
+        let row_id = uuid::Uuid::new_v4();
+        let recipient = format!("lost_lease_{}@example.com", row_id);
+        let payload = serde_json::json!({
+            "user_id": uuid::Uuid::new_v4(),
+            "to": recipient,
+            "token": "tok123",
+            "url": "https://example.com",
+            "expires_at": chrono::Utc::now()
+        });
+        sqlx::query(
+            r#"
+            INSERT INTO email_outbox (id, recipient, email_type, payload, status, retry_count, next_retry_at)
+            VALUES ($1, $2, 'verification', $3, $4, 0, NOW())
+            "#,
+        )
+        .bind(row_id)
+        .bind(&recipient)
+        .bind(payload)
+        .bind(crate::db::models::OUTBOX_STATUS_PENDING)
+        .execute(&pool)
+        .await
+        .expect("insert outbox row for lost lease test");
+
+        let msg = crate::db::outbox::get_outbox_by_id(&pool, row_id)
+            .await
+            .expect("fetch row")
+            .unwrap();
+
+        let sender: SharedEmailSender = Arc::new(crate::email::NoopEmailSender);
+        deliver_single_message(
+            &pool,
+            &sender,
+            msg,
+            Duration::from_secs(1),
+            &OutboxWorkerConfig::default(),
+        )
+        .await;
+
+        let row = crate::db::outbox::get_outbox_by_id(&pool, row_id)
+            .await
+            .expect("fetch row")
+            .unwrap();
+        assert_eq!(row.status, crate::db::models::OUTBOX_STATUS_PENDING);
+
+        let _ = sqlx::query("DELETE FROM email_outbox WHERE id = $1")
+            .bind(row_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn drain_outbox_batches_loops_until_empty() {
+        let _guard = DB_OUTBOX_TEST_MUTEX.lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let id = uuid::Uuid::new_v4();
+            let recipient = format!("multibatch_{i}_{}@example.com", id);
+            let payload = serde_json::json!({
+                "user_id": uuid::Uuid::new_v4(),
+                "to": recipient,
+                "token": "tok",
+                "url": "https://example.com",
+                "expires_at": chrono::Utc::now()
+            });
+            sqlx::query(
+                r#"
+                INSERT INTO email_outbox (id, recipient, email_type, payload, status, retry_count, next_retry_at)
+                VALUES ($1, $2, 'verification', $3, $4, 0, NOW())
+                "#,
+            )
+            .bind(id)
+            .bind(&recipient)
+            .bind(payload)
+            .bind(crate::db::models::OUTBOX_STATUS_PENDING)
+            .execute(&pool)
+            .await
+            .expect("insert outbox row");
+            ids.push(id);
+        }
+
+        let sender: Option<SharedEmailSender> = Some(Arc::new(crate::email::NoopEmailSender));
+        let config = OutboxWorkerConfig {
+            batch_size: 1,
+            ..OutboxWorkerConfig::default()
+        };
+
+        drain_outbox_batches(&pool, &sender, Duration::from_secs(1), &config).await;
+
+        for id in &ids {
+            let row = crate::db::outbox::get_outbox_by_id(&pool, *id)
+                .await
+                .expect("fetch row")
+                .unwrap();
+            assert_eq!(row.status, crate::db::models::OUTBOX_STATUS_SENT);
+        }
+
+        let _ = sqlx::query("DELETE FROM email_outbox WHERE id = ANY($1)")
+            .bind(&ids)
+            .execute(&pool)
+            .await;
+    }
 }

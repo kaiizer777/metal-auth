@@ -15,3 +15,7 @@ CREATE TABLE IF NOT EXISTS email_outbox (
 
 CREATE INDEX IF NOT EXISTS idx_email_outbox_status_next_retry_at
     ON email_outbox (status, next_retry_at);
+
+CREATE INDEX IF NOT EXISTS idx_email_outbox_status_sent_at
+    ON email_outbox (status, sent_at);
+

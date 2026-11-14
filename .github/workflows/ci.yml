@@ -70,8 +70,6 @@ jobs:
             sleep 2
           done
           exit 1
-      - name: Run database migrations
-        run: cargo run --bin migrate
       - run: cargo test --locked --lib
       - run: cargo test --locked --doc
 

@@ -62,12 +62,8 @@ tracing = "0.1"
 default = []
 test-utils = []
 
-[[test]]
-name = "common"
-path = "tests/common/mod.rs"
-
 [dev-dependencies]
-metal-auth = { path = ".", features = ["test-utils"] }
+metal-auth = { path = ".", version = "0.1.0", features = ["test-utils"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

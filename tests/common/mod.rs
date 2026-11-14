@@ -14,8 +14,12 @@ use metal_auth::{
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// Global database isolation mutex for integration tests that require serialized database access
-/// or execute global table truncation.
+/// In-process database serialization mutex for tests running within the same binary process.
+///
+/// Note: Cargo compiles each integration test file (`tests/*.rs`) into a separate OS process.
+/// Logical cross-binary test isolation is guaranteed by `dynamic_email()` and unique UUID keys.
+/// Global table truncation (`truncate_tables`) must not be called during parallel multi-binary
+/// test runs without PostgreSQL-level advisory locking (`pg_advisory_lock`).
 pub static DB_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Truncates all authentication and session domain tables with CASCADE.
@@ -336,17 +340,4 @@ pub async fn setup_test_app_with_auth_config(auth_config: Arc<AppConfig>) -> Opt
         email_sender,
         base_url: "https://example.com".into(),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn harness_initializes() {
-        let email = dynamic_email();
-        assert!(email.contains("@example.com"));
-        let pass = dynamic_password();
-        assert!(pass.starts_with("JourneyPass!_"));
-    }
 }

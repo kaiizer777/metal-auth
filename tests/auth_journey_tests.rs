@@ -8,6 +8,7 @@ use serde_json::json;
 const ENDPOINT_SIGNUP: &str = "/auth/signup";
 const ENDPOINT_LOGIN: &str = "/auth/login";
 const ENDPOINT_VERIFY: &str = "/auth/verify";
+const ENDPOINT_LOGOUT: &str = "/auth/logout";
 
 #[tokio::test]
 async fn test_journey_full_registration_and_login() {
@@ -93,6 +94,16 @@ async fn test_journey_full_registration_and_login() {
     assert_eq!(
         login_res.json()["user_id"],
         email_payload.user_id.to_string()
+    );
+
+    // 5. Logout round trip with Bearer header -> 204 No Content
+    let logout_res = app
+        .post_empty_with_bearer(ENDPOINT_LOGOUT, "test-bearer-token")
+        .await;
+    assert_eq!(
+        logout_res.status(),
+        StatusCode::NO_CONTENT,
+        "logout endpoint must return 204 No Content"
     );
 }
 
@@ -366,4 +377,103 @@ async fn test_journey_login_invalid_credentials() {
         .await;
     assert_eq!(success_res.status(), StatusCode::OK);
     assert!(success_res.json().get("user_id").is_some());
+}
+
+#[tokio::test]
+async fn test_journey_verify_email_expired_token() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let email = dynamic_email();
+    let password = dynamic_password();
+
+    // 1. Register new user
+    let signup_res = app
+        .post_json(
+            ENDPOINT_SIGNUP,
+            json!({
+                "email": email,
+                "password": password
+            }),
+        )
+        .await;
+    assert_eq!(signup_res.status(), StatusCode::OK);
+
+    let captured = app.email_sender.verification_calls();
+    assert_eq!(captured.len(), 1, "verification email dispatched");
+    let user_id = captured[0].user_id;
+    let token = &captured[0].token;
+
+    // Pre-check: user unverified in DB
+    assert!(
+        !is_email_verified(&app.pool, user_id)
+            .await
+            .expect("fetch verification status")
+    );
+
+    // 2. Expire verification token in database
+    expire_verification_tokens_for_user(&app.pool, user_id)
+        .await
+        .expect("expire verification tokens in DB");
+
+    // 3. Attempt verification with expired token -> 400 Bad Request (TOKEN_EXPIRED)
+    let verify_res = app
+        .post_json(
+            ENDPOINT_VERIFY,
+            json!({
+                "token": token
+            }),
+        )
+        .await;
+    assert_eq!(verify_res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(verify_res.error_code(), Some(ErrorCode::TokenExpired));
+    assert_eq!(verify_res.json()["code"], "TOKEN_EXPIRED");
+
+    // 4. Assert user remains unverified in database
+    assert!(
+        !is_email_verified(&app.pool, user_id)
+            .await
+            .expect("fetch verification status"),
+        "user must remain unverified after expired token rejection"
+    );
+
+    // 5. Attempt login -> 403 Forbidden (EMAIL_NOT_VERIFIED)
+    let login_res = app
+        .post_json(
+            ENDPOINT_LOGIN,
+            json!({
+                "email": email,
+                "password": password
+            }),
+        )
+        .await;
+    assert_eq!(login_res.status(), StatusCode::FORBIDDEN);
+    assert_eq!(login_res.error_code(), Some(ErrorCode::EmailNotVerified));
+}
+
+#[tokio::test]
+async fn test_journey_logout_roundtrip() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let logout_res = app
+        .post_empty_with_bearer(ENDPOINT_LOGOUT, "test-bearer-token")
+        .await;
+    assert_eq!(
+        logout_res.status(),
+        StatusCode::NO_CONTENT,
+        "logout endpoint must return 204 No Content"
+    );
+}
+
+#[test]
+fn test_harness_initializes() {
+    let email = dynamic_email();
+    assert!(email.contains("@example.com"));
+    let pass = dynamic_password();
+    assert!(pass.starts_with("JourneyPass!_"));
 }

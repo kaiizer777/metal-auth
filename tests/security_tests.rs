@@ -98,6 +98,10 @@ fn json_request(method: Method, uri: &str, body: serde_json::Value) -> Request<B
         .unwrap()
 }
 
+fn dynamic_test_password() -> String {
+    format!("SecPass!_{}", Uuid::new_v4())
+}
+
 fn raw_json_request(method: Method, uri: &str, raw_body: &str) -> Request<Body> {
     Request::builder()
         .method(method)
@@ -511,9 +515,9 @@ async fn test_login_wrong_password_returns_invalid_credentials() {
         return;
     };
     let email = format!("wrong_pw_{}@example.com", Uuid::new_v4());
-    let password = "CorrectPassword123!";
+    let password = dynamic_test_password();
     let config = ctx.state.auth_service.config.clone();
-    let password_hash = hash_password(password, &config).unwrap();
+    let password_hash = hash_password(&password, &config).unwrap();
 
     sqlx::query("INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true)")
         .bind(&email)
@@ -522,12 +526,13 @@ async fn test_login_wrong_password_returns_invalid_credentials() {
         .await
         .unwrap();
 
+    let wrong_password = dynamic_test_password();
     let req = json_request(
         Method::POST,
         "/auth/login",
         json!({
             "email": email,
-            "password": "WrongPassword123!"
+            "password": wrong_password
         }),
     );
     let resp = ctx.router.oneshot(req).await.unwrap();
@@ -545,9 +550,9 @@ async fn test_login_anti_enumeration_response_equality() {
         return;
     };
     let email = format!("enum_user_{}@example.com", Uuid::new_v4());
-    let password = "CorrectPassword123!";
+    let password = dynamic_test_password();
     let config = ctx.state.auth_service.config.clone();
-    let password_hash = hash_password(password, &config).unwrap();
+    let password_hash = hash_password(&password, &config).unwrap();
 
     sqlx::query("INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true)")
         .bind(&email)
@@ -556,10 +561,11 @@ async fn test_login_anti_enumeration_response_equality() {
         .await
         .unwrap();
 
+    let wrong_password = dynamic_test_password();
     let req1 = json_request(
         Method::POST,
         "/auth/login",
-        json!({"email": email, "password": "WrongPassword123!"}),
+        json!({"email": email, "password": wrong_password.clone()}),
     );
     let resp1 = ctx.router.clone().oneshot(req1).await.unwrap();
     let (status1, body1, _) = response_json(resp1).await;
@@ -568,7 +574,7 @@ async fn test_login_anti_enumeration_response_equality() {
     let req2 = json_request(
         Method::POST,
         "/auth/login",
-        json!({"email": unknown_email, "password": "WrongPassword123!"}),
+        json!({"email": unknown_email, "password": wrong_password}),
     );
     let resp2 = ctx.router.oneshot(req2).await.unwrap();
     let (status2, body2, _) = response_json(resp2).await;
@@ -836,9 +842,9 @@ async fn test_verify_tampered_token_rejected() {
     };
 
     let email = format!("tamper_{}@example.com", Uuid::new_v4());
-    let password = "ValidPassword123!";
+    let password = dynamic_test_password();
     let config = ctx.state.auth_service.config.clone();
-    let password_hash = hash_password(password, &config).unwrap();
+    let password_hash = hash_password(&password, &config).unwrap();
 
     let user_row = sqlx::query(
         "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, false) RETURNING id",
@@ -886,9 +892,9 @@ async fn test_verify_uppercase_hex_accepted() {
     };
 
     let email = format!("upper_hex_{}@example.com", Uuid::new_v4());
-    let password = "ValidPassword123!";
+    let password = dynamic_test_password();
     let config = ctx.state.auth_service.config.clone();
-    let password_hash = hash_password(password, &config).unwrap();
+    let password_hash = hash_password(&password, &config).unwrap();
 
     let user_row = sqlx::query(
         "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, false) RETURNING id",
@@ -938,9 +944,9 @@ async fn test_verify_token_from_reset_flow_rejected() {
     };
 
     let email = format!("cross_verify_{}@example.com", Uuid::new_v4());
-    let password = "ValidPassword123!";
+    let password = dynamic_test_password();
     let config = ctx.state.auth_service.config.clone();
-    let password_hash = hash_password(password, &config).unwrap();
+    let password_hash = hash_password(&password, &config).unwrap();
 
     let user_row = sqlx::query(
         "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, false) RETURNING id",
@@ -1626,13 +1632,13 @@ async fn test_anti_enumeration_signup() {
     };
 
     let email = format!("anti_enum_{}@example.com", Uuid::new_v4());
-    let password = "SuperSecurePassword123!";
+    let password = dynamic_test_password();
 
     // First signup returns 200
     let req1 = json_request(
         Method::POST,
         "/auth/signup",
-        json!({"email": email, "password": password}),
+        json!({"email": email, "password": &password}),
     );
     let resp1 = ctx.router.clone().oneshot(req1).await.unwrap();
     let (status1, body1, _) = response_json(resp1).await;
@@ -1642,7 +1648,7 @@ async fn test_anti_enumeration_signup() {
     let req2 = json_request(
         Method::POST,
         "/auth/signup",
-        json!({"email": email, "password": password}),
+        json!({"email": email, "password": &password}),
     );
     let resp2 = ctx.router.oneshot(req2).await.unwrap();
     let (status2, body2, _) = response_json(resp2).await;
@@ -1661,12 +1667,12 @@ async fn test_signup_duplicate_does_not_create_verification_token() {
     };
 
     let email = format!("dup_token_{}@example.com", Uuid::new_v4());
-    let password = "SuperSecurePassword123!";
+    let password = dynamic_test_password();
 
     let req1 = json_request(
         Method::POST,
         "/auth/signup",
-        json!({"email": email, "password": password}),
+        json!({"email": email, "password": &password}),
     );
     let resp1 = ctx.router.clone().oneshot(req1).await.unwrap();
     assert_eq!(resp1.status(), StatusCode::OK);
@@ -1691,7 +1697,7 @@ async fn test_signup_duplicate_does_not_create_verification_token() {
     let req2 = json_request(
         Method::POST,
         "/auth/signup",
-        json!({"email": email, "password": password}),
+        json!({"email": email, "password": &password}),
     );
     let resp2 = ctx.router.oneshot(req2).await.unwrap();
     assert_eq!(resp2.status(), StatusCode::OK);
@@ -1715,9 +1721,9 @@ async fn test_anti_enumeration_password_reset() {
     };
 
     let email = format!("existing_reset_{}@example.com", Uuid::new_v4());
-    let password = "ValidPassword123!";
+    let password = dynamic_test_password();
     let config = ctx.state.auth_service.config.clone();
-    let password_hash = hash_password(password, &config).unwrap();
+    let password_hash = hash_password(&password, &config).unwrap();
 
     let row = sqlx::query(
         "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true) RETURNING id",
@@ -1770,9 +1776,9 @@ async fn test_require_email_verification_block() {
     };
 
     let email = format!("unverified_e2e_{}@example.com", Uuid::new_v4());
-    let password = "ValidPassword123!";
+    let password = dynamic_test_password();
     let config = ctx.state.auth_service.config.clone();
-    let password_hash = hash_password(password, &config).unwrap();
+    let password_hash = hash_password(&password, &config).unwrap();
 
     let row = sqlx::query(
         "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, false) RETURNING id",
@@ -1821,9 +1827,9 @@ async fn test_verification_token_replay_rejected() {
     };
 
     let email = format!("token_replay_{}@example.com", Uuid::new_v4());
-    let password = "ValidPassword123!";
+    let password = dynamic_test_password();
     let config = ctx.state.auth_service.config.clone();
-    let password_hash = hash_password(password, &config).unwrap();
+    let password_hash = hash_password(&password, &config).unwrap();
 
     let user_row = sqlx::query(
         "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, false) RETURNING id",
@@ -1871,9 +1877,9 @@ async fn test_reset_password_revokes_all_tokens() {
     };
 
     let email = format!("token_revoke_{}@example.com", Uuid::new_v4());
-    let password = "OldPassword123!";
+    let password = dynamic_test_password();
     let config = ctx.state.auth_service.config.clone();
-    let password_hash = hash_password(password, &config).unwrap();
+    let password_hash = hash_password(&password, &config).unwrap();
 
     let user_row = sqlx::query(
         "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true) RETURNING id",
@@ -1908,7 +1914,7 @@ async fn test_reset_password_revokes_all_tokens() {
         "/auth/password/reset",
         json!({
             "token": token1,
-            "new_password": "NewSecurePassword123!"
+            "new_password": dynamic_test_password()
         }),
     );
     let resp1 = ctx.router.clone().oneshot(req1).await.unwrap();
@@ -1922,7 +1928,7 @@ async fn test_reset_password_revokes_all_tokens() {
         "/auth/password/reset",
         json!({
             "token": token2,
-            "new_password": "AnotherNewPassword123!"
+            "new_password": dynamic_test_password()
         }),
     );
     let resp2 = ctx.router.oneshot(req2).await.unwrap();
@@ -1939,9 +1945,9 @@ async fn test_password_reset_confirm_same_token_replay_rejected() {
     };
 
     let email = format!("reset_replay_{}@example.com", Uuid::new_v4());
-    let password = "OldPassword123!";
+    let password = dynamic_test_password();
     let config = ctx.state.auth_service.config.clone();
-    let password_hash = hash_password(password, &config).unwrap();
+    let password_hash = hash_password(&password, &config).unwrap();
 
     let user_row = sqlx::query(
         "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true) RETURNING id",
@@ -1971,7 +1977,7 @@ async fn test_password_reset_confirm_same_token_replay_rejected() {
         "/auth/password/reset",
         json!({
             "token": raw_token,
-            "new_password": "NewValidPassword123!"
+            "new_password": dynamic_test_password()
         }),
     );
     let resp1 = ctx.router.clone().oneshot(req1).await.unwrap();
@@ -1984,7 +1990,7 @@ async fn test_password_reset_confirm_same_token_replay_rejected() {
         "/auth/password/reset",
         json!({
             "token": raw_token,
-            "new_password": "YetAnotherPassword123!"
+            "new_password": dynamic_test_password()
         }),
     );
     let resp2 = ctx.router.oneshot(req2).await.unwrap();
@@ -2001,9 +2007,9 @@ async fn test_password_reset_confirm_token_from_verify_flow_rejected() {
     };
 
     let email = format!("cross_reset_{}@example.com", Uuid::new_v4());
-    let password = "OldPassword123!";
+    let password = dynamic_test_password();
     let config = ctx.state.auth_service.config.clone();
-    let password_hash = hash_password(password, &config).unwrap();
+    let password_hash = hash_password(&password, &config).unwrap();
 
     let user_row = sqlx::query(
         "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true) RETURNING id",
@@ -2033,7 +2039,7 @@ async fn test_password_reset_confirm_token_from_verify_flow_rejected() {
         "/auth/password/reset",
         json!({
             "token": verify_token,
-            "new_password": "NewValidPassword123!"
+            "new_password": dynamic_test_password()
         }),
     );
     let resp = ctx.router.oneshot(req).await.unwrap();
@@ -2058,9 +2064,9 @@ async fn test_password_reset_confirm_invalid_token_does_not_change_password() {
     };
 
     let email = format!("untouched_pw_{}@example.com", Uuid::new_v4());
-    let password = "OriginalPassword123!";
+    let password = dynamic_test_password();
     let config = ctx.state.auth_service.config.clone();
-    let original_hash = hash_password(password, &config).unwrap();
+    let original_hash = hash_password(&password, &config).unwrap();
 
     let user_row = sqlx::query(
         "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true) RETURNING id",
@@ -2078,7 +2084,7 @@ async fn test_password_reset_confirm_invalid_token_does_not_change_password() {
         "/auth/password/reset",
         json!({
             "token": fake_token,
-            "new_password": "AttemptedNewPassword123!"
+            "new_password": dynamic_test_password()
         }),
     );
     let resp = ctx.router.oneshot(req).await.unwrap();
@@ -2183,9 +2189,9 @@ async fn test_expired_verification_token() {
     };
 
     let email = format!("expired_verify_{}@example.com", Uuid::new_v4());
-    let password = "ValidPassword123!";
+    let password = dynamic_test_password();
     let config = ctx.state.auth_service.config.clone();
-    let password_hash = hash_password(password, &config).unwrap();
+    let password_hash = hash_password(&password, &config).unwrap();
 
     let user_row = sqlx::query(
         "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, false) RETURNING id",
@@ -2232,9 +2238,9 @@ async fn test_expired_password_reset_token_rejected() {
     };
 
     let email = format!("expired_reset_{}@example.com", Uuid::new_v4());
-    let password = "ValidPassword123!";
+    let password = dynamic_test_password();
     let config = ctx.state.auth_service.config.clone();
-    let password_hash = hash_password(password, &config).unwrap();
+    let password_hash = hash_password(&password, &config).unwrap();
 
     let user_row = sqlx::query(
         "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true) RETURNING id",
@@ -2259,10 +2265,11 @@ async fn test_expired_password_reset_token_rejected() {
     .await
     .unwrap();
 
+    let new_password = dynamic_test_password();
     let req = json_request(
         Method::POST,
         "/auth/password/reset",
-        json!({"token": raw_token, "new_password": "NewValidPassword123!"}),
+        json!({"token": raw_token, "new_password": &new_password}),
     );
     let resp = ctx.router.clone().oneshot(req).await.unwrap();
     let (status, _, body_str) = response_json(resp).await;
@@ -2280,7 +2287,7 @@ async fn test_expired_password_reset_token_rejected() {
     let login_req = json_request(
         Method::POST,
         "/auth/login",
-        json!({"email": email, "password": "NewValidPassword123!"}),
+        json!({"email": email, "password": &new_password}),
     );
     let login_resp = ctx.router.oneshot(login_req).await.unwrap();
     let (login_status, _, login_body) = response_json(login_resp).await;
@@ -2344,7 +2351,7 @@ async fn test_rate_limit_signup() {
             "/auth/signup",
             json!({
                 "email": format!("flood_{}@example.com", i),
-                "password": "ValidPassword123!"
+                "password": dynamic_test_password()
             }),
         );
         let resp = router.clone().oneshot(req).await.unwrap();
@@ -2424,7 +2431,7 @@ async fn test_rate_limit_reset_confirm() {
             "/auth/password/reset",
             json!({
                 "token": "invalid",
-                "new_password": "NewValidPassword123!"
+                "new_password": dynamic_test_password()
             }),
         );
         let resp = router.clone().oneshot(req).await.unwrap();
@@ -2449,9 +2456,9 @@ async fn test_login_timing_parity_unknown_vs_wrong() {
     };
 
     let email = format!("timing_{}@example.com", Uuid::new_v4());
-    let password = "RegisteredPassword123!";
+    let password = dynamic_test_password();
     let config = ctx.state.auth_service.config.clone();
-    let password_hash = hash_password(password, &config).unwrap();
+    let password_hash = hash_password(&password, &config).unwrap();
 
     sqlx::query("INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true)")
         .bind(&email)
@@ -2460,12 +2467,14 @@ async fn test_login_timing_parity_unknown_vs_wrong() {
         .await
         .unwrap();
 
+    let wrong_password = dynamic_test_password();
+
     // Measure existing user + wrong password
     let start_wrong = std::time::Instant::now();
     let req1 = json_request(
         Method::POST,
         "/auth/login",
-        json!({"email": email, "password": "WrongPassword123!"}),
+        json!({"email": email, "password": wrong_password.clone()}),
     );
     let resp1 = ctx.router.clone().oneshot(req1).await.unwrap();
     let duration_wrong = start_wrong.elapsed();
@@ -2477,7 +2486,7 @@ async fn test_login_timing_parity_unknown_vs_wrong() {
     let req2 = json_request(
         Method::POST,
         "/auth/login",
-        json!({"email": unknown_email, "password": "WrongPassword123!"}),
+        json!({"email": unknown_email, "password": wrong_password}),
     );
     let resp2 = ctx.router.oneshot(req2).await.unwrap();
     let duration_unknown = start_unknown.elapsed();
@@ -2508,9 +2517,9 @@ async fn test_session_fixation_login_issues_fresh_session() {
     };
 
     let email = format!("session_fix_{}@example.com", Uuid::new_v4());
-    let password = "ValidPassword123!";
+    let password = dynamic_test_password();
     let config = ctx.state.auth_service.config.clone();
-    let password_hash = hash_password(password, &config).unwrap();
+    let password_hash = hash_password(&password, &config).unwrap();
 
     let row = sqlx::query(
         "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true) RETURNING id",

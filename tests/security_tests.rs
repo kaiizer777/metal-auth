@@ -515,14 +515,12 @@ async fn test_login_wrong_password_returns_invalid_credentials() {
     let config = ctx.state.auth_service.config.clone();
     let password_hash = hash_password(password, &config).unwrap();
 
-    sqlx::query(
-        "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true)",
-    )
-    .bind(&email)
-    .bind(&password_hash)
-    .execute(&ctx.pool)
-    .await
-    .unwrap();
+    sqlx::query("INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true)")
+        .bind(&email)
+        .bind(&password_hash)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
 
     let req = json_request(
         Method::POST,
@@ -551,14 +549,12 @@ async fn test_login_anti_enumeration_response_equality() {
     let config = ctx.state.auth_service.config.clone();
     let password_hash = hash_password(password, &config).unwrap();
 
-    sqlx::query(
-        "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true)",
-    )
-    .bind(&email)
-    .bind(&password_hash)
-    .execute(&ctx.pool)
-    .await
-    .unwrap();
+    sqlx::query("INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true)")
+        .bind(&email)
+        .bind(&password_hash)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
 
     let req1 = json_request(
         Method::POST,
@@ -920,11 +916,7 @@ async fn test_verify_uppercase_hex_accepted() {
     let upper_token = raw_token.to_uppercase();
     assert_ne!(upper_token, raw_token);
 
-    let req = json_request(
-        Method::POST,
-        "/auth/verify",
-        json!({"token": upper_token}),
-    );
+    let req = json_request(Method::POST, "/auth/verify", json!({"token": upper_token}));
     let resp = ctx.router.oneshot(req).await.unwrap();
     let (status, body, _) = response_json(resp).await;
 
@@ -973,11 +965,7 @@ async fn test_verify_token_from_reset_flow_rejected() {
     .await
     .unwrap();
 
-    let req = json_request(
-        Method::POST,
-        "/auth/verify",
-        json!({"token": reset_token}),
-    );
+    let req = json_request(Method::POST, "/auth/verify", json!({"token": reset_token}));
     let resp = ctx.router.oneshot(req).await.unwrap();
     let (status, _, body_str) = response_json(resp).await;
 
@@ -1315,12 +1303,16 @@ async fn test_cors_disallowed_origin_no_acao_on_actual_post() {
         .uri("/auth/signup")
         .header(header::ORIGIN, "https://evil.com")
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"email":"user@example.com","password":"ValidPassword123!"}"#))
+        .body(Body::from(
+            r#"{"email":"user@example.com","password":"ValidPassword123!"}"#,
+        ))
         .unwrap();
 
     let resp = router.oneshot(req).await.unwrap();
     assert!(
-        resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+        resp.headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none(),
         "Disallowed origin https://evil.com must not receive Access-Control-Allow-Origin header"
     );
 }
@@ -1334,12 +1326,16 @@ async fn test_cors_null_origin_rejected() {
         .uri("/auth/login")
         .header(header::ORIGIN, "null")
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"email":"user@example.com","password":"ValidPassword123!"}"#))
+        .body(Body::from(
+            r#"{"email":"user@example.com","password":"ValidPassword123!"}"#,
+        ))
         .unwrap();
 
     let resp = router.oneshot(req).await.unwrap();
     assert!(
-        resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+        resp.headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none(),
         "Origin: null must not receive Access-Control-Allow-Origin header"
     );
 }
@@ -1354,7 +1350,9 @@ async fn test_csrf_state_changing_request_requires_allowed_origin() {
         .uri("/auth/signup")
         .header(header::ORIGIN, "https://app.example.com")
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"email":"bad-email","password":"ValidPassword123!"}"#))
+        .body(Body::from(
+            r#"{"email":"bad-email","password":"ValidPassword123!"}"#,
+        ))
         .unwrap();
 
     let allowed_resp = router.clone().oneshot(allowed_req).await.unwrap();
@@ -1372,7 +1370,9 @@ async fn test_csrf_state_changing_request_requires_allowed_origin() {
         .uri("/auth/signup")
         .header(header::ORIGIN, "https://attacker.com")
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"email":"bad-email","password":"ValidPassword123!"}"#))
+        .body(Body::from(
+            r#"{"email":"bad-email","password":"ValidPassword123!"}"#,
+        ))
         .unwrap();
 
     let untrusted_resp = router.oneshot(untrusted_req).await.unwrap();
@@ -1674,7 +1674,10 @@ async fn test_signup_duplicate_does_not_create_verification_token() {
             .fetch_one(&ctx.pool)
             .await
             .unwrap();
-    assert_eq!(token_count_1, 1, "first signup should create exactly 1 verification token");
+    assert_eq!(
+        token_count_1, 1,
+        "first signup should create exactly 1 verification token"
+    );
 
     let req2 = json_request(
         Method::POST,
@@ -1690,7 +1693,10 @@ async fn test_signup_duplicate_does_not_create_verification_token() {
             .fetch_one(&ctx.pool)
             .await
             .unwrap();
-    assert_eq!(token_count_2, 1, "duplicate signup must not create a second verification token");
+    assert_eq!(
+        token_count_2, 1,
+        "duplicate signup must not create a second verification token"
+    );
 }
 
 #[tokio::test]
@@ -2078,7 +2084,10 @@ async fn test_password_reset_confirm_invalid_token_does_not_change_password() {
         .fetch_one(&ctx.pool)
         .await
         .unwrap();
-    assert_eq!(current_hash, original_hash, "password hash must remain unchanged on invalid token reset");
+    assert_eq!(
+        current_hash, original_hash,
+        "password hash must remain unchanged on invalid token reset"
+    );
 }
 
 #[tokio::test]
@@ -2327,7 +2336,9 @@ async fn test_rate_limit_signup() {
         );
         let resp = router.clone().oneshot(req).await.unwrap();
         assert!(
-            resp.status() == StatusCode::INTERNAL_SERVER_ERROR || resp.status() == StatusCode::TOO_MANY_REQUESTS || resp.status() == StatusCode::OK,
+            resp.status() == StatusCode::INTERNAL_SERVER_ERROR
+                || resp.status() == StatusCode::TOO_MANY_REQUESTS
+                || resp.status() == StatusCode::OK,
             "Signup under burst should be handled safely (status: {})",
             resp.status()
         );
@@ -2349,7 +2360,9 @@ async fn test_rate_limit_password_reset_request() {
         );
         let resp = router.clone().oneshot(req).await.unwrap();
         assert!(
-            resp.status() == StatusCode::INTERNAL_SERVER_ERROR || resp.status() == StatusCode::TOO_MANY_REQUESTS || resp.status() == StatusCode::OK,
+            resp.status() == StatusCode::INTERNAL_SERVER_ERROR
+                || resp.status() == StatusCode::TOO_MANY_REQUESTS
+                || resp.status() == StatusCode::OK,
             "Reset request burst handled deterministically"
         );
     }
@@ -2363,14 +2376,11 @@ async fn test_rate_limit_verify_token() {
     let router = setup_rate_limit_router().await;
 
     for _ in 0..5 {
-        let req = json_request(
-            Method::POST,
-            "/auth/verify",
-            json!({"token": "12345"}),
-        );
+        let req = json_request(Method::POST, "/auth/verify", json!({"token": "12345"}));
         let resp = router.clone().oneshot(req).await.unwrap();
         assert!(
-            resp.status() == StatusCode::BAD_REQUEST || resp.status() == StatusCode::TOO_MANY_REQUESTS,
+            resp.status() == StatusCode::BAD_REQUEST
+                || resp.status() == StatusCode::TOO_MANY_REQUESTS,
             "Verify token attempts handled deterministically"
         );
     }
@@ -2394,7 +2404,8 @@ async fn test_rate_limit_reset_confirm() {
         );
         let resp = router.clone().oneshot(req).await.unwrap();
         assert!(
-            resp.status() == StatusCode::BAD_REQUEST || resp.status() == StatusCode::TOO_MANY_REQUESTS,
+            resp.status() == StatusCode::BAD_REQUEST
+                || resp.status() == StatusCode::TOO_MANY_REQUESTS,
             "Reset confirm attempts handled deterministically"
         );
     }
@@ -2414,14 +2425,12 @@ async fn test_login_timing_parity_unknown_vs_wrong() {
     let config = ctx.state.auth_service.config.clone();
     let password_hash = hash_password(password, &config).unwrap();
 
-    sqlx::query(
-        "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true)",
-    )
-    .bind(&email)
-    .bind(&password_hash)
-    .execute(&ctx.pool)
-    .await
-    .unwrap();
+    sqlx::query("INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true)")
+        .bind(&email)
+        .bind(&password_hash)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
 
     // Measure existing user + wrong password
     let start_wrong = std::time::Instant::now();

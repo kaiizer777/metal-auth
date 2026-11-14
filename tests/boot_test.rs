@@ -402,7 +402,7 @@ async fn test_migration_applies_on_fresh_db_schema() {
     let schema_name = format!("test_schema_{}", Uuid::new_v4().simple());
 
     // Create fresh isolated schema
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema_name}")))
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA \"{schema_name}\"")))
         .execute(&base_pool)
         .await
         .expect("create isolated test schema");
@@ -415,7 +415,7 @@ async fn test_migration_applies_on_fresh_db_schema() {
             let s = test_schema.clone();
             Box::pin(async move {
                 sqlx::query(sqlx::AssertSqlSafe(format!(
-                    "SET search_path TO {s}, public"
+                    "SET search_path TO \"{s}\", public"
                 )))
                 .execute(conn)
                 .await?;
@@ -426,38 +426,62 @@ async fn test_migration_applies_on_fresh_db_schema() {
         .await
         .expect("connect to isolated test schema pool");
 
-    // 1. Initial migration run from scratch on fresh schema
-    let migrator = sqlx::migrate!("./migrations");
-    migrator
-        .run(&schema_pool)
+    // Run migrations and assertions inside a captured task so failures do not bypass teardown
+    let test_schema_pool = schema_pool.clone();
+    let test_base_pool = base_pool.clone();
+    let test_schema_name = schema_name.clone();
+
+    let test_task = tokio::spawn(async move {
+        let migrator = sqlx::migrate!("./migrations");
+
+        // 1. Initial migration run from scratch on fresh schema
+        migrator
+            .run(&test_schema_pool)
+            .await
+            .map_err(|e| format!("migrations must apply cleanly on fresh schema: {e}"))?;
+
+        // 2. Assert core domain tables were created in the fresh schema
+        let table_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = $1 AND table_name IN ('users', 'sessions', 'verification_tokens', 'password_reset_tokens', '_sqlx_migrations')",
+        )
+        .bind(&test_schema_name)
+        .fetch_one(&test_base_pool)
         .await
-        .expect("migrations must apply cleanly on fresh schema");
+        .map_err(|e| format!("query tables in test schema: {e}"))?;
 
-    // 2. Assert core domain tables were created in the fresh schema
-    let table_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = $1 AND table_name IN ('users', 'sessions', 'verification_tokens', 'password_reset_tokens', '_sqlx_migrations')",
-    )
-    .bind(&schema_name)
-    .fetch_one(&base_pool)
-    .await
-    .expect("query tables in test schema");
-    assert_eq!(
-        table_count, 5,
-        "all migrated tables must exist in the fresh schema"
-    );
+        if table_count != 5 {
+            return Err(format!(
+                "expected 5 migrated tables in fresh schema, found {table_count}"
+            ));
+        }
 
-    // 3. Idempotency assertion: re-running migrations on the same schema must succeed without error
-    migrator
-        .run(&schema_pool)
-        .await
-        .expect("re-running migrations must be idempotent and succeed without error");
+        // 3. Idempotency assertion: re-running migrations on the same schema must succeed without error
+        migrator
+            .run(&test_schema_pool)
+            .await
+            .map_err(|e| format!("re-running migrations must be idempotent and succeed without error: {e}"))?;
 
-    // Cleanup: drop pool and isolated schema
-    drop(schema_pool);
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "DROP SCHEMA {schema_name} CASCADE"
+        Ok::<(), String>(())
+    });
+
+    let test_res = test_task.await;
+
+    // Cleanup: explicitly close isolated schema pool and unconditionally drop schema
+    schema_pool.close().await;
+    let cleanup_res = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP SCHEMA \"{schema_name}\" CASCADE"
     )))
     .execute(&base_pool)
-    .await
-    .expect("clean up test schema");
+    .await;
+
+    match test_res {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => panic!("{err}"),
+        Err(join_err) => match join_err.try_into_panic() {
+            Ok(panic_payload) => std::panic::resume_unwind(panic_payload),
+            Err(e) => panic!("test task cancelled or failed: {e}"),
+        },
+    }
+
+    cleanup_res.expect("clean up test schema");
 }

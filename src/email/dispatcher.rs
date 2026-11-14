@@ -118,17 +118,18 @@ impl EmailDispatcher {
     ///
     /// Under blocking test mode (`new_blocking`), delivers pending messages inline so
     /// assertions can verify delivery synchronously without polling.
-    pub async fn on_outbox_committed(&self, pool: &sqlx::PgPool) {
+    pub async fn on_outbox_committed(&self, _pool: &sqlx::PgPool) {
         #[cfg(any(test, feature = "test-utils"))]
         if self.block_on_delivery {
             let _ = crate::email::outbox::process_outbox_batch(
-                pool,
+                _pool,
                 &self.sender,
                 self.timeout,
                 self.outbox_config.batch_size,
                 self.outbox_config.max_retries,
                 self.outbox_config.initial_backoff,
                 self.outbox_config.max_backoff,
+                self.outbox_config.lease_duration,
             )
             .await;
             return;
@@ -147,6 +148,7 @@ impl EmailDispatcher {
             self.outbox_config.max_retries,
             self.outbox_config.initial_backoff,
             self.outbox_config.max_backoff,
+            self.outbox_config.lease_duration,
         )
         .await
     }

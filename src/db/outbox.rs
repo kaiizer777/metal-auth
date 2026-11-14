@@ -1,4 +1,6 @@
-use chrono::{DateTime, Utc};
+use std::time::Duration;
+
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use sqlx::{Executor, PgPool, Postgres};
 use uuid::Uuid;
 
@@ -32,21 +34,27 @@ where
     .await
 }
 
-/// Atomically claims pending outbox entries due for delivery using `FOR UPDATE SKIP LOCKED`.
+/// Atomically claims pending or expired processing outbox entries due for delivery using `FOR UPDATE SKIP LOCKED`.
 ///
-/// Concurrent workers will never claim the same rows.
+/// Sets `status = 'processing'` and advances `next_retry_at` to the lease expiration timestamp.
+/// Expired `processing` entries from crashed workers are reclaimed automatically.
 pub async fn claim_pending_outbox(
     pool: &PgPool,
     limit: i64,
+    lease_duration: Duration,
 ) -> Result<Vec<EmailOutbox>, sqlx::Error> {
+    let lease_expires_at = Utc::now()
+        + ChronoDuration::from_std(lease_duration).unwrap_or(ChronoDuration::seconds(300));
+
     sqlx::query_as::<Postgres, EmailOutbox>(
         r#"
         UPDATE email_outbox
-        SET status = $1
+        SET status = $1, next_retry_at = $4
         WHERE id IN (
             SELECT id
             FROM email_outbox
-            WHERE status = $2 AND next_retry_at <= NOW()
+            WHERE (status = $2 AND next_retry_at <= NOW())
+               OR (status = $1 AND next_retry_at <= NOW())
             ORDER BY next_retry_at ASC
             LIMIT $3
             FOR UPDATE SKIP LOCKED
@@ -57,8 +65,26 @@ pub async fn claim_pending_outbox(
     .bind(OUTBOX_STATUS_PROCESSING)
     .bind(OUTBOX_STATUS_PENDING)
     .bind(limit)
+    .bind(lease_expires_at)
     .fetch_all(pool)
     .await
+}
+
+/// Resets stale processing records whose lease has expired back to pending status.
+pub async fn recover_stale_processing(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        r#"
+        UPDATE email_outbox
+        SET status = $1
+        WHERE status = $2 AND next_retry_at <= NOW()
+        "#,
+    )
+    .bind(OUTBOX_STATUS_PENDING)
+    .bind(OUTBOX_STATUS_PROCESSING)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
 }
 
 /// Marks an outbox message as successfully sent.

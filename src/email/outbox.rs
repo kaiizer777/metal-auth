@@ -23,6 +23,7 @@ pub struct OutboxWorkerConfig {
     pub max_retries: u32,
     pub initial_backoff: Duration,
     pub max_backoff: Duration,
+    pub lease_duration: Duration,
 }
 
 impl Default for OutboxWorkerConfig {
@@ -33,6 +34,7 @@ impl Default for OutboxWorkerConfig {
             max_retries: crate::config::DEFAULT_OUTBOX_MAX_RETRIES,
             initial_backoff: Duration::from_secs(crate::config::DEFAULT_OUTBOX_INITIAL_BACKOFF_SECS),
             max_backoff: Duration::from_secs(crate::config::DEFAULT_OUTBOX_MAX_BACKOFF_SECS),
+            lease_duration: Duration::from_secs(300),
         }
     }
 }
@@ -45,7 +47,15 @@ impl From<&Config> for OutboxWorkerConfig {
             max_retries: cfg.outbox_max_retries,
             initial_backoff: cfg.outbox_initial_backoff,
             max_backoff: cfg.outbox_max_backoff,
+            lease_duration: Duration::from_secs(300),
         }
+    }
+}
+
+impl OutboxWorkerConfig {
+    pub fn with_lease_duration(mut self, lease_duration: Duration) -> Self {
+        self.lease_duration = lease_duration;
+        self
     }
 }
 
@@ -71,8 +81,9 @@ pub async fn process_outbox_batch(
     max_retries: u32,
     initial_backoff: Duration,
     max_backoff: Duration,
+    lease_duration: Duration,
 ) -> Result<usize, sqlx::Error> {
-    let messages = claim_pending_outbox(pool, batch_size as i64).await?;
+    let messages = claim_pending_outbox(pool, batch_size as i64, lease_duration).await?;
     if messages.is_empty() {
         return Ok(0);
     }
@@ -228,6 +239,10 @@ pub async fn run_outbox_worker(
     config: OutboxWorkerConfig,
     notify: Arc<tokio::sync::Notify>,
 ) {
+    if let Err(e) = crate::db::outbox::recover_stale_processing(&pool).await {
+        error!(err = %e, "failed to recover stale outbox processing records on startup");
+    }
+
     loop {
         tokio::select! {
             _ = tokio::time::sleep(config.poll_interval) => {}
@@ -243,6 +258,7 @@ pub async fn run_outbox_worker(
                 config.max_retries,
                 config.initial_backoff,
                 config.max_backoff,
+                config.lease_duration,
             )
             .await
             {

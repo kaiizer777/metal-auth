@@ -9,6 +9,7 @@ license = "MIT"
 readme = "README.md"
 keywords = ["auth", "authentication", "session", "oauth2", "security"]
 categories = ["authentication", "web-programming"]
+autotests = true
 
 [dependencies]
 # async runtime
@@ -60,6 +61,10 @@ tracing = "0.1"
 [features]
 default = []
 test-utils = []
+
+[[test]]
+name = "common"
+path = "tests/common/mod.rs"
 
 [dev-dependencies]
 metal-auth = { path = ".", features = ["test-utils"] }

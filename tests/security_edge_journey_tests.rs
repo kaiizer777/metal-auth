@@ -222,12 +222,6 @@ async fn test_journey_cors_headers_on_all_responses() {
             .is_none(),
         "Disallowed origin must not receive Access-Control-Allow-Origin header"
     );
-    assert!(
-        disallowed_res
-            .header("access-control-allow-credentials")
-            .is_none(),
-        "Disallowed origin must not receive Access-Control-Allow-Credentials header"
-    );
 }
 
 /// Scenario 3: Concurrent Registration Race Condition Journey

@@ -8,7 +8,7 @@ use axum::{
     http::{HeaderMap, Method, Request, StatusCode, header},
 };
 use metal_auth::{
-    AppConfig, AppState, Config, EmailDispatcher, ErrorCode,
+    AppConfig, AppState, Config, EmailDispatcher, ErrorCode, User,
     email::test_utils::CapturingEmailSender,
 };
 use sqlx::PgPool;
@@ -247,6 +247,16 @@ pub async fn is_email_verified(pool: &PgPool, user_id: Uuid) -> Result<bool, sql
         .bind(user_id)
         .fetch_one(pool)
         .await
+}
+
+/// DB query helper: fetches a complete user row by user ID.
+pub async fn get_user_by_id(pool: &PgPool, user_id: Uuid) -> Result<User, sqlx::Error> {
+    sqlx::query_as::<_, User>(
+        "SELECT id, email, password_hash, email_verified, created_at, updated_at FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
 }
 
 /// DB query helper: expires all password reset tokens for a user (sets expires_at to 1 hour in the past).

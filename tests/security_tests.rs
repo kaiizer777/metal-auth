@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use axum::{
     body::Body,
@@ -1465,9 +1465,9 @@ async fn test_zero_secret_leakage_in_error_responses() {
 // ─── Log secret leakage audit & DB error leak tests ──────────────────────────
 
 #[derive(Clone)]
-struct LogBuf(Arc<Mutex<Vec<u8>>>);
+struct TestLogWriter(Arc<Mutex<Vec<u8>>>);
 
-impl std::io::Write for LogBuf {
+impl std::io::Write for TestLogWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.0.lock().unwrap().extend_from_slice(buf);
         Ok(buf.len())
@@ -1477,103 +1477,157 @@ impl std::io::Write for LogBuf {
     }
 }
 
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
-    type Writer = LogBuf;
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TestLogWriter {
+    type Writer = TestLogWriter;
     fn make_writer(&self) -> Self::Writer {
         self.clone()
     }
 }
 
-static LOG_BUF: OnceLock<LogBuf> = OnceLock::new();
-static LOG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-fn init_security_test_logs() {
-    let buf = LOG_BUF.get_or_init(|| LogBuf(Arc::new(Mutex::new(Vec::new()))));
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_writer(buf.clone())
-        .with_ansi(false)
-        .try_init();
+struct TestLogScope {
+    buf: Arc<Mutex<Vec<u8>>>,
+    _guard: tracing::subscriber::DefaultGuard,
 }
 
-fn clear_security_test_logs() {
-    if let Some(buf) = LOG_BUF.get() {
-        buf.0.lock().unwrap().clear();
+impl TestLogScope {
+    fn new() -> Self {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(TestLogWriter(buf.clone()))
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        Self { buf, _guard: guard }
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8(self.buf.lock().unwrap().clone()).unwrap_or_default()
     }
 }
 
-fn security_log_text() -> String {
-    if let Some(buf) = LOG_BUF.get() {
-        String::from_utf8(buf.0.lock().unwrap().clone()).unwrap_or_default()
-    } else {
-        String::new()
-    }
-}
-
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn test_no_secrets_in_tracing_logs() {
-    init_security_test_logs();
-    let _guard = LOG_LOCK.lock().await;
-    clear_security_test_logs();
+    let Some(ctx) = setup_live_db().await else {
+        return;
+    };
 
-    let router = create_test_router();
+    let log_scope = TestLogScope::new();
 
-    let secret_pw = "SuperSecret_P@ssw0rd!_9876";
-    let test_email = "secret_audit@example.com";
+    let secret_pw = format!("SuperSecret_{}_P@ssw0rd!", Uuid::new_v4());
+    let new_secret_pw = format!("NewSecret_{}_P@ssw0rd!", Uuid::new_v4());
+    let test_email = format!("secret_audit_{}@example.com", Uuid::new_v4());
 
-    // 1. Signup request with secret password
+    // 1. Signup request with secret password (Argon2 hash + verification token generation)
     let req1 = json_request(
         Method::POST,
         "/auth/signup",
         json!({"email": test_email, "password": secret_pw}),
     );
-    let _ = router.clone().oneshot(req1).await.unwrap();
+    let resp1 = ctx.router.clone().oneshot(req1).await.unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
 
-    // 2. Login request with secret password
+    // Verify user in DB so login succeeds
+    let user_row = sqlx::query("SELECT id FROM users WHERE email = $1")
+        .bind(&test_email)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+    let user_id: Uuid = user_row.get("id");
+
+    sqlx::query("UPDATE users SET email_verified = true WHERE id = $1")
+        .bind(user_id)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+
+    // 2. Login request with secret password (Argon2 password verification)
     let req2 = json_request(
         Method::POST,
         "/auth/login",
         json!({"email": test_email, "password": secret_pw}),
     );
-    let _ = router.clone().oneshot(req2).await.unwrap();
+    let resp2 = ctx.router.clone().oneshot(req2).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
 
-    // 3. Password reset request
+    // 3. Password reset request (reset token generation)
     let req3 = json_request(
         Method::POST,
         "/auth/password/reset-request",
         json!({"email": test_email}),
     );
-    let _ = router.clone().oneshot(req3).await.unwrap();
+    let resp3 = ctx.router.clone().oneshot(req3).await.unwrap();
+    assert_eq!(resp3.status(), StatusCode::OK);
 
-    // 4. Password reset confirm with secret new password and hex token
-    let secret_token = "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234";
+    // 4. Password reset confirmation with raw reset token and new secret password
+    let (raw_reset_token, stored_reset_hash) = generate_token();
+    let expires_at = Utc::now() + Duration::hours(1);
+    sqlx::query(
+        "INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
+    )
+    .bind(stored_reset_hash.as_slice())
+    .bind(user_id)
+    .bind(expires_at)
+    .execute(&ctx.pool)
+    .await
+    .unwrap();
+
     let req4 = json_request(
         Method::POST,
         "/auth/password/reset",
-        json!({"token": secret_token, "new_password": secret_pw}),
+        json!({"token": raw_reset_token, "new_password": new_secret_pw}),
     );
-    let _ = router.oneshot(req4).await.unwrap();
+    let resp4 = ctx.router.clone().oneshot(req4).await.unwrap();
+    assert_eq!(resp4.status(), StatusCode::OK);
 
-    let logs = security_log_text();
+    // 5. Verification token confirmation with raw verify token
+    let (raw_verify_token, stored_verify_hash) = generate_token();
+    sqlx::query(
+        "INSERT INTO verification_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
+    )
+    .bind(stored_verify_hash.as_slice())
+    .bind(user_id)
+    .bind(expires_at)
+    .execute(&ctx.pool)
+    .await
+    .unwrap();
+
+    let req5 = json_request(
+        Method::POST,
+        "/auth/verify",
+        json!({"token": raw_verify_token}),
+    );
+    let resp5 = ctx.router.oneshot(req5).await.unwrap();
+    assert_eq!(resp5.status(), StatusCode::OK);
+
+    let logs = log_scope.text();
     assert!(
-        !logs.contains(secret_pw),
-        "Secret plaintext password leaked in tracing logs: {}",
-        logs
+        !logs.is_empty(),
+        "Log buffer should have captured tracing events from requests"
     );
     assert!(
-        !logs.contains(secret_token),
-        "Secret raw token leaked in tracing logs: {}",
-        logs
+        !logs.contains(&secret_pw),
+        "Secret plaintext password leaked in tracing logs: {logs}"
+    );
+    assert!(
+        !logs.contains(&new_secret_pw),
+        "Secret plaintext new password leaked in tracing logs: {logs}"
+    );
+    assert!(
+        !logs.contains(&raw_reset_token),
+        "Secret raw reset token leaked in tracing logs: {logs}"
+    );
+    assert!(
+        !logs.contains(&raw_verify_token),
+        "Secret raw verify token leaked in tracing logs: {logs}"
     );
     assert!(
         !logs.contains("$argon2id$"),
-        "Argon2 password hash string leaked in tracing logs: {}",
-        logs
+        "Argon2 password hash string leaked in tracing logs: {logs}"
     );
     assert!(
         !logs.to_lowercase().contains("syntax error"),
-        "Raw SQL syntax error leaked in tracing logs: {}",
-        logs
+        "Raw SQL syntax error leaked in tracing logs: {logs}"
     );
 }
 

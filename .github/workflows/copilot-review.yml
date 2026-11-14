@@ -24,7 +24,7 @@ jobs:
           script: |
             const prNumber = context.payload.pull_request ? context.payload.pull_request.number : context.issue.number;
             try {
-              await github.request('POST /repos/{owner}/{repo}/pulls/{pull_number}/copilot/review', {
+              await github.request('POST /repos/{owner}/{repo}/pulls/{pull_number}/copilot-code-review', {
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 pull_number: prNumber,

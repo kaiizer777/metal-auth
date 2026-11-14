@@ -83,23 +83,14 @@ pub async fn process_outbox_batch(
     max_backoff: Duration,
     lease_duration: Duration,
 ) -> Result<usize, sqlx::Error> {
+    let Some(sender) = sender.as_ref() else {
+        return Ok(0);
+    };
+
     let messages = claim_pending_outbox(pool, batch_size as i64, lease_duration).await?;
     if messages.is_empty() {
         return Ok(0);
     }
-
-    let Some(sender) = sender.as_ref() else {
-        warn!(
-            op = "outbox_delivery",
-            count = messages.len(),
-            "no email sender configured; rescheduling outbox messages"
-        );
-        for msg in messages {
-            let next_retry = Utc::now() + ChronoDuration::seconds(5);
-            let _ = record_outbox_retry(pool, msg.id, next_retry, "no email sender configured").await;
-        }
-        return Ok(0);
-    };
 
     let count = messages.len();
     for msg in messages {
@@ -231,6 +222,37 @@ async fn handle_delivery_failure(
     }
 }
 
+async fn drain_outbox_batches(
+    pool: &PgPool,
+    sender: &Option<SharedEmailSender>,
+    timeout: Duration,
+    config: &OutboxWorkerConfig,
+) {
+    loop {
+        match process_outbox_batch(
+            pool,
+            sender,
+            timeout,
+            config.batch_size,
+            config.max_retries,
+            config.initial_backoff,
+            config.max_backoff,
+            config.lease_duration,
+        )
+        .await
+        {
+            Ok(count) if count >= config.batch_size as usize => {
+                continue;
+            }
+            Ok(_) => break,
+            Err(e) => {
+                error!(err = %e, "outbox batch processing error");
+                break;
+            }
+        }
+    }
+}
+
 /// Spawns the background outbox polling loop.
 pub async fn run_outbox_worker(
     pool: PgPool,
@@ -243,35 +265,16 @@ pub async fn run_outbox_worker(
         error!(err = %e, "failed to recover stale outbox processing records on startup");
     }
 
+    // Drain existing pending records immediately on startup before sleeping
+    drain_outbox_batches(&pool, &sender, timeout, &config).await;
+
     loop {
         tokio::select! {
             _ = tokio::time::sleep(config.poll_interval) => {}
             _ = notify.notified() => {}
         }
 
-        loop {
-            match process_outbox_batch(
-                &pool,
-                &sender,
-                timeout,
-                config.batch_size,
-                config.max_retries,
-                config.initial_backoff,
-                config.max_backoff,
-                config.lease_duration,
-            )
-            .await
-            {
-                Ok(count) if count >= config.batch_size as usize => {
-                    continue;
-                }
-                Ok(_) => break,
-                Err(e) => {
-                    error!(err = %e, "outbox batch processing error");
-                    break;
-                }
-            }
-        }
+        drain_outbox_batches(&pool, &sender, timeout, &config).await;
     }
 }
 

@@ -12,6 +12,7 @@ use metal_auth::db::outbox::{
     claim_pending_outbox, get_outbox_by_id, insert_outbox, mark_outbox_failed,
     record_outbox_retry, recover_stale_processing,
 };
+use metal_auth::email::outbox::process_outbox_batch;
 use metal_auth::email::test_utils::CapturingEmailSender;
 use metal_auth::{EmailDispatcher, SharedEmailSender};
 use serde_json::json;
@@ -330,4 +331,47 @@ async fn test_outbox_stale_processing_lease_recovery() {
         .expect("get outbox")
         .unwrap();
     assert_eq!(recovered_row.status, OUTBOX_STATUS_PENDING);
+}
+
+#[tokio::test]
+async fn test_outbox_unconfigured_sender_does_not_burn_retries() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let recipient = format!("unconfigured_{}@example.com", uuid::Uuid::new_v4());
+    let payload = json!({
+        "user_id": uuid::Uuid::new_v4(),
+        "to": recipient,
+        "token": "tok123",
+        "url": "https://example.com/verify?token=tok123",
+        "expires_at": chrono::Utc::now()
+    });
+    let row = insert_outbox(&app.pool, &recipient, "verification", payload)
+        .await
+        .expect("insert outbox");
+
+    let processed = process_outbox_batch(
+        &app.pool,
+        &None,
+        Duration::from_secs(5),
+        50,
+        5,
+        Duration::from_secs(1),
+        Duration::from_secs(300),
+        Duration::from_secs(300),
+    )
+    .await
+    .expect("process outbox batch");
+
+    assert_eq!(processed, 0, "no messages claimed or processed when sender is None");
+
+    let row_in_db = get_outbox_by_id(&app.pool, row.id)
+        .await
+        .expect("get outbox")
+        .unwrap();
+
+    assert_eq!(row_in_db.status, OUTBOX_STATUS_PENDING, "status must remain pending");
+    assert_eq!(row_in_db.retry_count, 0, "retry count must not be incremented");
 }

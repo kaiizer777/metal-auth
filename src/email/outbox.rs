@@ -36,9 +36,7 @@ impl Default for OutboxWorkerConfig {
             ),
             max_backoff: Duration::from_secs(crate::config::DEFAULT_OUTBOX_MAX_BACKOFF_SECS),
             lease_duration: Duration::from_secs(300),
-            sent_retention: Duration::from_secs(
-                crate::config::DEFAULT_OUTBOX_SENT_RETENTION_SECS,
-            ),
+            sent_retention: Duration::from_secs(crate::config::DEFAULT_OUTBOX_SENT_RETENTION_SECS),
         }
     }
 }
@@ -124,8 +122,12 @@ async fn deliver_single_message(
                     error!(op = "outbox_delivery", id = %msg.id, err = %err_msg);
                     match mark_outbox_failed(pool, msg.id, &err_msg).await {
                         Ok(true) => {}
-                        Ok(false) => warn!(op = "outbox_delivery", id = %msg.id, "outbox lease expired; claim lost before marking failed"),
-                        Err(e) => error!(op = "outbox_delivery", id = %msg.id, err = %e, "database error marking outbox as failed"),
+                        Ok(false) => {
+                            warn!(op = "outbox_delivery", id = %msg.id, "outbox lease expired; claim lost before marking failed")
+                        }
+                        Err(e) => {
+                            error!(op = "outbox_delivery", id = %msg.id, err = %e, "database error marking outbox as failed")
+                        }
                     }
                     return;
                 }
@@ -141,8 +143,12 @@ async fn deliver_single_message(
                     error!(op = "outbox_delivery", id = %msg.id, err = %err_msg);
                     match mark_outbox_failed(pool, msg.id, &err_msg).await {
                         Ok(true) => {}
-                        Ok(false) => warn!(op = "outbox_delivery", id = %msg.id, "outbox lease expired; claim lost before marking failed"),
-                        Err(e) => error!(op = "outbox_delivery", id = %msg.id, err = %e, "database error marking outbox as failed"),
+                        Ok(false) => {
+                            warn!(op = "outbox_delivery", id = %msg.id, "outbox lease expired; claim lost before marking failed")
+                        }
+                        Err(e) => {
+                            error!(op = "outbox_delivery", id = %msg.id, err = %e, "database error marking outbox as failed")
+                        }
                     }
                     return;
                 }
@@ -153,8 +159,12 @@ async fn deliver_single_message(
             error!(op = "outbox_delivery", id = %msg.id, err = %err_msg);
             match mark_outbox_failed(pool, msg.id, &err_msg).await {
                 Ok(true) => {}
-                Ok(false) => warn!(op = "outbox_delivery", id = %msg.id, "outbox lease expired; claim lost before marking failed"),
-                Err(e) => error!(op = "outbox_delivery", id = %msg.id, err = %e, "database error marking outbox as failed"),
+                Ok(false) => {
+                    warn!(op = "outbox_delivery", id = %msg.id, "outbox lease expired; claim lost before marking failed")
+                }
+                Err(e) => {
+                    error!(op = "outbox_delivery", id = %msg.id, err = %e, "database error marking outbox as failed")
+                }
             }
             return;
         }
@@ -162,9 +172,15 @@ async fn deliver_single_message(
 
     match result {
         Ok(Ok(())) => match mark_outbox_sent(pool, msg.id).await {
-            Ok(true) => info!(op = "outbox_delivery", id = %msg.id, email_type = %msg.email_type, "outbox email sent"),
-            Ok(false) => warn!(op = "outbox_delivery", id = %msg.id, "outbox lease expired; claim lost before completion"),
-            Err(e) => error!(op = "outbox_delivery", id = %msg.id, err = %e, "database error marking sent"),
+            Ok(true) => {
+                info!(op = "outbox_delivery", id = %msg.id, email_type = %msg.email_type, "outbox email sent")
+            }
+            Ok(false) => {
+                warn!(op = "outbox_delivery", id = %msg.id, "outbox lease expired; claim lost before completion")
+            }
+            Err(e) => {
+                error!(op = "outbox_delivery", id = %msg.id, err = %e, "database error marking sent")
+            }
         },
         Ok(Err(send_err)) => {
             let err_msg = format!("send error: {send_err}");
@@ -309,10 +325,22 @@ mod tests {
     fn test_calculate_backoff_fractional_seconds() {
         let initial = Duration::from_millis(500);
         let max = Duration::from_secs(10);
-        assert_eq!(calculate_backoff(0, initial, max), Duration::from_millis(500));
-        assert_eq!(calculate_backoff(1, initial, max), Duration::from_millis(1000));
-        assert_eq!(calculate_backoff(2, initial, max), Duration::from_millis(2000));
-        assert_eq!(calculate_backoff(3, initial, max), Duration::from_millis(4000));
+        assert_eq!(
+            calculate_backoff(0, initial, max),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            calculate_backoff(1, initial, max),
+            Duration::from_millis(1000)
+        );
+        assert_eq!(
+            calculate_backoff(2, initial, max),
+            Duration::from_millis(2000)
+        );
+        assert_eq!(
+            calculate_backoff(3, initial, max),
+            Duration::from_millis(4000)
+        );
     }
 
     #[test]

@@ -232,7 +232,13 @@ async fn test_outbox_retry_and_exhaustion_to_failed() {
         .unwrap();
     assert_eq!(updated.status, OUTBOX_STATUS_PENDING);
     assert_eq!(updated.retry_count, 1);
-    assert!(updated.error_log.as_deref().unwrap_or("").contains("simulated transport failure"));
+    assert!(
+        updated
+            .error_log
+            .as_deref()
+            .unwrap_or("")
+            .contains("simulated transport failure")
+    );
 
     // Advance next_retry_at to NOW() so attempt 2 is eligible
     sqlx::query("UPDATE email_outbox SET next_retry_at = NOW() WHERE id = $1")
@@ -272,7 +278,13 @@ async fn test_outbox_retry_and_exhaustion_to_failed() {
         .expect("get outbox")
         .unwrap();
     assert_eq!(failed.status, OUTBOX_STATUS_FAILED);
-    assert!(failed.error_log.as_deref().unwrap_or("").contains("simulated transport failure"));
+    assert!(
+        failed
+            .error_log
+            .as_deref()
+            .unwrap_or("")
+            .contains("simulated transport failure")
+    );
 }
 
 #[tokio::test]
@@ -465,12 +477,14 @@ async fn test_outbox_retention_cleanup() {
     let old_row = insert_outbox(&app.pool, &old_recipient, "verification", payload.clone())
         .await
         .expect("insert old row");
-    sqlx::query("UPDATE email_outbox SET status = $1, sent_at = NOW() - INTERVAL '8 days' WHERE id = $2")
-        .bind(OUTBOX_STATUS_SENT)
-        .bind(old_row.id)
-        .execute(&app.pool)
-        .await
-        .expect("update old row to sent");
+    sqlx::query(
+        "UPDATE email_outbox SET status = $1, sent_at = NOW() - INTERVAL '8 days' WHERE id = $2",
+    )
+    .bind(OUTBOX_STATUS_SENT)
+    .bind(old_row.id)
+    .execute(&app.pool)
+    .await
+    .expect("update old row to sent");
 
     // 2. Insert fresh sent row with sent_at = NOW()
     let fresh_row = insert_outbox(&app.pool, &fresh_recipient, "verification", payload.clone())

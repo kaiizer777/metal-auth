@@ -73,12 +73,11 @@ mod tests {
     };
     use tower::Service;
 
-    #[tokio::test]
-    async fn test_cors_layer_empty_origins_denies_all() {
-        let cfg = Config {
+    fn test_config() -> Config {
+        Config {
             database_url: "postgres://localhost/test".into(),
             port: 3000,
-            allowed_origins: vec![],
+            allowed_origins: vec!["https://app.example.com".into()],
             allowed_methods: vec!["GET".into(), "POST".into()],
             allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
             max_connections: 5,
@@ -86,6 +85,19 @@ mod tests {
             base_url: "https://example.com".into(),
             email_dispatch_timeout: std::time::Duration::from_secs(10),
             async_email_dispatch: true,
+            outbox_poll_interval: std::time::Duration::from_millis(crate::config::DEFAULT_OUTBOX_POLL_INTERVAL_MS),
+            outbox_batch_size: crate::config::DEFAULT_OUTBOX_BATCH_SIZE,
+            outbox_max_retries: crate::config::DEFAULT_OUTBOX_MAX_RETRIES,
+            outbox_initial_backoff: std::time::Duration::from_secs(crate::config::DEFAULT_OUTBOX_INITIAL_BACKOFF_SECS),
+            outbox_max_backoff: std::time::Duration::from_secs(crate::config::DEFAULT_OUTBOX_MAX_BACKOFF_SECS),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cors_layer_empty_origins_denies_all() {
+        let cfg = Config {
+            allowed_origins: vec![],
+            ..test_config()
         };
 
         let mut app = Router::new()
@@ -110,18 +122,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cors_layer_allowed_origin_and_credentials() {
-        let cfg = Config {
-            database_url: "postgres://localhost/test".into(),
-            port: 3000,
-            allowed_origins: vec!["https://app.example.com".into()],
-            allowed_methods: vec!["GET".into(), "POST".into()],
-            allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
-            max_connections: 5,
-            min_connections: 1,
-            base_url: "https://example.com".into(),
-            email_dispatch_timeout: std::time::Duration::from_secs(10),
-            async_email_dispatch: true,
-        };
+        let cfg = test_config();
 
         let mut app = Router::new()
             .route("/test", get(|| async { "ok" }))
@@ -152,18 +153,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cors_layer_preflight() {
-        let cfg = Config {
-            database_url: "postgres://localhost/test".into(),
-            port: 3000,
-            allowed_origins: vec!["https://app.example.com".into()],
-            allowed_methods: vec!["GET".into(), "POST".into()],
-            allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
-            max_connections: 5,
-            min_connections: 1,
-            base_url: "https://example.com".into(),
-            email_dispatch_timeout: std::time::Duration::from_secs(10),
-            async_email_dispatch: true,
-        };
+        let cfg = test_config();
 
         let mut app = Router::new()
             .route("/test", get(|| async { "ok" }))
@@ -197,16 +187,8 @@ mod tests {
     #[tokio::test]
     async fn test_cors_layer_wildcard_origin_filtered_out() {
         let cfg = Config {
-            database_url: "postgres://localhost/test".into(),
-            port: 3000,
             allowed_origins: vec!["*".into(), " * ".into()],
-            allowed_methods: vec!["GET".into(), "POST".into()],
-            allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
-            max_connections: 5,
-            min_connections: 1,
-            base_url: "https://example.com".into(),
-            email_dispatch_timeout: std::time::Duration::from_secs(10),
-            async_email_dispatch: true,
+            ..test_config()
         };
 
         let mut app = Router::new()
@@ -232,16 +214,8 @@ mod tests {
     #[test]
     fn test_cors_layer_rejects_malformed_origin() {
         let cfg = Config {
-            database_url: "postgres://localhost/test".into(),
-            port: 3000,
             allowed_origins: vec!["invalid\norigin".into()],
-            allowed_methods: vec!["GET".into()],
-            allowed_headers: vec!["Content-Type".into()],
-            max_connections: 5,
-            min_connections: 1,
-            base_url: "https://example.com".into(),
-            email_dispatch_timeout: std::time::Duration::from_secs(10),
-            async_email_dispatch: true,
+            ..test_config()
         };
 
         assert!(matches!(
@@ -253,16 +227,8 @@ mod tests {
     #[test]
     fn test_cors_layer_rejects_malformed_method() {
         let cfg = Config {
-            database_url: "postgres://localhost/test".into(),
-            port: 3000,
-            allowed_origins: vec!["https://app.example.com".into()],
             allowed_methods: vec!["INVALID METHOD WITH SPACES".into()],
-            allowed_headers: vec!["Content-Type".into()],
-            max_connections: 5,
-            min_connections: 1,
-            base_url: "https://example.com".into(),
-            email_dispatch_timeout: std::time::Duration::from_secs(10),
-            async_email_dispatch: true,
+            ..test_config()
         };
 
         assert!(matches!(
@@ -274,19 +240,11 @@ mod tests {
     #[tokio::test]
     async fn test_cors_layer_multiple_origins_each_echoed() {
         let cfg = Config {
-            database_url: "postgres://localhost/test".into(),
-            port: 3000,
             allowed_origins: vec![
                 "https://app.example.com".into(),
                 "https://admin.example.com".into(),
             ],
-            allowed_methods: vec!["GET".into()],
-            allowed_headers: vec!["Content-Type".into()],
-            max_connections: 5,
-            min_connections: 1,
-            base_url: "https://example.com".into(),
-            email_dispatch_timeout: std::time::Duration::from_secs(10),
-            async_email_dispatch: true,
+            ..test_config()
         };
 
         for origin in &["https://app.example.com", "https://admin.example.com"] {
@@ -314,18 +272,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cors_layer_disallowed_origin_no_allow_header() {
-        let cfg = Config {
-            database_url: "postgres://localhost/test".into(),
-            port: 3000,
-            allowed_origins: vec!["https://app.example.com".into()],
-            allowed_methods: vec!["GET".into()],
-            allowed_headers: vec!["Content-Type".into()],
-            max_connections: 5,
-            min_connections: 1,
-            base_url: "https://example.com".into(),
-            email_dispatch_timeout: std::time::Duration::from_secs(10),
-            async_email_dispatch: true,
-        };
+        let cfg = test_config();
 
         let mut app = Router::new()
             .route("/test", get(|| async { "ok" }))
@@ -350,17 +297,8 @@ mod tests {
     #[tokio::test]
     async fn test_cors_layer_whitespace_trimmed_origin_matches() {
         let cfg = Config {
-            database_url: "postgres://localhost/test".into(),
-            port: 3000,
-            // leading/trailing spaces around the origin value
             allowed_origins: vec!["  https://app.example.com  ".into()],
-            allowed_methods: vec!["GET".into()],
-            allowed_headers: vec!["Content-Type".into()],
-            max_connections: 5,
-            min_connections: 1,
-            base_url: "https://example.com".into(),
-            email_dispatch_timeout: std::time::Duration::from_secs(10),
-            async_email_dispatch: true,
+            ..test_config()
         };
 
         let mut app = Router::new()
@@ -387,16 +325,8 @@ mod tests {
     #[test]
     fn test_cors_layer_rejects_malformed_header() {
         let cfg = Config {
-            database_url: "postgres://localhost/test".into(),
-            port: 3000,
-            allowed_origins: vec!["https://app.example.com".into()],
-            allowed_methods: vec!["GET".into()],
             allowed_headers: vec!["Invalid Header With Spaces".into()],
-            max_connections: 5,
-            min_connections: 1,
-            base_url: "https://example.com".into(),
-            email_dispatch_timeout: std::time::Duration::from_secs(10),
-            async_email_dispatch: true,
+            ..test_config()
         };
 
         assert!(matches!(

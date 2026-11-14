@@ -336,6 +336,11 @@ pub async fn setup_test_app_with_auth_config(auth_config: Arc<AppConfig>) -> Opt
         base_url: "https://example.com".into(),
         email_dispatch_timeout: Duration::from_secs(10),
         async_email_dispatch: true,
+        outbox_poll_interval: Duration::from_millis(50),
+        outbox_batch_size: 50,
+        outbox_max_retries: 5,
+        outbox_initial_backoff: Duration::from_secs(1),
+        outbox_max_backoff: Duration::from_secs(300),
     };
 
     let state = AppState::with_dispatcher(pool.clone(), cfg, auth_config, dispatcher)

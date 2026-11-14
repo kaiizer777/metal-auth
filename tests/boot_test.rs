@@ -13,9 +13,8 @@ use sqlx::PgPool;
 use tower::Service;
 use uuid::Uuid;
 
-#[tokio::test]
-async fn test_auth_facade_and_router_boot() {
-    let cfg = Config {
+fn test_config() -> Config {
+    Config {
         database_url: "postgres://user:pass@localhost:5432/metal_auth_test".into(),
         port: 8080,
         allowed_origins: vec!["https://app.example.com".into()],
@@ -26,7 +25,17 @@ async fn test_auth_facade_and_router_boot() {
         base_url: "https://example.com".into(),
         email_dispatch_timeout: std::time::Duration::from_secs(10),
         async_email_dispatch: true,
-    };
+        outbox_poll_interval: std::time::Duration::from_millis(50),
+        outbox_batch_size: 50,
+        outbox_max_retries: 5,
+        outbox_initial_backoff: std::time::Duration::from_secs(1),
+        outbox_max_backoff: std::time::Duration::from_secs(300),
+    }
+}
+
+#[tokio::test]
+async fn test_auth_facade_and_router_boot() {
+    let cfg = test_config();
 
     let pool = PgPool::connect_lazy(&cfg.database_url).expect("lazy pool creation");
     let state = AppState::new(pool, cfg).unwrap();
@@ -96,15 +105,7 @@ async fn test_auth_facade_and_router_boot() {
 async fn test_auth_new_fails_gracefully_on_invalid_db() {
     let cfg = Config {
         database_url: "postgres://invalid_user:invalid_pass@127.0.0.1:54329/nonexistent".into(),
-        port: 3000,
-        allowed_origins: vec![],
-        allowed_methods: vec!["GET".into()],
-        allowed_headers: vec!["Content-Type".into()],
-        max_connections: 2,
-        min_connections: 1,
-        base_url: "https://example.com".into(),
-        email_dispatch_timeout: std::time::Duration::from_secs(10),
-        async_email_dispatch: true,
+        ..test_config()
     };
 
     let result = Auth::new(cfg).await;
@@ -230,16 +231,8 @@ fn test_facade_re_exported_error_contract() {
 #[tokio::test]
 async fn test_auth_boot_fails_fast_on_invalid_cors() {
     let cfg = Config {
-        database_url: "postgres://user:pass@localhost:5432/metal_auth_test".into(),
-        port: 8080,
         allowed_origins: vec!["invalid\norigin".into()],
-        allowed_methods: vec!["GET".into()],
-        allowed_headers: vec!["Content-Type".into()],
-        max_connections: 10,
-        min_connections: 2,
-        base_url: "https://example.com".into(),
-        email_dispatch_timeout: std::time::Duration::from_secs(10),
-        async_email_dispatch: true,
+        ..test_config()
     };
 
     let pool = PgPool::connect_lazy(&cfg.database_url).expect("lazy pool creation");
@@ -254,16 +247,8 @@ async fn test_auth_boot_fails_fast_on_invalid_cors() {
 #[tokio::test]
 async fn test_auth_boot_rejects_sync_email_dispatch() {
     let cfg = Config {
-        database_url: "postgres://user:pass@localhost:5432/metal_auth_test".into(),
-        port: 8080,
-        allowed_origins: vec![],
-        allowed_methods: vec!["GET".into()],
-        allowed_headers: vec!["Content-Type".into()],
-        max_connections: 10,
-        min_connections: 2,
-        base_url: "https://example.com".into(),
-        email_dispatch_timeout: std::time::Duration::from_secs(10),
         async_email_dispatch: false,
+        ..test_config()
     };
 
     let pool = PgPool::connect_lazy(&cfg.database_url).expect("lazy pool creation");
@@ -281,15 +266,8 @@ async fn test_auth_boot_rejects_sync_email_dispatch() {
 async fn test_auth_new_fails_fast_on_invalid_cors_before_db() {
     let cfg = Config {
         database_url: "not-a-valid-database-url".into(),
-        port: 3000,
         allowed_origins: vec!["invalid\norigin".into()],
-        allowed_methods: vec!["GET".into()],
-        allowed_headers: vec!["Content-Type".into()],
-        max_connections: 2,
-        min_connections: 1,
-        base_url: "https://example.com".into(),
-        email_dispatch_timeout: std::time::Duration::from_secs(10),
-        async_email_dispatch: true,
+        ..test_config()
     };
 
     let result = Auth::new(cfg).await;
@@ -303,15 +281,7 @@ async fn test_auth_new_fails_fast_on_invalid_cors_before_db() {
 async fn test_auth_new_fails_with_database_error_on_malformed_url() {
     let cfg = Config {
         database_url: "not-a-valid-database-url".into(),
-        port: 3000,
-        allowed_origins: vec![],
-        allowed_methods: vec!["GET".into()],
-        allowed_headers: vec!["Content-Type".into()],
-        max_connections: 2,
-        min_connections: 1,
-        base_url: "https://example.com".into(),
-        email_dispatch_timeout: std::time::Duration::from_secs(10),
-        async_email_dispatch: true,
+        ..test_config()
     };
 
     let result = Auth::new(cfg).await;
@@ -321,18 +291,7 @@ async fn test_auth_new_fails_with_database_error_on_malformed_url() {
 #[tokio::test]
 async fn test_state_with_auth_config_propagates_error() {
     let pool = PgPool::connect_lazy("postgres://localhost/test").expect("lazy pool");
-    let cfg = Config {
-        database_url: "postgres://localhost/test".into(),
-        port: 3000,
-        allowed_origins: vec![],
-        allowed_methods: vec![],
-        allowed_headers: vec![],
-        max_connections: 2,
-        min_connections: 1,
-        base_url: "https://example.com".into(),
-        email_dispatch_timeout: std::time::Duration::from_secs(10),
-        async_email_dispatch: true,
-    };
+    let cfg = test_config();
     let state = AppState::new(pool.clone(), cfg.clone()).unwrap();
 
     let valid_config = std::sync::Arc::new(AppConfig::default());

@@ -18,6 +18,11 @@ async fn test_auth_new_fails_on_invalid_auth_env_config() {
         base_url: "https://example.com".into(),
         email_dispatch_timeout: std::time::Duration::from_secs(10),
         async_email_dispatch: true,
+        outbox_poll_interval: std::time::Duration::from_millis(50),
+        outbox_batch_size: 50,
+        outbox_max_retries: 5,
+        outbox_initial_backoff: std::time::Duration::from_secs(1),
+        outbox_max_backoff: std::time::Duration::from_secs(300),
     };
 
     let res = Auth::new(cfg).await;

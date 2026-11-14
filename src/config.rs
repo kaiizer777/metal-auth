@@ -7,6 +7,11 @@ pub const DEFAULT_PORT: u16 = 3000;
 pub const DEFAULT_MAX_CONNECTIONS: u32 = 25;
 pub const DEFAULT_MIN_CONNECTIONS: u32 = 2;
 pub const DEFAULT_EMAIL_DISPATCH_TIMEOUT_SECS: u64 = 10;
+pub const DEFAULT_OUTBOX_POLL_INTERVAL_MS: u64 = 1000;
+pub const DEFAULT_OUTBOX_BATCH_SIZE: u32 = 50;
+pub const DEFAULT_OUTBOX_MAX_RETRIES: u32 = 5;
+pub const DEFAULT_OUTBOX_INITIAL_BACKOFF_SECS: u64 = 1;
+pub const DEFAULT_OUTBOX_MAX_BACKOFF_SECS: u64 = 300;
 
 // ─── Phase 1 — Infra Config ──────────────────────────────────────────────────
 
@@ -33,6 +38,13 @@ pub struct Config {
     /// [`Config::validate`] rejects `false` so a deployment still setting it fails at boot
     /// instead of silently keeping a dead knob.
     pub async_email_dispatch: bool,
+
+    // Outbox worker configuration
+    pub outbox_poll_interval: Duration,
+    pub outbox_batch_size: u32,
+    pub outbox_max_retries: u32,
+    pub outbox_initial_backoff: Duration,
+    pub outbox_max_backoff: Duration,
 }
 
 impl std::fmt::Debug for Config {
@@ -48,6 +60,11 @@ impl std::fmt::Debug for Config {
             .field("base_url", &"[REDACTED]")
             .field("email_dispatch_timeout", &self.email_dispatch_timeout)
             .field("async_email_dispatch", &self.async_email_dispatch)
+            .field("outbox_poll_interval", &self.outbox_poll_interval)
+            .field("outbox_batch_size", &self.outbox_batch_size)
+            .field("outbox_max_retries", &self.outbox_max_retries)
+            .field("outbox_initial_backoff", &self.outbox_initial_backoff)
+            .field("outbox_max_backoff", &self.outbox_max_backoff)
             .finish()
     }
 }
@@ -93,6 +110,36 @@ impl Config {
             return Err(ConfigError::InvalidValue {
                 field: "ASYNC_EMAIL_DISPATCH",
                 reason: "must be true: the inline dispatch path no longer exists, unset ASYNC_EMAIL_DISPATCH or set it to true",
+            });
+        }
+        if self.outbox_poll_interval == Duration::ZERO {
+            return Err(ConfigError::InvalidValue {
+                field: "outbox_poll_interval",
+                reason: "must be greater than 0",
+            });
+        }
+        if self.outbox_batch_size == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "outbox_batch_size",
+                reason: "must be greater than 0",
+            });
+        }
+        if self.outbox_max_retries == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "outbox_max_retries",
+                reason: "must be at least 1",
+            });
+        }
+        if self.outbox_initial_backoff == Duration::ZERO {
+            return Err(ConfigError::InvalidValue {
+                field: "outbox_initial_backoff",
+                reason: "must be greater than 0",
+            });
+        }
+        if self.outbox_max_backoff < self.outbox_initial_backoff {
+            return Err(ConfigError::InvalidValue {
+                field: "outbox_max_backoff",
+                reason: "must be greater than or equal to outbox_initial_backoff",
             });
         }
         for origin in &self.allowed_origins {
@@ -191,6 +238,92 @@ impl Config {
             }
         };
 
+        let outbox_poll_interval = match std::env::var("OUTBOX_POLL_INTERVAL_MS") {
+            Ok(val) => {
+                let ms: u64 = val
+                    .parse()
+                    .map_err(|_| ConfigError::InvalidEnvVar("OUTBOX_POLL_INTERVAL_MS"))?;
+                if ms == 0 {
+                    return Err(ConfigError::InvalidEnvVar("OUTBOX_POLL_INTERVAL_MS"));
+                }
+                Duration::from_millis(ms)
+            }
+            Err(std::env::VarError::NotPresent) => {
+                Duration::from_millis(DEFAULT_OUTBOX_POLL_INTERVAL_MS)
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar("OUTBOX_POLL_INTERVAL_MS"));
+            }
+        };
+
+        let outbox_batch_size = match std::env::var("OUTBOX_BATCH_SIZE") {
+            Ok(val) => {
+                let size: u32 = val
+                    .parse()
+                    .map_err(|_| ConfigError::InvalidEnvVar("OUTBOX_BATCH_SIZE"))?;
+                if size == 0 {
+                    return Err(ConfigError::InvalidEnvVar("OUTBOX_BATCH_SIZE"));
+                }
+                size
+            }
+            Err(std::env::VarError::NotPresent) => DEFAULT_OUTBOX_BATCH_SIZE,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar("OUTBOX_BATCH_SIZE"));
+            }
+        };
+
+        let outbox_max_retries = match std::env::var("OUTBOX_MAX_RETRIES") {
+            Ok(val) => {
+                let retries: u32 = val
+                    .parse()
+                    .map_err(|_| ConfigError::InvalidEnvVar("OUTBOX_MAX_RETRIES"))?;
+                if retries == 0 {
+                    return Err(ConfigError::InvalidEnvVar("OUTBOX_MAX_RETRIES"));
+                }
+                retries
+            }
+            Err(std::env::VarError::NotPresent) => DEFAULT_OUTBOX_MAX_RETRIES,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar("OUTBOX_MAX_RETRIES"));
+            }
+        };
+
+        let outbox_initial_backoff = match std::env::var("OUTBOX_INITIAL_BACKOFF_SECS") {
+            Ok(val) => {
+                let secs: u64 = val
+                    .parse()
+                    .map_err(|_| ConfigError::InvalidEnvVar("OUTBOX_INITIAL_BACKOFF_SECS"))?;
+                if secs == 0 {
+                    return Err(ConfigError::InvalidEnvVar("OUTBOX_INITIAL_BACKOFF_SECS"));
+                }
+                Duration::from_secs(secs)
+            }
+            Err(std::env::VarError::NotPresent) => {
+                Duration::from_secs(DEFAULT_OUTBOX_INITIAL_BACKOFF_SECS)
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar("OUTBOX_INITIAL_BACKOFF_SECS"));
+            }
+        };
+
+        let outbox_max_backoff = match std::env::var("OUTBOX_MAX_BACKOFF_SECS") {
+            Ok(val) => {
+                let secs: u64 = val
+                    .parse()
+                    .map_err(|_| ConfigError::InvalidEnvVar("OUTBOX_MAX_BACKOFF_SECS"))?;
+                if secs == 0 {
+                    return Err(ConfigError::InvalidEnvVar("OUTBOX_MAX_BACKOFF_SECS"));
+                }
+                Duration::from_secs(secs)
+            }
+            Err(std::env::VarError::NotPresent) => {
+                Duration::from_secs(DEFAULT_OUTBOX_MAX_BACKOFF_SECS)
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar("OUTBOX_MAX_BACKOFF_SECS"));
+            }
+        };
+
         let cfg = Self {
             database_url,
             port,
@@ -208,6 +341,11 @@ impl Config {
             base_url,
             email_dispatch_timeout,
             async_email_dispatch,
+            outbox_poll_interval,
+            outbox_batch_size,
+            outbox_max_retries,
+            outbox_initial_backoff,
+            outbox_max_backoff,
         };
 
         cfg.validate()?;
@@ -488,34 +626,41 @@ mod tests {
     fn test_config_defaults() {
         let cfg = Config {
             database_url: "postgres://user:pass@localhost:5432/metal_auth".into(),
-            port: DEFAULT_PORT,
-            allowed_origins: vec![],
-            allowed_methods: vec!["GET".into(), "POST".into()],
-            allowed_headers: vec!["Content-Type".into()],
-            max_connections: DEFAULT_MAX_CONNECTIONS,
-            min_connections: DEFAULT_MIN_CONNECTIONS,
-            base_url: "https://example.com".into(),
-            email_dispatch_timeout: Duration::from_secs(10),
-            async_email_dispatch: true,
+            ..test_infra_config()
         };
         assert_eq!(cfg.port, 3000);
         assert_eq!(cfg.max_connections, 25);
         assert_eq!(cfg.min_connections, 2);
+        assert_eq!(cfg.outbox_batch_size, 50);
+        assert_eq!(cfg.outbox_max_retries, 5);
+    }
+
+    fn test_infra_config() -> Config {
+        Config {
+            database_url: "postgres://localhost/test".into(),
+            port: 3000,
+            allowed_origins: vec!["https://app.example.com".into()],
+            allowed_methods: vec!["GET".into(), "POST".into()],
+            allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            min_connections: DEFAULT_MIN_CONNECTIONS,
+            base_url: "https://app.example.com".into(),
+            email_dispatch_timeout: Duration::from_secs(10),
+            async_email_dispatch: true,
+            outbox_poll_interval: Duration::from_millis(DEFAULT_OUTBOX_POLL_INTERVAL_MS),
+            outbox_batch_size: DEFAULT_OUTBOX_BATCH_SIZE,
+            outbox_max_retries: DEFAULT_OUTBOX_MAX_RETRIES,
+            outbox_initial_backoff: Duration::from_secs(DEFAULT_OUTBOX_INITIAL_BACKOFF_SECS),
+            outbox_max_backoff: Duration::from_secs(DEFAULT_OUTBOX_MAX_BACKOFF_SECS),
+        }
     }
 
     #[test]
     fn test_config_debug_redacts_database_url() {
         let cfg = Config {
             database_url: "postgres://secret_user:super_secret_password@localhost:5432/db".into(),
-            port: DEFAULT_PORT,
-            allowed_origins: vec![],
-            allowed_methods: vec!["GET".into()],
-            allowed_headers: vec!["Content-Type".into()],
-            max_connections: DEFAULT_MAX_CONNECTIONS,
-            min_connections: DEFAULT_MIN_CONNECTIONS,
             base_url: "https://example.com".into(),
-            email_dispatch_timeout: Duration::from_secs(10),
-            async_email_dispatch: true,
+            ..test_infra_config()
         };
         let debug_output = format!("{cfg:?}");
         assert!(debug_output.contains("[REDACTED]"));
@@ -545,16 +690,8 @@ mod tests {
     #[test]
     fn test_config_validate_success() {
         let cfg = Config {
-            database_url: "postgres://localhost/test".into(),
-            port: 3000,
             allowed_origins: vec!["https://app.example.com".into(), "*".into()],
-            allowed_methods: vec!["GET".into(), "POST".into()],
-            allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
-            max_connections: 5,
-            min_connections: 1,
-            base_url: "https://app.example.com".into(),
-            email_dispatch_timeout: Duration::from_secs(10),
-            async_email_dispatch: true,
+            ..test_infra_config()
         };
         assert!(cfg.validate().is_ok());
     }
@@ -562,16 +699,8 @@ mod tests {
     #[test]
     fn test_config_validate_rejects_malformed_origin() {
         let cfg = Config {
-            database_url: "postgres://localhost/test".into(),
-            port: 3000,
             allowed_origins: vec!["bad\norigin".into()],
-            allowed_methods: vec!["GET".into()],
-            allowed_headers: vec!["Content-Type".into()],
-            max_connections: 5,
-            min_connections: 1,
-            base_url: "https://app.example.com".into(),
-            email_dispatch_timeout: Duration::from_secs(10),
-            async_email_dispatch: true,
+            ..test_infra_config()
         };
         assert!(matches!(
             cfg.validate(),
@@ -582,16 +711,8 @@ mod tests {
     #[test]
     fn test_config_validate_rejects_malformed_method() {
         let cfg = Config {
-            database_url: "postgres://localhost/test".into(),
-            port: 3000,
-            allowed_origins: vec!["https://app.example.com".into()],
             allowed_methods: vec!["BAD METHOD".into()],
-            allowed_headers: vec!["Content-Type".into()],
-            max_connections: 5,
-            min_connections: 1,
-            base_url: "https://app.example.com".into(),
-            email_dispatch_timeout: Duration::from_secs(10),
-            async_email_dispatch: true,
+            ..test_infra_config()
         };
         assert!(matches!(
             cfg.validate(),
@@ -602,16 +723,8 @@ mod tests {
     #[test]
     fn test_config_validate_rejects_malformed_header() {
         let cfg = Config {
-            database_url: "postgres://localhost/test".into(),
-            port: 3000,
-            allowed_origins: vec!["https://app.example.com".into()],
-            allowed_methods: vec!["GET".into()],
             allowed_headers: vec!["Bad Header".into()],
-            max_connections: 5,
-            min_connections: 1,
-            base_url: "https://app.example.com".into(),
-            email_dispatch_timeout: Duration::from_secs(10),
-            async_email_dispatch: true,
+            ..test_infra_config()
         };
         assert!(matches!(
             cfg.validate(),
@@ -623,15 +736,7 @@ mod tests {
     fn test_config_validate_rejects_empty_database_url() {
         let cfg = Config {
             database_url: "".into(),
-            port: 3000,
-            allowed_origins: vec![],
-            allowed_methods: vec!["GET".into()],
-            allowed_headers: vec!["Content-Type".into()],
-            max_connections: 5,
-            min_connections: 1,
-            base_url: "https://app.example.com".into(),
-            email_dispatch_timeout: Duration::from_secs(10),
-            async_email_dispatch: true,
+            ..test_infra_config()
         };
         assert!(matches!(
             cfg.validate(),
@@ -646,15 +751,7 @@ mod tests {
     fn test_config_validate_rejects_whitespace_database_url() {
         let cfg = Config {
             database_url: "   \t\n  ".into(),
-            port: 3000,
-            allowed_origins: vec![],
-            allowed_methods: vec!["GET".into()],
-            allowed_headers: vec!["Content-Type".into()],
-            max_connections: 5,
-            min_connections: 1,
-            base_url: "https://app.example.com".into(),
-            email_dispatch_timeout: Duration::from_secs(10),
-            async_email_dispatch: true,
+            ..test_infra_config()
         };
         assert!(matches!(
             cfg.validate(),
@@ -668,16 +765,8 @@ mod tests {
     #[test]
     fn test_config_validate_rejects_zero_max_connections() {
         let cfg = Config {
-            database_url: "postgres://localhost/test".into(),
-            port: 3000,
-            allowed_origins: vec![],
-            allowed_methods: vec!["GET".into()],
-            allowed_headers: vec!["Content-Type".into()],
             max_connections: 0,
-            min_connections: 0,
-            base_url: "https://app.example.com".into(),
-            email_dispatch_timeout: Duration::from_secs(10),
-            async_email_dispatch: true,
+            ..test_infra_config()
         };
         assert!(matches!(
             cfg.validate(),
@@ -691,16 +780,9 @@ mod tests {
     #[test]
     fn test_config_validate_rejects_min_connections_greater_than_max() {
         let cfg = Config {
-            database_url: "postgres://localhost/test".into(),
-            port: 3000,
-            allowed_origins: vec![],
-            allowed_methods: vec!["GET".into()],
-            allowed_headers: vec!["Content-Type".into()],
             max_connections: 5,
             min_connections: 6,
-            base_url: "https://app.example.com".into(),
-            email_dispatch_timeout: Duration::from_secs(10),
-            async_email_dispatch: true,
+            ..test_infra_config()
         };
         assert!(matches!(
             cfg.validate(),
@@ -714,16 +796,9 @@ mod tests {
     #[test]
     fn test_config_validate_accepts_equal_min_and_max_connections() {
         let cfg = Config {
-            database_url: "postgres://localhost/test".into(),
-            port: 3000,
-            allowed_origins: vec![],
-            allowed_methods: vec!["GET".into()],
-            allowed_headers: vec!["Content-Type".into()],
             max_connections: 5,
             min_connections: 5,
-            base_url: "https://app.example.com".into(),
-            email_dispatch_timeout: Duration::from_secs(10),
-            async_email_dispatch: true,
+            ..test_infra_config()
         };
         assert!(cfg.validate().is_ok());
     }
@@ -731,16 +806,8 @@ mod tests {
     #[test]
     fn config_validate_rejects_sync_email_dispatch() {
         let cfg = Config {
-            database_url: "postgres://localhost/test".into(),
-            port: 3000,
-            allowed_origins: vec![],
-            allowed_methods: vec!["GET".into()],
-            allowed_headers: vec!["Content-Type".into()],
-            max_connections: 5,
-            min_connections: 1,
-            base_url: "https://app.example.com".into(),
-            email_dispatch_timeout: Duration::from_secs(10),
             async_email_dispatch: false,
+            ..test_infra_config()
         };
         assert!(matches!(
             cfg.validate(),
@@ -754,22 +821,78 @@ mod tests {
     #[test]
     fn test_config_validate_rejects_origin_with_trailing_slash() {
         let cfg = Config {
-            database_url: "postgres://localhost/test".into(),
-            port: 3000,
             allowed_origins: vec!["https://app.example.com/".into()],
-            allowed_methods: vec!["GET".into()],
-            allowed_headers: vec!["Content-Type".into()],
-            max_connections: 5,
-            min_connections: 1,
-            base_url: "https://app.example.com".into(),
-            email_dispatch_timeout: Duration::from_secs(10),
-            async_email_dispatch: true,
+            ..test_infra_config()
         };
         assert!(matches!(
             cfg.validate(),
             Err(ConfigError::InvalidValue {
                 field: "allowed_origins",
                 reason: "must not contain trailing slash",
+            })
+        ));
+    }
+
+    #[test]
+    fn test_config_validate_outbox_params() {
+        let cfg_zero_interval = Config {
+            outbox_poll_interval: Duration::ZERO,
+            ..test_infra_config()
+        };
+        assert!(matches!(
+            cfg_zero_interval.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "outbox_poll_interval",
+                ..
+            })
+        ));
+
+        let cfg_zero_batch = Config {
+            outbox_batch_size: 0,
+            ..test_infra_config()
+        };
+        assert!(matches!(
+            cfg_zero_batch.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "outbox_batch_size",
+                ..
+            })
+        ));
+
+        let cfg_zero_retries = Config {
+            outbox_max_retries: 0,
+            ..test_infra_config()
+        };
+        assert!(matches!(
+            cfg_zero_retries.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "outbox_max_retries",
+                ..
+            })
+        ));
+
+        let cfg_zero_initial_backoff = Config {
+            outbox_initial_backoff: Duration::ZERO,
+            ..test_infra_config()
+        };
+        assert!(matches!(
+            cfg_zero_initial_backoff.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "outbox_initial_backoff",
+                ..
+            })
+        ));
+
+        let cfg_bad_max_backoff = Config {
+            outbox_initial_backoff: Duration::from_secs(10),
+            outbox_max_backoff: Duration::from_secs(5),
+            ..test_infra_config()
+        };
+        assert!(matches!(
+            cfg_bad_max_backoff.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "outbox_max_backoff",
+                ..
             })
         ));
     }
@@ -949,18 +1072,7 @@ mod tests {
     // ── Config::validate base_url rejection tests ─────────────────────────────
 
     fn valid_config_base() -> Config {
-        Config {
-            database_url: "postgres://localhost/test".into(),
-            port: 3000,
-            allowed_origins: vec![],
-            allowed_methods: vec!["GET".into()],
-            allowed_headers: vec!["Content-Type".into()],
-            max_connections: 5,
-            min_connections: 1,
-            base_url: "https://app.example.com".into(),
-            email_dispatch_timeout: Duration::from_secs(10),
-            async_email_dispatch: true,
-        }
+        test_infra_config()
     }
 
     #[test]

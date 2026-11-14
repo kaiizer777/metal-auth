@@ -339,9 +339,8 @@ async fn timeout_does_not_panic() {
     assert!(log_text().contains("timed out"));
 }
 
-#[test]
-fn zero_timeout_rejected() {
-    let cfg = Config {
+fn test_config() -> Config {
+    Config {
         database_url: "postgres://localhost/test".into(),
         port: 3000,
         allowed_origins: vec![],
@@ -350,8 +349,21 @@ fn zero_timeout_rejected() {
         max_connections: 5,
         min_connections: 1,
         base_url: "https://example.com".into(),
-        email_dispatch_timeout: Duration::ZERO,
+        email_dispatch_timeout: Duration::from_secs(10),
         async_email_dispatch: true,
+        outbox_poll_interval: Duration::from_millis(50),
+        outbox_batch_size: 50,
+        outbox_max_retries: 5,
+        outbox_initial_backoff: Duration::from_secs(1),
+        outbox_max_backoff: Duration::from_secs(300),
+    }
+}
+
+#[test]
+fn zero_timeout_rejected() {
+    let cfg = Config {
+        email_dispatch_timeout: Duration::ZERO,
+        ..test_config()
     };
     assert!(matches!(
         cfg.validate(),
@@ -377,16 +389,8 @@ fn email_app_error_methods_do_not_panic() {
 #[test]
 fn empty_base_url_rejected() {
     let cfg = Config {
-        database_url: "postgres://localhost/test".into(),
-        port: 3000,
-        allowed_origins: vec![],
-        allowed_methods: vec!["GET".into()],
-        allowed_headers: vec!["Content-Type".into()],
-        max_connections: 5,
-        min_connections: 1,
         base_url: "".into(),
-        email_dispatch_timeout: Duration::from_secs(10),
-        async_email_dispatch: true,
+        ..test_config()
     };
     assert!(matches!(
         cfg.validate(),
@@ -397,16 +401,8 @@ fn empty_base_url_rejected() {
 #[test]
 fn base_url_validation_rejects_invalid_urls() {
     let make_cfg = |url: &str| Config {
-        database_url: "postgres://localhost/test".into(),
-        port: 3000,
-        allowed_origins: vec![],
-        allowed_methods: vec!["GET".into()],
-        allowed_headers: vec!["Content-Type".into()],
-        max_connections: 5,
-        min_connections: 1,
         base_url: url.into(),
-        email_dispatch_timeout: Duration::from_secs(10),
-        async_email_dispatch: true,
+        ..test_config()
     };
 
     assert!(matches!(
@@ -444,16 +440,8 @@ fn base_url_validation_rejects_invalid_urls() {
 #[test]
 fn base_url_validation_rejects_query_string() {
     let cfg = Config {
-        database_url: "postgres://localhost/test".into(),
-        port: 3000,
-        allowed_origins: vec![],
-        allowed_methods: vec!["GET".into()],
-        allowed_headers: vec!["Content-Type".into()],
-        max_connections: 5,
-        min_connections: 1,
         base_url: "https://example.com?tenant=x".into(),
-        email_dispatch_timeout: Duration::from_secs(10),
-        async_email_dispatch: true,
+        ..test_config()
     };
     assert!(matches!(
         cfg.validate(),
@@ -464,16 +452,8 @@ fn base_url_validation_rejects_query_string() {
 #[test]
 fn base_url_validation_rejects_userinfo() {
     let cfg = Config {
-        database_url: "postgres://localhost/test".into(),
-        port: 3000,
-        allowed_origins: vec![],
-        allowed_methods: vec!["GET".into()],
-        allowed_headers: vec!["Content-Type".into()],
-        max_connections: 5,
-        min_connections: 1,
         base_url: "https://user:pass@example.com".into(),
-        email_dispatch_timeout: Duration::from_secs(10),
-        async_email_dispatch: true,
+        ..test_config()
     };
     assert!(matches!(
         cfg.validate(),

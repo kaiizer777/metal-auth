@@ -25,7 +25,7 @@ pub static DB_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// Truncates all authentication and session domain tables with CASCADE.
 pub async fn truncate_tables(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "TRUNCATE TABLE users, sessions, verification_tokens, password_reset_tokens CASCADE",
+        "TRUNCATE TABLE users, sessions, verification_tokens, password_reset_tokens, email_outbox CASCADE",
     )
     .execute(pool)
     .await?;
@@ -282,6 +282,27 @@ pub async fn expire_verification_tokens_for_user(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// DB query helper: returns total count of outbox records.
+pub async fn count_outbox_rows(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM email_outbox")
+        .fetch_one(pool)
+        .await?;
+    Ok(row.0)
+}
+
+/// DB query helper: returns all outbox records for a given recipient.
+pub async fn get_outbox_rows_for_recipient(
+    pool: &PgPool,
+    recipient: &str,
+) -> Result<Vec<metal_auth::EmailOutbox>, sqlx::Error> {
+    sqlx::query_as::<sqlx::Postgres, metal_auth::EmailOutbox>(
+        "SELECT id, recipient, email_type, payload, status, retry_count, next_retry_at, created_at, sent_at, error_log FROM email_outbox WHERE recipient = $1 ORDER BY created_at ASC",
+    )
+    .bind(recipient)
+    .fetch_all(pool)
+    .await
 }
 
 /// Initializes a live-DB test app with default `AppConfig` and blocking email dispatcher.

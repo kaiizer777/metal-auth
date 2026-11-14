@@ -15,7 +15,9 @@ pub fn create_email_dispatcher(
     sender: Option<SharedEmailSender>,
 ) -> Arc<EmailDispatcher> {
     Arc::new(
-        EmailDispatcher::new(sender, config.email_dispatch_timeout).with_base_url(&config.base_url),
+        EmailDispatcher::new(sender, config.email_dispatch_timeout)
+            .with_base_url(&config.base_url)
+            .with_outbox_config(config),
     )
 }
 

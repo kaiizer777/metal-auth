@@ -1,9 +1,12 @@
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tracing::{Instrument, error, info_span, warn};
 
 use crate::email::hook::{DynError, SharedEmailSender};
+use crate::email::outbox::OutboxWorkerConfig;
 use crate::email::payload::{PasswordResetEmailPayload, VerificationEmailPayload};
 
 fn percent_encode_token(input: &str) -> String {
@@ -54,6 +57,9 @@ pub struct EmailDispatcher {
     sender: Option<SharedEmailSender>,
     timeout: Duration,
     base_url: Option<String>,
+    notify: Arc<tokio::sync::Notify>,
+    worker_started: Arc<AtomicBool>,
+    outbox_config: OutboxWorkerConfig,
     /// Inline (caller-blocking) delivery — test-only, absent from default builds.
     #[cfg(any(test, feature = "test-utils"))]
     block_on_delivery: bool,
@@ -66,6 +72,9 @@ impl EmailDispatcher {
             sender,
             timeout,
             base_url: None,
+            notify: Arc::new(tokio::sync::Notify::new()),
+            worker_started: Arc::new(AtomicBool::new(false)),
+            outbox_config: OutboxWorkerConfig::default(),
             #[cfg(any(test, feature = "test-utils"))]
             block_on_delivery: false,
         }
@@ -82,6 +91,69 @@ impl EmailDispatcher {
             block_on_delivery: true,
             ..Self::new(sender, timeout)
         }
+    }
+
+    /// Configures outbox worker settings from application configuration.
+    pub fn with_outbox_config(mut self, config: &crate::config::Config) -> Self {
+        self.outbox_config = OutboxWorkerConfig::from(config);
+        self
+    }
+
+    /// Spawns the background outbox worker loop once if not already running.
+    pub fn ensure_worker_started(&self, pool: &sqlx::PgPool) {
+        if !self.worker_started.swap(true, Ordering::SeqCst) {
+            let pool = pool.clone();
+            let sender = self.sender.clone();
+            let timeout = self.timeout;
+            let config = self.outbox_config.clone();
+            let notify = Arc::clone(&self.notify);
+
+            tokio::spawn(async move {
+                crate::email::outbox::run_outbox_worker(pool, sender, timeout, config, notify).await;
+            });
+        }
+    }
+
+    /// Called immediately after committing an outbox row to wake up the processor.
+    ///
+    /// Under blocking test mode (`new_blocking`), delivers pending messages inline so
+    /// assertions can verify delivery synchronously without polling.
+    pub async fn on_outbox_committed(&self, pool: &sqlx::PgPool) {
+        #[cfg(any(test, feature = "test-utils"))]
+        if self.block_on_delivery {
+            let _ = crate::email::outbox::process_outbox_batch(
+                pool,
+                &self.sender,
+                self.timeout,
+                self.outbox_config.batch_size,
+                self.outbox_config.max_retries,
+                self.outbox_config.initial_backoff,
+                self.outbox_config.max_backoff,
+            )
+            .await;
+            return;
+        }
+
+        self.notify.notify_one();
+    }
+
+    /// Test helper to synchronously drain and process all due outbox messages.
+    pub async fn flush_outbox(&self, pool: &sqlx::PgPool) -> Result<usize, sqlx::Error> {
+        crate::email::outbox::process_outbox_batch(
+            pool,
+            &self.sender,
+            self.timeout,
+            self.outbox_config.batch_size,
+            self.outbox_config.max_retries,
+            self.outbox_config.initial_backoff,
+            self.outbox_config.max_backoff,
+        )
+        .await
+    }
+
+    /// Returns a reference to the configured email sender, if any.
+    pub fn sender(&self) -> Option<&SharedEmailSender> {
+        self.sender.as_ref()
     }
 
     /// Configures a base URL on the dispatcher.
@@ -199,7 +271,8 @@ impl fmt::Debug for EmailDispatcher {
         debug
             .field("timeout", &self.timeout)
             .field("sender", &self.sender.is_some())
-            .field("base_url", &self.base_url);
+            .field("base_url", &self.base_url)
+            .field("outbox_config", &self.outbox_config);
         #[cfg(any(test, feature = "test-utils"))]
         debug.field("block_on_delivery", &self.block_on_delivery);
         debug.finish()

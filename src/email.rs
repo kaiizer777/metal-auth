@@ -2,10 +2,12 @@
 
 pub mod dispatcher;
 pub mod hook;
+pub mod outbox;
 pub mod payload;
 
 pub use dispatcher::{EmailDispatcher, build_reset_url, build_verification_url};
 pub use hook::{DynError, EmailSender, SharedEmailSender};
+pub use outbox::{OutboxWorkerConfig, process_outbox_batch, run_outbox_worker};
 pub use payload::{PasswordResetEmailPayload, VerificationEmailPayload};
 
 /// No-op email sender — drops all payloads without sending.

@@ -98,6 +98,9 @@ async fn test_journey_password_reset_full_lifecycle() {
     assert_eq!(reset_token_from_url, reset_payload.token);
     assert_eq!(reset_token_from_url.len(), 64);
 
+    // Sleep buffer ensures clock advancement beyond PostgreSQL microsecond/tick boundary
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
     // 4. Submit new password via POST /auth/password/reset
     let reset_res = app
         .post_json(
@@ -133,7 +136,7 @@ async fn test_journey_password_reset_full_lifecycle() {
         "updated_at must be strictly greater than created_at upon password reset"
     );
     assert!(
-        user_after_reset.updated_at >= user_before_reset.updated_at,
+        user_after_reset.updated_at > user_before_reset.updated_at,
         "updated_at must advance upon password reset"
     );
 

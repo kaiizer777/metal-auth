@@ -97,7 +97,17 @@ impl AppState {
         let session_service = Arc::new(SessionService::new(pool.clone(), Arc::new(config.clone())));
         let rate_limiter = Arc::new(RateLimiter::with_config(config.rate_limit.clone()));
         if config.rate_limit.enabled {
-            Arc::clone(&rate_limiter).start_cleanup_task(config.rate_limit.window());
+            match tokio::runtime::Handle::try_current() {
+                Ok(_) => {
+                    Arc::clone(&rate_limiter).start_cleanup_task(config.rate_limit.window());
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        event = "rate_limiter_cleanup_skipped",
+                        reason = "no_tokio_runtime",
+                    );
+                }
+            }
         }
 
         Ok(Self {
@@ -214,5 +224,20 @@ mod tests {
                 .rate_limiter
                 .allow("test_key", 10, Duration::from_secs(60))
         );
+    }
+
+    #[tokio::test]
+    async fn app_state_initialization_does_not_panic_outside_tokio_runtime() {
+        let config = valid_config();
+        let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
+        let auth_config = Arc::new(AppConfig::default());
+        let handle = std::thread::spawn(move || {
+            AppState::with_configs_and_dispatcher(pool, config, auth_config, None)
+        });
+        let state = handle
+            .join()
+            .expect("thread must not panic")
+            .expect("valid AppState initialization");
+        assert!(state.rate_limiter.allow("sync_key", 5, Duration::from_secs(60)));
     }
 }

@@ -121,6 +121,14 @@ impl RateLimiter {
 
     /// Spawn a background task periodically pruning expired keys.
     pub fn start_cleanup_task(self: Arc<Self>, window: Duration) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            tracing::warn!(
+                event = "rate_limiter_cleanup_skipped",
+                reason = "no_tokio_runtime",
+            );
+            return;
+        }
+
         tokio::spawn(async move {
             loop {
                 sleep(window).await;
@@ -255,5 +263,11 @@ mod tests {
         assert!(limiter.check_rate_limit("shared_key").is_err());
         // allow() on same key must see lockout and reject
         assert!(!limiter.allow("shared_key", 10, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn start_cleanup_task_does_not_panic_outside_tokio_runtime() {
+        let limiter = Arc::new(RateLimiter::new());
+        limiter.start_cleanup_task(Duration::from_secs(60));
     }
 }

@@ -4,8 +4,8 @@
 BEGIN;
 
 ALTER TABLE sessions
-    ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    ADD COLUMN IF NOT EXISTS absolute_expires_at TIMESTAMPTZ NOT NULL DEFAULT now() + INTERVAL '30 days',
+    ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS absolute_expires_at TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS session_type TEXT NOT NULL DEFAULT 'cookie'
         CHECK (session_type IN ('cookie', 'bearer')),
     ADD COLUMN IF NOT EXISTS csrf_token TEXT;
@@ -15,14 +15,24 @@ ALTER TABLE sessions
     ALTER COLUMN expires_at DROP NOT NULL,
     ALTER COLUMN idle_expires_at DROP NOT NULL;
 
--- Backfill existing rows if any: default last_active_at to created_at
+-- Backfill legacy rows: only touch unpopulated rows (IS NULL).
+-- Replay-safe: re-executing this migration will never touch or rewrite live sessions.
 UPDATE sessions
 SET last_active_at = created_at
-WHERE last_active_at = now();
+WHERE last_active_at IS NULL;
 
+-- Backfill absolute_expires_at capped at 1 day (aligning with default_absolute_lifetime_secs 86400)
+-- or legacy expires_at if sooner.
 UPDATE sessions
-SET absolute_expires_at = LEAST(created_at + INTERVAL '30 days', COALESCE(expires_at, created_at + INTERVAL '30 days'))
-WHERE absolute_expires_at >= now();
+SET absolute_expires_at = LEAST(created_at + INTERVAL '1 day', COALESCE(expires_at, created_at + INTERVAL '1 day'))
+WHERE absolute_expires_at IS NULL;
+
+-- Enforce NOT NULL and defaults for future inserts
+ALTER TABLE sessions
+    ALTER COLUMN last_active_at SET DEFAULT now(),
+    ALTER COLUMN last_active_at SET NOT NULL,
+    ALTER COLUMN absolute_expires_at SET DEFAULT now() + INTERVAL '1 day',
+    ALTER COLUMN absolute_expires_at SET NOT NULL;
 
 -- Index for fast TTL sweeps
 CREATE INDEX IF NOT EXISTS idx_sessions_absolute_expires_at

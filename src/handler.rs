@@ -65,6 +65,8 @@ mod tests {
             outbox_sent_retention: std::time::Duration::from_secs(
                 crate::config::DEFAULT_OUTBOX_SENT_RETENTION_SECS,
             ),
+            session: crate::config::SessionConfig::default(),
+            rate_limit: crate::config::RateLimitConfig::default(),
         }
     }
 

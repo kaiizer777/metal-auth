@@ -177,6 +177,8 @@ mod tests {
             outbox_sent_retention: Duration::from_secs(
                 crate::config::DEFAULT_OUTBOX_SENT_RETENTION_SECS,
             ),
+            session: crate::config::SessionConfig::default(),
+            rate_limit: crate::config::RateLimitConfig::default(),
         };
         let opts = DbPoolOptions::from(&cfg);
         assert_eq!(opts.max_connections, 50);

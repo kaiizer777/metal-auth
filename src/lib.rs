@@ -37,7 +37,7 @@ pub mod session;
 pub mod state;
 
 pub use auth::{Auth, AuthService, AuthServiceImpl, UserResponse};
-pub use config::{AppConfig, Config};
+pub use config::{AppConfig, Config, RateLimitConfig, SessionConfig};
 pub use db::models::{EmailOutbox, PasswordResetToken, Session, User, VerificationToken};
 pub use email::{
     DynError, EmailDispatcher, EmailSender, NoopEmailSender, PasswordResetEmailPayload,

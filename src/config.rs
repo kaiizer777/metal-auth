@@ -47,6 +47,10 @@ pub struct Config {
     pub outbox_initial_backoff: Duration,
     pub outbox_max_backoff: Duration,
     pub outbox_sent_retention: Duration,
+
+    // Phase 4: Session & Rate Limit
+    pub session: SessionConfig,
+    pub rate_limit: RateLimitConfig,
 }
 
 impl std::fmt::Debug for Config {
@@ -68,6 +72,8 @@ impl std::fmt::Debug for Config {
             .field("outbox_initial_backoff", &self.outbox_initial_backoff)
             .field("outbox_max_backoff", &self.outbox_max_backoff)
             .field("outbox_sent_retention", &self.outbox_sent_retention)
+            .field("session", &self.session)
+            .field("rate_limit", &self.rate_limit)
             .finish()
     }
 }
@@ -184,6 +190,8 @@ impl Config {
                 }
             })?;
         }
+        self.session.validate()?;
+        self.rate_limit.validate()?;
         Ok(())
     }
 
@@ -363,6 +371,86 @@ impl Config {
             }
         };
 
+        let cookie_name = match lookup("SESSION_COOKIE_NAME") {
+            Ok(val) => val,
+            Err(std::env::VarError::NotPresent) => default_cookie_name(),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar("SESSION_COOKIE_NAME"));
+            }
+        };
+        let cookie_domain = match lookup("SESSION_COOKIE_DOMAIN") {
+            Ok(val) => {
+                let trimmed = val.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar("SESSION_COOKIE_DOMAIN"));
+            }
+        };
+        let cookie_same_site = match lookup("SESSION_COOKIE_SAME_SITE") {
+            Ok(val) => val,
+            Err(std::env::VarError::NotPresent) => default_cookie_same_site(),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar("SESSION_COOKIE_SAME_SITE"));
+            }
+        };
+        let cookie_secure = parse_env_bool(&lookup, "SESSION_COOKIE_SECURE", default_cookie_secure())?;
+        let idle_timeout_secs = parse_env_u64(&lookup, "SESSION_IDLE_TIMEOUT_SECS", default_idle_timeout_secs())?;
+        let absolute_timeout_secs = parse_env_u64(&lookup, "SESSION_ABSOLUTE_TIMEOUT_SECS", default_absolute_timeout_secs())?;
+        let max_active_sessions_per_user = match lookup("SESSION_MAX_ACTIVE_PER_USER") {
+            Ok(val) => val.parse::<usize>().map_err(|_| ConfigError::InvalidValue {
+                field: "max_active_sessions_per_user",
+                reason: "must be a valid integer",
+            })?,
+            Err(std::env::VarError::NotPresent) => default_max_active_sessions_per_user(),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar("SESSION_MAX_ACTIVE_PER_USER"));
+            }
+        };
+        let session = SessionConfig {
+            cookie_name,
+            cookie_domain,
+            cookie_same_site,
+            cookie_secure,
+            idle_timeout_secs,
+            absolute_timeout_secs,
+            max_active_sessions_per_user,
+        };
+
+        let rate_limit_enabled = parse_env_bool(&lookup, "RATE_LIMIT_ENABLED", default_rate_limit_enabled())?;
+        let login_attempts_per_minute = match lookup("RATE_LIMIT_LOGIN_ATTEMPTS_PER_MINUTE") {
+            Ok(val) => val.parse::<u32>().map_err(|_| ConfigError::InvalidValue {
+                field: "login_attempts_per_minute",
+                reason: "must be a valid integer",
+            })?,
+            Err(std::env::VarError::NotPresent) => default_login_attempts_per_minute(),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar("RATE_LIMIT_LOGIN_ATTEMPTS_PER_MINUTE"));
+            }
+        };
+        let login_cooldown_secs = parse_env_u64(&lookup, "RATE_LIMIT_LOGIN_COOLDOWN_SECS", default_login_cooldown_secs())?;
+        let registration_attempts_per_minute = match lookup("RATE_LIMIT_REGISTRATION_ATTEMPTS_PER_MINUTE") {
+            Ok(val) => val.parse::<u32>().map_err(|_| ConfigError::InvalidValue {
+                field: "registration_attempts_per_minute",
+                reason: "must be a valid integer",
+            })?,
+            Err(std::env::VarError::NotPresent) => default_registration_attempts_per_minute(),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar("RATE_LIMIT_REGISTRATION_ATTEMPTS_PER_MINUTE"));
+            }
+        };
+        let rate_limit = RateLimitConfig {
+            enabled: rate_limit_enabled,
+            login_attempts_per_minute,
+            login_cooldown_secs,
+            registration_attempts_per_minute,
+        };
+
         let cfg = Self {
             database_url,
             port,
@@ -386,6 +474,8 @@ impl Config {
             outbox_initial_backoff,
             outbox_max_backoff,
             outbox_sent_retention,
+            session,
+            rate_limit,
         };
 
         cfg.validate()?;
@@ -627,6 +717,158 @@ fn parse_env_bool(
     }
 }
 
+// ─── Phase 4 — Session & Rate Limiting Configuration ──────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionConfig {
+    #[serde(default = "default_cookie_name")]
+    pub cookie_name: String,
+    #[serde(default)]
+    pub cookie_domain: Option<String>,
+    #[serde(default = "default_cookie_same_site")]
+    pub cookie_same_site: String,
+    #[serde(default = "default_cookie_secure")]
+    pub cookie_secure: bool,
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+    #[serde(default = "default_absolute_timeout_secs")]
+    pub absolute_timeout_secs: u64,
+    #[serde(default = "default_max_active_sessions_per_user")]
+    pub max_active_sessions_per_user: usize,
+}
+
+pub fn default_cookie_name() -> String {
+    "sid".into()
+}
+
+pub fn default_cookie_same_site() -> String {
+    "Lax".into()
+}
+
+pub fn default_cookie_secure() -> bool {
+    true
+}
+
+pub fn default_idle_timeout_secs() -> u64 {
+    1800
+}
+
+pub fn default_absolute_timeout_secs() -> u64 {
+    86400
+}
+
+pub fn default_max_active_sessions_per_user() -> usize {
+    5
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        serde_json::from_str("{}").expect("default SessionConfig deserialization must not fail")
+    }
+}
+
+impl SessionConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.cookie_name.trim().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "cookie_name",
+                reason: "must not be empty",
+            });
+        }
+        if self.idle_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "idle_timeout_secs",
+                reason: "must be greater than 0",
+            });
+        }
+        if self.absolute_timeout_secs <= self.idle_timeout_secs {
+            return Err(ConfigError::InvalidValue {
+                field: "absolute_timeout_secs",
+                reason: "must be greater than idle_timeout_secs",
+            });
+        }
+        if self.max_active_sessions_per_user == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "max_active_sessions_per_user",
+                reason: "must be at least 1",
+            });
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn idle_timeout(&self) -> Duration {
+        Duration::from_secs(self.idle_timeout_secs)
+    }
+
+    #[must_use]
+    pub fn absolute_lifetime(&self) -> Duration {
+        Duration::from_secs(self.absolute_timeout_secs)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RateLimitConfig {
+    #[serde(default = "default_rate_limit_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_login_attempts_per_minute")]
+    pub login_attempts_per_minute: u32,
+    #[serde(default = "default_login_cooldown_secs")]
+    pub login_cooldown_secs: u64,
+    #[serde(default = "default_registration_attempts_per_minute")]
+    pub registration_attempts_per_minute: u32,
+}
+
+pub fn default_rate_limit_enabled() -> bool {
+    true
+}
+
+pub fn default_login_attempts_per_minute() -> u32 {
+    5
+}
+
+pub fn default_login_cooldown_secs() -> u64 {
+    900
+}
+
+pub fn default_registration_attempts_per_minute() -> u32 {
+    3
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        serde_json::from_str("{}").expect("default RateLimitConfig deserialization must not fail")
+    }
+}
+
+impl RateLimitConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.login_attempts_per_minute == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "login_attempts_per_minute",
+                reason: "must be at least 1",
+            });
+        }
+        if self.registration_attempts_per_minute == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "registration_attempts_per_minute",
+                reason: "must be at least 1",
+            });
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn window(&self) -> Duration {
+        Duration::from_secs(60)
+    }
+
+    #[must_use]
+    pub fn cooldown(&self) -> Duration {
+        Duration::from_secs(self.login_cooldown_secs)
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -652,6 +894,8 @@ impl Default for Config {
             outbox_initial_backoff: Duration::from_secs(DEFAULT_OUTBOX_INITIAL_BACKOFF_SECS),
             outbox_max_backoff: Duration::from_secs(DEFAULT_OUTBOX_MAX_BACKOFF_SECS),
             outbox_sent_retention: Duration::from_secs(DEFAULT_OUTBOX_SENT_RETENTION_SECS),
+            session: SessionConfig::default(),
+            rate_limit: RateLimitConfig::default(),
         }
     }
 }
@@ -712,6 +956,8 @@ mod tests {
             outbox_initial_backoff: Duration::from_secs(DEFAULT_OUTBOX_INITIAL_BACKOFF_SECS),
             outbox_max_backoff: Duration::from_secs(DEFAULT_OUTBOX_MAX_BACKOFF_SECS),
             outbox_sent_retention: Duration::from_secs(DEFAULT_OUTBOX_SENT_RETENTION_SECS),
+            session: SessionConfig::default(),
+            rate_limit: RateLimitConfig::default(),
         }
     }
 

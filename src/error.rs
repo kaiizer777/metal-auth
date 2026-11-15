@@ -373,8 +373,22 @@ impl IntoResponse for AppError {
 
         let status = self.status_code();
         let payload = ErrorResponse::from(&self);
+        let mut resp = (status, Json(payload)).into_response();
 
-        (status, Json(payload)).into_response()
+        // RFC 6750 §3.1: Bearer 401s must carry a WWW-Authenticate challenge.
+        if matches!(
+            self,
+            Self::SessionNotFound | Self::SessionExpired | Self::SessionInvalid
+        ) {
+            resp.headers_mut().insert(
+                axum::http::header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static(
+                    r#"Bearer realm="metal-auth", error="invalid_token""#,
+                ),
+            );
+        }
+
+        resp
     }
 }
 
@@ -745,5 +759,32 @@ mod tests {
         use axum::response::IntoResponse;
         let response = AppError::from_code(ErrorCode::RateLimitExceeded).into_response();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn session_401_responses_include_www_authenticate_header() {
+        use axum::response::IntoResponse;
+        let session_errors = [
+            AppError::SessionNotFound,
+            AppError::SessionExpired,
+            AppError::SessionInvalid,
+        ];
+
+        for err in session_errors {
+            let resp = err.into_response();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            let auth_header = resp
+                .headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .expect("WWW-Authenticate header must be present on session 401");
+            assert_eq!(
+                auth_header.to_str().unwrap(),
+                r#"Bearer realm="metal-auth", error="invalid_token""#
+            );
+        }
+
+        let other_401 = AppError::InvalidCredentials.into_response();
+        assert_eq!(other_401.status(), StatusCode::UNAUTHORIZED);
+        assert!(other_401.headers().get(axum::http::header::WWW_AUTHENTICATE).is_none());
     }
 }

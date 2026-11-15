@@ -45,6 +45,10 @@ pub use email::{
 };
 pub use error::{AppError, AppResult, ConfigError, ErrorCode, ErrorResponse};
 pub use handler::auth_routes;
+pub use session::{
+    clear_session_cookie, has_bearer_token, read_bearer_token, read_session_cookie,
+    set_csrf_cookie, set_session_cookie, SessionCookieSource, SessionService,
+};
 pub use state::AppState;
 
 #[cfg(any(test, feature = "test-utils"))]

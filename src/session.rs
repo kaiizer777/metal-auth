@@ -2,12 +2,14 @@
 
 pub mod bearer;
 pub mod cookie;
+pub mod service;
 
 pub use bearer::{has_bearer_token, read_bearer_token};
 pub use cookie::{
     clear_session_cookie, read_session_cookie, set_csrf_cookie, set_session_cookie,
     SessionCookieSource,
 };
+pub use service::SessionService;
 
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};

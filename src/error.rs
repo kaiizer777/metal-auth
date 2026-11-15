@@ -326,6 +326,11 @@ impl AppError {
             ErrorCode::RateLimitExceeded => Self::RateLimitExceeded,
         }
     }
+
+    #[must_use]
+    pub fn internal() -> Self {
+        Self::Internal
+    }
 }
 
 impl IntoResponse for AppError {

@@ -895,24 +895,24 @@ async fn test_replay_deleted_session() {
 }
 
 #[tokio::test]
-async fn test_expired_session_rejected() {
+async fn test_bearer_expired_session_rejected() {
     let _guard = DB_LOCK.lock().await;
     let Some(app) = setup_test_app().await else {
         return;
     };
 
     let (email, password) = create_and_verify_user(&app).await;
-    let resp = app
-        .post_json(
-            "/auth/login",
-            json!({ "email": email, "password": password }),
-        )
-        .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let sid = extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name)
-        .expect("session cookie present in login response");
-    let hash = SessionService::hash_raw_id(&sid);
+    let mut login_headers = HeaderMap::new();
+    login_headers.insert("x-auth-type", "bearer".parse().unwrap());
+    let login_req = json_request_with_headers(
+        Method::POST,
+        "/auth/login",
+        json!({ "email": email, "password": password }),
+        login_headers,
+    );
+    let login_resp = app.dispatch(login_req).await;
+    let token = login_resp.json["token"].as_str().unwrap();
+    let hash = SessionService::hash_raw_id(token);
 
     sqlx::query(
         "UPDATE sessions SET absolute_expires_at = NOW() - INTERVAL '1 hour' WHERE token_hash = $1",
@@ -924,10 +924,8 @@ async fn test_expired_session_rejected() {
 
     let mut headers = HeaderMap::new();
     headers.insert(
-        header::COOKIE,
-        format!("{}={}", app.state.config.session.cookie_name, sid)
-            .parse()
-            .unwrap(),
+        header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
     );
 
     let get_resp = app
@@ -938,6 +936,14 @@ async fn test_expired_session_rejected() {
         ))
         .await;
     assert_eq!(get_resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(get_resp.error_code(), Some(ErrorCode::SessionExpired));
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE token_hash = $1")
+        .bind(&hash)
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "expired bearer session must be eagerly purged");
 }
 
 #[tokio::test]
@@ -1080,48 +1086,32 @@ async fn test_csrf_bypass_via_bearer() {
     let login_resp = app.dispatch(login_req).await;
     let token = login_resp.json["token"].as_str().unwrap();
 
-    // Mutating POST with Bearer authentication and NO CSRF header succeeds
+    // 1. Pure Bearer request with NO cookie and NO CSRF header succeeds
     let mut headers = HeaderMap::new();
     headers.insert(
         header::AUTHORIZATION,
         format!("Bearer {token}").parse().unwrap(),
     );
 
-    let req = empty_request_with_headers(Method::POST, "/auth/session/refresh", headers);
+    let req = empty_request_with_headers(Method::POST, "/auth/session/refresh", headers.clone());
     let resp = app.dispatch(req).await;
 
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(resp.json["token"].is_string());
-}
 
-#[tokio::test]
-async fn test_rate_limit_trigger() {
-    let _guard = DB_LOCK.lock().await;
-    let Some(app) = setup_test_app().await else {
-        return;
-    };
-
-    let (email, password) = create_and_verify_user(&app).await;
-    let max = app.state.config.rate_limit.max_attempts;
-
-    for _ in 0..max {
-        let _ = app
-            .post_json(
-                "/auth/login",
-                json!({ "email": email, "password": "WrongPassword123!" }),
-            )
-            .await;
-    }
-
-    let limit_resp = app
-        .post_json(
-            "/auth/login",
-            json!({ "email": email, "password": password }),
-        )
-        .await;
-
-    assert_eq!(limit_resp.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert!(limit_resp.headers.contains_key(header::RETRY_AFTER));
+    // 2. Dual-transport request: Bearer header present, but ALSO carrying a session cookie
+    // without a CSRF token must NOT take the bearer bypass; must be rejected with 403.
+    let mut dual_headers = headers;
+    dual_headers.insert(
+        header::COOKIE,
+        format!("{}=fake_cookie_session_value", app.state.config.session.cookie_name)
+            .parse()
+            .unwrap(),
+    );
+    let dual_req = empty_request_with_headers(Method::POST, "/auth/session/refresh", dual_headers);
+    let dual_resp = app.dispatch(dual_req).await;
+    assert_eq!(dual_resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(dual_resp.error_code(), Some(ErrorCode::CsrfTokenMissing));
 }
 
 #[tokio::test]

@@ -78,6 +78,21 @@ impl SessionService {
             None
         };
 
+        let mut tx = self.db.begin().await.map_err(|e| {
+            tracing::error!(error = %e, "Failed to begin transaction for create_session");
+            AppError::Database(e)
+        })?;
+
+        // Row lock on the user row to serialize concurrent session creations for the user
+        sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "Failed to lock user row for session capacity check");
+                AppError::Database(e)
+            })?;
+
         // Enforce maximum concurrent active sessions limit per user.
         if self.config.session.max_active_sessions_per_user > 0 {
             let active_sessions: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
@@ -89,7 +104,7 @@ impl SessionService {
             )
             .bind(user_id)
             .bind(now)
-            .fetch_all(&self.db)
+            .fetch_all(&mut *tx)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Failed to check active sessions for capacity limit");
@@ -102,7 +117,7 @@ impl SessionService {
                 let ids_to_evict = &active_sessions[..to_evict_count];
                 sqlx::query("DELETE FROM sessions WHERE id = ANY($1)")
                     .bind(ids_to_evict)
-                    .execute(&self.db)
+                    .execute(&mut *tx)
                     .await
                     .map_err(|e| {
                         tracing::error!(error = %e, "Failed to evict oldest active sessions");
@@ -138,10 +153,15 @@ impl SessionService {
         .bind(idle_expires_at)
         .bind(session_type)
         .bind(csrf_token)
-        .fetch_one(&self.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to insert session");
+            AppError::Database(e)
+        })?;
+
+        tx.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "Failed to commit session creation transaction");
             AppError::Database(e)
         })?;
 

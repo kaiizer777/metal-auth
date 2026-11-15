@@ -291,8 +291,9 @@ pub async fn logout(State(state): State<AuthHandlerState>, headers: HeaderMap) -
 
     if let Some(ref raw_id) = raw_id_opt {
         if let Some(ref session_svc) = state.session_service {
-            if let Err(e) = session_svc.invalidate_session(raw_id).await {
-                return service_error_response(e);
+            match session_svc.invalidate_session(raw_id).await {
+                Ok(()) => {}
+                Err(e) => return service_error_response(e),
             }
         }
         if let Err(e) = state.service.logout(raw_id).await {

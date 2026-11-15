@@ -1,17 +1,15 @@
 //! Session management primitives, storage abstractions, and lifecycle tracking.
-//!
-//! # Architectural Boundary
-//!
-//! This module is an architectural extension point reserved for future phase stateful session management.
-//!
-//! ## Planned Capabilities
-//! - Pluggable session store traits (e.g., Redis, PostgreSQL, distributed cache).
-//! - Lifecycle tracking: sliding window expiration, idle timeouts, and absolute limits.
-//! - Multi-device session enumeration, revocation lists, and concurrent session caps.
-//!
-//! ## Boundaries & Constraints
-//! - Storage backends operate on the [`Session`](crate::Session) model while remaining decoupled
-//!   from core Axum HTTP handler bindings.
+
+pub mod bearer;
+pub mod cookie;
+pub mod service;
+
+pub use bearer::{has_bearer_token, read_bearer_token};
+pub use cookie::{
+    SessionCookieSource, clear_session_cookie, read_session_cookie, set_csrf_cookie,
+    set_session_cookie,
+};
+pub use service::SessionService;
 
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};

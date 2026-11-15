@@ -20,6 +20,10 @@ argon2 = { version = "0.5", features = ["std"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 sha2 = "0.10"
 hex = "0.4"
+subtle = "2.6"
+
+# rate limiting (Phase 4)
+dashmap = "6"
 
 # async trait (dyn-compatible email hook)
 async-trait = "0.1"

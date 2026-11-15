@@ -363,6 +363,8 @@ pub async fn setup_test_app_with_auth_config(auth_config: Arc<AppConfig>) -> Opt
         outbox_initial_backoff: Duration::from_secs(1),
         outbox_max_backoff: Duration::from_secs(300),
         outbox_sent_retention: Duration::from_secs(7 * 24 * 3600),
+        session: metal_auth::SessionConfig::default(),
+        rate_limit: metal_auth::RateLimitConfig::default(),
     };
 
     let state = AppState::with_dispatcher(pool.clone(), cfg, auth_config, dispatcher)

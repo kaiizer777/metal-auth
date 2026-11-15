@@ -31,6 +31,8 @@ fn test_config() -> Config {
         outbox_initial_backoff: std::time::Duration::from_secs(1),
         outbox_max_backoff: std::time::Duration::from_secs(300),
         outbox_sent_retention: std::time::Duration::from_secs(7 * 24 * 3600),
+        session: metal_auth::SessionConfig::default(),
+        rate_limit: metal_auth::RateLimitConfig::default(),
     }
 }
 
@@ -136,11 +138,14 @@ fn test_facade_re_exported_models_contract() {
         id: Uuid::new_v4(),
         user_id: uid,
         token_hash: "sha256_hash_here".into(),
-        expires_at: now,
-        idle_expires_at: now,
         created_at: now,
+        last_active_at: now,
+        absolute_expires_at: now,
+        session_type: "cookie".into(),
+        csrf_token: None,
     };
     assert_eq!(session.user_id, uid);
+    assert_eq!(session.session_type, "cookie");
 
     let v_token = VerificationToken {
         token_hash: vec![0u8; 32],

@@ -423,6 +423,19 @@ impl AuthServiceImpl {
             .await
             .map_err(AppError::Database)?;
 
+        // Invalidate ALL sessions for this user upon password change
+        sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::Database)?;
+
+        tracing::info!(
+            event = "all_sessions_invalidated",
+            user_id = %user_id,
+            triggered_by = "password_change",
+        );
+
         tx.commit().await.map_err(AppError::Database)?;
         Ok(())
     }

@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use axum::Router;
 use tower_http::trace::TraceLayer;
 
@@ -7,9 +5,11 @@ use crate::{error::AppError, state::AppState};
 
 pub mod auth;
 pub mod cors;
+pub mod session;
 
 pub use auth::routes as auth_routes;
 pub use cors::cors_layer;
+pub use session::routes as session_routes;
 
 async fn fallback_not_found() -> AppError {
     AppError::NotFound
@@ -21,8 +21,11 @@ pub fn create_router(state: AppState) -> Result<Router, AppError> {
     state.config.validate().map_err(AppError::Config)?;
     let cors = cors_layer(&state.config)?;
 
+    let auth_router =
+        auth::routes_with_app_state(state.clone()).merge(session::routes(state.clone()));
+
     Ok(Router::new()
-        .nest("/auth", auth::routes(Arc::clone(&state.auth_service)))
+        .nest("/auth", auth_router)
         .fallback(fallback_not_found)
         .layer(cors)
         .layer(TraceLayer::new_for_http()))
@@ -37,6 +40,7 @@ mod tests {
         http::{Method, Request, StatusCode},
     };
     use sqlx::PgPool;
+    use std::sync::Arc;
     use tower::Service;
 
     fn valid_config() -> Config {
@@ -65,6 +69,8 @@ mod tests {
             outbox_sent_retention: std::time::Duration::from_secs(
                 crate::config::DEFAULT_OUTBOX_SENT_RETENTION_SECS,
             ),
+            session: crate::config::SessionConfig::default(),
+            rate_limit: crate::config::RateLimitConfig::default(),
         }
     }
 
@@ -102,5 +108,43 @@ mod tests {
 
         let resp = router.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_create_router_mounts_session_routes_with_require_auth() {
+        let cfg = valid_config();
+        let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
+        let state =
+            AppState::with_configs_and_dispatcher(pool, cfg, Arc::new(AppConfig::default()), None)
+                .unwrap();
+        let mut router = create_router(state).unwrap();
+
+        let req = Request::builder()
+            .uri("/auth/session")
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_session_mutating_routes_require_auth() {
+        let cfg = valid_config();
+        let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
+        let state =
+            AppState::with_configs_and_dispatcher(pool, cfg, Arc::new(AppConfig::default()), None)
+                .unwrap();
+        let mut router = create_router(state).unwrap();
+
+        let req = Request::builder()
+            .uri("/auth/session/revoke-all")
+            .method(Method::POST)
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

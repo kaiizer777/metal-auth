@@ -27,10 +27,17 @@ pub struct User {
 pub struct Session {
     pub id: Uuid,
     pub user_id: Uuid,
+    /// SHA-256 hex digest of the raw session token. Safe to store; raw token is never persisted.
     pub token_hash: String,
-    pub expires_at: DateTime<Utc>,
-    pub idle_expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+    /// Updated on every validated request. Used for idle timeout enforcement.
+    pub last_active_at: DateTime<Utc>,
+    /// Computed at creation: created_at + config.session.absolute_lifetime.
+    pub absolute_expires_at: DateTime<Utc>,
+    /// "cookie" or "bearer".
+    pub session_type: String,
+    /// 64-char hex CSRF token. None for bearer sessions.
+    pub csrf_token: Option<String>,
 }
 
 /// Single-use email verification token entity.

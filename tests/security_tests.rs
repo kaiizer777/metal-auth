@@ -16,8 +16,11 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 fn create_test_router() -> axum::Router {
+    dotenvy::dotenv().ok();
+    let db_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://user:pass@localhost:5432/metal_auth_test".to_string());
     let cfg = Config {
-        database_url: "postgres://user:pass@localhost:5432/metal_auth_test".into(),
+        database_url: db_url,
         port: 8080,
         allowed_origins: vec!["https://app.example.com".into()],
         allowed_methods: vec!["GET".into(), "POST".into(), "OPTIONS".into()],
@@ -33,6 +36,8 @@ fn create_test_router() -> axum::Router {
         outbox_initial_backoff: std::time::Duration::from_secs(1),
         outbox_max_backoff: std::time::Duration::from_secs(300),
         outbox_sent_retention: std::time::Duration::from_secs(7 * 24 * 3600),
+        session: metal_auth::SessionConfig::default(),
+        rate_limit: metal_auth::RateLimitConfig::default(),
     };
     let pool = sqlx::postgres::PgPoolOptions::new()
         .acquire_timeout(std::time::Duration::from_millis(500))
@@ -63,6 +68,8 @@ fn create_failing_db_router() -> axum::Router {
         outbox_initial_backoff: std::time::Duration::from_secs(1),
         outbox_max_backoff: std::time::Duration::from_secs(300),
         outbox_sent_retention: std::time::Duration::from_secs(7 * 24 * 3600),
+        session: metal_auth::SessionConfig::default(),
+        rate_limit: metal_auth::RateLimitConfig::default(),
     };
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
@@ -122,6 +129,8 @@ async fn setup_live_db() -> Option<LiveDbTestContext> {
         outbox_initial_backoff: std::time::Duration::from_secs(1),
         outbox_max_backoff: std::time::Duration::from_secs(300),
         outbox_sent_retention: std::time::Duration::from_secs(7 * 24 * 3600),
+        session: metal_auth::SessionConfig::default(),
+        rate_limit: metal_auth::RateLimitConfig::default(),
     };
     let state = AppState::new(pool.clone(), cfg).expect("failed to create app state with live DB");
     let router = create_router(state.clone()).expect("failed to create router for live DB test");
@@ -756,7 +765,9 @@ async fn test_malformed_json_body_rejection() {
 
 #[tokio::test]
 async fn test_logout_returns_no_content() {
-    let router = create_test_router();
+    let Some(ctx) = setup_live_db().await else {
+        return;
+    };
 
     let req = Request::builder()
         .method(Method::POST)
@@ -765,7 +776,7 @@ async fn test_logout_returns_no_content() {
         .body(Body::empty())
         .unwrap();
 
-    let resp = router.oneshot(req).await.unwrap();
+    let resp = ctx.router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
@@ -774,7 +785,9 @@ async fn test_logout_returns_no_content() {
 
 #[tokio::test]
 async fn test_logout_invalid_bearer_does_not_panic() {
-    let router = create_test_router();
+    let Some(ctx) = setup_live_db().await else {
+        return;
+    };
 
     let invalid_auth_headers = [
         None,
@@ -791,7 +804,7 @@ async fn test_logout_invalid_bearer_does_not_panic() {
             builder = builder.header(header::AUTHORIZATION, val);
         }
         let req = builder.body(Body::empty()).unwrap();
-        let resp = router.clone().oneshot(req).await.unwrap();
+        let resp = ctx.router.clone().oneshot(req).await.unwrap();
         assert_eq!(
             resp.status(),
             StatusCode::NO_CONTENT,
@@ -2519,6 +2532,9 @@ async fn test_login_timing_parity_unknown_vs_wrong() {
 
     // Warmup both paths to stabilise Argon2 state and OS scheduler.
     for _ in 0..WARMUP {
+        ctx.state
+            .rate_limiter
+            .reset(&metal_auth::rate_limit_key("127.0.0.1", &email));
         let req = json_request(
             Method::POST,
             "/auth/login",
@@ -2526,6 +2542,9 @@ async fn test_login_timing_parity_unknown_vs_wrong() {
         );
         let _ = ctx.router.clone().oneshot(req).await.unwrap();
 
+        ctx.state
+            .rate_limiter
+            .reset(&metal_auth::rate_limit_key("127.0.0.1", &unknown_email));
         let req = json_request(
             Method::POST,
             "/auth/login",
@@ -2539,6 +2558,9 @@ async fn test_login_timing_parity_unknown_vs_wrong() {
     let mut durations_unknown: Vec<std::time::Duration> = Vec::with_capacity(MEASURED);
 
     for _ in 0..MEASURED {
+        ctx.state
+            .rate_limiter
+            .reset(&metal_auth::rate_limit_key("127.0.0.1", &email));
         let t = std::time::Instant::now();
         let req = json_request(
             Method::POST,
@@ -2549,6 +2571,9 @@ async fn test_login_timing_parity_unknown_vs_wrong() {
         durations_wrong.push(t.elapsed());
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
+        ctx.state
+            .rate_limiter
+            .reset(&metal_auth::rate_limit_key("127.0.0.1", &unknown_email));
         let t = std::time::Instant::now();
         let req = json_request(
             Method::POST,
@@ -2668,4 +2693,225 @@ async fn test_csrf_state_changing_request_requires_allowed_origin() {
             .is_none(),
         "Untrusted cross-origin request must not be granted CORS origin access"
     );
+}
+
+// ─── Scenario 13: Phase 4 Session Service Validation & Timeout Lifecycle ────
+
+#[tokio::test]
+async fn test_rotate_session_rejects_expired_session() {
+    let Some(ctx) = setup_live_db().await else {
+        return;
+    };
+    let session_service =
+        metal_auth::SessionService::new(ctx.pool.clone(), Arc::new(ctx.state.config.clone()));
+
+    let user_id = Uuid::new_v4();
+    let email = format!("sess_{}@example.com", user_id);
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, true)",
+    )
+    .bind(user_id)
+    .bind(&email)
+    .bind("hash_placeholder")
+    .execute(&ctx.pool)
+    .await
+    .expect("insert test user");
+    let (session, raw_token) = session_service
+        .create_session(user_id, "cookie", None, None)
+        .await
+        .expect("session created");
+
+    // Case 1: Manually expire absolute lifetime in DB
+    sqlx::query("UPDATE sessions SET absolute_expires_at = $1 WHERE id = $2")
+        .bind(Utc::now() - Duration::seconds(10))
+        .bind(session.id)
+        .execute(&ctx.pool)
+        .await
+        .expect("updated absolute_expires_at");
+
+    let err = session_service
+        .rotate_session(&raw_token, None, None)
+        .await
+        .expect_err("rotating absolute-expired session must fail");
+    assert!(
+        matches!(err, metal_auth::AppError::SessionExpired),
+        "expected SessionExpired, got {:?}",
+        err
+    );
+
+    // Verify session row was eagerly purged on expiration
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE id = $1")
+        .bind(session.id)
+        .fetch_one(&ctx.pool)
+        .await
+        .expect("count sessions");
+    assert_eq!(
+        count, 0,
+        "expired session must be eagerly deleted from database"
+    );
+
+    // Case 2: Create a second session and expire idle timeout
+    let (session2, raw_token2) = session_service
+        .create_session(user_id, "cookie", None, None)
+        .await
+        .expect("session2 created");
+
+    sqlx::query("UPDATE sessions SET last_active_at = $1 WHERE id = $2")
+        .bind(Utc::now() - Duration::hours(2))
+        .bind(session2.id)
+        .execute(&ctx.pool)
+        .await
+        .expect("updated last_active_at");
+
+    let err2 = session_service
+        .rotate_session(&raw_token2, None, None)
+        .await
+        .expect_err("rotating idle-expired session must fail");
+    assert!(
+        matches!(err2, metal_auth::AppError::SessionExpired),
+        "expected SessionExpired for idle timeout, got {:?}",
+        err2
+    );
+
+    let count2: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE id = $1")
+        .bind(session2.id)
+        .fetch_one(&ctx.pool)
+        .await
+        .expect("count sessions");
+    assert_eq!(
+        count2, 0,
+        "idle-expired session must be eagerly deleted from database"
+    );
+}
+
+#[tokio::test]
+async fn test_touch_session_rejects_expired_session() {
+    let Some(ctx) = setup_live_db().await else {
+        return;
+    };
+    let session_service =
+        metal_auth::SessionService::new(ctx.pool.clone(), Arc::new(ctx.state.config.clone()));
+
+    let user_id = Uuid::new_v4();
+    let email = format!("sess_{}@example.com", user_id);
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, true)",
+    )
+    .bind(user_id)
+    .bind(&email)
+    .bind("hash_placeholder")
+    .execute(&ctx.pool)
+    .await
+    .expect("insert test user");
+    let (session, _) = session_service
+        .create_session(user_id, "bearer", None, None)
+        .await
+        .expect("session created");
+
+    // Expire idle timeout
+    sqlx::query("UPDATE sessions SET last_active_at = $1 WHERE id = $2")
+        .bind(Utc::now() - Duration::hours(2))
+        .bind(session.id)
+        .execute(&ctx.pool)
+        .await
+        .expect("updated last_active_at");
+
+    let err = session_service
+        .touch_session(&session.token_hash)
+        .await
+        .expect_err("touching idle-expired session must fail");
+    assert!(
+        matches!(err, metal_auth::AppError::SessionExpired),
+        "expected SessionExpired, got {:?}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn test_rotate_session_success_lifecycle() {
+    let Some(ctx) = setup_live_db().await else {
+        return;
+    };
+    let session_service =
+        metal_auth::SessionService::new(ctx.pool.clone(), Arc::new(ctx.state.config.clone()));
+
+    let user_id = Uuid::new_v4();
+    let email = format!("sess_{}@example.com", user_id);
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, true)",
+    )
+    .bind(user_id)
+    .bind(&email)
+    .bind("hash_placeholder")
+    .execute(&ctx.pool)
+    .await
+    .expect("insert test user");
+    let (session1, raw_token1) = session_service
+        .create_session(user_id, "cookie", Some("127.0.0.1"), Some("test-agent"))
+        .await
+        .expect("session1 created");
+
+    let (session2, raw_token2) = session_service
+        .rotate_session(&raw_token1, Some("127.0.0.1"), Some("test-agent"))
+        .await
+        .expect("session rotated successfully");
+
+    assert_ne!(session1.token_hash, session2.token_hash);
+    assert_ne!(raw_token1, raw_token2);
+    assert_eq!(session2.user_id, user_id);
+    assert_eq!(session2.session_type, "cookie");
+    assert_eq!(session2.absolute_expires_at, session1.absolute_expires_at);
+
+    // Old token must no longer be found
+    let err = session_service
+        .get_session(&raw_token1)
+        .await
+        .expect_err("old token must be invalidated");
+    assert!(matches!(err, metal_auth::AppError::SessionNotFound));
+
+    // New token must be valid
+    let fetched = session_service
+        .get_session(&raw_token2)
+        .await
+        .expect("new token must be active");
+    assert_eq!(fetched.id, session2.id);
+}
+
+#[tokio::test]
+async fn test_invalidate_all_user_sessions_spec_contract() {
+    let Some(ctx) = setup_live_db().await else {
+        return;
+    };
+    let session_service =
+        metal_auth::SessionService::new(ctx.pool.clone(), Arc::new(ctx.state.config.clone()));
+
+    let user_id = Uuid::new_v4();
+    let email = format!("sess_{}@example.com", user_id);
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, true)",
+    )
+    .bind(user_id)
+    .bind(&email)
+    .bind("hash_placeholder")
+    .execute(&ctx.pool)
+    .await
+    .expect("insert test user");
+    let (_, raw1) = session_service
+        .create_session(user_id, "cookie", None, None)
+        .await
+        .unwrap();
+    let (_, raw2) = session_service
+        .create_session(user_id, "bearer", None, None)
+        .await
+        .unwrap();
+
+    let res: Result<(), metal_auth::AppError> =
+        session_service.invalidate_all_user_sessions(user_id).await;
+    assert!(
+        res.is_ok(),
+        "invalidate_all_user_sessions returns Result<(), AppError>"
+    );
+
+    assert!(session_service.get_session(&raw1).await.is_err());
+    assert!(session_service.get_session(&raw2).await.is_err());
 }

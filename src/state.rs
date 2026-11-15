@@ -7,6 +7,8 @@ use crate::{
     config::{AppConfig, Config},
     email::{dispatcher::EmailDispatcher, hook::SharedEmailSender},
     error::AppError,
+    ratelimit::RateLimiter,
+    session::SessionService,
 };
 
 /// Constructs an [`EmailDispatcher`] from application config and optional email sender.
@@ -33,6 +35,8 @@ pub struct AppState {
     pub auth_config: Arc<AppConfig>,
     pub auth_service: Arc<AuthServiceImpl>,
     pub email_dispatcher: Option<Arc<EmailDispatcher>>,
+    pub session_service: Arc<SessionService>,
+    pub rate_limiter: Arc<RateLimiter>,
 }
 
 impl AppState {
@@ -90,12 +94,30 @@ impl AppState {
             dispatcher,
         )?);
 
+        let session_service = Arc::new(SessionService::new(pool.clone(), Arc::new(config.clone())));
+        let rate_limiter = Arc::new(RateLimiter::with_config(config.rate_limit.clone()));
+        if config.rate_limit.enabled {
+            match tokio::runtime::Handle::try_current() {
+                Ok(_) => {
+                    Arc::clone(&rate_limiter).start_cleanup_task(config.rate_limit.window());
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        event = "rate_limiter_cleanup_skipped",
+                        reason = "no_tokio_runtime",
+                    );
+                }
+            }
+        }
+
         Ok(Self {
             pool,
             config,
             auth_config,
             auth_service,
             email_dispatcher,
+            session_service,
+            rate_limiter,
         })
     }
 
@@ -142,6 +164,8 @@ mod tests {
             outbox_sent_retention: Duration::from_secs(
                 crate::config::DEFAULT_OUTBOX_SENT_RETENTION_SECS,
             ),
+            session: crate::config::SessionConfig::default(),
+            rate_limit: crate::config::RateLimitConfig::default(),
         }
     }
 
@@ -180,6 +204,44 @@ mod tests {
         assert!(
             matches!(result, Err(AppError::Config(_))),
             "invalid config must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_state_initializes_session_service_and_rate_limiter() {
+        let config = valid_config();
+        let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
+        let auth_config = Arc::new(AppConfig::default());
+        let state = AppState::with_configs_and_dispatcher(pool, config, auth_config, None)
+            .expect("valid AppState initialization");
+
+        // Verify session_service is constructed and wired
+        let _ = state.session_service.clone();
+
+        // Verify rate_limiter is constructed and can evaluate rate limits
+        assert!(
+            state
+                .rate_limiter
+                .allow("test_key", 10, Duration::from_secs(60))
+        );
+    }
+
+    #[tokio::test]
+    async fn app_state_initialization_does_not_panic_outside_tokio_runtime() {
+        let config = valid_config();
+        let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
+        let auth_config = Arc::new(AppConfig::default());
+        let handle = std::thread::spawn(move || {
+            AppState::with_configs_and_dispatcher(pool, config, auth_config, None)
+        });
+        let state = handle
+            .join()
+            .expect("thread must not panic")
+            .expect("valid AppState initialization");
+        assert!(
+            state
+                .rate_limiter
+                .allow("sync_key", 5, Duration::from_secs(60))
         );
     }
 }

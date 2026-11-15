@@ -35,6 +35,13 @@ pub enum ErrorCode {
     ValidationError,
     InvalidToken,
     TokenExpired,
+    // Phase 4 — session, CSRF, rate limit
+    SessionNotFound,
+    SessionExpired,
+    SessionInvalid,
+    CsrfTokenMissing,
+    CsrfTokenInvalid,
+    RateLimitExceeded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +164,25 @@ pub enum AppError {
     /// Preserves anti-enumeration guarantees without revealing account existence to clients.
     #[error("email already exists")]
     EmailAlreadyExists,
+
+    // Phase 4 — session, CSRF, rate limit
+    #[error("session not found")]
+    SessionNotFound,
+
+    #[error("session expired")]
+    SessionExpired,
+
+    #[error("session invalid")]
+    SessionInvalid,
+
+    #[error("CSRF token missing")]
+    CsrfTokenMissing,
+
+    #[error("CSRF token invalid")]
+    CsrfTokenInvalid,
+
+    #[error("rate limit exceeded")]
+    RateLimitExceeded,
 }
 
 impl AppError {
@@ -185,6 +211,13 @@ impl AppError {
             Self::ValidationError(_) => ErrorCode::ValidationError,
             Self::InvalidToken => ErrorCode::InvalidToken,
             Self::TokenExpired => ErrorCode::TokenExpired,
+            // Phase 4
+            Self::SessionNotFound => ErrorCode::SessionNotFound,
+            Self::SessionExpired => ErrorCode::SessionExpired,
+            Self::SessionInvalid => ErrorCode::SessionInvalid,
+            Self::CsrfTokenMissing => ErrorCode::CsrfTokenMissing,
+            Self::CsrfTokenInvalid => ErrorCode::CsrfTokenInvalid,
+            Self::RateLimitExceeded => ErrorCode::RateLimitExceeded,
         }
     }
 
@@ -203,9 +236,17 @@ impl AppError {
             | Self::EmailDispatchTimeout
             | Self::EmailAlreadyExists => StatusCode::INTERNAL_SERVER_ERROR,
             // 401
-            Self::InvalidCredentials | Self::Unauthenticated => StatusCode::UNAUTHORIZED,
+            Self::InvalidCredentials
+            | Self::Unauthenticated
+            | Self::SessionNotFound
+            | Self::SessionExpired
+            | Self::SessionInvalid => StatusCode::UNAUTHORIZED,
             // 403
-            Self::EmailNotVerified => StatusCode::FORBIDDEN,
+            Self::EmailNotVerified | Self::CsrfTokenMissing | Self::CsrfTokenInvalid => {
+                StatusCode::FORBIDDEN
+            }
+            // 429
+            Self::RateLimitExceeded => StatusCode::TOO_MANY_REQUESTS,
             // 400
             Self::PasswordTooShort
             | Self::PasswordTooLong
@@ -242,7 +283,53 @@ impl AppError {
             Self::ValidationError(_) => "Invalid request body",
             Self::InvalidToken => "Invalid or already used token",
             Self::TokenExpired => "Token has expired",
+            // Phase 4
+            Self::SessionNotFound | Self::SessionExpired | Self::SessionInvalid => {
+                "Session is invalid or has expired"
+            }
+            Self::CsrfTokenMissing => "CSRF token is missing",
+            Self::CsrfTokenInvalid => "CSRF token is invalid",
+            Self::RateLimitExceeded => "Too many requests, please try again later",
         }
+    }
+
+    #[must_use]
+    pub fn from_code(code: ErrorCode) -> Self {
+        match code {
+            ErrorCode::InvalidConfig => Self::Config(ConfigError::InvalidValue {
+                field: "unknown",
+                reason: "invalid configuration",
+            }),
+            ErrorCode::DatabaseError => Self::Database(sqlx::Error::RowNotFound),
+            ErrorCode::DatabaseUnavailable => Self::DatabaseUnavailable(sqlx::Error::PoolClosed),
+            ErrorCode::MigrationFailed => {
+                Self::Migration(sqlx::migrate::MigrateError::VersionMissing(1))
+            }
+            ErrorCode::NotFound => Self::NotFound,
+            ErrorCode::MethodNotAllowed => Self::MethodNotAllowed,
+            ErrorCode::InternalError => Self::Internal,
+            ErrorCode::InvalidCredentials => Self::InvalidCredentials,
+            ErrorCode::Unauthenticated => Self::Unauthenticated,
+            ErrorCode::EmailNotVerified => Self::EmailNotVerified,
+            ErrorCode::PasswordTooShort => Self::PasswordTooShort,
+            ErrorCode::PasswordTooLong => Self::PasswordTooLong,
+            ErrorCode::PasswordTooCommon => Self::PasswordTooCommon,
+            ErrorCode::InvalidEmail => Self::InvalidEmail,
+            ErrorCode::ValidationError => Self::ValidationError("validation error".into()),
+            ErrorCode::InvalidToken => Self::InvalidToken,
+            ErrorCode::TokenExpired => Self::TokenExpired,
+            ErrorCode::SessionNotFound => Self::SessionNotFound,
+            ErrorCode::SessionExpired => Self::SessionExpired,
+            ErrorCode::SessionInvalid => Self::SessionInvalid,
+            ErrorCode::CsrfTokenMissing => Self::CsrfTokenMissing,
+            ErrorCode::CsrfTokenInvalid => Self::CsrfTokenInvalid,
+            ErrorCode::RateLimitExceeded => Self::RateLimitExceeded,
+        }
+    }
+
+    #[must_use]
+    pub fn internal() -> Self {
+        Self::Internal
     }
 }
 
@@ -274,12 +361,34 @@ impl IntoResponse for AppError {
             Self::TokenExpired => tracing::debug!("expired token presented"),
             // EmailAlreadyExists is internal-only — never reaches this handler in normal flow
             Self::EmailAlreadyExists => tracing::info!("signup attempt on existing account"),
+            // Phase 4 — session, CSRF, rate limit
+            Self::SessionNotFound | Self::SessionExpired | Self::SessionInvalid => {
+                tracing::debug!("session validation failure")
+            }
+            Self::CsrfTokenMissing | Self::CsrfTokenInvalid => {
+                tracing::debug!("csrf validation failure")
+            }
+            Self::RateLimitExceeded => tracing::warn!("rate limit exceeded"),
         }
 
         let status = self.status_code();
         let payload = ErrorResponse::from(&self);
+        let mut resp = (status, Json(payload)).into_response();
 
-        (status, Json(payload)).into_response()
+        // RFC 6750 §3.1: Bearer 401s must carry a WWW-Authenticate challenge.
+        if matches!(
+            self,
+            Self::SessionNotFound | Self::SessionExpired | Self::SessionInvalid
+        ) {
+            resp.headers_mut().insert(
+                axum::http::header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static(
+                    r#"Bearer realm="metal-auth", error="invalid_token""#,
+                ),
+            );
+        }
+
+        resp
     }
 }
 
@@ -491,6 +600,43 @@ mod tests {
                 ErrorCode::InvalidConfig,
                 "Invalid configuration",
             ),
+            // Phase 4 — session, CSRF, rate limit
+            (
+                AppError::SessionNotFound,
+                StatusCode::UNAUTHORIZED,
+                ErrorCode::SessionNotFound,
+                "Session is invalid or has expired",
+            ),
+            (
+                AppError::SessionExpired,
+                StatusCode::UNAUTHORIZED,
+                ErrorCode::SessionExpired,
+                "Session is invalid or has expired",
+            ),
+            (
+                AppError::SessionInvalid,
+                StatusCode::UNAUTHORIZED,
+                ErrorCode::SessionInvalid,
+                "Session is invalid or has expired",
+            ),
+            (
+                AppError::CsrfTokenMissing,
+                StatusCode::FORBIDDEN,
+                ErrorCode::CsrfTokenMissing,
+                "CSRF token is missing",
+            ),
+            (
+                AppError::CsrfTokenInvalid,
+                StatusCode::FORBIDDEN,
+                ErrorCode::CsrfTokenInvalid,
+                "CSRF token is invalid",
+            ),
+            (
+                AppError::RateLimitExceeded,
+                StatusCode::TOO_MANY_REQUESTS,
+                ErrorCode::RateLimitExceeded,
+                "Too many requests, please try again later",
+            ),
         ];
 
         for (err, expected_status, expected_code, expected_msg) in test_cases {
@@ -509,5 +655,141 @@ mod tests {
             assert_eq!(parsed.code, expected_code);
             assert_eq!(parsed.message, expected_msg);
         }
+    }
+
+    #[test]
+    fn test_phase4_error_codes_http_mapping() {
+        assert_eq!(
+            AppError::SessionNotFound.status_code(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            AppError::SessionExpired.status_code(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            AppError::SessionInvalid.status_code(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            AppError::CsrfTokenMissing.status_code(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            AppError::CsrfTokenInvalid.status_code(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            AppError::RateLimitExceeded.status_code(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[test]
+    fn test_app_error_from_code() {
+        assert!(matches!(
+            AppError::from_code(ErrorCode::SessionNotFound),
+            AppError::SessionNotFound
+        ));
+        assert!(matches!(
+            AppError::from_code(ErrorCode::SessionExpired),
+            AppError::SessionExpired
+        ));
+        assert!(matches!(
+            AppError::from_code(ErrorCode::SessionInvalid),
+            AppError::SessionInvalid
+        ));
+        assert!(matches!(
+            AppError::from_code(ErrorCode::CsrfTokenMissing),
+            AppError::CsrfTokenMissing
+        ));
+        assert!(matches!(
+            AppError::from_code(ErrorCode::CsrfTokenInvalid),
+            AppError::CsrfTokenInvalid
+        ));
+        assert!(matches!(
+            AppError::from_code(ErrorCode::RateLimitExceeded),
+            AppError::RateLimitExceeded
+        ));
+        assert!(matches!(
+            AppError::from_code(ErrorCode::InvalidCredentials),
+            AppError::InvalidCredentials
+        ));
+    }
+
+    #[test]
+    fn test_session_anti_enumeration_messages() {
+        let msg_not_found = AppError::SessionNotFound.response_message();
+        let msg_expired = AppError::SessionExpired.response_message();
+        let msg_invalid = AppError::SessionInvalid.response_message();
+
+        assert_eq!(msg_not_found, msg_expired);
+        assert_eq!(msg_expired, msg_invalid);
+        assert_eq!(msg_not_found, "Session is invalid or has expired");
+    }
+
+    #[test]
+    fn test_error_response_serialization() {
+        let err = ErrorResponse {
+            code: ErrorCode::SessionNotFound,
+            message: "Session is invalid or has expired".into(),
+        };
+        let json = serde_json::to_string(&err).expect("serialize ErrorResponse");
+        assert!(json.contains("\"code\":\"SESSION_NOT_FOUND\""));
+        assert!(json.contains("\"message\":\"Session is invalid or has expired\""));
+    }
+
+    #[test]
+    fn error_code_session_not_found_serializes_correctly() {
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::SessionNotFound).expect("serialize ErrorCode"),
+            "\"SESSION_NOT_FOUND\""
+        );
+    }
+
+    #[test]
+    fn error_code_csrf_token_missing_maps_to_403() {
+        use axum::response::IntoResponse;
+        let response = AppError::from_code(ErrorCode::CsrfTokenMissing).into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn error_code_rate_limit_exceeded_maps_to_429() {
+        use axum::response::IntoResponse;
+        let response = AppError::from_code(ErrorCode::RateLimitExceeded).into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn session_401_responses_include_www_authenticate_header() {
+        use axum::response::IntoResponse;
+        let session_errors = [
+            AppError::SessionNotFound,
+            AppError::SessionExpired,
+            AppError::SessionInvalid,
+        ];
+
+        for err in session_errors {
+            let resp = err.into_response();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            let auth_header = resp
+                .headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .expect("WWW-Authenticate header must be present on session 401");
+            assert_eq!(
+                auth_header.to_str().unwrap(),
+                r#"Bearer realm="metal-auth", error="invalid_token""#
+            );
+        }
+
+        let other_401 = AppError::InvalidCredentials.into_response();
+        assert_eq!(other_401.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            other_401
+                .headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .is_none()
+        );
     }
 }

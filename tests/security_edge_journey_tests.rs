@@ -42,7 +42,12 @@ async fn test_journey_duplicate_registration_anti_enumeration() {
     );
 
     // Initial email dispatch check
-    let verification_calls = app.email_sender.verification_calls();
+    let verification_calls: Vec<_> = app
+        .email_sender
+        .verification_calls()
+        .into_iter()
+        .filter(|c| c.to == email)
+        .collect();
     assert_eq!(
         verification_calls.len(),
         1,
@@ -92,7 +97,11 @@ async fn test_journey_duplicate_registration_anti_enumeration() {
 
     // Verification emails must not be sent again for duplicate registration
     assert_eq!(
-        app.email_sender.verification_calls().len(),
+        app.email_sender
+            .verification_calls()
+            .into_iter()
+            .filter(|c| c.to == email)
+            .count(),
         1,
         "duplicate registration must suppress email dispatch"
     );
@@ -297,7 +306,12 @@ async fn test_journey_concurrent_registration_race_condition() {
     );
 
     // Exactly 1 verification email must be dispatched despite concurrency
-    let verification_calls = app.email_sender.verification_calls();
+    let verification_calls: Vec<_> = app
+        .email_sender
+        .verification_calls()
+        .into_iter()
+        .filter(|c| c.to == target_email)
+        .collect();
     assert_eq!(
         verification_calls.len(),
         1,
@@ -355,7 +369,12 @@ async fn test_journey_case_insensitive_email_uniqueness() {
     );
 
     // Verify 1 verification email was sent to lower_email
-    let verification_calls = app.email_sender.verification_calls();
+    let verification_calls: Vec<_> = app
+        .email_sender
+        .verification_calls()
+        .into_iter()
+        .filter(|c| c.to == lower_email)
+        .collect();
     assert_eq!(verification_calls.len(), 1);
     assert_eq!(verification_calls[0].to, lower_email);
     let user_id = verification_calls[0].user_id;
@@ -396,7 +415,11 @@ async fn test_journey_case_insensitive_email_uniqueness() {
 
     // Verification emails must not have been sent again
     assert_eq!(
-        app.email_sender.verification_calls().len(),
+        app.email_sender
+            .verification_calls()
+            .into_iter()
+            .filter(|c| c.to == lower_email)
+            .count(),
         1,
         "duplicate registrations under casing variants must suppress email dispatch"
     );
@@ -446,7 +469,12 @@ async fn test_journey_case_insensitive_email_uniqueness() {
         .await;
     assert_eq!(reset_req.status(), StatusCode::OK);
 
-    let reset_calls = app.email_sender.reset_calls();
+    let reset_calls: Vec<_> = app
+        .email_sender
+        .reset_calls()
+        .into_iter()
+        .filter(|c| c.to == lower_email)
+        .collect();
     assert_eq!(reset_calls.len(), 1);
     assert_eq!(reset_calls[0].to, lower_email);
     assert_eq!(reset_calls[0].user_id, user_id);

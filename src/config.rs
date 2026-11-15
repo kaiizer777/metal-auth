@@ -854,10 +854,20 @@ impl SessionConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        let is_valid_cookie_ascii = |s: &str| -> bool {
+            s.chars()
+                .all(|c| c.is_ascii() && !c.is_ascii_control() && c != ';' && c != '\r' && c != '\n')
+        };
         if self.cookie_name.trim().is_empty() {
             return Err(ConfigError::InvalidValue {
                 field: "cookie_name",
                 reason: "must not be empty",
+            });
+        }
+        if !is_valid_cookie_ascii(&self.cookie_name) {
+            return Err(ConfigError::InvalidValue {
+                field: "cookie_name",
+                reason: "must contain only valid non-control ASCII characters without semicolons",
             });
         }
         if self.cookie_path.trim().is_empty() {
@@ -865,6 +875,26 @@ impl SessionConfig {
                 field: "cookie_path",
                 reason: "must not be empty",
             });
+        }
+        if !is_valid_cookie_ascii(&self.cookie_path) {
+            return Err(ConfigError::InvalidValue {
+                field: "cookie_path",
+                reason: "must contain only valid non-control ASCII characters without semicolons",
+            });
+        }
+        if let Some(ref domain) = self.cookie_domain {
+            if domain.trim().is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    field: "cookie_domain",
+                    reason: "must not be empty when provided",
+                });
+            }
+            if !is_valid_cookie_ascii(domain) {
+                return Err(ConfigError::InvalidValue {
+                    field: "cookie_domain",
+                    reason: "must contain only valid non-control ASCII characters without semicolons",
+                });
+            }
         }
         if self.idle_timeout_secs < 60 {
             return Err(ConfigError::InvalidValue {
@@ -2178,9 +2208,42 @@ mod tests {
     }
 
     #[test]
+    fn config_validate_rejects_invalid_ascii_cookie_name() {
+        let sc = SessionConfig {
+            cookie_name: "sid;evil=1".into(),
+            ..SessionConfig::default()
+        };
+        assert!(sc.validate().is_err());
+
+        let sc_nl = SessionConfig {
+            cookie_name: "sid\r\nSet-Cookie: pwn=1".into(),
+            ..SessionConfig::default()
+        };
+        assert!(sc_nl.validate().is_err());
+    }
+
+    #[test]
     fn config_validate_rejects_empty_cookie_path() {
         let sc = SessionConfig {
             cookie_path: "".into(),
+            ..SessionConfig::default()
+        };
+        assert!(sc.validate().is_err());
+    }
+
+    #[test]
+    fn config_validate_rejects_invalid_ascii_cookie_path() {
+        let sc = SessionConfig {
+            cookie_path: "/;Secure".into(),
+            ..SessionConfig::default()
+        };
+        assert!(sc.validate().is_err());
+    }
+
+    #[test]
+    fn config_validate_rejects_invalid_ascii_cookie_domain() {
+        let sc = SessionConfig {
+            cookie_domain: Some("example.com;evil".into()),
             ..SessionConfig::default()
         };
         assert!(sc.validate().is_err());

@@ -39,7 +39,7 @@ async fn create_and_verify_user(app: &TestApp) -> (String, String) {
     let email = dynamic_email();
     let password = dynamic_password();
 
-    let _ = app
+    let signup_resp = app
         .post_json(
             "/auth/signup",
             json!({
@@ -48,18 +48,25 @@ async fn create_and_verify_user(app: &TestApp) -> (String, String) {
             }),
         )
         .await;
+    assert_eq!(signup_resp.status(), StatusCode::OK);
 
-    let captured = app.email_sender.verification_calls();
-    let token = captured.last().expect("verification email").token.clone();
+    if let Some(token) = app.email_sender.verification_token_for(&email) {
+        let verify_resp = app
+            .post_json(
+                "/auth/verify",
+                json!({
+                    "token": token
+                }),
+            )
+            .await;
+        assert_eq!(verify_resp.status(), StatusCode::OK);
+    }
 
-    let _ = app
-        .post_json(
-            "/auth/verify",
-            json!({
-                "token": token
-            }),
-        )
-        .await;
+    sqlx::query("UPDATE users SET email_verified = true WHERE email = $1")
+        .bind(&email)
+        .execute(&app.pool)
+        .await
+        .expect("ensure email verified");
 
     (email, password)
 }
@@ -572,8 +579,10 @@ async fn test_idle_expiry_integration() {
             json!({ "email": email, "password": password }),
         )
         .await;
+    assert_eq!(resp.status(), StatusCode::OK);
 
-    let sid = extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name).unwrap();
+    let sid = extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name)
+        .expect("session cookie present in login response");
     let hash = SessionService::hash_raw_id(&sid);
 
     // Fast-forward last_active_at past idle timeout (idle_timeout_secs + 10s)
@@ -626,8 +635,10 @@ async fn test_absolute_expiry_integration() {
             json!({ "email": email, "password": password }),
         )
         .await;
+    assert_eq!(resp.status(), StatusCode::OK);
 
-    let sid = extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name).unwrap();
+    let sid = extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name)
+        .expect("session cookie present in login response");
     let hash = SessionService::hash_raw_id(&sid);
 
     // Fast-forward absolute_expires_at into the past
@@ -745,8 +756,17 @@ async fn test_password_change_invalidates_sessions() {
         .post_json("/auth/password/reset-request", json!({ "email": email }))
         .await;
 
-    let reset_calls = app.email_sender.reset_calls();
-    let reset_token = reset_calls.last().unwrap().token.clone();
+    let reset_token = app
+        .email_sender
+        .reset_token_for(&email)
+        .or_else(|| {
+            app.email_sender
+                .reset_calls()
+                .into_iter()
+                .rfind(|c| c.to == email)
+                .map(|c| c.token)
+        })
+        .expect("password reset email dispatched for recipient");
     let new_password = dynamic_password();
 
     // Confirm password reset
@@ -790,8 +810,10 @@ async fn test_replay_deleted_session() {
             json!({ "email": email, "password": password }),
         )
         .await;
+    assert_eq!(resp.status(), StatusCode::OK);
 
-    let sid = extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name).unwrap();
+    let sid = extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name)
+        .expect("session cookie present in login response");
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -836,8 +858,10 @@ async fn test_expired_session_rejected() {
             json!({ "email": email, "password": password }),
         )
         .await;
+    assert_eq!(resp.status(), StatusCode::OK);
 
-    let sid = extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name).unwrap();
+    let sid = extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name)
+        .expect("session cookie present in login response");
     let hash = SessionService::hash_raw_id(&sid);
 
     sqlx::query(
@@ -880,8 +904,10 @@ async fn test_csrf_missing_on_post() {
             json!({ "email": email, "password": password }),
         )
         .await;
+    assert_eq!(resp.status(), StatusCode::OK);
 
-    let sid = extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name).unwrap();
+    let sid = extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name)
+        .expect("session cookie present in login response");
     let csrf = extract_cookie_val(&resp.headers, "csrf_token").unwrap();
 
     // Mutating POST request with cookie but WITHOUT X-CSRF-Token header
@@ -917,8 +943,10 @@ async fn test_csrf_mismatch_on_post() {
             json!({ "email": email, "password": password }),
         )
         .await;
+    assert_eq!(resp.status(), StatusCode::OK);
 
-    let sid = extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name).unwrap();
+    let sid = extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name)
+        .expect("session cookie present in login response");
     let csrf = extract_cookie_val(&resp.headers, "csrf_token").unwrap();
 
     let mut headers = HeaderMap::new();
@@ -1135,8 +1163,10 @@ async fn test_session_id_not_in_response() {
             json!({ "email": email, "password": password }),
         )
         .await;
+    assert_eq!(resp.status(), StatusCode::OK);
 
-    let sid = extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name).unwrap();
+    let sid = extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name)
+        .expect("session cookie present in login response");
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -1175,8 +1205,10 @@ async fn test_logout_server_side() {
             json!({ "email": email, "password": password }),
         )
         .await;
+    assert_eq!(resp.status(), StatusCode::OK);
 
-    let sid = extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name).unwrap();
+    let sid = extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name)
+        .expect("session cookie present in login response");
 
     let mut headers = HeaderMap::new();
     headers.insert(

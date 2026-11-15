@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Service managing persistent session lifecycle, dual-timeout expiry, and revocation.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct SessionService {
     db: PgPool,
     config: Arc<Config>,

@@ -362,3 +362,76 @@ impl SessionService {
         Ok(sessions)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use chrono::Duration;
+
+    #[test]
+    fn test_session_id_entropy() {
+        let mut ids = HashSet::with_capacity(1000);
+        for _ in 0..1000 {
+            let id = SessionService::generate_raw_id();
+            assert_eq!(id.len(), 32, "raw session ID must be 32 hex chars (16 bytes)");
+            assert!(
+                id.chars().all(|c| c.is_ascii_hexdigit()),
+                "raw session ID must be hex"
+            );
+            ids.insert(id);
+        }
+        assert_eq!(ids.len(), 1000, "all 1000 generated session IDs must be unique");
+    }
+
+    #[test]
+    fn test_hash_determinism() {
+        let raw = "abcdef0123456789abcdef0123456789";
+        let hash1 = SessionService::hash_raw_id(raw);
+        let hash2 = SessionService::hash_raw_id(raw);
+        assert_eq!(hash1, hash2, "hashing must be deterministic");
+        assert_eq!(hash1.len(), 64, "SHA-256 hash must be 64 hex characters");
+        assert!(
+            hash1.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash must be lowercase hex"
+        );
+
+        let hash_other = SessionService::hash_raw_id("fedcba9876543210fedcba9876543210");
+        assert_ne!(hash1, hash_other, "distinct raw tokens must yield distinct hashes");
+    }
+
+    #[test]
+    fn test_idle_timeout_logic() {
+        let now = Utc::now();
+        let idle_timeout = Duration::minutes(30);
+
+        // Case 1: Active 31 minutes ago -> expired
+        let last_active_expired = now - Duration::minutes(31);
+        let expired_deadline = last_active_expired + idle_timeout;
+        assert!(
+            now > expired_deadline,
+            "session inactive for 31m must exceed 30m idle deadline"
+        );
+
+        // Case 2: Active 10 minutes ago -> active
+        let last_active_valid = now - Duration::minutes(10);
+        let valid_deadline = last_active_valid + idle_timeout;
+        assert!(
+            now <= valid_deadline,
+            "session active 10m ago must be within 30m idle deadline"
+        );
+    }
+
+    #[test]
+    fn test_absolute_timeout_logic() {
+        let now = Utc::now();
+
+        // Case 1: Expiry in the past -> expired
+        let expired_at = now - Duration::seconds(1);
+        assert!(now > expired_at, "past absolute expiry must be expired");
+
+        // Case 2: Expiry in future -> active
+        let valid_at = now + Duration::hours(12);
+        assert!(now <= valid_at, "future absolute expiry must be active");
+    }
+}

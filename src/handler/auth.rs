@@ -177,22 +177,22 @@ pub async fn login(
         .map(str::to_string);
 
     // Pre-credential rate limit check prevents account existence timing oracles
-    if let (Some(limiter), Some(cfg)) = (&state.rate_limiter, &state.config) {
-        if cfg.rate_limit.enabled {
-            let key = rate_limit_key(&client_ip, &req.email);
-            if !limiter.allow(&key, cfg.rate_limit.max_attempts, cfg.rate_limit.window()) {
-                tracing::warn!(
-                    event = "rate_limit_exceeded",
-                    ip = %client_ip,
-                    key_prefix = "login",
-                );
-                let mut resp = service_error_response(AppError::RateLimitExceeded);
-                let _ = resp.headers_mut().insert(
-                    header::RETRY_AFTER,
-                    cfg.rate_limit.window_secs.to_string().parse().unwrap(),
-                );
-                return resp;
-            }
+    if let (Some(limiter), Some(cfg)) = (&state.rate_limiter, &state.config)
+        && cfg.rate_limit.enabled
+    {
+        let key = rate_limit_key(&client_ip, &req.email);
+        if !limiter.allow(&key, cfg.rate_limit.max_attempts, cfg.rate_limit.window()) {
+            tracing::warn!(
+                event = "rate_limit_exceeded",
+                ip = %client_ip,
+                key_prefix = "login",
+            );
+            let mut resp = service_error_response(AppError::RateLimitExceeded);
+            let _ = resp.headers_mut().insert(
+                header::RETRY_AFTER,
+                cfg.rate_limit.window_secs.to_string().parse().unwrap(),
+            );
+            return resp;
         }
     }
 

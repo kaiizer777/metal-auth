@@ -34,6 +34,7 @@ pub fn create_router(state: AppState) -> Result<Router, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use crate::config::{AppConfig, Config};
     use axum::{
         body::Body,

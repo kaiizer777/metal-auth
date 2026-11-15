@@ -7,9 +7,11 @@ use crate::{error::AppError, state::AppState};
 
 pub mod auth;
 pub mod cors;
+pub mod session;
 
 pub use auth::routes as auth_routes;
 pub use cors::cors_layer;
+pub use session::routes as session_routes;
 
 async fn fallback_not_found() -> AppError {
     AppError::NotFound

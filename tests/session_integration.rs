@@ -1442,64 +1442,78 @@ async fn test_device_and_session_limits_eviction() {
 
     let (email, password) = create_and_verify_user(&app).await;
     let limit = app.state.config.session.max_active_sessions_per_user;
+    assert!(
+        limit > 0,
+        "max_active_sessions_per_user must be configured > 0 for eviction testing"
+    );
 
-    if limit > 0 {
-        let mut sids = Vec::new();
-        for _ in 0..limit {
-            let resp = app
-                .post_json(
-                    "/auth/login",
-                    json!({ "email": email, "password": password }),
-                )
-                .await;
-            let sid =
-                extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name).unwrap();
-            sids.push(sid);
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-
-        // Login one more time -> exceeds limit, evicts oldest (sids[0])
-        let resp_extra = app
+    let mut sids = Vec::new();
+    for _ in 0..limit {
+        let resp = app
             .post_json(
                 "/auth/login",
                 json!({ "email": email, "password": password }),
             )
             .await;
-        let sid_extra =
-            extract_cookie_val(&resp_extra.headers, &app.state.config.session.cookie_name).unwrap();
-
-        // Oldest session sids[0] must now return 401
-        let mut old_headers = HeaderMap::new();
-        old_headers.insert(
-            header::COOKIE,
-            format!("{}={}", app.state.config.session.cookie_name, sids[0])
-                .parse()
-                .unwrap(),
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "eviction loop setup login must succeed"
         );
-        let check_old = app
-            .dispatch(empty_request_with_headers(
-                Method::GET,
-                "/auth/session",
-                old_headers,
-            ))
-            .await;
-        assert_eq!(check_old.status(), StatusCode::UNAUTHORIZED);
-
-        // Extra session must be valid
-        let mut extra_headers = HeaderMap::new();
-        extra_headers.insert(
-            header::COOKIE,
-            format!("{}={}", app.state.config.session.cookie_name, sid_extra)
-                .parse()
-                .unwrap(),
-        );
-        let check_extra = app
-            .dispatch(empty_request_with_headers(
-                Method::GET,
-                "/auth/session",
-                extra_headers,
-            ))
-            .await;
-        assert_eq!(check_extra.status(), StatusCode::OK);
+        let sid =
+            extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name)
+                .expect("session cookie present in login response");
+        sids.push(sid);
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
+
+    // Login one more time -> exceeds limit, evicts oldest (sids[0])
+    let resp_extra = app
+        .post_json(
+            "/auth/login",
+            json!({ "email": email, "password": password }),
+        )
+        .await;
+    assert_eq!(
+        resp_extra.status(),
+        StatusCode::OK,
+        "overflow login must succeed and trigger eviction"
+    );
+    let sid_extra =
+        extract_cookie_val(&resp_extra.headers, &app.state.config.session.cookie_name)
+            .expect("session cookie present in overflow login response");
+
+    // Oldest session sids[0] must now return 401
+    let mut old_headers = HeaderMap::new();
+    old_headers.insert(
+        header::COOKIE,
+        format!("{}={}", app.state.config.session.cookie_name, sids[0])
+            .parse()
+            .unwrap(),
+    );
+    let check_old = app
+        .dispatch(empty_request_with_headers(
+            Method::GET,
+            "/auth/session",
+            old_headers,
+        ))
+        .await;
+    assert_eq!(check_old.status(), StatusCode::UNAUTHORIZED);
+
+    // Extra session must be valid
+    let mut extra_headers = HeaderMap::new();
+    extra_headers.insert(
+        header::COOKIE,
+        format!("{}={}", app.state.config.session.cookie_name, sid_extra)
+            .parse()
+            .unwrap(),
+    );
+    let check_extra = app
+        .dispatch(empty_request_with_headers(
+            Method::GET,
+            "/auth/session",
+            extra_headers,
+        ))
+        .await;
+    assert_eq!(check_extra.status(), StatusCode::OK);
 }

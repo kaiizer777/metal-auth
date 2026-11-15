@@ -176,27 +176,31 @@ pub async fn login(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
+    let normalized_email = req.email.trim().to_lowercase();
+
     // Pre-credential rate limit check prevents account existence timing oracles
-    if let (Some(limiter), Some(cfg)) = (&state.rate_limiter, &state.config)
-        && cfg.rate_limit.enabled
-    {
-        let key = rate_limit_key(&client_ip, &req.email);
-        if !limiter.allow(&key, cfg.rate_limit.max_attempts, cfg.rate_limit.window()) {
+    if let Some(limiter) = &state.rate_limiter {
+        let key = rate_limit_key(&client_ip, &normalized_email);
+        if let Err(e) = limiter.check_rate_limit(&key) {
             tracing::warn!(
                 event = "rate_limit_exceeded",
                 ip = %client_ip,
                 key_prefix = "login",
             );
-            let mut resp = service_error_response(AppError::RateLimitExceeded);
-            let _ = resp.headers_mut().insert(
-                header::RETRY_AFTER,
-                cfg.rate_limit.window_secs.to_string().parse().unwrap(),
-            );
+            let mut resp = service_error_response(e);
+            let cooldown = state
+                .config
+                .as_ref()
+                .map(|c| c.rate_limit.login_cooldown_secs)
+                .unwrap_or(900);
+            if let Ok(val) = header::HeaderValue::from_str(&cooldown.to_string()) {
+                resp.headers_mut().insert(header::RETRY_AFTER, val);
+            }
             return resp;
         }
     }
 
-    let user_id = match state.service.login(&req.email, &req.password).await {
+    let user_id = match state.service.login(&normalized_email, &req.password).await {
         Ok(uid) => uid,
         Err(e) => {
             tracing::warn!(
@@ -211,7 +215,7 @@ pub async fn login(
 
     // Reset rate limit attempts upon successful authentication
     if let Some(limiter) = &state.rate_limiter {
-        let key = rate_limit_key(&client_ip, &req.email);
+        let key = rate_limit_key(&client_ip, &normalized_email);
         limiter.reset(&key);
     }
 
@@ -542,5 +546,44 @@ mod tests {
         let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(err.code, ErrorCode::MethodNotAllowed);
         assert_eq!(err.message, "Method not allowed");
+    }
+
+    #[tokio::test]
+    async fn login_handler_rate_limits_and_normalizes_email() {
+        let mut state = create_test_state();
+        let limiter = Arc::new(RateLimiter::with_config(crate::config::RateLimitConfig {
+            enabled: true,
+            max_attempts: 2,
+            window_secs: 60,
+            login_cooldown_secs: 300,
+        }));
+        state.rate_limiter = Some(limiter);
+
+        // First attempt with " User@Example.COM "
+        let payload1 = LoginRequest {
+            email: " User@Example.COM ".to_string(),
+            password: "wrong-password".to_string(),
+        };
+        let _ = login(State(state.clone()), HeaderMap::new(), Ok(Json(payload1))).await;
+
+        // Second attempt with "user@example.com"
+        let payload2 = LoginRequest {
+            email: "user@example.com".to_string(),
+            password: "wrong-password".to_string(),
+        };
+        let _ = login(State(state.clone()), HeaderMap::new(), Ok(Json(payload2))).await;
+
+        // Third attempt exceeds max_attempts (2) and activates cooldown
+        let payload3 = LoginRequest {
+            email: "USER@EXAMPLE.COM".to_string(),
+            password: "wrong-password".to_string(),
+        };
+        let resp = login(State(state), HeaderMap::new(), Ok(Json(payload3))).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().contains_key(header::RETRY_AFTER));
+
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err.code, ErrorCode::RateLimitExceeded);
     }
 }

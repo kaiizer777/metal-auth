@@ -1,17 +1,13 @@
 //! Stateful session service and PostgreSQL lifecycle management.
 
-use std::sync::Arc;
 use chrono::Utc;
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::{
-    config::Config,
-    db::models::Session,
-    error::AppError,
-};
+use crate::{config::Config, db::models::Session, error::AppError};
 
 /// Service managing persistent session lifecycle, dual-timeout expiry, and revocation.
 #[derive(Clone, Debug)]
@@ -193,10 +189,7 @@ impl SessionService {
 
         // Defence-in-depth: check absolute timeout first.
         if now > session.absolute_expires_at {
-            tracing::info!(
-                event = "session_expired",
-                reason = "absolute",
-            );
+            tracing::info!(event = "session_expired", reason = "absolute",);
             let _ = self.invalidate_by_hash(&token_hash).await;
             return Err(AppError::SessionExpired);
         }
@@ -206,10 +199,7 @@ impl SessionService {
             + chrono::Duration::from_std(self.config.session.idle_timeout())
                 .map_err(|_| AppError::Internal)?;
         if now > idle_deadline {
-            tracing::info!(
-                event = "session_expired",
-                reason = "idle",
-            );
+            tracing::info!(event = "session_expired", reason = "idle",);
             let _ = self.invalidate_by_hash(&token_hash).await;
             return Err(AppError::SessionExpired);
         }
@@ -259,10 +249,7 @@ impl SessionService {
 
         // Defence-in-depth: check absolute timeout first.
         if now > session.absolute_expires_at {
-            tracing::info!(
-                event = "session_expired",
-                reason = "absolute",
-            );
+            tracing::info!(event = "session_expired", reason = "absolute",);
             let _ = self.invalidate_by_hash(token_hash).await;
             return Err(AppError::SessionExpired);
         }
@@ -272,10 +259,7 @@ impl SessionService {
             + chrono::Duration::from_std(self.config.session.idle_timeout())
                 .map_err(|_| AppError::Internal)?;
         if now > idle_deadline {
-            tracing::info!(
-                event = "session_expired",
-                reason = "idle",
-            );
+            tracing::info!(event = "session_expired", reason = "idle",);
             let _ = self.invalidate_by_hash(token_hash).await;
             return Err(AppError::SessionExpired);
         }
@@ -394,22 +378,30 @@ impl SessionService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
     use chrono::Duration;
+    use std::collections::HashSet;
 
     #[test]
     fn test_session_id_entropy() {
         let mut ids = HashSet::with_capacity(1000);
         for _ in 0..1000 {
             let id = SessionService::generate_raw_id();
-            assert_eq!(id.len(), 32, "raw session ID must be 32 hex chars (16 bytes)");
+            assert_eq!(
+                id.len(),
+                32,
+                "raw session ID must be 32 hex chars (16 bytes)"
+            );
             assert!(
                 id.chars().all(|c| c.is_ascii_hexdigit()),
                 "raw session ID must be hex"
             );
             ids.insert(id);
         }
-        assert_eq!(ids.len(), 1000, "all 1000 generated session IDs must be unique");
+        assert_eq!(
+            ids.len(),
+            1000,
+            "all 1000 generated session IDs must be unique"
+        );
     }
 
     #[test]
@@ -425,7 +417,10 @@ mod tests {
         );
 
         let hash_other = SessionService::hash_raw_id("fedcba9876543210fedcba9876543210");
-        assert_ne!(hash1, hash_other, "distinct raw tokens must yield distinct hashes");
+        assert_ne!(
+            hash1, hash_other,
+            "distinct raw tokens must yield distinct hashes"
+        );
     }
 
     #[test]

@@ -1,10 +1,10 @@
 //! In-process sliding-window rate limiter using DashMap.
 
+use dashmap::DashMap;
 use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use dashmap::DashMap;
 use tokio::time::sleep;
 
 use crate::{
@@ -45,10 +45,13 @@ impl RateLimiter {
     /// Check if an action under `key` is allowed given explicit `max` attempts within `window`.
     pub fn allow(&self, key: &str, max: u32, window: Duration) -> bool {
         let now = Instant::now();
-        let mut entry = self.windows.entry(key.to_string()).or_insert_with(|| WindowEntry {
-            attempts: Vec::new(),
-            locked_until: None,
-        });
+        let mut entry = self
+            .windows
+            .entry(key.to_string())
+            .or_insert_with(|| WindowEntry {
+                attempts: Vec::new(),
+                locked_until: None,
+            });
 
         if let Some(locked_until) = entry.locked_until {
             if now < locked_until {
@@ -75,10 +78,13 @@ impl RateLimiter {
         }
 
         let now = Instant::now();
-        let mut entry = self.windows.entry(key.to_string()).or_insert_with(|| WindowEntry {
-            attempts: Vec::new(),
-            locked_until: None,
-        });
+        let mut entry = self
+            .windows
+            .entry(key.to_string())
+            .or_insert_with(|| WindowEntry {
+                attempts: Vec::new(),
+                locked_until: None,
+            });
 
         if let Some(locked_until) = entry.locked_until {
             if now < locked_until {

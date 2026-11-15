@@ -1,7 +1,7 @@
 //! Session and CSRF cookie builders and parsers.
 
-use axum::http::{HeaderMap, HeaderValue};
 use crate::config::{Config, SessionConfig};
+use axum::http::{HeaderMap, HeaderValue};
 
 /// Trait abstracting access to session cookie configuration.
 ///
@@ -254,7 +254,11 @@ mod tests {
         assert!(s.contains("SameSite=Lax"));
         assert!(s.contains("Path=/"));
         assert!(s.contains(&format!("Max-Age={}", cfg.session.idle_timeout_secs)));
-        assert_eq!(s.matches("HttpOnly").count(), 1, "HttpOnly must occur exactly once");
+        assert_eq!(
+            s.matches("HttpOnly").count(),
+            1,
+            "HttpOnly must occur exactly once"
+        );
 
         // Test with SessionConfig directly and inverted argument order
         let sc = SessionConfig::default();
@@ -315,8 +319,14 @@ mod tests {
             HeaderValue::from_static("theme=dark; sid=abc123xyz; lang=en"),
         );
 
-        assert_eq!(read_session_cookie(&headers, "sid"), Some("abc123xyz".to_string()));
-        assert_eq!(read_session_cookie(&headers, "theme"), Some("dark".to_string()));
+        assert_eq!(
+            read_session_cookie(&headers, "sid"),
+            Some("abc123xyz".to_string())
+        );
+        assert_eq!(
+            read_session_cookie(&headers, "theme"),
+            Some("dark".to_string())
+        );
         assert_eq!(read_session_cookie(&headers, "nonexistent"), None);
     }
 

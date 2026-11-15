@@ -2683,10 +2683,8 @@ async fn test_rotate_session_rejects_expired_session() {
     let Some(ctx) = setup_live_db().await else {
         return;
     };
-    let session_service = metal_auth::SessionService::new(
-        ctx.pool.clone(),
-        Arc::new(ctx.state.config.clone()),
-    );
+    let session_service =
+        metal_auth::SessionService::new(ctx.pool.clone(), Arc::new(ctx.state.config.clone()));
 
     let user_id = Uuid::new_v4();
     let (session, raw_token) = session_service
@@ -2718,7 +2716,10 @@ async fn test_rotate_session_rejects_expired_session() {
         .fetch_one(&ctx.pool)
         .await
         .expect("count sessions");
-    assert_eq!(count, 0, "expired session must be eagerly deleted from database");
+    assert_eq!(
+        count, 0,
+        "expired session must be eagerly deleted from database"
+    );
 
     // Case 2: Create a second session and expire idle timeout
     let (session2, raw_token2) = session_service
@@ -2748,7 +2749,10 @@ async fn test_rotate_session_rejects_expired_session() {
         .fetch_one(&ctx.pool)
         .await
         .expect("count sessions");
-    assert_eq!(count2, 0, "idle-expired session must be eagerly deleted from database");
+    assert_eq!(
+        count2, 0,
+        "idle-expired session must be eagerly deleted from database"
+    );
 }
 
 #[tokio::test]
@@ -2756,10 +2760,8 @@ async fn test_touch_session_rejects_expired_session() {
     let Some(ctx) = setup_live_db().await else {
         return;
     };
-    let session_service = metal_auth::SessionService::new(
-        ctx.pool.clone(),
-        Arc::new(ctx.state.config.clone()),
-    );
+    let session_service =
+        metal_auth::SessionService::new(ctx.pool.clone(), Arc::new(ctx.state.config.clone()));
 
     let user_id = Uuid::new_v4();
     let (session, _) = session_service
@@ -2791,10 +2793,8 @@ async fn test_rotate_session_success_lifecycle() {
     let Some(ctx) = setup_live_db().await else {
         return;
     };
-    let session_service = metal_auth::SessionService::new(
-        ctx.pool.clone(),
-        Arc::new(ctx.state.config.clone()),
-    );
+    let session_service =
+        metal_auth::SessionService::new(ctx.pool.clone(), Arc::new(ctx.state.config.clone()));
 
     let user_id = Uuid::new_v4();
     let (session1, raw_token1) = session_service
@@ -2832,17 +2832,25 @@ async fn test_invalidate_all_user_sessions_spec_contract() {
     let Some(ctx) = setup_live_db().await else {
         return;
     };
-    let session_service = metal_auth::SessionService::new(
-        ctx.pool.clone(),
-        Arc::new(ctx.state.config.clone()),
-    );
+    let session_service =
+        metal_auth::SessionService::new(ctx.pool.clone(), Arc::new(ctx.state.config.clone()));
 
     let user_id = Uuid::new_v4();
-    let (_, raw1) = session_service.create_session(user_id, "cookie", None, None).await.unwrap();
-    let (_, raw2) = session_service.create_session(user_id, "bearer", None, None).await.unwrap();
+    let (_, raw1) = session_service
+        .create_session(user_id, "cookie", None, None)
+        .await
+        .unwrap();
+    let (_, raw2) = session_service
+        .create_session(user_id, "bearer", None, None)
+        .await
+        .unwrap();
 
-    let res: Result<(), metal_auth::AppError> = session_service.invalidate_all_user_sessions(user_id).await;
-    assert!(res.is_ok(), "invalidate_all_user_sessions returns Result<(), AppError>");
+    let res: Result<(), metal_auth::AppError> =
+        session_service.invalidate_all_user_sessions(user_id).await;
+    assert!(
+        res.is_ok(),
+        "invalidate_all_user_sessions returns Result<(), AppError>"
+    );
 
     assert!(session_service.get_session(&raw1).await.is_err());
     assert!(session_service.get_session(&raw2).await.is_err());

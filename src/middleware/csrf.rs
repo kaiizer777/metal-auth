@@ -90,10 +90,10 @@ pub async fn maybe_attach_csrf_cookie(
 mod tests {
     use super::*;
     use axum::{
+        Router,
         body::to_bytes,
         middleware::from_fn_with_state,
         routing::{get, post},
-        Router,
     };
     use sqlx::postgres::PgPoolOptions;
     use tower::ServiceExt;

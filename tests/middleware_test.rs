@@ -3,20 +3,20 @@
 use std::time::Duration;
 
 use axum::{
-    body::{to_bytes, Body},
+    Router,
+    body::{Body, to_bytes},
     extract::FromRequestParts,
-    http::{header, Method, Request, StatusCode},
+    http::{Method, Request, StatusCode, header},
     middleware::from_fn_with_state,
     routing::{get, post},
-    Router,
 };
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::{PgPool, postgres::PgPoolOptions};
 use tower::ServiceExt;
 use uuid::Uuid;
 
 use metal_auth::{
-    csrf_middleware, rate_limit_key, require_auth, AppState, AuthUser, Config,
-    ErrorCode, ErrorResponse, RateLimitConfig, RateLimiter, SessionConfig,
+    AppState, AuthUser, Config, ErrorCode, ErrorResponse, RateLimitConfig, RateLimiter,
+    SessionConfig, csrf_middleware, rate_limit_key, require_auth,
 };
 
 fn dummy_app_state() -> AppState {
@@ -313,7 +313,8 @@ async fn test_auth_user_extractor_unit_validation() {
     let user_id = Uuid::new_v4();
     let user = AuthUser {
         user_id,
-        session_hash: "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234".to_string(),
+        session_hash: "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234"
+            .to_string(),
         session_type: "bearer".to_string(),
     };
 

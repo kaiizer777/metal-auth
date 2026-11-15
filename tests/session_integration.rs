@@ -3,7 +3,7 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::http::{header, HeaderMap, Method, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use common::*;
 use metal_auth::{ErrorCode, SessionService};
 use serde_json::json;
@@ -82,8 +82,9 @@ async fn test_login_response_sets_session_cookie_with_httponly() {
         .await;
 
     assert_eq!(resp.status(), StatusCode::OK);
-    let cookie_header = extract_cookie_header_string(&resp.headers, &app.state.config.session.cookie_name)
-        .expect("session cookie in Set-Cookie header");
+    let cookie_header =
+        extract_cookie_header_string(&resp.headers, &app.state.config.session.cookie_name)
+            .expect("session cookie in Set-Cookie header");
 
     assert!(cookie_header.contains("HttpOnly"));
     assert!(cookie_header.contains("SameSite=Lax"));
@@ -138,7 +139,9 @@ async fn test_login_bearer_response_returns_token_in_json() {
     let resp = app.dispatch(req).await;
 
     assert_eq!(resp.status(), StatusCode::OK);
-    let token = resp.json["token"].as_str().expect("bearer token string in json");
+    let token = resp.json["token"]
+        .as_str()
+        .expect("bearer token string in json");
     assert_eq!(token.len(), 32, "raw session ID must be 32-character hex");
     assert!(resp.json["user_id"].is_string());
 }
@@ -181,7 +184,8 @@ async fn test_logout_clears_session_cookie() {
         )
         .await;
 
-    let sid = extract_cookie_val(&login_resp.headers, &app.state.config.session.cookie_name).unwrap();
+    let sid =
+        extract_cookie_val(&login_resp.headers, &app.state.config.session.cookie_name).unwrap();
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -195,8 +199,9 @@ async fn test_logout_clears_session_cookie() {
     let resp = app.dispatch(req).await;
 
     assert_eq!(resp.status(), StatusCode::OK);
-    let clear_header = extract_cookie_header_string(&resp.headers, &app.state.config.session.cookie_name)
-        .expect("clearing Set-Cookie header");
+    let clear_header =
+        extract_cookie_header_string(&resp.headers, &app.state.config.session.cookie_name)
+            .expect("clearing Set-Cookie header");
     assert!(clear_header.contains("Max-Age=0"));
     assert!(clear_header.contains("Expires=Thu, 01 Jan 1970"));
 }
@@ -216,7 +221,8 @@ async fn test_get_session_response_session_id_is_64_chars() {
         )
         .await;
 
-    let sid = extract_cookie_val(&login_resp.headers, &app.state.config.session.cookie_name).unwrap();
+    let sid =
+        extract_cookie_val(&login_resp.headers, &app.state.config.session.cookie_name).unwrap();
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -231,8 +237,15 @@ async fn test_get_session_response_session_id_is_64_chars() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let session_id = resp.json["session_id"].as_str().expect("session_id string");
-    assert_eq!(session_id.len(), 64, "session_id in json response must be 64-character SHA-256 hash");
-    assert_ne!(session_id, sid, "raw session ID must never be exposed as session_id");
+    assert_eq!(
+        session_id.len(),
+        64,
+        "session_id in json response must be 64-character SHA-256 hash"
+    );
+    assert_ne!(
+        session_id, sid,
+        "raw session ID must never be exposed as session_id"
+    );
 }
 
 #[tokio::test]
@@ -250,7 +263,8 @@ async fn test_get_session_response_does_not_contain_csrf_token() {
         )
         .await;
 
-    let sid = extract_cookie_val(&login_resp.headers, &app.state.config.session.cookie_name).unwrap();
+    let sid =
+        extract_cookie_val(&login_resp.headers, &app.state.config.session.cookie_name).unwrap();
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -283,7 +297,8 @@ async fn test_list_sessions_returns_array() {
         )
         .await;
 
-    let sid = extract_cookie_val(&login_resp.headers, &app.state.config.session.cookie_name).unwrap();
+    let sid =
+        extract_cookie_val(&login_resp.headers, &app.state.config.session.cookie_name).unwrap();
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -316,7 +331,8 @@ async fn test_delete_all_sessions_clears_cookie() {
         )
         .await;
 
-    let sid = extract_cookie_val(&login_resp.headers, &app.state.config.session.cookie_name).unwrap();
+    let sid =
+        extract_cookie_val(&login_resp.headers, &app.state.config.session.cookie_name).unwrap();
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -330,8 +346,9 @@ async fn test_delete_all_sessions_clears_cookie() {
     let resp = app.dispatch(req).await;
 
     assert_eq!(resp.status(), StatusCode::OK);
-    let clear_header = extract_cookie_header_string(&resp.headers, &app.state.config.session.cookie_name)
-        .expect("clear cookie header");
+    let clear_header =
+        extract_cookie_header_string(&resp.headers, &app.state.config.session.cookie_name)
+            .expect("clear cookie header");
     assert!(clear_header.contains("Max-Age=0"));
 }
 
@@ -362,7 +379,10 @@ async fn test_login_rate_limited_after_max_attempts() {
         .await;
 
     assert_eq!(blocked_resp.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(blocked_resp.error_code(), Some(ErrorCode::RateLimitExceeded));
+    assert_eq!(
+        blocked_resp.error_code(),
+        Some(ErrorCode::RateLimitExceeded)
+    );
     assert!(blocked_resp.headers.contains_key(header::RETRY_AFTER));
 }
 
@@ -385,7 +405,8 @@ async fn test_login_cookie_session_lifecycle() {
         )
         .await;
     assert_eq!(login_resp.status(), StatusCode::OK);
-    let sid = extract_cookie_val(&login_resp.headers, &app.state.config.session.cookie_name).unwrap();
+    let sid =
+        extract_cookie_val(&login_resp.headers, &app.state.config.session.cookie_name).unwrap();
 
     // 2. GET /auth/session
     let mut get_headers = HeaderMap::new();
@@ -512,7 +533,10 @@ async fn test_session_fixation() {
         .await;
     let sid2 = extract_cookie_val(&resp2.headers, &app.state.config.session.cookie_name).unwrap();
 
-    assert_ne!(sid1, sid2, "subsequent logins must issue distinct session tokens");
+    assert_ne!(
+        sid1, sid2,
+        "subsequent logins must issue distinct session tokens"
+    );
 
     // Rotate session sid1
     let (new_session, sid3) = app
@@ -688,11 +712,7 @@ async fn test_invalidate_all_sessions() {
                 .unwrap(),
         );
         let check_resp = app
-            .dispatch(empty_request_with_headers(
-                Method::GET,
-                "/auth/session",
-                h,
-            ))
+            .dispatch(empty_request_with_headers(Method::GET, "/auth/session", h))
             .await;
         assert_eq!(check_resp.status(), StatusCode::UNAUTHORIZED);
     }
@@ -722,10 +742,7 @@ async fn test_password_change_invalidates_sessions() {
 
     // Request password reset
     let _ = app
-        .post_json(
-            "/auth/password/reset-request",
-            json!({ "email": email }),
-        )
+        .post_json("/auth/password/reset-request", json!({ "email": email }))
         .await;
 
     let reset_calls = app.email_sender.reset_calls();
@@ -751,11 +768,7 @@ async fn test_password_change_invalidates_sessions() {
                 .unwrap(),
         );
         let check_resp = app
-            .dispatch(empty_request_with_headers(
-                Method::GET,
-                "/auth/session",
-                h,
-            ))
+            .dispatch(empty_request_with_headers(Method::GET, "/auth/session", h))
             .await;
         assert_eq!(check_resp.status(), StatusCode::UNAUTHORIZED);
     }
@@ -827,11 +840,13 @@ async fn test_expired_session_rejected() {
     let sid = extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name).unwrap();
     let hash = SessionService::hash_raw_id(&sid);
 
-    sqlx::query("UPDATE sessions SET absolute_expires_at = NOW() - INTERVAL '1 hour' WHERE token_hash = $1")
-        .bind(&hash)
-        .execute(&app.pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE sessions SET absolute_expires_at = NOW() - INTERVAL '1 hour' WHERE token_hash = $1",
+    )
+    .bind(&hash)
+    .execute(&app.pool)
+    .await
+    .unwrap();
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -1092,9 +1107,18 @@ async fn test_session_hash_not_logged() {
     let logs = String::from_utf8(log_buf.0.lock().unwrap().clone()).unwrap();
     let hash = SessionService::hash_raw_id(&sid);
 
-    assert!(!logs.contains(&sid), "raw session token must never appear in logs");
-    assert!(!logs.contains(&hash), "token hash must never appear in logs");
-    assert!(!logs.contains(&csrf), "csrf token value must never appear in logs");
+    assert!(
+        !logs.contains(&sid),
+        "raw session token must never appear in logs"
+    );
+    assert!(
+        !logs.contains(&hash),
+        "token hash must never appear in logs"
+    );
+    assert!(
+        !logs.contains(&csrf),
+        "csrf token value must never appear in logs"
+    );
 }
 
 #[tokio::test]
@@ -1131,7 +1155,10 @@ async fn test_session_id_not_in_response() {
         .await;
 
     assert_eq!(get_resp.status(), StatusCode::OK);
-    assert!(!get_resp.body_str.contains(&sid), "raw session token must never be present in response body");
+    assert!(
+        !get_resp.body_str.contains(&sid),
+        "raw session token must never be present in response body"
+    );
 }
 
 #[tokio::test]
@@ -1195,8 +1222,9 @@ async fn test_cookie_httponly_flag() {
         )
         .await;
 
-    let cookie_header = extract_cookie_header_string(&resp.headers, &app.state.config.session.cookie_name)
-        .expect("cookie header exists");
+    let cookie_header =
+        extract_cookie_header_string(&resp.headers, &app.state.config.session.cookie_name)
+            .expect("cookie header exists");
     assert!(cookie_header.contains("HttpOnly"));
 }
 
@@ -1242,7 +1270,10 @@ async fn test_session_refresh_rotates_token() {
 
     let sid2 = extract_cookie_val(&refresh_resp.headers, &app.state.config.session.cookie_name)
         .expect("fresh session cookie");
-    assert_ne!(sid1, sid2, "refreshed session token must differ from old token");
+    assert_ne!(
+        sid1, sid2,
+        "refreshed session token must differ from old token"
+    );
 
     // Old token sid1 must now return 401
     let old_resp = app
@@ -1291,7 +1322,8 @@ async fn test_device_and_session_limits_eviction() {
                     json!({ "email": email, "password": password }),
                 )
                 .await;
-            let sid = extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name).unwrap();
+            let sid =
+                extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name).unwrap();
             sids.push(sid);
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1303,7 +1335,8 @@ async fn test_device_and_session_limits_eviction() {
                 json!({ "email": email, "password": password }),
             )
             .await;
-        let sid_extra = extract_cookie_val(&resp_extra.headers, &app.state.config.session.cookie_name).unwrap();
+        let sid_extra =
+            extract_cookie_val(&resp_extra.headers, &app.state.config.session.cookie_name).unwrap();
 
         // Oldest session sids[0] must now return 401
         let mut old_headers = HeaderMap::new();

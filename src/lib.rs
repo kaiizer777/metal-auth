@@ -47,11 +47,11 @@ pub use email::{
 };
 pub use error::{AppError, AppResult, ConfigError, ErrorCode, ErrorResponse};
 pub use handler::{auth_routes, session_routes};
-pub use middleware::{csrf_middleware, require_auth, AuthUser};
-pub use ratelimit::{rate_limit_key, RateLimiter};
+pub use middleware::{AuthUser, csrf_middleware, require_auth};
+pub use ratelimit::{RateLimiter, rate_limit_key};
 pub use session::{
-    clear_session_cookie, has_bearer_token, read_bearer_token, read_session_cookie,
-    set_csrf_cookie, set_session_cookie, SessionCookieSource, SessionService,
+    SessionCookieSource, SessionService, clear_session_cookie, has_bearer_token, read_bearer_token,
+    read_session_cookie, set_csrf_cookie, set_session_cookie,
 };
 pub use state::AppState;
 

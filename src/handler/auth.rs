@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{rejection::JsonRejection, State},
-    http::{header, HeaderMap, StatusCode},
+    extract::{State, rejection::JsonRejection},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 
@@ -21,11 +21,11 @@ use crate::{
     auth::service::AuthServiceImpl,
     config::Config,
     error::{AppError, ErrorCode, ErrorResponse},
-    ratelimit::{rate_limit_key, RateLimiter},
+    ratelimit::{RateLimiter, rate_limit_key},
     session::{
+        SessionService,
         bearer::read_bearer_token,
         cookie::{clear_session_cookie, read_session_cookie, set_csrf_cookie, set_session_cookie},
-        SessionService,
     },
     state::AppState,
 };
@@ -225,7 +225,12 @@ pub async fn login(
 
     if let Some(session_svc) = &state.session_service {
         let (session, raw_id) = match session_svc
-            .create_session(user_id, session_type, Some(&client_ip), user_agent.as_deref())
+            .create_session(
+                user_id,
+                session_type,
+                Some(&client_ip),
+                user_agent.as_deref(),
+            )
             .await
         {
             Ok(s) => s,
@@ -270,18 +275,15 @@ pub async fn login(
 /// POST /auth/logout
 ///
 /// Revokes session on server side and clears the session cookie.
-pub async fn logout(
-    State(state): State<AuthHandlerState>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn logout(State(state): State<AuthHandlerState>, headers: HeaderMap) -> Response {
     let cookie_name = state
         .config
         .as_ref()
         .map(|c| c.session.cookie_name.as_str())
         .unwrap_or("sid");
 
-    let raw_id_opt = read_session_cookie(&headers, cookie_name)
-        .or_else(|| read_bearer_token(&headers));
+    let raw_id_opt =
+        read_session_cookie(&headers, cookie_name).or_else(|| read_bearer_token(&headers));
 
     if let Some(ref raw_id) = raw_id_opt {
         if let Some(ref session_svc) = state.session_service {
@@ -294,10 +296,9 @@ pub async fn logout(
 
     let mut response = StatusCode::NO_CONTENT.into_response();
     if let Some(ref cfg) = state.config {
-        response.headers_mut().insert(
-            header::SET_COOKIE,
-            clear_session_cookie(cfg.as_ref()),
-        );
+        response
+            .headers_mut()
+            .insert(header::SET_COOKIE, clear_session_cookie(cfg.as_ref()));
     }
     response
 }

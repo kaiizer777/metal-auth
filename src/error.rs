@@ -645,23 +645,62 @@ mod tests {
 
     #[test]
     fn test_phase4_error_codes_http_mapping() {
-        assert_eq!(AppError::SessionNotFound.status_code(), StatusCode::UNAUTHORIZED);
-        assert_eq!(AppError::SessionExpired.status_code(), StatusCode::UNAUTHORIZED);
-        assert_eq!(AppError::SessionInvalid.status_code(), StatusCode::UNAUTHORIZED);
-        assert_eq!(AppError::CsrfTokenMissing.status_code(), StatusCode::FORBIDDEN);
-        assert_eq!(AppError::CsrfTokenInvalid.status_code(), StatusCode::FORBIDDEN);
-        assert_eq!(AppError::RateLimitExceeded.status_code(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            AppError::SessionNotFound.status_code(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            AppError::SessionExpired.status_code(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            AppError::SessionInvalid.status_code(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            AppError::CsrfTokenMissing.status_code(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            AppError::CsrfTokenInvalid.status_code(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            AppError::RateLimitExceeded.status_code(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
     }
 
     #[test]
     fn test_app_error_from_code() {
-        assert!(matches!(AppError::from_code(ErrorCode::SessionNotFound), AppError::SessionNotFound));
-        assert!(matches!(AppError::from_code(ErrorCode::SessionExpired), AppError::SessionExpired));
-        assert!(matches!(AppError::from_code(ErrorCode::SessionInvalid), AppError::SessionInvalid));
-        assert!(matches!(AppError::from_code(ErrorCode::CsrfTokenMissing), AppError::CsrfTokenMissing));
-        assert!(matches!(AppError::from_code(ErrorCode::CsrfTokenInvalid), AppError::CsrfTokenInvalid));
-        assert!(matches!(AppError::from_code(ErrorCode::RateLimitExceeded), AppError::RateLimitExceeded));
-        assert!(matches!(AppError::from_code(ErrorCode::InvalidCredentials), AppError::InvalidCredentials));
+        assert!(matches!(
+            AppError::from_code(ErrorCode::SessionNotFound),
+            AppError::SessionNotFound
+        ));
+        assert!(matches!(
+            AppError::from_code(ErrorCode::SessionExpired),
+            AppError::SessionExpired
+        ));
+        assert!(matches!(
+            AppError::from_code(ErrorCode::SessionInvalid),
+            AppError::SessionInvalid
+        ));
+        assert!(matches!(
+            AppError::from_code(ErrorCode::CsrfTokenMissing),
+            AppError::CsrfTokenMissing
+        ));
+        assert!(matches!(
+            AppError::from_code(ErrorCode::CsrfTokenInvalid),
+            AppError::CsrfTokenInvalid
+        ));
+        assert!(matches!(
+            AppError::from_code(ErrorCode::RateLimitExceeded),
+            AppError::RateLimitExceeded
+        ));
+        assert!(matches!(
+            AppError::from_code(ErrorCode::InvalidCredentials),
+            AppError::InvalidCredentials
+        ));
     }
 
     #[test]

@@ -413,34 +413,43 @@ impl Config {
                 return Err(ConfigError::NonUnicodeEnvVar("SESSION_COOKIE_SAME_SITE"));
             }
         };
-        let cookie_secure = parse_env_bool(&lookup, "SESSION_COOKIE_SECURE", default_cookie_secure())?;
-        let idle_timeout_secs = parse_env_u64(&lookup, "SESSION_IDLE_TIMEOUT_SECS", default_idle_timeout_secs())?;
+        let cookie_secure =
+            parse_env_bool(&lookup, "SESSION_COOKIE_SECURE", default_cookie_secure())?;
+        let idle_timeout_secs = parse_env_u64(
+            &lookup,
+            "SESSION_IDLE_TIMEOUT_SECS",
+            default_idle_timeout_secs(),
+        )?;
         let absolute_lifetime_secs = match lookup("SESSION_ABSOLUTE_LIFETIME_SECS") {
             Ok(val) => val.parse::<u64>().map_err(|_| ConfigError::InvalidValue {
                 field: "absolute_lifetime_secs",
                 reason: "must be a valid integer",
             })?,
-            Err(std::env::VarError::NotPresent) => {
-                match lookup("SESSION_ABSOLUTE_TIMEOUT_SECS") {
-                    Ok(val) => val.parse::<u64>().map_err(|_| ConfigError::InvalidValue {
-                        field: "absolute_lifetime_secs",
-                        reason: "must be a valid integer",
-                    })?,
-                    Err(std::env::VarError::NotPresent) => default_absolute_lifetime_secs(),
-                    Err(std::env::VarError::NotUnicode(_)) => {
-                        return Err(ConfigError::NonUnicodeEnvVar("SESSION_ABSOLUTE_TIMEOUT_SECS"));
-                    }
+            Err(std::env::VarError::NotPresent) => match lookup("SESSION_ABSOLUTE_TIMEOUT_SECS") {
+                Ok(val) => val.parse::<u64>().map_err(|_| ConfigError::InvalidValue {
+                    field: "absolute_lifetime_secs",
+                    reason: "must be a valid integer",
+                })?,
+                Err(std::env::VarError::NotPresent) => default_absolute_lifetime_secs(),
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    return Err(ConfigError::NonUnicodeEnvVar(
+                        "SESSION_ABSOLUTE_TIMEOUT_SECS",
+                    ));
                 }
-            }
+            },
             Err(std::env::VarError::NotUnicode(_)) => {
-                return Err(ConfigError::NonUnicodeEnvVar("SESSION_ABSOLUTE_LIFETIME_SECS"));
+                return Err(ConfigError::NonUnicodeEnvVar(
+                    "SESSION_ABSOLUTE_LIFETIME_SECS",
+                ));
             }
         };
         let max_active_sessions_per_user = match lookup("SESSION_MAX_ACTIVE_PER_USER") {
-            Ok(val) => val.parse::<usize>().map_err(|_| ConfigError::InvalidValue {
-                field: "max_active_sessions_per_user",
-                reason: "must be a valid integer",
-            })?,
+            Ok(val) => val
+                .parse::<usize>()
+                .map_err(|_| ConfigError::InvalidValue {
+                    field: "max_active_sessions_per_user",
+                    reason: "must be a valid integer",
+                })?,
             Err(std::env::VarError::NotPresent) => default_max_active_sessions_per_user(),
             Err(std::env::VarError::NotUnicode(_)) => {
                 return Err(ConfigError::NonUnicodeEnvVar("SESSION_MAX_ACTIVE_PER_USER"));
@@ -457,7 +466,8 @@ impl Config {
             max_active_sessions_per_user,
         };
 
-        let rate_limit_enabled = parse_env_bool(&lookup, "RATE_LIMIT_ENABLED", default_rate_limit_enabled())?;
+        let rate_limit_enabled =
+            parse_env_bool(&lookup, "RATE_LIMIT_ENABLED", default_rate_limit_enabled())?;
         let max_attempts = match lookup("RATE_LIMIT_MAX_ATTEMPTS") {
             Ok(val) => val.parse::<u32>().map_err(|_| ConfigError::InvalidValue {
                 field: "max_attempts",
@@ -469,7 +479,11 @@ impl Config {
             }
         };
         let window_secs = parse_env_u64(&lookup, "RATE_LIMIT_WINDOW_SECS", default_window_secs())?;
-        let login_cooldown_secs = parse_env_u64(&lookup, "RATE_LIMIT_LOGIN_COOLDOWN_SECS", default_login_cooldown_secs())?;
+        let login_cooldown_secs = parse_env_u64(
+            &lookup,
+            "RATE_LIMIT_LOGIN_COOLDOWN_SECS",
+            default_login_cooldown_secs(),
+        )?;
 
         let rate_limit = RateLimitConfig {
             enabled: rate_limit_enabled,

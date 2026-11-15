@@ -21,8 +21,8 @@ pub fn create_router(state: AppState) -> Result<Router, AppError> {
     state.config.validate().map_err(AppError::Config)?;
     let cors = cors_layer(&state.config)?;
 
-    let auth_router = auth::routes_with_app_state(state.clone())
-        .merge(session::routes(state.clone()));
+    let auth_router =
+        auth::routes_with_app_state(state.clone()).merge(session::routes(state.clone()));
 
     Ok(Router::new()
         .nest("/auth", auth_router)
@@ -34,13 +34,13 @@ pub fn create_router(state: AppState) -> Result<Router, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use crate::config::{AppConfig, Config};
     use axum::{
         body::Body,
         http::{Method, Request, StatusCode},
     };
     use sqlx::PgPool;
+    use std::sync::Arc;
     use tower::Service;
 
     fn valid_config() -> Config {

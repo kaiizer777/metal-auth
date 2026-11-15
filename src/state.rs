@@ -209,6 +209,10 @@ mod tests {
         let _ = state.session_service.clone();
 
         // Verify rate_limiter is constructed and can evaluate rate limits
-        assert!(state.rate_limiter.allow("test_key", 10, Duration::from_secs(60)));
+        assert!(
+            state
+                .rate_limiter
+                .allow("test_key", 10, Duration::from_secs(60))
+        );
     }
 }

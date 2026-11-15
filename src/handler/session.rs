@@ -1,8 +1,8 @@
 use axum::{
-    extract::State,
-    http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
     Json, Router,
+    extract::State,
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     db::models::Session,
     error::AppError,
-    middleware::auth::{require_auth, AuthUser},
+    middleware::auth::{AuthUser, require_auth},
     session::{
         bearer::read_bearer_token,
         cookie::{clear_session_cookie, read_session_cookie, set_csrf_cookie, set_session_cookie},
@@ -84,10 +84,9 @@ pub async fn delete_session(
     );
 
     let mut response = StatusCode::OK.into_response();
-    response.headers_mut().insert(
-        header::SET_COOKIE,
-        clear_session_cookie(&state.config),
-    );
+    response
+        .headers_mut()
+        .insert(header::SET_COOKIE, clear_session_cookie(&state.config));
     Ok(response)
 }
 
@@ -136,10 +135,9 @@ pub async fn delete_all_sessions(
     );
 
     let mut response = StatusCode::OK.into_response();
-    response.headers_mut().insert(
-        header::SET_COOKIE,
-        clear_session_cookie(&state.config),
-    );
+    response
+        .headers_mut()
+        .insert(header::SET_COOKIE, clear_session_cookie(&state.config));
     Ok(response)
 }
 
@@ -204,16 +202,25 @@ pub async fn refresh_session(
 /// Router builder for session endpoints protected by `require_auth` middleware.
 pub fn routes(state: AppState) -> Router {
     Router::new()
-        .route("/session", axum::routing::get(get_session).delete(delete_session))
+        .route(
+            "/session",
+            axum::routing::get(get_session).delete(delete_session),
+        )
         .route("/session/me", axum::routing::get(get_session))
         .route("/session/refresh", axum::routing::post(refresh_session))
         .route("/session/revoke", axum::routing::post(delete_session))
-        .route("/session/revoke-all", axum::routing::post(delete_all_sessions))
+        .route(
+            "/session/revoke-all",
+            axum::routing::post(delete_all_sessions),
+        )
         .route(
             "/sessions",
             axum::routing::get(list_sessions).delete(delete_all_sessions),
         )
-        .layer(axum::middleware::from_fn_with_state(state.clone(), require_auth))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_auth,
+        ))
         .with_state(state)
 }
 
@@ -252,15 +259,13 @@ mod tests {
 
     #[test]
     fn list_sessions_returns_array() {
-        let list = vec![
-            SessionInfoResponse {
-                session_id: "c".repeat(64),
-                created_at: Utc::now(),
-                last_active_at: Utc::now(),
-                absolute_expires_at: Utc::now(),
-                session_type: "bearer".to_string(),
-            },
-        ];
+        let list = vec![SessionInfoResponse {
+            session_id: "c".repeat(64),
+            created_at: Utc::now(),
+            last_active_at: Utc::now(),
+            absolute_expires_at: Utc::now(),
+            session_type: "bearer".to_string(),
+        }];
         let val = serde_json::to_value(&list).unwrap();
         assert!(val.is_array());
         assert_eq!(val.as_array().unwrap().len(), 1);

@@ -3,17 +3,14 @@
 use axum::{
     body::Body,
     extract::{FromRequestParts, State},
-    http::{request::Parts, Request, Response},
+    http::{Request, Response, request::Parts},
     middleware::Next,
 };
 use uuid::Uuid;
 
 use crate::{
     error::{AppError, ErrorCode},
-    session::{
-        bearer::read_bearer_token,
-        cookie::read_session_cookie,
-    },
+    session::{bearer::read_bearer_token, cookie::read_session_cookie},
     state::AppState,
 };
 
@@ -32,10 +29,7 @@ where
 {
     type Rejection = AppError;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        _state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         parts
             .extensions
             .get::<Self>()
@@ -69,12 +63,7 @@ pub async fn require_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{
-        http::StatusCode,
-        middleware::from_fn_with_state,
-        routing::get,
-        Router,
-    };
+    use axum::{Router, http::StatusCode, middleware::from_fn_with_state, routing::get};
     use sqlx::postgres::PgPoolOptions;
     use tower::ServiceExt;
 
@@ -93,10 +82,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_user_extractor_missing_extension() {
-        let req = Request::builder()
-            .uri("/test")
-            .body(Body::empty())
-            .unwrap();
+        let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
         let (mut parts, _) = req.into_parts();
         let result = AuthUser::from_request_parts(&mut parts, &()).await;
         assert!(matches!(result, Err(AppError::SessionNotFound)));
@@ -111,10 +97,7 @@ mod tests {
             session_type: "cookie".to_string(),
         };
 
-        let mut req = Request::builder()
-            .uri("/test")
-            .body(Body::empty())
-            .unwrap();
+        let mut req = Request::builder().uri("/test").body(Body::empty()).unwrap();
         req.extensions_mut().insert(expected.clone());
 
         let (mut parts, _) = req.into_parts();
@@ -144,4 +127,3 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }
-

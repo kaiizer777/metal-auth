@@ -10,9 +10,7 @@ use axum::http::HeaderMap;
 /// RFC 6750 requires the "Bearer " scheme prefix (case-sensitive) with a single space.
 /// Trailing whitespace is not trimmed per RFC 6750 token syntax.
 pub fn read_bearer_token(headers: &HeaderMap) -> Option<String> {
-    let auth_header = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())?;
+    let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok())?;
 
     let token = auth_header.strip_prefix("Bearer ")?;
     if token.is_empty() {
@@ -40,7 +38,10 @@ mod tests {
             HeaderValue::from_static("Bearer my-secret-token-123"),
         );
 
-        assert_eq!(read_bearer_token(&headers), Some("my-secret-token-123".to_string()));
+        assert_eq!(
+            read_bearer_token(&headers),
+            Some("my-secret-token-123".to_string())
+        );
         assert!(has_bearer_token(&headers));
     }
 
@@ -68,7 +69,11 @@ mod tests {
             if let Ok(hv) = HeaderValue::from_str(val) {
                 headers.insert("authorization", hv);
             }
-            assert_eq!(read_bearer_token(&headers), None, "Failed for header: {val}");
+            assert_eq!(
+                read_bearer_token(&headers),
+                None,
+                "Failed for header: {val}"
+            );
             assert!(!has_bearer_token(&headers), "Failed for header: {val}");
         }
     }

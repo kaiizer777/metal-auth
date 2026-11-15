@@ -6,8 +6,8 @@ pub mod service;
 
 pub use bearer::{has_bearer_token, read_bearer_token};
 pub use cookie::{
-    clear_session_cookie, read_session_cookie, set_csrf_cookie, set_session_cookie,
-    SessionCookieSource,
+    SessionCookieSource, clear_session_cookie, read_session_cookie, set_csrf_cookie,
+    set_session_cookie,
 };
 pub use service::SessionService;
 

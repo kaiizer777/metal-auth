@@ -392,6 +392,20 @@ impl Config {
                 return Err(ConfigError::NonUnicodeEnvVar("SESSION_COOKIE_DOMAIN"));
             }
         };
+        let cookie_path = match lookup("SESSION_COOKIE_PATH") {
+            Ok(val) => {
+                let trimmed = val.trim();
+                if trimmed.is_empty() {
+                    default_cookie_path()
+                } else {
+                    trimmed.to_string()
+                }
+            }
+            Err(std::env::VarError::NotPresent) => default_cookie_path(),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar("SESSION_COOKIE_PATH"));
+            }
+        };
         let cookie_same_site = match lookup("SESSION_COOKIE_SAME_SITE") {
             Ok(val) => val,
             Err(std::env::VarError::NotPresent) => default_cookie_same_site(),
@@ -401,7 +415,27 @@ impl Config {
         };
         let cookie_secure = parse_env_bool(&lookup, "SESSION_COOKIE_SECURE", default_cookie_secure())?;
         let idle_timeout_secs = parse_env_u64(&lookup, "SESSION_IDLE_TIMEOUT_SECS", default_idle_timeout_secs())?;
-        let absolute_timeout_secs = parse_env_u64(&lookup, "SESSION_ABSOLUTE_TIMEOUT_SECS", default_absolute_timeout_secs())?;
+        let absolute_lifetime_secs = match lookup("SESSION_ABSOLUTE_LIFETIME_SECS") {
+            Ok(val) => val.parse::<u64>().map_err(|_| ConfigError::InvalidValue {
+                field: "absolute_lifetime_secs",
+                reason: "must be a valid integer",
+            })?,
+            Err(std::env::VarError::NotPresent) => {
+                match lookup("SESSION_ABSOLUTE_TIMEOUT_SECS") {
+                    Ok(val) => val.parse::<u64>().map_err(|_| ConfigError::InvalidValue {
+                        field: "absolute_lifetime_secs",
+                        reason: "must be a valid integer",
+                    })?,
+                    Err(std::env::VarError::NotPresent) => default_absolute_lifetime_secs(),
+                    Err(std::env::VarError::NotUnicode(_)) => {
+                        return Err(ConfigError::NonUnicodeEnvVar("SESSION_ABSOLUTE_TIMEOUT_SECS"));
+                    }
+                }
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar("SESSION_ABSOLUTE_LIFETIME_SECS"));
+            }
+        };
         let max_active_sessions_per_user = match lookup("SESSION_MAX_ACTIVE_PER_USER") {
             Ok(val) => val.parse::<usize>().map_err(|_| ConfigError::InvalidValue {
                 field: "max_active_sessions_per_user",
@@ -415,40 +449,33 @@ impl Config {
         let session = SessionConfig {
             cookie_name,
             cookie_domain,
+            cookie_path,
             cookie_same_site,
             cookie_secure,
             idle_timeout_secs,
-            absolute_timeout_secs,
+            absolute_lifetime_secs,
             max_active_sessions_per_user,
         };
 
         let rate_limit_enabled = parse_env_bool(&lookup, "RATE_LIMIT_ENABLED", default_rate_limit_enabled())?;
-        let login_attempts_per_minute = match lookup("RATE_LIMIT_LOGIN_ATTEMPTS_PER_MINUTE") {
+        let max_attempts = match lookup("RATE_LIMIT_MAX_ATTEMPTS") {
             Ok(val) => val.parse::<u32>().map_err(|_| ConfigError::InvalidValue {
-                field: "login_attempts_per_minute",
+                field: "max_attempts",
                 reason: "must be a valid integer",
             })?,
-            Err(std::env::VarError::NotPresent) => default_login_attempts_per_minute(),
+            Err(std::env::VarError::NotPresent) => default_max_attempts(),
             Err(std::env::VarError::NotUnicode(_)) => {
-                return Err(ConfigError::NonUnicodeEnvVar("RATE_LIMIT_LOGIN_ATTEMPTS_PER_MINUTE"));
+                return Err(ConfigError::NonUnicodeEnvVar("RATE_LIMIT_MAX_ATTEMPTS"));
             }
         };
+        let window_secs = parse_env_u64(&lookup, "RATE_LIMIT_WINDOW_SECS", default_window_secs())?;
         let login_cooldown_secs = parse_env_u64(&lookup, "RATE_LIMIT_LOGIN_COOLDOWN_SECS", default_login_cooldown_secs())?;
-        let registration_attempts_per_minute = match lookup("RATE_LIMIT_REGISTRATION_ATTEMPTS_PER_MINUTE") {
-            Ok(val) => val.parse::<u32>().map_err(|_| ConfigError::InvalidValue {
-                field: "registration_attempts_per_minute",
-                reason: "must be a valid integer",
-            })?,
-            Err(std::env::VarError::NotPresent) => default_registration_attempts_per_minute(),
-            Err(std::env::VarError::NotUnicode(_)) => {
-                return Err(ConfigError::NonUnicodeEnvVar("RATE_LIMIT_REGISTRATION_ATTEMPTS_PER_MINUTE"));
-            }
-        };
+
         let rate_limit = RateLimitConfig {
             enabled: rate_limit_enabled,
-            login_attempts_per_minute,
+            max_attempts,
+            window_secs,
             login_cooldown_secs,
-            registration_attempts_per_minute,
         };
 
         let cfg = Self {
@@ -719,26 +746,36 @@ fn parse_env_bool(
 
 // ─── Phase 4 — Session & Rate Limiting Configuration ──────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct SessionConfig {
     #[serde(default = "default_cookie_name")]
     pub cookie_name: String,
     #[serde(default)]
     pub cookie_domain: Option<String>,
+    #[serde(default = "default_cookie_path")]
+    pub cookie_path: String,
     #[serde(default = "default_cookie_same_site")]
     pub cookie_same_site: String,
     #[serde(default = "default_cookie_secure")]
     pub cookie_secure: bool,
     #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
-    #[serde(default = "default_absolute_timeout_secs")]
-    pub absolute_timeout_secs: u64,
+    #[serde(default = "default_absolute_lifetime_secs")]
+    pub absolute_lifetime_secs: u64,
     #[serde(default = "default_max_active_sessions_per_user")]
     pub max_active_sessions_per_user: usize,
 }
 
 pub fn default_cookie_name() -> String {
     "sid".into()
+}
+
+pub fn default_cookie_domain() -> Option<String> {
+    None
+}
+
+pub fn default_cookie_path() -> String {
+    "/".into()
 }
 
 pub fn default_cookie_same_site() -> String {
@@ -753,7 +790,7 @@ pub fn default_idle_timeout_secs() -> u64 {
     1800
 }
 
-pub fn default_absolute_timeout_secs() -> u64 {
+pub fn default_absolute_lifetime_secs() -> u64 {
     86400
 }
 
@@ -768,6 +805,31 @@ impl Default for SessionConfig {
 }
 
 impl SessionConfig {
+    pub fn default_cookie_name() -> String {
+        default_cookie_name()
+    }
+    pub fn default_cookie_domain() -> Option<String> {
+        default_cookie_domain()
+    }
+    pub fn default_cookie_path() -> String {
+        default_cookie_path()
+    }
+    pub fn default_cookie_same_site() -> String {
+        default_cookie_same_site()
+    }
+    pub fn default_cookie_secure() -> bool {
+        default_cookie_secure()
+    }
+    pub fn default_idle_timeout_secs() -> u64 {
+        default_idle_timeout_secs()
+    }
+    pub fn default_absolute_lifetime_secs() -> u64 {
+        default_absolute_lifetime_secs()
+    }
+    pub fn default_max_active_sessions_per_user() -> usize {
+        default_max_active_sessions_per_user()
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.cookie_name.trim().is_empty() {
             return Err(ConfigError::InvalidValue {
@@ -775,16 +837,41 @@ impl SessionConfig {
                 reason: "must not be empty",
             });
         }
-        if self.idle_timeout_secs == 0 {
+        if self.cookie_path.trim().is_empty() {
             return Err(ConfigError::InvalidValue {
-                field: "idle_timeout_secs",
-                reason: "must be greater than 0",
+                field: "cookie_path",
+                reason: "must not be empty",
             });
         }
-        if self.absolute_timeout_secs <= self.idle_timeout_secs {
+        if self.idle_timeout_secs < 60 {
             return Err(ConfigError::InvalidValue {
-                field: "absolute_timeout_secs",
-                reason: "must be greater than idle_timeout_secs",
+                field: "idle_timeout_secs",
+                reason: "must be at least 60 seconds",
+            });
+        }
+        if self.idle_timeout_secs > self.absolute_lifetime_secs {
+            return Err(ConfigError::InvalidValue {
+                field: "idle_timeout_secs",
+                reason: "must be less than or equal to absolute_lifetime_secs",
+            });
+        }
+        if self.absolute_lifetime_secs > 2_592_000 {
+            return Err(ConfigError::InvalidValue {
+                field: "absolute_lifetime_secs",
+                reason: "must not exceed 2592000 seconds (30 days)",
+            });
+        }
+        let same_site_lower = self.cookie_same_site.trim().to_ascii_lowercase();
+        if !matches!(same_site_lower.as_str(), "lax" | "strict" | "none") {
+            return Err(ConfigError::InvalidValue {
+                field: "cookie_same_site",
+                reason: "must be Lax, Strict, or None",
+            });
+        }
+        if same_site_lower == "none" && !self.cookie_secure {
+            return Err(ConfigError::InvalidValue {
+                field: "cookie_secure",
+                reason: "SameSite=None requires cookie_secure=true",
             });
         }
         if self.max_active_sessions_per_user == 0 {
@@ -803,36 +890,36 @@ impl SessionConfig {
 
     #[must_use]
     pub fn absolute_lifetime(&self) -> Duration {
-        Duration::from_secs(self.absolute_timeout_secs)
+        Duration::from_secs(self.absolute_lifetime_secs)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct RateLimitConfig {
     #[serde(default = "default_rate_limit_enabled")]
     pub enabled: bool,
-    #[serde(default = "default_login_attempts_per_minute")]
-    pub login_attempts_per_minute: u32,
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
+    #[serde(default = "default_window_secs")]
+    pub window_secs: u64,
     #[serde(default = "default_login_cooldown_secs")]
     pub login_cooldown_secs: u64,
-    #[serde(default = "default_registration_attempts_per_minute")]
-    pub registration_attempts_per_minute: u32,
 }
 
 pub fn default_rate_limit_enabled() -> bool {
     true
 }
 
-pub fn default_login_attempts_per_minute() -> u32 {
-    5
+pub fn default_max_attempts() -> u32 {
+    10
+}
+
+pub fn default_window_secs() -> u64 {
+    900
 }
 
 pub fn default_login_cooldown_secs() -> u64 {
     900
-}
-
-pub fn default_registration_attempts_per_minute() -> u32 {
-    3
 }
 
 impl Default for RateLimitConfig {
@@ -842,25 +929,46 @@ impl Default for RateLimitConfig {
 }
 
 impl RateLimitConfig {
+    pub fn default_max_attempts() -> u32 {
+        default_max_attempts()
+    }
+    pub fn default_window_secs() -> u64 {
+        default_window_secs()
+    }
+    pub fn default_login_cooldown_secs() -> u64 {
+        default_login_cooldown_secs()
+    }
+    pub fn default_rate_limit_enabled() -> bool {
+        default_rate_limit_enabled()
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.login_attempts_per_minute == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "login_attempts_per_minute",
-                reason: "must be at least 1",
-            });
-        }
-        if self.registration_attempts_per_minute == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "registration_attempts_per_minute",
-                reason: "must be at least 1",
-            });
+        if self.enabled {
+            if self.max_attempts == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "max_attempts",
+                    reason: "must be at least 1",
+                });
+            }
+            if self.window_secs < 60 {
+                return Err(ConfigError::InvalidValue {
+                    field: "window_secs",
+                    reason: "must be at least 60 seconds",
+                });
+            }
+            if self.login_cooldown_secs == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "login_cooldown_secs",
+                    reason: "must be at least 1",
+                });
+            }
         }
         Ok(())
     }
 
     #[must_use]
     pub fn window(&self) -> Duration {
-        Duration::from_secs(60)
+        Duration::from_secs(self.window_secs)
     }
 
     #[must_use]
@@ -1663,10 +1771,11 @@ mod tests {
         let sc = SessionConfig::default();
         assert_eq!(sc.cookie_name, "sid");
         assert_eq!(sc.cookie_domain, None);
+        assert_eq!(sc.cookie_path, "/");
         assert_eq!(sc.cookie_same_site, "Lax");
         assert!(sc.cookie_secure);
         assert_eq!(sc.idle_timeout_secs, 1800);
-        assert_eq!(sc.absolute_timeout_secs, 86400);
+        assert_eq!(sc.absolute_lifetime_secs, 86400);
         assert_eq!(sc.max_active_sessions_per_user, 5);
         assert_eq!(sc.idle_timeout(), Duration::from_secs(1800));
         assert_eq!(sc.absolute_lifetime(), Duration::from_secs(86400));
@@ -1677,10 +1786,10 @@ mod tests {
     fn test_rate_limit_config_defaults() {
         let rlc = RateLimitConfig::default();
         assert!(rlc.enabled);
-        assert_eq!(rlc.login_attempts_per_minute, 5);
+        assert_eq!(rlc.max_attempts, 10);
+        assert_eq!(rlc.window_secs, 900);
         assert_eq!(rlc.login_cooldown_secs, 900);
-        assert_eq!(rlc.registration_attempts_per_minute, 3);
-        assert_eq!(rlc.window(), Duration::from_secs(60));
+        assert_eq!(rlc.window(), Duration::from_secs(900));
         assert_eq!(rlc.cooldown(), Duration::from_secs(900));
         assert!(rlc.validate().is_ok());
     }
@@ -1690,10 +1799,11 @@ mod tests {
         let sc = SessionConfig {
             cookie_name: "custom_sid".into(),
             cookie_domain: Some("app.example.com".into()),
+            cookie_path: "/auth".into(),
             cookie_same_site: "Strict".into(),
             cookie_secure: true,
             idle_timeout_secs: 600,
-            absolute_timeout_secs: 3600,
+            absolute_lifetime_secs: 3600,
             max_active_sessions_per_user: 10,
         };
         assert!(sc.validate().is_ok());
@@ -1713,12 +1823,24 @@ mod tests {
             })
         ));
 
-        let zero_idle = SessionConfig {
-            idle_timeout_secs: 0,
+        let empty_path = SessionConfig {
+            cookie_path: "   ".into(),
             ..SessionConfig::default()
         };
         assert!(matches!(
-            zero_idle.validate(),
+            empty_path.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "cookie_path",
+                ..
+            })
+        ));
+
+        let lt_60_idle = SessionConfig {
+            idle_timeout_secs: 59,
+            ..SessionConfig::default()
+        };
+        assert!(matches!(
+            lt_60_idle.validate(),
             Err(ConfigError::InvalidValue {
                 field: "idle_timeout_secs",
                 ..
@@ -1727,13 +1849,13 @@ mod tests {
 
         let bad_abs = SessionConfig {
             idle_timeout_secs: 1800,
-            absolute_timeout_secs: 1800,
+            absolute_lifetime_secs: 900,
             ..SessionConfig::default()
         };
         assert!(matches!(
             bad_abs.validate(),
             Err(ConfigError::InvalidValue {
-                field: "absolute_timeout_secs",
+                field: "idle_timeout_secs",
                 ..
             })
         ));
@@ -1753,26 +1875,38 @@ mod tests {
 
     #[test]
     fn test_rate_limit_config_validation_failures() {
-        let zero_login = RateLimitConfig {
-            login_attempts_per_minute: 0,
+        let zero_attempts = RateLimitConfig {
+            max_attempts: 0,
             ..RateLimitConfig::default()
         };
         assert!(matches!(
-            zero_login.validate(),
+            zero_attempts.validate(),
             Err(ConfigError::InvalidValue {
-                field: "login_attempts_per_minute",
+                field: "max_attempts",
                 ..
             })
         ));
 
-        let zero_reg = RateLimitConfig {
-            registration_attempts_per_minute: 0,
+        let lt_60_window = RateLimitConfig {
+            window_secs: 30,
             ..RateLimitConfig::default()
         };
         assert!(matches!(
-            zero_reg.validate(),
+            lt_60_window.validate(),
             Err(ConfigError::InvalidValue {
-                field: "registration_attempts_per_minute",
+                field: "window_secs",
+                ..
+            })
+        ));
+
+        let zero_cooldown = RateLimitConfig {
+            login_cooldown_secs: 0,
+            ..RateLimitConfig::default()
+        };
+        assert!(matches!(
+            zero_cooldown.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "login_cooldown_secs",
                 ..
             })
         ));
@@ -1797,7 +1931,7 @@ mod tests {
 
         let cfg_bad_rate = Config {
             rate_limit: RateLimitConfig {
-                login_attempts_per_minute: 0,
+                max_attempts: 0,
                 ..RateLimitConfig::default()
             },
             ..test_infra_config()
@@ -1805,7 +1939,7 @@ mod tests {
         assert!(matches!(
             cfg_bad_rate.validate(),
             Err(ConfigError::InvalidValue {
-                field: "login_attempts_per_minute",
+                field: "max_attempts",
                 ..
             })
         ));
@@ -1818,30 +1952,32 @@ mod tests {
             "BASE_URL" => Ok("https://app.example.com".into()),
             "SESSION_COOKIE_NAME" => Ok("my_session".into()),
             "SESSION_COOKIE_DOMAIN" => Ok("example.com".into()),
+            "SESSION_COOKIE_PATH" => Ok("/app".into()),
             "SESSION_COOKIE_SAME_SITE" => Ok("Strict".into()),
-            "SESSION_COOKIE_SECURE" => Ok("false".into()),
+            "SESSION_COOKIE_SECURE" => Ok("true".into()),
             "SESSION_IDLE_TIMEOUT_SECS" => Ok("900".into()),
-            "SESSION_ABSOLUTE_TIMEOUT_SECS" => Ok("7200".into()),
+            "SESSION_ABSOLUTE_LIFETIME_SECS" => Ok("7200".into()),
             "SESSION_MAX_ACTIVE_PER_USER" => Ok("3".into()),
             "RATE_LIMIT_ENABLED" => Ok("false".into()),
-            "RATE_LIMIT_LOGIN_ATTEMPTS_PER_MINUTE" => Ok("8".into()),
+            "RATE_LIMIT_MAX_ATTEMPTS" => Ok("20".into()),
+            "RATE_LIMIT_WINDOW_SECS" => Ok("600".into()),
             "RATE_LIMIT_LOGIN_COOLDOWN_SECS" => Ok("300".into()),
-            "RATE_LIMIT_REGISTRATION_ATTEMPTS_PER_MINUTE" => Ok("4".into()),
             _ => Err(std::env::VarError::NotPresent),
         })
         .expect("from_lookup with phase 4 env vars should succeed");
 
         assert_eq!(cfg.session.cookie_name, "my_session");
         assert_eq!(cfg.session.cookie_domain, Some("example.com".into()));
+        assert_eq!(cfg.session.cookie_path, "/app");
         assert_eq!(cfg.session.cookie_same_site, "Strict");
-        assert!(!cfg.session.cookie_secure);
+        assert!(cfg.session.cookie_secure);
         assert_eq!(cfg.session.idle_timeout_secs, 900);
-        assert_eq!(cfg.session.absolute_timeout_secs, 7200);
+        assert_eq!(cfg.session.absolute_lifetime_secs, 7200);
         assert_eq!(cfg.session.max_active_sessions_per_user, 3);
 
         assert!(!cfg.rate_limit.enabled);
-        assert_eq!(cfg.rate_limit.login_attempts_per_minute, 8);
+        assert_eq!(cfg.rate_limit.max_attempts, 20);
+        assert_eq!(cfg.rate_limit.window_secs, 600);
         assert_eq!(cfg.rate_limit.login_cooldown_secs, 300);
-        assert_eq!(cfg.rate_limit.registration_attempts_per_minute, 4);
     }
 }

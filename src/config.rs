@@ -814,7 +814,16 @@ pub fn default_max_active_sessions_per_user() -> usize {
 
 impl Default for SessionConfig {
     fn default() -> Self {
-        serde_json::from_str("{}").expect("default SessionConfig deserialization must not fail")
+        Self {
+            cookie_name: default_cookie_name(),
+            cookie_domain: default_cookie_domain(),
+            cookie_path: default_cookie_path(),
+            cookie_same_site: default_cookie_same_site(),
+            cookie_secure: default_cookie_secure(),
+            idle_timeout_secs: default_idle_timeout_secs(),
+            absolute_lifetime_secs: default_absolute_lifetime_secs(),
+            max_active_sessions_per_user: default_max_active_sessions_per_user(),
+        }
     }
 }
 
@@ -938,7 +947,12 @@ pub fn default_login_cooldown_secs() -> u64 {
 
 impl Default for RateLimitConfig {
     fn default() -> Self {
-        serde_json::from_str("{}").expect("default RateLimitConfig deserialization must not fail")
+        Self {
+            enabled: default_rate_limit_enabled(),
+            max_attempts: default_max_attempts(),
+            window_secs: default_window_secs(),
+            login_cooldown_secs: default_login_cooldown_secs(),
+        }
     }
 }
 

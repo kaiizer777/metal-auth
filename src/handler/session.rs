@@ -210,13 +210,7 @@ pub fn routes(state: AppState) -> Router {
             axum::routing::get(get_session).delete(delete_session),
         )
         .route("/session/me", axum::routing::get(get_session))
-        .route(
-            "/session/refresh",
-            axum::routing::post(refresh_session).layer(axum::middleware::from_fn_with_state(
-                state.clone(),
-                csrf_middleware,
-            )),
-        )
+        .route("/session/refresh", axum::routing::post(refresh_session))
         .route("/session/revoke", axum::routing::post(delete_session))
         .route(
             "/session/revoke-all",
@@ -226,6 +220,10 @@ pub fn routes(state: AppState) -> Router {
             "/sessions",
             axum::routing::get(list_sessions).delete(delete_all_sessions),
         )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            csrf_middleware,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_auth,

@@ -128,4 +128,23 @@ mod tests {
         let resp = router.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
+
+    #[tokio::test]
+    async fn test_session_mutating_routes_require_auth() {
+        let cfg = valid_config();
+        let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
+        let state =
+            AppState::with_configs_and_dispatcher(pool, cfg, Arc::new(AppConfig::default()), None)
+                .unwrap();
+        let mut router = create_router(state).unwrap();
+
+        let req = Request::builder()
+            .uri("/auth/session/revoke-all")
+            .method(Method::POST)
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
 }

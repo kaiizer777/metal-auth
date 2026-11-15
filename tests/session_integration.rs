@@ -193,14 +193,19 @@ async fn test_logout_clears_session_cookie() {
 
     let sid =
         extract_cookie_val(&login_resp.headers, &app.state.config.session.cookie_name).unwrap();
+    let csrf = extract_cookie_val(&login_resp.headers, "csrf_token").unwrap();
 
     let mut headers = HeaderMap::new();
     headers.insert(
         header::COOKIE,
-        format!("{}={}", app.state.config.session.cookie_name, sid)
-            .parse()
-            .unwrap(),
+        format!(
+            "{}={}; csrf_token={}",
+            app.state.config.session.cookie_name, sid, csrf
+        )
+        .parse()
+        .unwrap(),
     );
+    headers.insert("x-csrf-token", csrf.parse().unwrap());
 
     let req = empty_request_with_headers(Method::DELETE, "/auth/session", headers);
     let resp = app.dispatch(req).await;
@@ -230,14 +235,19 @@ async fn test_get_session_response_session_id_is_64_chars() {
 
     let sid =
         extract_cookie_val(&login_resp.headers, &app.state.config.session.cookie_name).unwrap();
+    let csrf = extract_cookie_val(&login_resp.headers, "csrf_token").unwrap();
 
     let mut headers = HeaderMap::new();
     headers.insert(
         header::COOKIE,
-        format!("{}={}", app.state.config.session.cookie_name, sid)
-            .parse()
-            .unwrap(),
+        format!(
+            "{}={}; csrf_token={}",
+            app.state.config.session.cookie_name, sid, csrf
+        )
+        .parse()
+        .unwrap(),
     );
+    headers.insert("x-csrf-token", csrf.parse().unwrap());
 
     let req = empty_request_with_headers(Method::GET, "/auth/session", headers);
     let resp = app.dispatch(req).await;
@@ -272,14 +282,19 @@ async fn test_get_session_response_does_not_contain_csrf_token() {
 
     let sid =
         extract_cookie_val(&login_resp.headers, &app.state.config.session.cookie_name).unwrap();
+    let csrf = extract_cookie_val(&login_resp.headers, "csrf_token").unwrap();
 
     let mut headers = HeaderMap::new();
     headers.insert(
         header::COOKIE,
-        format!("{}={}", app.state.config.session.cookie_name, sid)
-            .parse()
-            .unwrap(),
+        format!(
+            "{}={}; csrf_token={}",
+            app.state.config.session.cookie_name, sid, csrf
+        )
+        .parse()
+        .unwrap(),
     );
+    headers.insert("x-csrf-token", csrf.parse().unwrap());
 
     let req = empty_request_with_headers(Method::GET, "/auth/session", headers);
     let resp = app.dispatch(req).await;
@@ -306,14 +321,19 @@ async fn test_list_sessions_returns_array() {
 
     let sid =
         extract_cookie_val(&login_resp.headers, &app.state.config.session.cookie_name).unwrap();
+    let csrf = extract_cookie_val(&login_resp.headers, "csrf_token").unwrap();
 
     let mut headers = HeaderMap::new();
     headers.insert(
         header::COOKIE,
-        format!("{}={}", app.state.config.session.cookie_name, sid)
-            .parse()
-            .unwrap(),
+        format!(
+            "{}={}; csrf_token={}",
+            app.state.config.session.cookie_name, sid, csrf
+        )
+        .parse()
+        .unwrap(),
     );
+    headers.insert("x-csrf-token", csrf.parse().unwrap());
 
     let req = empty_request_with_headers(Method::GET, "/auth/sessions", headers);
     let resp = app.dispatch(req).await;
@@ -340,14 +360,19 @@ async fn test_delete_all_sessions_clears_cookie() {
 
     let sid =
         extract_cookie_val(&login_resp.headers, &app.state.config.session.cookie_name).unwrap();
+    let csrf = extract_cookie_val(&login_resp.headers, "csrf_token").unwrap();
 
     let mut headers = HeaderMap::new();
     headers.insert(
         header::COOKIE,
-        format!("{}={}", app.state.config.session.cookie_name, sid)
-            .parse()
-            .unwrap(),
+        format!(
+            "{}={}; csrf_token={}",
+            app.state.config.session.cookie_name, sid, csrf
+        )
+        .parse()
+        .unwrap(),
     );
+    headers.insert("x-csrf-token", csrf.parse().unwrap());
 
     let req = empty_request_with_headers(Method::DELETE, "/auth/sessions", headers);
     let resp = app.dispatch(req).await;
@@ -685,6 +710,7 @@ async fn test_invalidate_all_sessions() {
 
     // Login from 3 different "devices"
     let mut sids = Vec::new();
+    let mut csrf_opt = None;
     for _ in 0..3 {
         let resp = app
             .post_json(
@@ -693,17 +719,25 @@ async fn test_invalidate_all_sessions() {
             )
             .await;
         let sid = extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name).unwrap();
+        if csrf_opt.is_none() {
+            csrf_opt = extract_cookie_val(&resp.headers, "csrf_token");
+        }
         sids.push(sid);
     }
+    let csrf = csrf_opt.expect("csrf_token in login response");
 
     // Invalidate all sessions using the 1st session
     let mut headers = HeaderMap::new();
     headers.insert(
         header::COOKIE,
-        format!("{}={}", app.state.config.session.cookie_name, sids[0])
-            .parse()
-            .unwrap(),
+        format!(
+            "{}={}; csrf_token={}",
+            app.state.config.session.cookie_name, sids[0], csrf
+        )
+        .parse()
+        .unwrap(),
     );
+    headers.insert("x-csrf-token", csrf.parse().unwrap());
     let del_resp = app
         .dispatch(empty_request_with_headers(
             Method::DELETE,
@@ -814,14 +848,19 @@ async fn test_replay_deleted_session() {
 
     let sid = extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name)
         .expect("session cookie present in login response");
+    let csrf = extract_cookie_val(&resp.headers, "csrf_token").unwrap();
 
     let mut headers = HeaderMap::new();
     headers.insert(
         header::COOKIE,
-        format!("{}={}", app.state.config.session.cookie_name, sid)
-            .parse()
-            .unwrap(),
+        format!(
+            "{}={}; csrf_token={}",
+            app.state.config.session.cookie_name, sid, csrf
+        )
+        .parse()
+        .unwrap(),
     );
+    headers.insert("x-csrf-token", csrf.parse().unwrap());
 
     // Delete session
     let _ = app
@@ -966,6 +1005,48 @@ async fn test_csrf_mismatch_on_post() {
 
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     assert_eq!(resp.error_code(), Some(ErrorCode::CsrfTokenInvalid));
+}
+
+#[tokio::test]
+async fn test_csrf_missing_on_delete_session_and_revoke_all() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let (email, password) = create_and_verify_user(&app).await;
+    let resp = app
+        .post_json(
+            "/auth/login",
+            json!({ "email": email, "password": password }),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let sid = extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name)
+        .expect("session cookie present in login response");
+    let csrf = extract_cookie_val(&resp.headers, "csrf_token").unwrap();
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::COOKIE,
+        format!(
+            "{}={}; csrf_token={}",
+            app.state.config.session.cookie_name, sid, csrf
+        )
+        .parse()
+        .unwrap(),
+    );
+
+    let req = empty_request_with_headers(Method::DELETE, "/auth/session", headers.clone());
+    let resp = app.dispatch(req).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.error_code(), Some(ErrorCode::CsrfTokenMissing));
+
+    let req2 = empty_request_with_headers(Method::POST, "/auth/session/revoke-all", headers);
+    let resp2 = app.dispatch(req2).await;
+    assert_eq!(resp2.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp2.error_code(), Some(ErrorCode::CsrfTokenMissing));
 }
 
 #[tokio::test]
@@ -1120,10 +1201,14 @@ async fn test_session_hash_not_logged() {
     let mut headers = HeaderMap::new();
     headers.insert(
         header::COOKIE,
-        format!("{}={}", app.state.config.session.cookie_name, sid)
-            .parse()
-            .unwrap(),
+        format!(
+            "{}={}; csrf_token={}",
+            app.state.config.session.cookie_name, sid, csrf
+        )
+        .parse()
+        .unwrap(),
     );
+    headers.insert("x-csrf-token", csrf.parse().unwrap());
     let _ = app
         .dispatch(empty_request_with_headers(
             Method::DELETE,
@@ -1167,14 +1252,19 @@ async fn test_session_id_not_in_response() {
 
     let sid = extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name)
         .expect("session cookie present in login response");
+    let csrf = extract_cookie_val(&resp.headers, "csrf_token").unwrap();
 
     let mut headers = HeaderMap::new();
     headers.insert(
         header::COOKIE,
-        format!("{}={}", app.state.config.session.cookie_name, sid)
-            .parse()
-            .unwrap(),
+        format!(
+            "{}={}; csrf_token={}",
+            app.state.config.session.cookie_name, sid, csrf
+        )
+        .parse()
+        .unwrap(),
     );
+    headers.insert("x-csrf-token", csrf.parse().unwrap());
 
     let get_resp = app
         .dispatch(empty_request_with_headers(
@@ -1209,14 +1299,19 @@ async fn test_logout_server_side() {
 
     let sid = extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name)
         .expect("session cookie present in login response");
+    let csrf = extract_cookie_val(&resp.headers, "csrf_token").unwrap();
 
     let mut headers = HeaderMap::new();
     headers.insert(
         header::COOKIE,
-        format!("{}={}", app.state.config.session.cookie_name, sid)
-            .parse()
-            .unwrap(),
+        format!(
+            "{}={}; csrf_token={}",
+            app.state.config.session.cookie_name, sid, csrf
+        )
+        .parse()
+        .unwrap(),
     );
+    headers.insert("x-csrf-token", csrf.parse().unwrap());
 
     // Logout
     let logout_resp = app

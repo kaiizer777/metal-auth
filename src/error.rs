@@ -581,6 +581,43 @@ mod tests {
                 ErrorCode::InvalidConfig,
                 "Invalid configuration",
             ),
+            // Phase 4 — session, CSRF, rate limit
+            (
+                AppError::SessionNotFound,
+                StatusCode::UNAUTHORIZED,
+                ErrorCode::SessionNotFound,
+                "Session is invalid or has expired",
+            ),
+            (
+                AppError::SessionExpired,
+                StatusCode::UNAUTHORIZED,
+                ErrorCode::SessionExpired,
+                "Session is invalid or has expired",
+            ),
+            (
+                AppError::SessionInvalid,
+                StatusCode::UNAUTHORIZED,
+                ErrorCode::SessionInvalid,
+                "Session is invalid or has expired",
+            ),
+            (
+                AppError::CsrfTokenMissing,
+                StatusCode::FORBIDDEN,
+                ErrorCode::CsrfTokenMissing,
+                "CSRF token is missing",
+            ),
+            (
+                AppError::CsrfTokenInvalid,
+                StatusCode::FORBIDDEN,
+                ErrorCode::CsrfTokenInvalid,
+                "CSRF token is invalid",
+            ),
+            (
+                AppError::RateLimitExceeded,
+                StatusCode::TOO_MANY_REQUESTS,
+                ErrorCode::RateLimitExceeded,
+                "Too many requests, please try again later",
+            ),
         ];
 
         for (err, expected_status, expected_code, expected_msg) in test_cases {
@@ -599,5 +636,48 @@ mod tests {
             assert_eq!(parsed.code, expected_code);
             assert_eq!(parsed.message, expected_msg);
         }
+    }
+
+    #[test]
+    fn test_phase4_error_codes_http_mapping() {
+        assert_eq!(AppError::SessionNotFound.status_code(), StatusCode::UNAUTHORIZED);
+        assert_eq!(AppError::SessionExpired.status_code(), StatusCode::UNAUTHORIZED);
+        assert_eq!(AppError::SessionInvalid.status_code(), StatusCode::UNAUTHORIZED);
+        assert_eq!(AppError::CsrfTokenMissing.status_code(), StatusCode::FORBIDDEN);
+        assert_eq!(AppError::CsrfTokenInvalid.status_code(), StatusCode::FORBIDDEN);
+        assert_eq!(AppError::RateLimitExceeded.status_code(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn test_app_error_from_code() {
+        assert!(matches!(AppError::from_code(ErrorCode::SessionNotFound), AppError::SessionNotFound));
+        assert!(matches!(AppError::from_code(ErrorCode::SessionExpired), AppError::SessionExpired));
+        assert!(matches!(AppError::from_code(ErrorCode::SessionInvalid), AppError::SessionInvalid));
+        assert!(matches!(AppError::from_code(ErrorCode::CsrfTokenMissing), AppError::CsrfTokenMissing));
+        assert!(matches!(AppError::from_code(ErrorCode::CsrfTokenInvalid), AppError::CsrfTokenInvalid));
+        assert!(matches!(AppError::from_code(ErrorCode::RateLimitExceeded), AppError::RateLimitExceeded));
+        assert!(matches!(AppError::from_code(ErrorCode::InvalidCredentials), AppError::InvalidCredentials));
+    }
+
+    #[test]
+    fn test_session_anti_enumeration_messages() {
+        let msg_not_found = AppError::SessionNotFound.response_message();
+        let msg_expired = AppError::SessionExpired.response_message();
+        let msg_invalid = AppError::SessionInvalid.response_message();
+
+        assert_eq!(msg_not_found, msg_expired);
+        assert_eq!(msg_expired, msg_invalid);
+        assert_eq!(msg_not_found, "Session is invalid or has expired");
+    }
+
+    #[test]
+    fn test_error_response_serialization() {
+        let err = ErrorResponse {
+            code: ErrorCode::SessionNotFound,
+            message: "Session is invalid or has expired".into(),
+        };
+        let json = serde_json::to_string(&err).expect("serialize ErrorResponse");
+        assert!(json.contains("\"code\":\"SESSION_NOT_FOUND\""));
+        assert!(json.contains("\"message\":\"Session is invalid or has expired\""));
     }
 }

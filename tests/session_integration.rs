@@ -1118,15 +1118,25 @@ async fn test_csrf_bypass_via_bearer() {
 
     // 2. Dual-transport request: Bearer header present, but ALSO carrying a session cookie
     // without a CSRF token must NOT take the bearer bypass; must be rejected with 403.
+    let cookie_login_resp = app
+        .post_json(
+            "/auth/login",
+            json!({ "email": email, "password": password }),
+        )
+        .await;
+    assert_eq!(cookie_login_resp.status(), StatusCode::OK);
+    let cookie_sid = extract_cookie_val(
+        &cookie_login_resp.headers,
+        &app.state.config.session.cookie_name,
+    )
+    .unwrap();
+
     let mut dual_headers = headers;
     dual_headers.insert(
         header::COOKIE,
-        format!(
-            "{}=fake_cookie_session_value",
-            app.state.config.session.cookie_name
-        )
-        .parse()
-        .unwrap(),
+        format!("{}={}", app.state.config.session.cookie_name, cookie_sid)
+            .parse()
+            .unwrap(),
     );
     let dual_req = empty_request_with_headers(Method::POST, "/auth/session/refresh", dual_headers);
     let dual_resp = app.dispatch(dual_req).await;

@@ -2525,6 +2525,9 @@ async fn test_login_timing_parity_unknown_vs_wrong() {
 
     // Warmup both paths to stabilise Argon2 state and OS scheduler.
     for _ in 0..WARMUP {
+        ctx.state
+            .rate_limiter
+            .reset(&metal_auth::rate_limit_key("127.0.0.1", &email));
         let req = json_request(
             Method::POST,
             "/auth/login",
@@ -2532,6 +2535,9 @@ async fn test_login_timing_parity_unknown_vs_wrong() {
         );
         let _ = ctx.router.clone().oneshot(req).await.unwrap();
 
+        ctx.state
+            .rate_limiter
+            .reset(&metal_auth::rate_limit_key("127.0.0.1", &unknown_email));
         let req = json_request(
             Method::POST,
             "/auth/login",
@@ -2545,6 +2551,9 @@ async fn test_login_timing_parity_unknown_vs_wrong() {
     let mut durations_unknown: Vec<std::time::Duration> = Vec::with_capacity(MEASURED);
 
     for _ in 0..MEASURED {
+        ctx.state
+            .rate_limiter
+            .reset(&metal_auth::rate_limit_key("127.0.0.1", &email));
         let t = std::time::Instant::now();
         let req = json_request(
             Method::POST,
@@ -2555,6 +2564,9 @@ async fn test_login_timing_parity_unknown_vs_wrong() {
         durations_wrong.push(t.elapsed());
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
+        ctx.state
+            .rate_limiter
+            .reset(&metal_auth::rate_limit_key("127.0.0.1", &unknown_email));
         let t = std::time::Instant::now();
         let req = json_request(
             Method::POST,

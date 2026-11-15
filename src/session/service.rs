@@ -317,10 +317,8 @@ impl SessionService {
     }
 
     /// Invalidate all active and inactive sessions belonging to `user_id`.
-    ///
-    /// Returns the number of sessions deleted.
-    pub async fn invalidate_all_user_sessions(&self, user_id: Uuid) -> Result<u64, AppError> {
-        let result = sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+    pub async fn invalidate_all_user_sessions(&self, user_id: Uuid) -> Result<(), AppError> {
+        let _result = sqlx::query("DELETE FROM sessions WHERE user_id = $1")
             .bind(user_id)
             .execute(&self.db)
             .await
@@ -334,11 +332,11 @@ impl SessionService {
             user_id = %user_id,
         );
 
-        Ok(result.rows_affected())
+        Ok(())
     }
 
     /// Alias for [`invalidate_all_user_sessions`](Self::invalidate_all_user_sessions).
-    pub async fn revoke_all_user_sessions(&self, user_id: Uuid) -> Result<u64, AppError> {
+    pub async fn revoke_all_user_sessions(&self, user_id: Uuid) -> Result<(), AppError> {
         self.invalidate_all_user_sessions(user_id).await
     }
 

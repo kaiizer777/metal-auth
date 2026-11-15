@@ -21,7 +21,7 @@ SET last_active_at = created_at
 WHERE last_active_at = now();
 
 UPDATE sessions
-SET absolute_expires_at = created_at + INTERVAL '30 days'
+SET absolute_expires_at = LEAST(created_at + INTERVAL '30 days', COALESCE(expires_at, created_at + INTERVAL '30 days'))
 WHERE absolute_expires_at >= now();
 
 -- Index for fast TTL sweeps

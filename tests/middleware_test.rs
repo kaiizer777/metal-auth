@@ -32,7 +32,17 @@ fn dummy_app_state() -> AppState {
 
 async fn setup_live_db() -> Option<(PgPool, AppState)> {
     dotenvy::dotenv().ok();
-    let url = std::env::var("DATABASE_URL").ok()?;
+    let url = match std::env::var("DATABASE_URL") {
+        Ok(val) => val,
+        Err(std::env::VarError::NotPresent) => {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "DATABASE_URL must be set in CI: live require_auth tests must not skip silently"
+            );
+            return None;
+        }
+        Err(e) => panic!("invalid DATABASE_URL environment variable: {e}"),
+    };
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .acquire_timeout(Duration::from_millis(500))
@@ -64,6 +74,9 @@ async fn setup_live_db() -> Option<(PgPool, AppState)> {
 // CSRF Middleware Integration Tests
 // =========================================================================
 
+/// NOTE: `test_csrf_app` applies `csrf_middleware` in isolation WITHOUT `require_auth` to test
+/// the Double-Submit CSRF layer independently. In production, mutating routes MUST also
+/// layer `require_auth` so that present-but-invalid Bearer tokens are rejected with 401.
 fn test_csrf_app(state: AppState) -> Router {
     Router::new()
         .route("/api/data", get(|| async { "safe_get" }))
@@ -93,6 +106,9 @@ async fn test_csrf_safe_methods_bypass_and_set_cookie() {
     assert!(!cookie_str.contains("HttpOnly"));
 }
 
+/// Verifies that `csrf_middleware` exempts requests carrying an Authorization Bearer header
+/// (as browsers cannot send custom headers cross-origin without a preflight).
+/// Downstream authentication (`require_auth`) is responsible for verifying token validity.
 #[tokio::test]
 async fn test_csrf_bearer_token_bypasses_check_on_post() {
     let state = dummy_app_state();
@@ -330,7 +346,10 @@ async fn test_auth_user_extractor_unit_validation() {
 
 #[tokio::test]
 async fn test_require_auth_live_session_cookie_and_bearer_lifecycle() {
-    let Some((_pool, state)) = setup_live_db().await else {
+    let Some((pool, state)) = setup_live_db().await else {
+        if std::env::var_os("CI").is_some() {
+            panic!("DATABASE_URL must be set in CI: live require_auth tests must not skip silently");
+        }
         println!("Skipping live DB require_auth tests: DATABASE_URL not available");
         return;
     };
@@ -410,4 +429,41 @@ async fn test_require_auth_live_session_cookie_and_bearer_lifecycle() {
 
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 4. Clean up test user and cascading sessions
+    let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await;
+}
+
+#[tokio::test]
+async fn test_csrf_bearer_bypass_fails_downstream_auth_with_invalid_token() {
+    let Some((_pool, state)) = setup_live_db().await else {
+        if std::env::var_os("CI").is_some() {
+            panic!("DATABASE_URL must be set in CI: live require_auth tests must not skip silently");
+        }
+        println!("Skipping live DB require_auth tests: DATABASE_URL not available");
+        return;
+    };
+
+    let app = Router::new()
+        .route("/api/mutate", post(|| async { "mutated" }))
+        .layer(from_fn_with_state(state.clone(), require_auth))
+        .layer(from_fn_with_state(state.clone(), csrf_middleware))
+        .with_state(state);
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/mutate")
+        .header(header::AUTHORIZATION, "Bearer invalid_or_garbage_token")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    // Passes CSRF check, but fails downstream require_auth with 401 Unauthorized
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+    let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(err.code, ErrorCode::SessionNotFound);
 }

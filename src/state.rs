@@ -196,4 +196,19 @@ mod tests {
             "invalid config must be rejected"
         );
     }
+
+    #[tokio::test]
+    async fn app_state_initializes_session_service_and_rate_limiter() {
+        let config = valid_config();
+        let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
+        let auth_config = Arc::new(AppConfig::default());
+        let state = AppState::with_configs_and_dispatcher(pool, config, auth_config, None)
+            .expect("valid AppState initialization");
+
+        // Verify session_service is constructed and wired
+        let _ = state.session_service.clone();
+
+        // Verify rate_limiter is constructed and can evaluate rate limits
+        assert!(state.rate_limiter.allow("test_key", 10, Duration::from_secs(60)));
+    }
 }

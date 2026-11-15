@@ -65,3 +65,83 @@ pub async fn require_auth(
     req.extensions_mut().insert(auth_user);
     Ok(next.run(req).await)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        http::StatusCode,
+        middleware::from_fn_with_state,
+        routing::get,
+        Router,
+    };
+    use sqlx::postgres::PgPoolOptions;
+    use tower::ServiceExt;
+
+    use crate::config::Config;
+
+    fn test_app_state() -> AppState {
+        let cfg = Config {
+            database_url: "postgres://postgres:postgres@127.0.0.1:1/postgres".to_string(),
+            ..Default::default()
+        };
+        let pool = PgPoolOptions::new()
+            .connect_lazy(&cfg.database_url)
+            .expect("lazy pool");
+        AppState::new(pool, cfg).expect("AppState::new")
+    }
+
+    #[tokio::test]
+    async fn test_auth_user_extractor_missing_extension() {
+        let req = Request::builder()
+            .uri("/test")
+            .body(Body::empty())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        let result = AuthUser::from_request_parts(&mut parts, &()).await;
+        assert!(matches!(result, Err(AppError::SessionNotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_auth_user_extractor_present_extension() {
+        let user_id = Uuid::new_v4();
+        let expected = AuthUser {
+            user_id,
+            session_hash: "hash123".to_string(),
+            session_type: "cookie".to_string(),
+        };
+
+        let mut req = Request::builder()
+            .uri("/test")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(expected.clone());
+
+        let (mut parts, _) = req.into_parts();
+        let result = AuthUser::from_request_parts(&mut parts, &()).await.unwrap();
+        assert_eq!(result.user_id, user_id);
+        assert_eq!(result.session_hash, "hash123");
+        assert_eq!(result.session_type, "cookie");
+    }
+
+    #[tokio::test]
+    async fn test_require_auth_missing_credentials_returns_401() {
+        let state = test_app_state();
+        let app = Router::new()
+            .route(
+                "/protected",
+                get(|user: AuthUser| async move { format!("hello {}", user.user_id) }),
+            )
+            .layer(from_fn_with_state(state.clone(), require_auth))
+            .with_state(state);
+
+        let req = Request::builder()
+            .uri("/protected")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+

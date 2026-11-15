@@ -23,8 +23,11 @@ pub fn create_router(state: AppState) -> Result<Router, AppError> {
     state.config.validate().map_err(AppError::Config)?;
     let cors = cors_layer(&state.config)?;
 
+    let auth_router = auth::routes(Arc::clone(&state.auth_service))
+        .merge(session::routes(state.clone()));
+
     Ok(Router::new()
-        .nest("/auth", auth::routes(Arc::clone(&state.auth_service)))
+        .nest("/auth", auth_router)
         .fallback(fallback_not_found)
         .layer(cors)
         .layer(TraceLayer::new_for_http()))
@@ -106,5 +109,24 @@ mod tests {
 
         let resp = router.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_create_router_mounts_session_routes_with_require_auth() {
+        let cfg = valid_config();
+        let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
+        let state =
+            AppState::with_configs_and_dispatcher(pool, cfg, Arc::new(AppConfig::default()), None)
+                .unwrap();
+        let mut router = create_router(state).unwrap();
+
+        let req = Request::builder()
+            .uri("/auth/session")
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

@@ -647,6 +647,7 @@ async fn test_idle_expiry_integration() {
         .await;
 
     assert_eq!(get_resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(get_resp.error_code(), Some(ErrorCode::SessionExpired));
 
     // Verify row was eagerly purged from database
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE token_hash = $1")
@@ -700,6 +701,7 @@ async fn test_absolute_expiry_integration() {
         .await;
 
     assert_eq!(get_resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(get_resp.error_code(), Some(ErrorCode::SessionExpired));
 
     // Verify eager deletion
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE token_hash = $1")

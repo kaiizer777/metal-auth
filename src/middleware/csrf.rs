@@ -24,8 +24,12 @@ pub async fn csrf_middleware(
     req: Request<Body>,
     next: Next,
 ) -> Result<Response<Body>, AppError> {
-    // 1. Bearer sessions are inherently CSRF-safe.
-    if has_bearer_token(req.headers()) {
+    // 1. Bearer-only requests carry no ambient authority and are CSRF-safe.
+    // A request that ALSO presents a session cookie is cookie-authenticated
+    // (require_auth prefers the cookie) and must still pass the CSRF check.
+    let has_session_cookie =
+        read_session_cookie(req.headers(), &state.config.session.cookie_name).is_some();
+    if has_bearer_token(req.headers()) && !has_session_cookie {
         return Ok(next.run(req).await);
     }
 
@@ -170,6 +174,28 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn bearer_with_session_cookie_does_not_bypass_csrf() {
+        let state = test_app_state();
+        let cookie_name = state.config.session.cookie_name.clone();
+        let app = test_router(state);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/test")
+            .header("authorization", "Bearer some_dummy_token")
+            .header("cookie", format!("{cookie_name}=session_value_123"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err.code, ErrorCode::CsrfTokenMissing);
     }
 
     #[tokio::test]

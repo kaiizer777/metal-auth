@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     db::models::Session,
     error::AppError,
-    middleware::auth::{AuthUser, require_auth},
+    middleware::{
+        auth::{AuthUser, require_auth},
+        csrf_middleware,
+    },
     session::{
         bearer::read_bearer_token,
         cookie::{clear_session_cookie, read_session_cookie, set_csrf_cookie, set_session_cookie},
@@ -207,7 +210,13 @@ pub fn routes(state: AppState) -> Router {
             axum::routing::get(get_session).delete(delete_session),
         )
         .route("/session/me", axum::routing::get(get_session))
-        .route("/session/refresh", axum::routing::post(refresh_session))
+        .route(
+            "/session/refresh",
+            axum::routing::post(refresh_session).layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                csrf_middleware,
+            )),
+        )
         .route("/session/revoke", axum::routing::post(delete_session))
         .route(
             "/session/revoke-all",

@@ -680,4 +680,26 @@ mod tests {
         assert!(json.contains("\"code\":\"SESSION_NOT_FOUND\""));
         assert!(json.contains("\"message\":\"Session is invalid or has expired\""));
     }
+
+    #[test]
+    fn error_code_session_not_found_serializes_correctly() {
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::SessionNotFound).expect("serialize ErrorCode"),
+            "\"SESSION_NOT_FOUND\""
+        );
+    }
+
+    #[test]
+    fn error_code_csrf_token_missing_maps_to_403() {
+        use axum::response::IntoResponse;
+        let response = AppError::from_code(ErrorCode::CsrfTokenMissing).into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn error_code_rate_limit_exceeded_maps_to_429() {
+        use axum::response::IntoResponse;
+        let response = AppError::from_code(ErrorCode::RateLimitExceeded).into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
 }

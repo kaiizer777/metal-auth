@@ -33,6 +33,7 @@ pub mod email;
 pub mod error;
 pub mod handler;
 pub mod oauth;
+pub mod ratelimit;
 pub mod session;
 pub mod state;
 
@@ -45,6 +46,7 @@ pub use email::{
 };
 pub use error::{AppError, AppResult, ConfigError, ErrorCode, ErrorResponse};
 pub use handler::auth_routes;
+pub use ratelimit::{rate_limit_key, RateLimiter};
 pub use session::{
     clear_session_cookie, has_bearer_token, read_bearer_token, read_session_cookie,
     set_csrf_cookie, set_session_cookie, SessionCookieSource, SessionService,

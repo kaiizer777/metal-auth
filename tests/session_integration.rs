@@ -439,6 +439,7 @@ async fn test_login_cookie_session_lifecycle() {
     assert_eq!(login_resp.status(), StatusCode::OK);
     let sid =
         extract_cookie_val(&login_resp.headers, &app.state.config.session.cookie_name).unwrap();
+    let csrf = extract_cookie_val(&login_resp.headers, "csrf_token").unwrap();
 
     // 2. GET /auth/session
     let mut get_headers = HeaderMap::new();
@@ -459,11 +460,22 @@ async fn test_login_cookie_session_lifecycle() {
     assert_eq!(get_resp.json["session_id"].as_str().unwrap().len(), 64);
 
     // 3. DELETE /auth/session
+    let mut del_headers = HeaderMap::new();
+    del_headers.insert(
+        header::COOKIE,
+        format!(
+            "{}={}; csrf_token={}",
+            app.state.config.session.cookie_name, sid, csrf
+        )
+        .parse()
+        .unwrap(),
+    );
+    del_headers.insert("x-csrf-token", csrf.parse().unwrap());
     let del_resp = app
         .dispatch(empty_request_with_headers(
             Method::DELETE,
             "/auth/session",
-            get_headers.clone(),
+            del_headers,
         ))
         .await;
     assert_eq!(del_resp.status(), StatusCode::OK);

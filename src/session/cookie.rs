@@ -69,7 +69,7 @@ impl SessionCookieSource for Config {
 pub fn build_session_cookie(sc: &impl SessionCookieSource, raw_id: &str) -> HeaderValue {
     let mut parts = vec![
         format!("{}={}", sc.cookie_name(), raw_id),
-        format!("Max-Age={}", sc.absolute_lifetime_secs()),
+        format!("Max-Age={}", sc.idle_timeout_secs()),
         format!("Path={}", sc.cookie_path()),
         format!("SameSite={}", sc.cookie_same_site()),
         // HttpOnly is UNCONDITIONAL — intentionally not behind a config flag.
@@ -253,6 +253,7 @@ mod tests {
         assert!(s.contains("Secure"));
         assert!(s.contains("SameSite=Lax"));
         assert!(s.contains("Path=/"));
+        assert!(s.contains(&format!("Max-Age={}", cfg.session.idle_timeout_secs)));
         assert_eq!(s.matches("HttpOnly").count(), 1, "HttpOnly must occur exactly once");
 
         // Test with SessionConfig directly and inverted argument order

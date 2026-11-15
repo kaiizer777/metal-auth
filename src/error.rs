@@ -35,6 +35,13 @@ pub enum ErrorCode {
     ValidationError,
     InvalidToken,
     TokenExpired,
+    // Phase 4 — session, CSRF, rate limit
+    SessionNotFound,
+    SessionExpired,
+    SessionInvalid,
+    CsrfTokenMissing,
+    CsrfTokenInvalid,
+    RateLimitExceeded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +164,25 @@ pub enum AppError {
     /// Preserves anti-enumeration guarantees without revealing account existence to clients.
     #[error("email already exists")]
     EmailAlreadyExists,
+
+    // Phase 4 — session, CSRF, rate limit
+    #[error("session not found")]
+    SessionNotFound,
+
+    #[error("session expired")]
+    SessionExpired,
+
+    #[error("session invalid")]
+    SessionInvalid,
+
+    #[error("CSRF token missing")]
+    CsrfTokenMissing,
+
+    #[error("CSRF token invalid")]
+    CsrfTokenInvalid,
+
+    #[error("rate limit exceeded")]
+    RateLimitExceeded,
 }
 
 impl AppError {
@@ -185,6 +211,13 @@ impl AppError {
             Self::ValidationError(_) => ErrorCode::ValidationError,
             Self::InvalidToken => ErrorCode::InvalidToken,
             Self::TokenExpired => ErrorCode::TokenExpired,
+            // Phase 4
+            Self::SessionNotFound => ErrorCode::SessionNotFound,
+            Self::SessionExpired => ErrorCode::SessionExpired,
+            Self::SessionInvalid => ErrorCode::SessionInvalid,
+            Self::CsrfTokenMissing => ErrorCode::CsrfTokenMissing,
+            Self::CsrfTokenInvalid => ErrorCode::CsrfTokenInvalid,
+            Self::RateLimitExceeded => ErrorCode::RateLimitExceeded,
         }
     }
 
@@ -203,9 +236,17 @@ impl AppError {
             | Self::EmailDispatchTimeout
             | Self::EmailAlreadyExists => StatusCode::INTERNAL_SERVER_ERROR,
             // 401
-            Self::InvalidCredentials | Self::Unauthenticated => StatusCode::UNAUTHORIZED,
+            Self::InvalidCredentials
+            | Self::Unauthenticated
+            | Self::SessionNotFound
+            | Self::SessionExpired
+            | Self::SessionInvalid => StatusCode::UNAUTHORIZED,
             // 403
-            Self::EmailNotVerified => StatusCode::FORBIDDEN,
+            Self::EmailNotVerified | Self::CsrfTokenMissing | Self::CsrfTokenInvalid => {
+                StatusCode::FORBIDDEN
+            }
+            // 429
+            Self::RateLimitExceeded => StatusCode::TOO_MANY_REQUESTS,
             // 400
             Self::PasswordTooShort
             | Self::PasswordTooLong
@@ -242,6 +283,47 @@ impl AppError {
             Self::ValidationError(_) => "Invalid request body",
             Self::InvalidToken => "Invalid or already used token",
             Self::TokenExpired => "Token has expired",
+            // Phase 4
+            Self::SessionNotFound | Self::SessionExpired | Self::SessionInvalid => {
+                "Session is invalid or has expired"
+            }
+            Self::CsrfTokenMissing => "CSRF token is missing",
+            Self::CsrfTokenInvalid => "CSRF token is invalid",
+            Self::RateLimitExceeded => "Too many requests, please try again later",
+        }
+    }
+
+    #[must_use]
+    pub fn from_code(code: ErrorCode) -> Self {
+        match code {
+            ErrorCode::InvalidConfig => Self::Config(ConfigError::InvalidValue {
+                field: "unknown",
+                reason: "invalid configuration",
+            }),
+            ErrorCode::DatabaseError => Self::Database(sqlx::Error::RowNotFound),
+            ErrorCode::DatabaseUnavailable => Self::DatabaseUnavailable(sqlx::Error::PoolClosed),
+            ErrorCode::MigrationFailed => {
+                Self::Migration(sqlx::migrate::MigrateError::VersionMissing(1))
+            }
+            ErrorCode::NotFound => Self::NotFound,
+            ErrorCode::MethodNotAllowed => Self::MethodNotAllowed,
+            ErrorCode::InternalError => Self::Internal,
+            ErrorCode::InvalidCredentials => Self::InvalidCredentials,
+            ErrorCode::Unauthenticated => Self::Unauthenticated,
+            ErrorCode::EmailNotVerified => Self::EmailNotVerified,
+            ErrorCode::PasswordTooShort => Self::PasswordTooShort,
+            ErrorCode::PasswordTooLong => Self::PasswordTooLong,
+            ErrorCode::PasswordTooCommon => Self::PasswordTooCommon,
+            ErrorCode::InvalidEmail => Self::InvalidEmail,
+            ErrorCode::ValidationError => Self::ValidationError("validation error".into()),
+            ErrorCode::InvalidToken => Self::InvalidToken,
+            ErrorCode::TokenExpired => Self::TokenExpired,
+            ErrorCode::SessionNotFound => Self::SessionNotFound,
+            ErrorCode::SessionExpired => Self::SessionExpired,
+            ErrorCode::SessionInvalid => Self::SessionInvalid,
+            ErrorCode::CsrfTokenMissing => Self::CsrfTokenMissing,
+            ErrorCode::CsrfTokenInvalid => Self::CsrfTokenInvalid,
+            ErrorCode::RateLimitExceeded => Self::RateLimitExceeded,
         }
     }
 }
@@ -274,6 +356,14 @@ impl IntoResponse for AppError {
             Self::TokenExpired => tracing::debug!("expired token presented"),
             // EmailAlreadyExists is internal-only — never reaches this handler in normal flow
             Self::EmailAlreadyExists => tracing::info!("signup attempt on existing account"),
+            // Phase 4 — session, CSRF, rate limit
+            Self::SessionNotFound | Self::SessionExpired | Self::SessionInvalid => {
+                tracing::debug!("session validation failure")
+            }
+            Self::CsrfTokenMissing | Self::CsrfTokenInvalid => {
+                tracing::debug!("csrf validation failure")
+            }
+            Self::RateLimitExceeded => tracing::warn!("rate limit exceeded"),
         }
 
         let status = self.status_code();

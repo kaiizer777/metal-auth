@@ -291,11 +291,15 @@ pub async fn logout(State(state): State<AuthHandlerState>, headers: HeaderMap) -
 
     if let Some(ref raw_id) = raw_id_opt {
         if let Some(ref session_svc) = state.session_service {
-            let _ = session_svc.invalidate_session(raw_id).await;
+            if let Err(e) = session_svc.invalidate_session(raw_id).await {
+                return service_error_response(e);
+            }
         }
-        let _ = state.service.logout(raw_id).await;
-    } else {
-        let _ = state.service.logout("").await;
+        if let Err(e) = state.service.logout(raw_id).await {
+            return service_error_response(e);
+        }
+    } else if let Err(e) = state.service.logout("").await {
+        return service_error_response(e);
     }
 
     let mut response = StatusCode::NO_CONTENT.into_response();
@@ -501,6 +505,26 @@ mod tests {
         let state = create_test_state();
         let resp = logout(State(state), HeaderMap::new()).await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn logout_handler_propagates_session_invalidation_error() {
+        let mut state = create_test_state();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(50))
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/postgres")
+            .expect("lazy pool");
+        let session_svc = Arc::new(SessionService::new(pool, Arc::new(Config::default())));
+        state.session_service = Some(session_svc);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        );
+
+        let resp = logout(State(state), headers).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]

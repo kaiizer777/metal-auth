@@ -785,6 +785,11 @@ mod tests {
 
         let other_401 = AppError::InvalidCredentials.into_response();
         assert_eq!(other_401.status(), StatusCode::UNAUTHORIZED);
-        assert!(other_401.headers().get(axum::http::header::WWW_AUTHENTICATE).is_none());
+        assert!(
+            other_401
+                .headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .is_none()
+        );
     }
 }

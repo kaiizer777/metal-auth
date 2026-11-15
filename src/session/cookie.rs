@@ -83,8 +83,7 @@ pub fn build_session_cookie(sc: &impl SessionCookieSource, raw_id: &str) -> Head
         parts.push(format!("Domain={}", domain));
     }
 
-    HeaderValue::from_str(&parts.join("; "))
-        .unwrap_or_else(|_| HeaderValue::from_static(""))
+    HeaderValue::from_str(&parts.join("; ")).unwrap_or_else(|_| HeaderValue::from_static(""))
 }
 
 /// Helper to build a clear session cookie `Set-Cookie` header value.
@@ -105,8 +104,7 @@ pub fn build_clear_cookie(sc: &impl SessionCookieSource) -> HeaderValue {
         parts.push(format!("Domain={}", domain));
     }
 
-    HeaderValue::from_str(&parts.join("; "))
-        .unwrap_or_else(|_| HeaderValue::from_static(""))
+    HeaderValue::from_str(&parts.join("; ")).unwrap_or_else(|_| HeaderValue::from_static(""))
 }
 
 /// Helper to build a CSRF cookie `Set-Cookie` header value.
@@ -126,8 +124,7 @@ pub fn build_csrf_cookie(sc: &impl SessionCookieSource, csrf_token: &str) -> Hea
         parts.push(format!("Domain={}", domain));
     }
 
-    HeaderValue::from_str(&parts.join("; "))
-        .unwrap_or_else(|_| HeaderValue::from_static(""))
+    HeaderValue::from_str(&parts.join("; ")).unwrap_or_else(|_| HeaderValue::from_static(""))
 }
 
 /// Trait to support flexible argument order for `set_session_cookie`.

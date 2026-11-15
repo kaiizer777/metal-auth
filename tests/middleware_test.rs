@@ -348,7 +348,9 @@ async fn test_auth_user_extractor_unit_validation() {
 async fn test_require_auth_live_session_cookie_and_bearer_lifecycle() {
     let Some((pool, state)) = setup_live_db().await else {
         if std::env::var_os("CI").is_some() {
-            panic!("DATABASE_URL must be set in CI: live require_auth tests must not skip silently");
+            panic!(
+                "DATABASE_URL must be set in CI: live require_auth tests must not skip silently"
+            );
         }
         println!("Skipping live DB require_auth tests: DATABASE_URL not available");
         return;
@@ -441,7 +443,9 @@ async fn test_require_auth_live_session_cookie_and_bearer_lifecycle() {
 async fn test_csrf_bearer_bypass_fails_downstream_auth_with_invalid_token() {
     let Some((_pool, state)) = setup_live_db().await else {
         if std::env::var_os("CI").is_some() {
-            panic!("DATABASE_URL must be set in CI: live require_auth tests must not skip silently");
+            panic!(
+                "DATABASE_URL must be set in CI: live require_auth tests must not skip silently"
+            );
         }
         println!("Skipping live DB require_auth tests: DATABASE_URL not available");
         return;

@@ -238,6 +238,10 @@ mod tests {
             .join()
             .expect("thread must not panic")
             .expect("valid AppState initialization");
-        assert!(state.rate_limiter.allow("sync_key", 5, Duration::from_secs(60)));
+        assert!(
+            state
+                .rate_limiter
+                .allow("sync_key", 5, Duration::from_secs(60))
+        );
     }
 }

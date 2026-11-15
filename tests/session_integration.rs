@@ -581,7 +581,10 @@ async fn test_session_fixation() {
 
     assert_ne!(sid1, sid3);
     assert_eq!(new_session.session_type, "cookie");
-    assert_eq!(new_session.absolute_expires_at, old_session.absolute_expires_at);
+    assert_eq!(
+        new_session.absolute_expires_at,
+        old_session.absolute_expires_at
+    );
 
     // Replay rotation of sid1 must fail with SessionNotFound
     let replay_err = app
@@ -1106,9 +1109,12 @@ async fn test_csrf_bypass_via_bearer() {
     let mut dual_headers = headers;
     dual_headers.insert(
         header::COOKIE,
-        format!("{}=fake_cookie_session_value", app.state.config.session.cookie_name)
-            .parse()
-            .unwrap(),
+        format!(
+            "{}=fake_cookie_session_value",
+            app.state.config.session.cookie_name
+        )
+        .parse()
+        .unwrap(),
     );
     let dual_req = empty_request_with_headers(Method::POST, "/auth/session/refresh", dual_headers);
     let dual_resp = app.dispatch(dual_req).await;
@@ -1460,9 +1466,8 @@ async fn test_device_and_session_limits_eviction() {
             StatusCode::OK,
             "eviction loop setup login must succeed"
         );
-        let sid =
-            extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name)
-                .expect("session cookie present in login response");
+        let sid = extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name)
+            .expect("session cookie present in login response");
         sids.push(sid);
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -1479,9 +1484,8 @@ async fn test_device_and_session_limits_eviction() {
         StatusCode::OK,
         "overflow login must succeed and trigger eviction"
     );
-    let sid_extra =
-        extract_cookie_val(&resp_extra.headers, &app.state.config.session.cookie_name)
-            .expect("session cookie present in overflow login response");
+    let sid_extra = extract_cookie_val(&resp_extra.headers, &app.state.config.session.cookie_name)
+        .expect("session cookie present in overflow login response");
 
     // Oldest session sids[0] must now return 401
     let mut old_headers = HeaderMap::new();

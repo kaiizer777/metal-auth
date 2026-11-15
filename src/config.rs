@@ -855,8 +855,9 @@ impl SessionConfig {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         let is_valid_cookie_ascii = |s: &str| -> bool {
-            s.chars()
-                .all(|c| c.is_ascii() && !c.is_ascii_control() && c != ';' && c != '\r' && c != '\n')
+            s.chars().all(|c| {
+                c.is_ascii() && !c.is_ascii_control() && c != ';' && c != '\r' && c != '\n'
+            })
         };
         if self.cookie_name.trim().is_empty() {
             return Err(ConfigError::InvalidValue {

@@ -337,13 +337,15 @@ async fn test_require_auth_live_session_cookie_and_bearer_lifecycle() {
 
     let user_id = Uuid::new_v4();
     let email = format!("mw_user_{}@example.com", user_id);
-    sqlx::query("INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, true)")
-        .bind(user_id)
-        .bind(&email)
-        .bind("test_placeholder_hash")
-        .execute(&state.pool)
-        .await
-        .expect("insert test user");
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, true)",
+    )
+    .bind(user_id)
+    .bind(&email)
+    .bind("test_placeholder_hash")
+    .execute(&state.pool)
+    .await
+    .expect("insert test user");
 
     // 1. Test Cookie Session Lifecycle
     let (cookie_session, raw_cookie_token) = state

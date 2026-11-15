@@ -418,8 +418,8 @@ mod tests {
     async fn login_handler_rejects_empty_credentials_without_db() {
         let state = create_test_state();
         let payload = LoginRequest {
-            email: "".to_string(),
-            password: "".to_string(),
+            email: String::new(),
+            password: String::new(),
         };
 
         let resp = login(State(state), HeaderMap::new(), Ok(Json(payload))).await;

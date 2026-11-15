@@ -56,11 +56,20 @@ impl MessageResponse {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LoginResponse {
     pub user_id: Uuid,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub token: Option<String>,
+}
+
+impl std::fmt::Debug for LoginResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginResponse")
+            .field("user_id", &self.user_id)
+            .field("token", &self.token.as_ref().map(|_| "[redacted]"))
+            .finish()
+    }
 }
 
 impl LoginResponse {
@@ -521,5 +530,17 @@ mod tests {
             validate_password(long_11_codepoints, &config),
             Err(AppError::PasswordTooLong)
         ));
+    }
+
+    #[test]
+    fn login_response_debug_redacts_token() {
+        let resp_with_token = LoginResponse::with_token(Uuid::nil(), "secret-bearer-token");
+        let debug_str = format!("{resp_with_token:?}");
+        assert!(!debug_str.contains("secret-bearer-token"));
+        assert!(debug_str.contains("[redacted]"));
+
+        let resp_no_token = LoginResponse::new(Uuid::nil());
+        let debug_no_token = format!("{resp_no_token:?}");
+        assert!(debug_no_token.contains("None"));
     }
 }

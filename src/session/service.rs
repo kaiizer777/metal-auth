@@ -67,6 +67,8 @@ impl SessionService {
 
         let now = Utc::now();
         let absolute_expires_at = now + self.config.session.absolute_lifetime();
+        let idle_expires_at =
+            now + chrono::Duration::seconds(self.config.session.idle_timeout_secs as i64);
 
         let csrf_token = if session_type == "cookie" {
             let mut csrf_bytes = [0u8; 32];
@@ -113,13 +115,15 @@ impl SessionService {
             r#"
             INSERT INTO sessions (
                 id, user_id, token_hash, created_at,
+                expires_at, idle_expires_at,
                 last_active_at, absolute_expires_at,
                 session_type, csrf_token
             )
             VALUES (
                 gen_random_uuid(), $1, $2, $3,
+                $4, $5,
                 $3, $4,
-                $5, $6
+                $6, $7
             )
             RETURNING
                 id, user_id, token_hash, created_at,
@@ -131,6 +135,7 @@ impl SessionService {
         .bind(&token_hash)
         .bind(now)
         .bind(absolute_expires_at)
+        .bind(idle_expires_at)
         .bind(session_type)
         .bind(csrf_token)
         .fetch_one(&self.db)

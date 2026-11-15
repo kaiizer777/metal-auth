@@ -10,6 +10,11 @@ ALTER TABLE sessions
         CHECK (session_type IN ('cookie', 'bearer')),
     ADD COLUMN IF NOT EXISTS csrf_token TEXT;
 
+-- Drop legacy NOT NULL constraints for backwards compatibility with phase 4 session lifecycle
+ALTER TABLE sessions
+    ALTER COLUMN expires_at DROP NOT NULL,
+    ALTER COLUMN idle_expires_at DROP NOT NULL;
+
 -- Backfill existing rows if any: default last_active_at to created_at
 UPDATE sessions
 SET last_active_at = created_at

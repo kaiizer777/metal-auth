@@ -2687,6 +2687,14 @@ async fn test_rotate_session_rejects_expired_session() {
         metal_auth::SessionService::new(ctx.pool.clone(), Arc::new(ctx.state.config.clone()));
 
     let user_id = Uuid::new_v4();
+    let email = format!("sess_{}@example.com", user_id);
+    sqlx::query("INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, true)")
+        .bind(user_id)
+        .bind(&email)
+        .bind("hash_placeholder")
+        .execute(&ctx.pool)
+        .await
+        .expect("insert test user");
     let (session, raw_token) = session_service
         .create_session(user_id, "cookie", None, None)
         .await
@@ -2764,6 +2772,14 @@ async fn test_touch_session_rejects_expired_session() {
         metal_auth::SessionService::new(ctx.pool.clone(), Arc::new(ctx.state.config.clone()));
 
     let user_id = Uuid::new_v4();
+    let email = format!("sess_{}@example.com", user_id);
+    sqlx::query("INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, true)")
+        .bind(user_id)
+        .bind(&email)
+        .bind("hash_placeholder")
+        .execute(&ctx.pool)
+        .await
+        .expect("insert test user");
     let (session, _) = session_service
         .create_session(user_id, "bearer", None, None)
         .await
@@ -2797,6 +2813,14 @@ async fn test_rotate_session_success_lifecycle() {
         metal_auth::SessionService::new(ctx.pool.clone(), Arc::new(ctx.state.config.clone()));
 
     let user_id = Uuid::new_v4();
+    let email = format!("sess_{}@example.com", user_id);
+    sqlx::query("INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, true)")
+        .bind(user_id)
+        .bind(&email)
+        .bind("hash_placeholder")
+        .execute(&ctx.pool)
+        .await
+        .expect("insert test user");
     let (session1, raw_token1) = session_service
         .create_session(user_id, "cookie", Some("127.0.0.1"), Some("test-agent"))
         .await
@@ -2836,6 +2860,14 @@ async fn test_invalidate_all_user_sessions_spec_contract() {
         metal_auth::SessionService::new(ctx.pool.clone(), Arc::new(ctx.state.config.clone()));
 
     let user_id = Uuid::new_v4();
+    let email = format!("sess_{}@example.com", user_id);
+    sqlx::query("INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, true)")
+        .bind(user_id)
+        .bind(&email)
+        .bind("hash_placeholder")
+        .execute(&ctx.pool)
+        .await
+        .expect("insert test user");
     let (_, raw1) = session_service
         .create_session(user_id, "cookie", None, None)
         .await

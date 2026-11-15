@@ -7,6 +7,8 @@ use crate::{
     config::{AppConfig, Config},
     email::{dispatcher::EmailDispatcher, hook::SharedEmailSender},
     error::AppError,
+    ratelimit::RateLimiter,
+    session::SessionService,
 };
 
 /// Constructs an [`EmailDispatcher`] from application config and optional email sender.
@@ -33,6 +35,8 @@ pub struct AppState {
     pub auth_config: Arc<AppConfig>,
     pub auth_service: Arc<AuthServiceImpl>,
     pub email_dispatcher: Option<Arc<EmailDispatcher>>,
+    pub session_service: Arc<SessionService>,
+    pub rate_limiter: Arc<RateLimiter>,
 }
 
 impl AppState {
@@ -90,12 +94,20 @@ impl AppState {
             dispatcher,
         )?);
 
+        let session_service = Arc::new(SessionService::new(pool.clone(), Arc::new(config.clone())));
+        let rate_limiter = Arc::new(RateLimiter::with_config(config.rate_limit.clone()));
+        if config.rate_limit.enabled {
+            Arc::clone(&rate_limiter).start_cleanup_task(config.rate_limit.window());
+        }
+
         Ok(Self {
             pool,
             config,
             auth_config,
             auth_service,
             email_dispatcher,
+            session_service,
+            rate_limiter,
         })
     }
 

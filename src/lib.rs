@@ -47,7 +47,7 @@ pub use email::{
 };
 pub use error::{AppError, AppResult, ConfigError, ErrorCode, ErrorResponse};
 pub use handler::auth_routes;
-pub use middleware::csrf_middleware;
+pub use middleware::{csrf_middleware, require_auth, AuthUser};
 pub use ratelimit::{rate_limit_key, RateLimiter};
 pub use session::{
     clear_session_cookie, has_bearer_token, read_bearer_token, read_session_cookie,

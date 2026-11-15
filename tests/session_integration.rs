@@ -571,6 +571,7 @@ async fn test_session_fixation() {
     );
 
     // Rotate session sid1
+    let old_session = app.state.session_service.get_session(&sid1).await.unwrap();
     let (new_session, sid3) = app
         .state
         .session_service
@@ -580,6 +581,16 @@ async fn test_session_fixation() {
 
     assert_ne!(sid1, sid3);
     assert_eq!(new_session.session_type, "cookie");
+    assert_eq!(new_session.absolute_expires_at, old_session.absolute_expires_at);
+
+    // Replay rotation of sid1 must fail with SessionNotFound
+    let replay_err = app
+        .state
+        .session_service
+        .rotate_session(&sid1, None, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(replay_err, metal_auth::AppError::SessionNotFound));
 
     // sid1 is invalidated
     let old_check = app.state.session_service.get_session(&sid1).await;

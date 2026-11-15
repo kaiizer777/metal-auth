@@ -349,7 +349,8 @@ impl SessionService {
         self.invalidate_all_user_sessions(user_id).await
     }
 
-    /// Atomically rotate a session: validates old session, revokes it, and issues a fresh session.
+    /// Atomically rotate a session: validates old session, revokes it within a transaction,
+    /// and issues a fresh session preserving the original absolute expiry deadline.
     pub async fn rotate_session(
         &self,
         old_raw_id: &str,
@@ -361,15 +362,90 @@ impl SessionService {
         let old_session = self.get_session(old_raw_id).await?;
         let old_hash = Self::hash_raw_id(old_raw_id);
 
-        self.invalidate_by_hash(&old_hash).await?;
+        let mut tx = self.db.begin().await.map_err(|e| {
+            tracing::error!(error = %e, "Failed to begin transaction for rotate_session");
+            AppError::Database(e)
+        })?;
 
-        self.create_session(
-            old_session.user_id,
-            &old_session.session_type,
-            ip,
-            user_agent,
+        // Atomically delete old session; must affect exactly 1 row to prevent replay/duplicate rotation
+        let delete_res = sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
+            .bind(&old_hash)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "Failed to delete old session during rotation");
+                AppError::Database(e)
+            })?;
+
+        if delete_res.rows_affected() == 0 {
+            return Err(AppError::SessionNotFound);
+        }
+
+        let raw_id = Self::generate_raw_id();
+        let token_hash = Self::hash_raw_id(&raw_id);
+        let now = Utc::now();
+        let idle_expires_at =
+            now + chrono::Duration::seconds(self.config.session.idle_timeout_secs as i64);
+        // Preserve old absolute deadline to prevent infinite session extension (ASVS L1)
+        let absolute_expires_at = old_session.absolute_expires_at;
+
+        let csrf_token = if old_session.session_type == "cookie" {
+            let mut csrf_bytes = [0u8; 32];
+            OsRng.fill_bytes(&mut csrf_bytes);
+            Some(hex::encode(csrf_bytes))
+        } else {
+            None
+        };
+
+        let session = sqlx::query_as::<_, Session>(
+            r#"
+            INSERT INTO sessions (
+                id, user_id, token_hash, created_at,
+                expires_at, idle_expires_at,
+                last_active_at, absolute_expires_at,
+                session_type, csrf_token
+            )
+            VALUES (
+                gen_random_uuid(), $1, $2, $3,
+                $4, $5,
+                $3, $4,
+                $6, $7
+            )
+            RETURNING
+                id, user_id, token_hash, created_at,
+                last_active_at, absolute_expires_at,
+                session_type, csrf_token
+            "#,
         )
+        .bind(old_session.user_id)
+        .bind(&token_hash)
+        .bind(now)
+        .bind(absolute_expires_at)
+        .bind(idle_expires_at)
+        .bind(&old_session.session_type)
+        .bind(csrf_token)
+        .fetch_one(&mut *tx)
         .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to insert rotated session");
+            AppError::Database(e)
+        })?;
+
+        tx.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "Failed to commit session rotation transaction");
+            AppError::Database(e)
+        })?;
+
+        tracing::info!(
+            event = "session_rotated",
+            user_id = %old_session.user_id,
+            old_hash = %old_hash,
+            new_hash = %session.token_hash,
+            ip = ip.unwrap_or("unknown"),
+            user_agent = user_agent.unwrap_or("unknown"),
+        );
+
+        Ok((session, raw_id))
     }
 
     /// List active, non-expired sessions for a user ordered by most recently active.

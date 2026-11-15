@@ -2853,6 +2853,7 @@ async fn test_rotate_session_success_lifecycle() {
     assert_ne!(raw_token1, raw_token2);
     assert_eq!(session2.user_id, user_id);
     assert_eq!(session2.session_type, "cookie");
+    assert_eq!(session2.absolute_expires_at, session1.absolute_expires_at);
 
     // Old token must no longer be found
     let err = session_service

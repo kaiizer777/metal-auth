@@ -29,7 +29,10 @@ pub struct Session {
     pub user_id: Uuid,
     pub token_hash: String,
     pub expires_at: DateTime<Utc>,
-    pub idle_expires_at: DateTime<Utc>,
+    pub last_active_at: Option<DateTime<Utc>>,
+    pub absolute_expires_at: Option<DateTime<Utc>>,
+    pub session_type: String,
+    pub csrf_token: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 

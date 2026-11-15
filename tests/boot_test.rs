@@ -139,10 +139,14 @@ fn test_facade_re_exported_models_contract() {
         user_id: uid,
         token_hash: "sha256_hash_here".into(),
         expires_at: now,
-        idle_expires_at: now,
+        last_active_at: Some(now),
+        absolute_expires_at: Some(now),
+        session_type: "web".into(),
+        csrf_token: None,
         created_at: now,
     };
     assert_eq!(session.user_id, uid);
+    assert_eq!(session.session_type, "web");
 
     let v_token = VerificationToken {
         token_hash: vec![0u8; 32],

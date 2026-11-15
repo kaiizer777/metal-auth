@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use axum::Router;
 use tower_http::trace::TraceLayer;
 
@@ -23,7 +21,7 @@ pub fn create_router(state: AppState) -> Result<Router, AppError> {
     state.config.validate().map_err(AppError::Config)?;
     let cors = cors_layer(&state.config)?;
 
-    let auth_router = auth::routes(Arc::clone(&state.auth_service))
+    let auth_router = auth::routes_with_app_state(state.clone())
         .merge(session::routes(state.clone()));
 
     Ok(Router::new()

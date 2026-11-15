@@ -59,6 +59,24 @@ impl MessageResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LoginResponse {
     pub user_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub token: Option<String>,
+}
+
+impl LoginResponse {
+    pub fn new(user_id: Uuid) -> Self {
+        Self {
+            user_id,
+            token: None,
+        }
+    }
+
+    pub fn with_token(user_id: Uuid, token: impl Into<String>) -> Self {
+        Self {
+            user_id,
+            token: Some(token.into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

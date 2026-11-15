@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{State, rejection::JsonRejection},
-    http::{StatusCode, header},
+    extract::{rejection::JsonRejection, State},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 
@@ -19,7 +19,15 @@ use crate::{
         PasswordResetRequest, SignupRequest, VerifyEmailRequest,
     },
     auth::service::AuthServiceImpl,
+    config::Config,
     error::{AppError, ErrorCode, ErrorResponse},
+    ratelimit::{rate_limit_key, RateLimiter},
+    session::{
+        bearer::read_bearer_token,
+        cookie::{clear_session_cookie, read_session_cookie, set_csrf_cookie, set_session_cookie},
+        SessionService,
+    },
+    state::AppState,
 };
 
 // ─── Shared app state for handlers ───────────────────────────────────────────
@@ -27,6 +35,9 @@ use crate::{
 #[derive(Clone)]
 pub struct AuthHandlerState {
     pub service: Arc<AuthServiceImpl>,
+    pub session_service: Option<Arc<SessionService>>,
+    pub rate_limiter: Option<Arc<RateLimiter>>,
+    pub config: Option<Arc<Config>>,
 }
 
 async fn method_not_allowed() -> impl IntoResponse {
@@ -38,7 +49,24 @@ async fn method_not_allowed() -> impl IntoResponse {
 }
 
 pub fn routes(service: Arc<AuthServiceImpl>) -> Router {
-    let state = AuthHandlerState { service };
+    routes_with_state(AuthHandlerState {
+        service,
+        session_service: None,
+        rate_limiter: None,
+        config: None,
+    })
+}
+
+pub fn routes_with_app_state(state: AppState) -> Router {
+    routes_with_state(AuthHandlerState {
+        service: Arc::clone(&state.auth_service),
+        session_service: Some(Arc::clone(&state.session_service)),
+        rate_limiter: Some(Arc::clone(&state.rate_limiter)),
+        config: Some(Arc::new(state.config.clone())),
+    })
+}
+
+pub fn routes_with_state(state: AuthHandlerState) -> Router {
     Router::new()
         .route(
             "/signup",
@@ -116,11 +144,14 @@ pub async fn signup(
 
 /// POST /auth/login
 ///
-/// Returns 200 with `user_id` on success.
+/// Returns 200 with `user_id` (and token if bearer) on success.
+/// Sets HttpOnly session cookie and SameSite=Strict CSRF cookie for cookie sessions.
 /// Returns 401 for wrong password OR unknown email (identical response — anti-enum).
 /// Returns 403 when `require_email_verification = true` and email unverified.
+/// Returns 429 when login rate limit is exceeded.
 pub async fn login(
     State(state): State<AuthHandlerState>,
+    headers: HeaderMap,
     body: Result<Json<LoginRequest>, JsonRejection>,
 ) -> Response {
     let Json(req) = match body {
@@ -132,19 +163,143 @@ pub async fn login(
         return service_error_response(e);
     }
 
-    match state.service.login(&req.email, &req.password).await {
-        Ok(user_id) => (StatusCode::OK, Json(LoginResponse { user_id })).into_response(),
-        Err(e) => service_error_response(e),
+    let client_ip = headers
+        .get("x-forwarded-for")
+        .or_else(|| headers.get("x-real-ip"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or(s).trim())
+        .unwrap_or("127.0.0.1")
+        .to_string();
+
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    // Pre-credential rate limit check prevents account existence timing oracles
+    if let (Some(limiter), Some(cfg)) = (&state.rate_limiter, &state.config) {
+        if cfg.rate_limit.enabled {
+            let key = rate_limit_key(&client_ip, &req.email);
+            if !limiter.allow(&key, cfg.rate_limit.max_attempts, cfg.rate_limit.window()) {
+                tracing::warn!(
+                    event = "rate_limit_exceeded",
+                    ip = %client_ip,
+                    key_prefix = "login",
+                );
+                let mut resp = service_error_response(AppError::RateLimitExceeded);
+                let _ = resp.headers_mut().insert(
+                    header::RETRY_AFTER,
+                    cfg.rate_limit.window_secs.to_string().parse().unwrap(),
+                );
+                return resp;
+            }
+        }
+    }
+
+    let user_id = match state.service.login(&req.email, &req.password).await {
+        Ok(uid) => uid,
+        Err(e) => {
+            tracing::warn!(
+                event = "login_failure",
+                reason = "invalid_credentials",
+                ip = %client_ip,
+                user_agent = %user_agent.as_deref().unwrap_or("unknown"),
+            );
+            return service_error_response(e);
+        }
+    };
+
+    // Reset rate limit attempts upon successful authentication
+    if let Some(limiter) = &state.rate_limiter {
+        let key = rate_limit_key(&client_ip, &req.email);
+        limiter.reset(&key);
+    }
+
+    let is_bearer = headers
+        .get("x-auth-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.eq_ignore_ascii_case("bearer"))
+        .unwrap_or(false);
+
+    let session_type = if is_bearer { "bearer" } else { "cookie" };
+
+    if let Some(session_svc) = &state.session_service {
+        let (session, raw_id) = match session_svc
+            .create_session(user_id, session_type, Some(&client_ip), user_agent.as_deref())
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => return service_error_response(e),
+        };
+
+        tracing::info!(
+            event = "login_success",
+            user_id = %user_id,
+            session_type = session_type,
+            ip = %client_ip,
+            user_agent = %user_agent.as_deref().unwrap_or("unknown"),
+        );
+
+        if is_bearer {
+            (
+                StatusCode::OK,
+                Json(LoginResponse::with_token(user_id, raw_id)),
+            )
+                .into_response()
+        } else {
+            let mut response = (StatusCode::OK, Json(LoginResponse::new(user_id))).into_response();
+            if let Some(cfg) = &state.config {
+                response.headers_mut().insert(
+                    header::SET_COOKIE,
+                    set_session_cookie(raw_id.as_str(), cfg.as_ref()),
+                );
+                if let Some(ref csrf) = session.csrf_token {
+                    response.headers_mut().append(
+                        header::SET_COOKIE,
+                        set_csrf_cookie(csrf.as_str(), cfg.as_ref()),
+                    );
+                }
+            }
+            response
+        }
+    } else {
+        (StatusCode::OK, Json(LoginResponse::new(user_id))).into_response()
     }
 }
 
 /// POST /auth/logout
 ///
-/// Phase 3 stub — returns 204 No Content.
-/// Authorization: Bearer <token> header is accepted but not validated in Phase 3.
-pub async fn logout(State(state): State<AuthHandlerState>) -> Response {
-    let _ = state.service.logout("").await;
-    StatusCode::NO_CONTENT.into_response()
+/// Revokes session on server side and clears the session cookie.
+pub async fn logout(
+    State(state): State<AuthHandlerState>,
+    headers: HeaderMap,
+) -> Response {
+    let cookie_name = state
+        .config
+        .as_ref()
+        .map(|c| c.session.cookie_name.as_str())
+        .unwrap_or("sid");
+
+    let raw_id_opt = read_session_cookie(&headers, cookie_name)
+        .or_else(|| read_bearer_token(&headers));
+
+    if let Some(ref raw_id) = raw_id_opt {
+        if let Some(ref session_svc) = state.session_service {
+            let _ = session_svc.invalidate_session(raw_id).await;
+        }
+        let _ = state.service.logout(raw_id).await;
+    } else {
+        let _ = state.service.logout("").await;
+    }
+
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    if let Some(ref cfg) = state.config {
+        response.headers_mut().insert(
+            header::SET_COOKIE,
+            clear_session_cookie(cfg.as_ref()),
+        );
+    }
+    response
 }
 
 /// POST /auth/verify
@@ -250,7 +405,12 @@ mod tests {
         ));
         let service =
             Arc::new(AuthServiceImpl::new(pool, config, dispatcher).expect("test service"));
-        AuthHandlerState { service }
+        AuthHandlerState {
+            service,
+            session_service: None,
+            rate_limiter: None,
+            config: None,
+        }
     }
 
     #[tokio::test]
@@ -261,7 +421,7 @@ mod tests {
             password: "".to_string(),
         };
 
-        let resp = login(State(state), Ok(Json(payload))).await;
+        let resp = login(State(state), HeaderMap::new(), Ok(Json(payload))).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
@@ -334,7 +494,7 @@ mod tests {
     #[tokio::test]
     async fn logout_handler_returns_no_content() {
         let state = create_test_state();
-        let resp = logout(State(state)).await;
+        let resp = logout(State(state), HeaderMap::new()).await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     }
 

@@ -225,6 +225,8 @@ impl SessionService {
                 AppError::Database(e)
             })?;
 
+        let mut session = session;
+        session.last_active_at = now;
         Ok(session)
     }
 
@@ -233,10 +235,53 @@ impl SessionService {
         self.get_session(raw_token).await
     }
 
-    /// Touch session activity timestamp by token hash without re-validating timeouts.
+    /// Touch session activity timestamp by token hash after verifying timeouts.
     pub async fn touch_session(&self, token_hash: &str) -> Result<(), AppError> {
+        let now = Utc::now();
+        let session = sqlx::query_as::<_, Session>(
+            r#"
+            SELECT
+                id, user_id, token_hash, created_at,
+                last_active_at, absolute_expires_at,
+                session_type, csrf_token
+            FROM sessions
+            WHERE token_hash = $1
+            "#,
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Database error fetching session to touch");
+            AppError::Database(e)
+        })?
+        .ok_or(AppError::SessionNotFound)?;
+
+        // Defence-in-depth: check absolute timeout first.
+        if now > session.absolute_expires_at {
+            tracing::info!(
+                event = "session_expired",
+                reason = "absolute",
+            );
+            let _ = self.invalidate_by_hash(token_hash).await;
+            return Err(AppError::SessionExpired);
+        }
+
+        // Check sliding idle timeout second.
+        let idle_deadline = session.last_active_at
+            + chrono::Duration::from_std(self.config.session.idle_timeout())
+                .map_err(|_| AppError::Internal)?;
+        if now > idle_deadline {
+            tracing::info!(
+                event = "session_expired",
+                reason = "idle",
+            );
+            let _ = self.invalidate_by_hash(token_hash).await;
+            return Err(AppError::SessionExpired);
+        }
+
         sqlx::query("UPDATE sessions SET last_active_at = $1 WHERE token_hash = $2")
-            .bind(Utc::now())
+            .bind(now)
             .bind(token_hash)
             .execute(&self.db)
             .await
@@ -304,25 +349,10 @@ impl SessionService {
         ip: Option<&str>,
         user_agent: Option<&str>,
     ) -> Result<(Session, String), AppError> {
+        // get_session validates existence, enforces absolute expiry first, enforces idle timeout second,
+        // and eagerly purges expired sessions returning AppError::SessionExpired.
+        let old_session = self.get_session(old_raw_id).await?;
         let old_hash = Self::hash_raw_id(old_raw_id);
-        let old_session = sqlx::query_as::<_, Session>(
-            r#"
-            SELECT
-                id, user_id, token_hash, created_at,
-                last_active_at, absolute_expires_at,
-                session_type, csrf_token
-            FROM sessions
-            WHERE token_hash = $1
-            "#,
-        )
-        .bind(&old_hash)
-        .fetch_optional(&self.db)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "Database error fetching session for rotation");
-            AppError::Database(e)
-        })?
-        .ok_or(AppError::SessionNotFound)?;
 
         self.invalidate_by_hash(&old_hash).await?;
 

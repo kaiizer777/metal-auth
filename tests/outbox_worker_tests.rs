@@ -10,6 +10,7 @@ use metal_auth::db::outbox::{
     claim_pending_outbox, cleanup_sent_outbox, get_outbox_by_id, insert_outbox,
     recover_stale_processing,
 };
+use metal_auth::email::NoopEmailSender;
 use metal_auth::email::outbox::{
     OutboxWorkerConfig, process_outbox_batch, run_outbox_worker_until,
 };
@@ -702,11 +703,29 @@ async fn test_outbox_worker_until_stops_on_shutdown() {
         return;
     };
 
+    // Seed pending rows: fails if shutdown skips the in-flight drain.
+    let mut ids = Vec::new();
+    for i in 0..2 {
+        let recipient = format!("shutdown_drain_{i}_{}@example.com", uuid::Uuid::new_v4());
+        let payload = json!({
+            "user_id": uuid::Uuid::new_v4(),
+            "to": recipient,
+            "token": "tok",
+            "url": "https://example.com",
+            "expires_at": chrono::Utc::now()
+        });
+        let row = insert_outbox(&app.pool, &recipient, "verification", payload)
+            .await
+            .expect("insert outbox row");
+        ids.push(row.id);
+    }
+
+    let sender: Option<SharedEmailSender> = Some(Arc::new(NoopEmailSender));
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let worker = tokio::spawn(run_outbox_worker_until(
         app.pool.clone(),
-        None,
-        Duration::from_millis(50),
+        sender,
+        Duration::from_secs(5),
         OutboxWorkerConfig::default(),
         Arc::new(tokio::sync::Notify::new()),
         shutdown_rx,
@@ -716,4 +735,20 @@ async fn test_outbox_worker_until_stops_on_shutdown() {
         .await
         .expect("worker stops after shutdown signal")
         .expect("worker join");
+
+    for id in &ids {
+        let row = get_outbox_by_id(&app.pool, *id)
+            .await
+            .expect("fetch row")
+            .expect("seeded row present");
+        assert_eq!(
+            row.status, OUTBOX_STATUS_SENT,
+            "shutdown must not abandon the in-flight drain"
+        );
+    }
+
+    let _ = sqlx::query("DELETE FROM email_outbox WHERE id = ANY($1)")
+        .bind(&ids)
+        .execute(&app.pool)
+        .await;
 }

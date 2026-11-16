@@ -142,7 +142,7 @@ impl SessionService {
                     .await
                     .map_err(AppError::Database)?;
             if current.as_deref() != Some(expected) {
-                return Err(AppError::InvalidCredentials);
+                return Err(AppError::SessionInvalid);
             }
         }
 

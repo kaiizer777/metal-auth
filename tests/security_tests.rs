@@ -2952,11 +2952,8 @@ async fn test_invalidate_all_user_sessions_waits_on_user_row() {
         .await
         .expect("guard lock acquired");
 
-    let revoke_handle = tokio::spawn(async move {
-        session_service
-            .invalidate_all_user_sessions(user_id)
-            .await
-    });
+    let revoke_handle =
+        tokio::spawn(async move { session_service.invalidate_all_user_sessions(user_id).await });
 
     // Pre-fix revoke-all never issues SELECT ... FOR UPDATE, so no backend
     // ever blocks and the deadline expires instead of passing by accident.
@@ -2988,5 +2985,8 @@ async fn test_invalidate_all_user_sessions_waits_on_user_row() {
         .fetch_one(&ctx.pool)
         .await
         .expect("session count readable");
-    assert_eq!(live, 0, "ISSUE48: live session survived committed revoke-all");
+    assert_eq!(
+        live, 0,
+        "ISSUE48: live session survived committed revoke-all"
+    );
 }

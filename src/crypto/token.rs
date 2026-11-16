@@ -16,6 +16,7 @@ pub fn generate_token() -> (String, [u8; 32]) {
     OsRng.fill_bytes(&mut buf);
     let raw_hex = hex::encode(buf);
     let stored_hash = Sha256::digest(buf).into();
+    super::zeroize_bytes(&mut buf);
     (raw_hex, stored_hash)
 }
 
@@ -34,10 +35,12 @@ pub fn hash_token(hex_token: &str) -> Result<[u8; 32], AppError> {
     }
     let mut bytes = [0u8; 32];
     hex::decode_to_slice(hex_token, &mut bytes).map_err(|_| AppError::InvalidToken)?;
-    Ok(Sha256::digest(bytes).into())
+    let digest: [u8; 32] = Sha256::digest(bytes).into();
+    super::zeroize_bytes(&mut bytes);
+    Ok(digest)
 }
 
-/// Alias for [`hash_token`] for backward compatibility with existing callers.
+/// Alias for [`hash_token`], kept for existing callers; prefer [`hash_token`] in new code.
 pub fn sha256_of_hex_token(hex_token: &str) -> Result<[u8; 32], AppError> {
     hash_token(hex_token)
 }
@@ -159,5 +162,34 @@ mod tests {
         assert!(is_valid_token_format(&upper));
         let hash = hash_token(&upper).unwrap();
         assert_eq!(hash, stored_hash);
+    }
+
+    #[test]
+    fn generated_token_satisfies_format_check() {
+        let (hex, _) = generate_token();
+        assert!(is_valid_token_format(&hex));
+    }
+
+    #[test]
+    fn concurrent_generation_yields_unique_tokens() {
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    s.spawn(|| {
+                        (0..16)
+                            .map(|_| generate_token())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            let mut seen = std::collections::HashSet::new();
+            for handle in handles {
+                for (hex, hash) in handle.join().expect("worker panicked") {
+                    assert!(is_valid_token_format(&hex));
+                    assert!(seen.insert((hex, hash)), "duplicate token generated");
+                }
+            }
+            assert_eq!(seen.len(), 8 * 16);
+        });
     }
 }

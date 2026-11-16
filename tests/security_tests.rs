@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use axum::{
     body::Body,
@@ -2914,4 +2915,78 @@ async fn test_invalidate_all_user_sessions_spec_contract() {
 
     assert!(session_service.get_session(&raw1).await.is_err());
     assert!(session_service.get_session(&raw2).await.is_err());
+}
+
+/// Issue #48: revoke-all must serialize with a concurrent rotate via the
+/// users-row lock. The guard tx stands in for an in-flight rotate holding
+/// that lock across its tx (#47); revoke-all must wait on the row BEFORE
+/// deleting, or a rotate can mint a session the DELETE never sees.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_invalidate_all_user_sessions_waits_on_user_row() {
+    let Some(ctx) = setup_live_db().await else {
+        return;
+    };
+    let session_service =
+        metal_auth::SessionService::new(ctx.pool.clone(), Arc::new(ctx.state.config.clone()));
+
+    let user_id = Uuid::new_v4();
+    let email = format!("revoke48_{}@example.com", user_id);
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, true)",
+    )
+    .bind(user_id)
+    .bind(&email)
+    .bind("hash_placeholder")
+    .execute(&ctx.pool)
+    .await
+    .expect("insert test user");
+    session_service
+        .create_session(user_id, "cookie", None, None)
+        .await
+        .expect("seed session mints");
+
+    let mut guard_tx = ctx.pool.begin().await.expect("guard tx begins");
+    sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        .bind(user_id)
+        .execute(&mut *guard_tx)
+        .await
+        .expect("guard lock acquired");
+
+    let revoke_handle = tokio::spawn(async move {
+        session_service
+            .invalidate_all_user_sessions(user_id)
+            .await
+    });
+
+    // Pre-fix revoke-all never issues SELECT ... FOR UPDATE, so no backend
+    // ever blocks and the deadline expires instead of passing by accident.
+    let deadline = Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity WHERE query LIKE 'SELECT id FROM users%FOR UPDATE' AND datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&ctx.pool)
+        .await
+        .expect("pg_stat_activity must be readable");
+        if waiting > 0 {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("ISSUE48: revoke-all never waited on the user-row lock before deleting");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    guard_tx.commit().await.expect("guard tx commits");
+    revoke_handle
+        .await
+        .expect("revoke task joins")
+        .expect("revoke commits");
+
+    let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_one(&ctx.pool)
+        .await
+        .expect("session count readable");
+    assert_eq!(live, 0, "ISSUE48: live session survived committed revoke-all");
 }

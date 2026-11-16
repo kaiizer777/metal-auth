@@ -364,6 +364,55 @@ async fn test_outbox_durability_across_process_restart() {
         .await;
 }
 
+/// Issue #50: `claim_pending_outbox` claims globally oldest-first, so rows inserted
+/// by parallel test binaries can be claimed ahead of ours and `claimed[0].id == row.id`
+/// flakes. Claim with a wide limit, match our own row by id, and restore any foreign
+/// rows we swept up to their pre-claim state so other binaries are unaffected.
+async fn claim_own_outbox_row(
+    pool: &sqlx::PgPool,
+    row_id: uuid::Uuid,
+    lease: Duration,
+) -> Option<metal_auth::EmailOutbox> {
+    let foreign: Vec<(uuid::Uuid, String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT id, status, next_retry_at FROM email_outbox \
+         WHERE id <> $1 AND ((status = 'pending' AND next_retry_at <= NOW()) \
+         OR (status = 'processing' AND next_retry_at <= NOW()))",
+    )
+    .bind(row_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let claimed = claim_pending_outbox(pool, 1000, lease)
+        .await
+        .expect("claim outbox");
+
+    let mut own = None;
+    for c in claimed {
+        if c.id == row_id {
+            own = Some(c);
+        } else if let Some(snap) = foreign.iter().find(|(id, _, _)| *id == c.id) {
+            let _ = sqlx::query(
+                "UPDATE email_outbox SET status = $1, next_retry_at = $2 WHERE id = $3",
+            )
+            .bind(&snap.1)
+            .bind(snap.2)
+            .bind(c.id)
+            .execute(pool)
+            .await;
+        } else {
+            // Raced in after our snapshot: leave it claimable again.
+            let _ = sqlx::query(
+                "UPDATE email_outbox SET status = 'pending', next_retry_at = NOW() WHERE id = $1",
+            )
+            .bind(c.id)
+            .execute(pool)
+            .await;
+        }
+    }
+    own
+}
+
 #[tokio::test]
 async fn test_outbox_stale_processing_lease_recovery() {
     let _guard = DB_LOCK.lock().await;
@@ -383,12 +432,13 @@ async fn test_outbox_stale_processing_lease_recovery() {
         .await
         .expect("insert outbox");
 
-    // 1. Claim row with a 1-second lease
-    let claimed = claim_pending_outbox(&app.pool, 1, Duration::from_secs(1))
+    // 1. Claim row with a 1-second lease (any-match on our id: foreign rows from
+    // parallel binaries may be claimed alongside ours)
+    let first = claim_own_outbox_row(&app.pool, row.id, Duration::from_secs(1))
         .await
-        .expect("claim outbox");
-    assert_eq!(claimed.len(), 1);
-    assert_eq!(claimed[0].id, row.id);
+        .expect("our outbox row must be claimed");
+    assert_eq!(first.status, "processing");
+    assert!(first.next_retry_at > chrono::Utc::now());
 
     // Verify row in DB is 'processing' with next_retry_at in the future
     let row_in_db = get_outbox_by_id(&app.pool, row.id)
@@ -399,20 +449,19 @@ async fn test_outbox_stale_processing_lease_recovery() {
     assert!(row_in_db.next_retry_at > chrono::Utc::now());
 
     // 2. Immediate claim attempt while lease is active should NOT claim the row
-    let unexpired = claim_pending_outbox(&app.pool, 1, Duration::from_secs(1))
-        .await
-        .expect("claim outbox unexpired");
-    assert_eq!(unexpired.len(), 0, "active lease must not be reclaimed");
+    // (foreign due rows may still be claimed; only ours must be absent)
+    let unexpired = claim_own_outbox_row(&app.pool, row.id, Duration::from_secs(1)).await;
+    assert!(unexpired.is_none(), "active lease must not be reclaimed");
 
     // 3. Wait for lease to expire
     tokio::time::sleep(Duration::from_millis(1100)).await;
 
     // 4. Claiming again should reclaim the stale processing record
-    let reclaimed = claim_pending_outbox(&app.pool, 1, Duration::from_secs(60))
+    let reclaimed = claim_own_outbox_row(&app.pool, row.id, Duration::from_secs(60))
         .await
-        .expect("claim outbox expired lease");
-    assert_eq!(reclaimed.len(), 1, "expired lease must be reclaimed");
-    assert_eq!(reclaimed[0].id, row.id);
+        .expect("expired lease must be reclaimed");
+    assert_eq!(reclaimed.status, "processing");
+    assert!(reclaimed.next_retry_at > chrono::Utc::now());
 
     // 5. Verify recover_stale_processing resets expired processing records to pending
     sqlx::query(

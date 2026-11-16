@@ -465,10 +465,10 @@ impl AuthServiceImpl {
         // simultaneously consumed tokens deterministically instead of racing
         // the final `UPDATE users` (last-writer-wins on identical cost).
         let locked = sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
-                .bind(user_id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(AppError::Database)?;
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(AppError::Database)?;
         if locked.is_none() {
             let _ = tx.rollback().await;
             return Err(AppError::InvalidToken);

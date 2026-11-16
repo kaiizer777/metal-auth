@@ -66,7 +66,10 @@ impl std::fmt::Debug for Session {
             .field("last_active_at", &self.last_active_at)
             .field("absolute_expires_at", &self.absolute_expires_at)
             .field("session_type", &self.session_type)
-            .field("csrf_token", &self.csrf_token.as_ref().map(|_| "[redacted]"))
+            .field(
+                "csrf_token",
+                &self.csrf_token.as_ref().map(|_| "[redacted]"),
+            )
             .finish()
     }
 }

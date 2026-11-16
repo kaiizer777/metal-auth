@@ -682,4 +682,97 @@ mod tests {
         let valid_at = now + Duration::hours(12);
         assert!(now <= valid_at, "future absolute expiry must be active");
     }
+
+    async fn live_pool() -> Option<PgPool> {
+        dotenvy::dotenv().ok();
+        let url = std::env::var("DATABASE_URL").ok()?;
+        let pool = crate::db::init_pool_with_options(
+            &url,
+            crate::db::DbPoolOptions {
+                max_connections: 2,
+                min_connections: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("DATABASE_URL is set, so the expiry test pool must connect");
+        Some(pool)
+    }
+
+    #[tokio::test]
+    async fn list_user_sessions_excludes_idle_and_absolute_expired() {
+        let Some(pool) = live_pool().await else {
+            eprintln!("SKIP: list_user_sessions expiry test needs DATABASE_URL");
+            return;
+        };
+        let config = Arc::new(crate::config::Config {
+            database_url: String::new(),
+            ..Default::default()
+        });
+        let service = SessionService::new(pool.clone(), config.clone());
+        let idle_margin = i64::try_from(config.session.idle_timeout_secs).unwrap_or(1800) + 120;
+
+        let user_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'test-hash')")
+            .bind(user_id)
+            .bind(format!("list_expiry_{user_id}@example.com"))
+            .execute(&pool)
+            .await
+            .expect("seed expiry-test user");
+
+        let (active, _) = service
+            .create_session_simple(user_id, "cookie")
+            .await
+            .expect("active session");
+        let (idle, _) = service
+            .create_session_simple(user_id, "cookie")
+            .await
+            .expect("idle-expired session");
+        let (absolute, _) = service
+            .create_session_simple(user_id, "cookie")
+            .await
+            .expect("absolute-expired session");
+
+        let now = Utc::now();
+        sqlx::query("UPDATE sessions SET last_active_at = $1 WHERE token_hash = $2")
+            .bind(now - Duration::seconds(idle_margin))
+            .bind(&idle.token_hash)
+            .execute(&pool)
+            .await
+            .expect("backdate idle-expired row");
+        sqlx::query(
+            "UPDATE sessions SET last_active_at = $1, absolute_expires_at = $2 WHERE token_hash = $3",
+        )
+        .bind(now)
+        .bind(now - Duration::seconds(60))
+        .bind(&absolute.token_hash)
+        .execute(&pool)
+        .await
+        .expect("backdate absolute-expired row");
+
+        let listed = service
+            .list_user_sessions(user_id)
+            .await
+            .expect("list sessions");
+        let hashes: Vec<&str> = listed.iter().map(|s| s.token_hash.as_str()).collect();
+        assert!(
+            hashes.contains(&active.token_hash.as_str()),
+            "active session must be listed"
+        );
+        assert!(
+            !hashes.contains(&idle.token_hash.as_str()),
+            "idle-expired row must be excluded"
+        );
+        assert!(
+            !hashes.contains(&absolute.token_hash.as_str()),
+            "absolute-expired row must be excluded"
+        );
+        assert_eq!(listed.len(), 1, "only the active session is listed");
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("remove expiry-test user");
+    }
 }

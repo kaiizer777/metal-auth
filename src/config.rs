@@ -105,9 +105,12 @@ impl Config {
             .base_url
             .parse::<axum::http::Uri>()
             .map_err(|_| ConfigError::InvalidEnvVar("BASE_URL"))?;
+        // Fragments would survive into email-link construction; `#` can only
+        // start a fragment here since it must be percent-encoded elsewhere.
         if !matches!(uri.scheme_str(), Some("http" | "https"))
             || uri.authority().is_none()
             || uri.query().is_some()
+            || self.base_url.contains('#')
             || uri.authority().is_some_and(|a| a.as_str().contains('@'))
         {
             return Err(ConfigError::InvalidEnvVar("BASE_URL"));
@@ -415,11 +418,14 @@ impl Config {
         };
         let cookie_secure =
             parse_env_bool(&lookup, "SESSION_COOKIE_SECURE", default_cookie_secure())?;
-        let idle_timeout_secs = parse_env_u64(
+        let idle_timeout_secs = parse_env_from_str(
             &lookup,
             "SESSION_IDLE_TIMEOUT_SECS",
             default_idle_timeout_secs(),
         )?;
+        // Legacy alias: SESSION_ABSOLUTE_LIFETIME_SECS wins when both are set;
+        // SESSION_ABSOLUTE_TIMEOUT_SECS is only read as a fallback and an
+        // invalid fallback value is rejected rather than ignored.
         let absolute_lifetime_secs = match lookup("SESSION_ABSOLUTE_LIFETIME_SECS") {
             Ok(val) => val.parse::<u64>().map_err(|_| ConfigError::InvalidValue {
                 field: "absolute_lifetime_secs",
@@ -478,8 +484,9 @@ impl Config {
                 return Err(ConfigError::NonUnicodeEnvVar("RATE_LIMIT_MAX_ATTEMPTS"));
             }
         };
-        let window_secs = parse_env_u64(&lookup, "RATE_LIMIT_WINDOW_SECS", default_window_secs())?;
-        let login_cooldown_secs = parse_env_u64(
+        let window_secs =
+            parse_env_from_str(&lookup, "RATE_LIMIT_WINDOW_SECS", default_window_secs())?;
+        let login_cooldown_secs = parse_env_from_str(
             &lookup,
             "RATE_LIMIT_LOGIN_COOLDOWN_SECS",
             default_login_cooldown_secs(),
@@ -524,6 +531,9 @@ impl Config {
     }
 }
 
+/// Canonical origin rule: origins are stored normalized (trimmed, no trailing
+/// `/`). The env loader normalizes via this helper; [`Config::validate`]
+/// rejects unnormalized programmatic values instead of silently fixing them.
 fn parse_allowed_origins_str(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(|s| s.trim().trim_end_matches('/'))
@@ -652,19 +662,19 @@ impl AppConfig {
     {
         let defaults = Self::default();
 
-        let argon2_m_cost = parse_env_u32(&lookup, "ARGON2_M_COST", defaults.argon2_m_cost)?;
-        let argon2_t_cost = parse_env_u32(&lookup, "ARGON2_T_COST", defaults.argon2_t_cost)?;
-        let argon2_p_cost = parse_env_u32(&lookup, "ARGON2_P_COST", defaults.argon2_p_cost)?;
+        let argon2_m_cost = parse_env_from_str(&lookup, "ARGON2_M_COST", defaults.argon2_m_cost)?;
+        let argon2_t_cost = parse_env_from_str(&lookup, "ARGON2_T_COST", defaults.argon2_t_cost)?;
+        let argon2_p_cost = parse_env_from_str(&lookup, "ARGON2_P_COST", defaults.argon2_p_cost)?;
         let password_min_len =
-            parse_env_usize(&lookup, "PASSWORD_MIN_LEN", defaults.password_min_len)?;
+            parse_env_from_str(&lookup, "PASSWORD_MIN_LEN", defaults.password_min_len)?;
         let password_max_len =
-            parse_env_usize(&lookup, "PASSWORD_MAX_LEN", defaults.password_max_len)?;
-        let verification_token_ttl_secs = parse_env_u64(
+            parse_env_from_str(&lookup, "PASSWORD_MAX_LEN", defaults.password_max_len)?;
+        let verification_token_ttl_secs = parse_env_from_str(
             &lookup,
             "VERIFICATION_TOKEN_TTL_SECS",
             defaults.verification_token_ttl_secs,
         )?;
-        let reset_token_ttl_secs = parse_env_u64(
+        let reset_token_ttl_secs = parse_env_from_str(
             &lookup,
             "RESET_TOKEN_TTL_SECS",
             defaults.reset_token_ttl_secs,
@@ -694,43 +704,16 @@ impl AppConfig {
     }
 }
 
-fn parse_env_u32(
+fn parse_env_from_str<T>(
     lookup: &impl Fn(&str) -> Result<String, std::env::VarError>,
     key: &'static str,
-    default: u32,
-) -> Result<u32, ConfigError> {
+    default: T,
+) -> Result<T, ConfigError>
+where
+    T: FromStr,
+{
     match lookup(key) {
-        Ok(val) => val.parse::<u32>().map_err(|_| ConfigError::InvalidValue {
-            field: key,
-            reason: "must be a valid integer",
-        }),
-        Err(std::env::VarError::NotPresent) => Ok(default),
-        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::NonUnicodeEnvVar(key)),
-    }
-}
-
-fn parse_env_usize(
-    lookup: &impl Fn(&str) -> Result<String, std::env::VarError>,
-    key: &'static str,
-    default: usize,
-) -> Result<usize, ConfigError> {
-    match lookup(key) {
-        Ok(val) => val.parse::<usize>().map_err(|_| ConfigError::InvalidValue {
-            field: key,
-            reason: "must be a valid integer",
-        }),
-        Err(std::env::VarError::NotPresent) => Ok(default),
-        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::NonUnicodeEnvVar(key)),
-    }
-}
-
-fn parse_env_u64(
-    lookup: &impl Fn(&str) -> Result<String, std::env::VarError>,
-    key: &'static str,
-    default: u64,
-) -> Result<u64, ConfigError> {
-    match lookup(key) {
-        Ok(val) => val.parse::<u64>().map_err(|_| ConfigError::InvalidValue {
+        Ok(val) => val.parse::<T>().map_err(|_| ConfigError::InvalidValue {
             field: key,
             reason: "must be a valid integer",
         }),
@@ -1001,6 +984,8 @@ impl RateLimitConfig {
         default_rate_limit_enabled()
     }
 
+    /// Bounds are enforced only while enabled. A disabled config may hold
+    /// degenerate zeros; re-validate after flipping `enabled` back on.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.enabled {
             if self.max_attempts == 0 {
@@ -1038,7 +1023,7 @@ impl RateLimitConfig {
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
+        let cfg = Self {
             database_url: "postgres://localhost/test".into(),
             port: DEFAULT_PORT,
             allowed_origins: vec!["https://app.example.com".into()],
@@ -1063,7 +1048,11 @@ impl Default for Config {
             outbox_sent_retention: Duration::from_secs(DEFAULT_OUTBOX_SENT_RETENTION_SECS),
             session: SessionConfig::default(),
             rate_limit: RateLimitConfig::default(),
-        }
+        };
+        // Compiled-in defaults must stay deployable: fail fast in debug/test
+        // if a future default edit stops validating.
+        debug_assert!(cfg.validate().is_ok());
+        cfg
     }
 }
 
@@ -1073,7 +1062,7 @@ impl Default for AppConfig {
     /// Default parameters meet RFC 9106 §4 second option and OWASP ASVS 5.0 L1 minimums:
     /// m=65536 KiB (64 MiB), t=3, p=4.
     fn default() -> Self {
-        Self {
+        let cfg = Self {
             argon2_m_cost: 65536,
             argon2_t_cost: 3,
             argon2_p_cost: 4,
@@ -1082,7 +1071,9 @@ impl Default for AppConfig {
             verification_token_ttl_secs: 1800,
             reset_token_ttl_secs: 900,
             require_email_verification: true,
-        }
+        };
+        debug_assert!(cfg.validate().is_ok());
+        cfg
     }
 }
 
@@ -2297,5 +2288,111 @@ mod tests {
         };
         assert_eq!(rlc.window(), Duration::from_secs(600));
         assert_eq!(rlc.cooldown(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn defaults_pass_validation() {
+        assert!(Config::default().validate().is_ok());
+        assert!(AppConfig::default().validate().is_ok());
+        assert!(SessionConfig::default().validate().is_ok());
+        assert!(RateLimitConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn config_validate_rejects_base_url_with_fragment() {
+        let cfg = Config {
+            base_url: "https://app.example.com/callback#section".into(),
+            ..test_infra_config()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidEnvVar("BASE_URL"))
+        ));
+    }
+
+    #[test]
+    fn config_validate_accepts_uppercase_scheme_base_url() {
+        let cfg = Config {
+            base_url: "HTTPS://app.example.com".into(),
+            ..test_infra_config()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn from_lookup_normalizes_trailing_slash_origins() {
+        let cfg = Config::from_lookup(|key| match key {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "ALLOWED_ORIGINS" => Ok("https://a.example.com/, https://b.example.com".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        })
+        .expect("load config with trailing-slash origin");
+        assert_eq!(
+            cfg.allowed_origins,
+            vec![
+                "https://a.example.com".to_string(),
+                "https://b.example.com".to_string(),
+            ]
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn session_absolute_lifetime_prefers_canonical_over_legacy_alias() {
+        let cfg = Config::from_lookup(|key| match key {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "SESSION_ABSOLUTE_LIFETIME_SECS" => Ok("7200".into()),
+            "SESSION_ABSOLUTE_TIMEOUT_SECS" => Ok("3600".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        })
+        .expect("load config with both lifetime vars");
+        assert_eq!(cfg.session.absolute_lifetime_secs, 7200);
+    }
+
+    #[test]
+    fn session_absolute_lifetime_falls_back_to_legacy_alias() {
+        let cfg = Config::from_lookup(|key| match key {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "SESSION_ABSOLUTE_TIMEOUT_SECS" => Ok("3600".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        })
+        .expect("load config with legacy timeout only");
+        assert_eq!(cfg.session.absolute_lifetime_secs, 3600);
+    }
+
+    #[test]
+    fn session_absolute_lifetime_rejects_invalid_legacy_alias() {
+        let cfg = Config::from_lookup(|key| match key {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "SESSION_ABSOLUTE_TIMEOUT_SECS" => Ok("not_a_number".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        });
+        assert!(matches!(
+            cfg,
+            Err(ConfigError::InvalidValue {
+                field: "absolute_lifetime_secs",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn disabled_rate_limit_reenabled_without_validation_stays_invalid() {
+        let degenerate = RateLimitConfig {
+            enabled: false,
+            max_attempts: 0,
+            window_secs: 0,
+            login_cooldown_secs: 0,
+        };
+        assert!(degenerate.validate().is_ok());
+        let reenabled = RateLimitConfig {
+            enabled: true,
+            ..degenerate
+        };
+        assert!(reenabled.validate().is_err());
     }
 }

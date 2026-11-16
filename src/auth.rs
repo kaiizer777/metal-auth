@@ -16,7 +16,7 @@ pub mod service;
 
 pub use crate::handler::auth_routes;
 pub use models::*;
-pub use service::{AuthService, AuthServiceImpl};
+pub use service::{AuthService, AuthServiceImpl, AuthenticatedLogin};
 
 /// Main authentication facade providing the configured HTTP [`Router`].
 #[derive(Clone)]

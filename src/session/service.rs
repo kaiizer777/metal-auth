@@ -380,14 +380,36 @@ impl SessionService {
 
     /// Invalidate all active and inactive sessions belonging to `user_id`.
     pub async fn invalidate_all_user_sessions(&self, user_id: Uuid) -> Result<(), AppError> {
-        let _result = sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+        let mut tx = self.db.begin().await.map_err(|e| {
+            tracing::error!(error = %e, user_id = %user_id, "Failed to begin transaction for revoke-all");
+            AppError::Database(e)
+        })?;
+
+        // Serialize with rotate_session, which locks this row before
+        // deleting/inserting sessions: whichever tx locks first wins, so no
+        // rotate can mint a session this DELETE never sees.
+        sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
             .bind(user_id)
-            .execute(&self.db)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, user_id = %user_id, "Failed to lock user row for revoke-all");
+                AppError::Database(e)
+            })?;
+
+        sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&mut *tx)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, user_id = %user_id, "Failed to delete all user sessions");
                 AppError::Database(e)
             })?;
+
+        tx.commit().await.map_err(|e| {
+            tracing::error!(error = %e, user_id = %user_id, "Failed to commit revoke-all sessions transaction");
+            AppError::Database(e)
+        })?;
 
         tracing::info!(
             event = "all_sessions_invalidated",

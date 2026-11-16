@@ -127,6 +127,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_session_extractor_missing_extension() {
+        let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
+        let (mut parts, _) = req.into_parts();
+        let result = Session::from_request_parts(&mut parts, &()).await;
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("missing Session extension must be rejected"),
+        };
+        assert!(matches!(err, AppError::SessionNotFound));
+        assert_eq!(err.status_code(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_session_extractor_present_extension() {
+        let now = chrono::Utc::now();
+        let expected = Session {
+            id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            token_hash: "d".repeat(64),
+            created_at: now,
+            last_active_at: now,
+            absolute_expires_at: now,
+            session_type: "cookie".to_string(),
+            csrf_token: None,
+        };
+
+        let mut req = Request::builder().uri("/test").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(expected.clone());
+
+        let (mut parts, _) = req.into_parts();
+        let session = Session::from_request_parts(&mut parts, &()).await.unwrap();
+        assert_eq!(session, expected);
+    }
+
+    #[tokio::test]
     async fn test_require_auth_missing_credentials_returns_401() {
         let state = test_app_state();
         let app = Router::new()

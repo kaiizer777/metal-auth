@@ -232,6 +232,32 @@ pub fn routes(state: AppState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn get_session_serves_extension_row_without_refetch() {
+        let now = Utc::now();
+        let csrf = "f".repeat(64);
+        let session = Session {
+            id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            token_hash: "e".repeat(64),
+            created_at: now,
+            last_active_at: now,
+            absolute_expires_at: now,
+            session_type: "cookie".to_string(),
+            csrf_token: Some(csrf.clone()),
+        };
+        // Handler takes the validated row from extensions; no DB read involved.
+        let body = get_session(session.clone()).await.0;
+        assert_eq!(body.session_id, session.token_hash);
+        assert_eq!(body.created_at, session.created_at);
+        assert_eq!(body.last_active_at, session.last_active_at);
+        assert_eq!(body.absolute_expires_at, session.absolute_expires_at);
+        assert_eq!(body.session_type, session.session_type);
+        let serialized = serde_json::to_string(&body).unwrap();
+        assert!(!serialized.contains(&csrf));
+    }
 
     #[test]
     fn get_session_response_session_id_is_64_chars() {

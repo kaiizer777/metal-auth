@@ -43,10 +43,20 @@ pub trait AuthService: Send + Sync {
 /// PHC string that was verified. Session creation compares this snapshot
 /// against the live row under `FOR UPDATE`; a mismatch means a concurrent
 /// password change superseded the check and the session must not be minted.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AuthenticatedLogin {
     pub user_id: Uuid,
     pub credential_hash: String,
+}
+
+// Manual `Debug`: the snapshot is a live credential authenticator.
+impl std::fmt::Debug for AuthenticatedLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthenticatedLogin")
+            .field("user_id", &self.user_id)
+            .field("credential_hash", &"[redacted]")
+            .finish()
+    }
 }
 
 pub struct AuthServiceImpl {
@@ -215,13 +225,18 @@ impl AuthServiceImpl {
 
         match maybe_user {
             None => {
-                // Anti-enumeration: run dummy verify to consume equivalent CPU time
+                // Anti-enumeration: run dummy verify to consume equivalent CPU time.
+                // A JoinError here (panic/cancel) still maps to InvalidCredentials:
+                // the timing signal is best-effort, the error signal is exact.
                 let dummy_hash = self.dummy_hash.clone();
                 let pw = password.to_string();
-                let _ = tokio::task::spawn_blocking(move || {
+                if let Err(join_err) = tokio::task::spawn_blocking(move || {
                     let _ = verify_password(&pw, &dummy_hash);
                 })
-                .await;
+                .await
+                {
+                    tracing::debug!(err = %join_err, "dummy password verify task failed");
+                }
                 Err(AppError::InvalidCredentials)
             }
             Some(row) => {
@@ -357,6 +372,19 @@ impl AuthServiceImpl {
 
             let mut tx = self.pool.begin().await.map_err(AppError::Database)?;
 
+            // Bound outstanding-token inventory: drop already-expired rows for
+            // this user before issuing a fresh token. Live tokens are untouched.
+            if let Err(e) = sqlx::query(
+                "DELETE FROM password_reset_tokens WHERE user_id = $1 AND expires_at <= NOW()",
+            )
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            {
+                let _ = tx.rollback().await;
+                return Err(AppError::Database(e));
+            }
+
             let insert_res = sqlx::query(
                 "INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
             )
@@ -432,6 +460,19 @@ impl AuthServiceImpl {
             .map_err(|_| AppError::Internal)??;
 
         let mut tx = self.pool.begin().await.map_err(AppError::Database)?;
+
+        // Serialize concurrent resets for this user: the lock orders two
+        // simultaneously consumed tokens deterministically instead of racing
+        // the final `UPDATE users` (last-writer-wins on identical cost).
+        let locked = sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+                .bind(user_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(AppError::Database)?;
+        if locked.is_none() {
+            let _ = tx.rollback().await;
+            return Err(AppError::InvalidToken);
+        }
 
         let update_res =
             sqlx::query("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2")
@@ -531,6 +572,17 @@ mod tests {
         ));
         let res = AuthServiceImpl::new(pool, invalid_config, dispatcher);
         assert!(matches!(res, Err(AppError::Config(_))));
+    }
+
+    #[test]
+    fn authenticated_login_debug_redacts_credential_hash() {
+        let proof = AuthenticatedLogin {
+            user_id: Uuid::new_v4(),
+            credential_hash: "argon2id$v=19$m=65536,t=3,p=4$salt$hash".to_string(),
+        };
+        let rendered = format!("{proof:?}");
+        assert!(!rendered.contains("argon2id"));
+        assert!(rendered.contains("[redacted]"));
     }
 
     #[derive(Clone, Default)]
@@ -818,6 +870,51 @@ mod tests {
             "second verification must fail with InvalidToken: {:?}",
             res2
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_double_consume_verification_token() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+
+        let email = format!("concurrent_{}@example.com", Uuid::new_v4());
+        ctx.service
+            .signup(&email, "SecurePassword123!")
+            .await
+            .unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ctx.sender.sent.notified(),
+        )
+        .await
+        .expect("verification email must be dispatched");
+
+        let token = {
+            let calls = ctx.sender.verification_calls.lock().unwrap();
+            let call = calls
+                .iter()
+                .find(|c| c.to == email)
+                .expect("token dispatched");
+            call.token.clone()
+        };
+
+        // Both consumers race the same DELETE RETURNING: exactly one wins.
+        let (first, second) = tokio::join!(
+            ctx.service.verify_email(&token),
+            ctx.service.verify_email(&token)
+        );
+        let oks = usize::from(first.is_ok()) + usize::from(second.is_ok());
+        assert_eq!(oks, 1, "exactly one concurrent consume must succeed");
+        for res in [&first, &second] {
+            if let Err(e) = res {
+                assert!(
+                    matches!(e, AppError::InvalidToken),
+                    "loser must see InvalidToken, got: {e:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

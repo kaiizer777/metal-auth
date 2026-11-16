@@ -78,19 +78,28 @@ fn redact_params(params: &str) -> String {
 }
 
 fn redact_url_token(url: &str) -> Cow<'_, str> {
-    let Some((base, rest)) = url.split_once('?') else {
-        return Cow::Borrowed(url);
-    };
-
-    let (query, fragment) = match rest.split_once('#') {
-        Some((q, f)) => (q, Some(f)),
-        None => (rest, None),
+    let (base, query, fragment) = match url.split_once('?') {
+        Some((base, rest)) => {
+            let (query, fragment) = match rest.split_once('#') {
+                Some((q, f)) => (Some(q), Some(f)),
+                None => (Some(rest), None),
+            };
+            (base, query, fragment)
+        }
+        // No query string: a fragment may still carry a token, so fall
+        // through to fragment handling instead of returning borrowed.
+        None => match url.split_once('#') {
+            Some((base, f)) => (base, None, Some(f)),
+            None => return Cow::Borrowed(url),
+        },
     };
 
     let mut result = String::with_capacity(url.len() + 16);
     result.push_str(base);
-    result.push('?');
-    result.push_str(&redact_params(query));
+    if let Some(q) = query {
+        result.push('?');
+        result.push_str(&redact_params(q));
+    }
     if let Some(f) = fragment {
         result.push('#');
         // Builders never emit fragments; a bare fragment is unclassifiable, so
@@ -167,6 +176,18 @@ mod tests {
         assert_eq!(
             redact_url_token("https://example.com/reset?token=abc#"),
             "https://example.com/reset?token=[REDACTED]#"
+        );
+        assert_eq!(
+            redact_url_token("https://example.com/reset#token=abc"),
+            "https://example.com/reset#token=[REDACTED]"
+        );
+        assert_eq!(
+            redact_url_token("https://example.com/reset#frag"),
+            "https://example.com/reset#[REDACTED]"
+        );
+        assert_eq!(
+            redact_url_token("https://example.com/reset#"),
+            "https://example.com/reset#"
         );
         assert_eq!(
             redact_url_token("https://example.com/auth/verify"),

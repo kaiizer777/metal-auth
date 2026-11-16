@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -44,9 +46,40 @@ impl std::fmt::Debug for PasswordResetEmailPayload {
     }
 }
 
-fn redact_url_token(url: &str) -> String {
+const REDACTED: &str = "[REDACTED]";
+
+// A query/fragment key carries a token when it is exactly `token` (any ASCII
+// case) or ends in `_token` (`auth_token=`); `token_type=` and friends stay.
+fn is_token_key(key: &str) -> bool {
+    key.eq_ignore_ascii_case("token")
+        || key.len() >= "_token".len()
+            && key.as_bytes()[key.len() - "_token".len()..].eq_ignore_ascii_case(b"_token")
+}
+
+fn redact_params(params: &str) -> String {
+    let mut redacted = String::with_capacity(params.len() + 16);
+    for (i, part) in params.split('&').enumerate() {
+        if i > 0 {
+            redacted.push('&');
+        }
+        match part.split_once('=') {
+            Some((k, _)) if is_token_key(k) => {
+                redacted.push_str(k);
+                redacted.push_str("=[REDACTED]");
+            }
+            None if is_token_key(part) => {
+                redacted.push_str(part);
+                redacted.push_str("=[REDACTED]");
+            }
+            _ => redacted.push_str(part),
+        }
+    }
+    redacted
+}
+
+fn redact_url_token(url: &str) -> Cow<'_, str> {
     let Some((base, rest)) = url.split_once('?') else {
-        return url.to_string();
+        return Cow::Borrowed(url);
     };
 
     let (query, fragment) = match rest.split_once('#') {
@@ -54,35 +87,21 @@ fn redact_url_token(url: &str) -> String {
         None => (rest, None),
     };
 
-    let mut redacted_query = String::with_capacity(query.len() + 16);
-    for (i, part) in query.split('&').enumerate() {
-        if i > 0 {
-            redacted_query.push('&');
-        }
-        if let Some((k, _v)) = part.split_once('=') {
-            if k == "token" {
-                redacted_query.push_str("token=[REDACTED]");
-            } else {
-                redacted_query.push_str(part);
-            }
-        } else if part == "token" {
-            redacted_query.push_str("token=[REDACTED]");
-        } else {
-            redacted_query.push_str(part);
-        }
-    }
-
-    let mut result = String::with_capacity(
-        base.len() + 1 + redacted_query.len() + fragment.map_or(0, |f| f.len() + 1),
-    );
+    let mut result = String::with_capacity(url.len() + 16);
     result.push_str(base);
     result.push('?');
-    result.push_str(&redacted_query);
+    result.push_str(&redact_params(query));
     if let Some(f) = fragment {
         result.push('#');
-        result.push_str(f);
+        // Builders never emit fragments; a bare fragment is unclassifiable, so
+        // redact it fail-closed while param-style fragments get key redaction.
+        if f.contains('=') {
+            result.push_str(&redact_params(f));
+        } else if !f.is_empty() {
+            result.push_str(REDACTED);
+        }
     }
-    result
+    Cow::Owned(result)
 }
 
 #[cfg(test)]
@@ -116,7 +135,7 @@ mod tests {
         let debug_str = format!("{payload:?}");
         assert!(debug_str.contains("[REDACTED]"));
         assert!(!debug_str.contains("supersecrettoken456"));
-        assert!(debug_str.contains("https://example.com/reset?token=[REDACTED]#frag"));
+        assert!(debug_str.contains("https://example.com/reset?token=[REDACTED]#[REDACTED]"));
     }
 
     #[test]
@@ -134,10 +153,30 @@ mod tests {
             "https://example.com/auth/verify?token_type=bearer&token=[REDACTED]"
         );
         assert_eq!(
+            redact_url_token("https://example.com/auth/verify?Token=abc&auth_token=def"),
+            "https://example.com/auth/verify?Token=[REDACTED]&auth_token=[REDACTED]"
+        );
+        assert_eq!(
+            redact_url_token("https://example.com/reset?token=abc#token=xyz"),
+            "https://example.com/reset?token=[REDACTED]#token=[REDACTED]"
+        );
+        assert_eq!(
+            redact_url_token("https://example.com/reset?token=abc#frag"),
+            "https://example.com/reset?token=[REDACTED]#[REDACTED]"
+        );
+        assert_eq!(
+            redact_url_token("https://example.com/reset?token=abc#"),
+            "https://example.com/reset?token=[REDACTED]#"
+        );
+        assert_eq!(
             redact_url_token("https://example.com/auth/verify"),
             "https://example.com/auth/verify"
         );
         assert_eq!(redact_url_token(""), "");
+        assert!(matches!(
+            redact_url_token("https://example.com/auth/verify"),
+            Cow::Borrowed(_)
+        ));
     }
 
     #[test]

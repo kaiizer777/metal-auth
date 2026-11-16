@@ -9,7 +9,7 @@ pub use crate::auth::models::UserResponse;
 /// Intentionally does NOT derive `Serialize` to prevent `password_hash`
 /// from ever leaking across API responses. Outbound serialization must
 /// use [`UserResponse`](crate::auth::models::UserResponse).
-#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
+#[derive(Clone, FromRow, PartialEq, Eq)]
 pub struct User {
     pub id: Uuid,
     pub email: String,
@@ -19,11 +19,25 @@ pub struct User {
     pub updated_at: DateTime<Utc>,
 }
 
+// Manual `Debug`: the Argon2 PHC string must never reach logs or traces.
+impl std::fmt::Debug for User {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("User")
+            .field("id", &self.id)
+            .field("email", &self.email)
+            .field("password_hash", &"[redacted]")
+            .field("email_verified", &self.email_verified)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
 /// Session entity stored with a cryptographic hash of the session token.
 ///
 /// Intentionally does NOT derive `Serialize` to prevent `token_hash`
 /// from leaking across API responses.
-#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
+#[derive(Clone, FromRow, PartialEq, Eq)]
 pub struct Session {
     pub id: Uuid,
     pub user_id: Uuid,
@@ -40,11 +54,28 @@ pub struct Session {
     pub csrf_token: Option<String>,
 }
 
+// Manual `Debug`: `token_hash` authenticates bearer sessions; csrf tokens
+// are per-session secrets. Neither belongs in logs or traces.
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("id", &self.id)
+            .field("user_id", &self.user_id)
+            .field("token_hash", &"[redacted]")
+            .field("created_at", &self.created_at)
+            .field("last_active_at", &self.last_active_at)
+            .field("absolute_expires_at", &self.absolute_expires_at)
+            .field("session_type", &self.session_type)
+            .field("csrf_token", &self.csrf_token.as_ref().map(|_| "[redacted]"))
+            .finish()
+    }
+}
+
 /// Single-use email verification token entity.
 ///
 /// Intentionally does NOT derive `Serialize` to prevent `token_hash`
 /// from leaking across API responses.
-#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
+#[derive(Clone, FromRow, PartialEq, Eq)]
 pub struct VerificationToken {
     pub token_hash: Vec<u8>,
     pub user_id: Uuid,
@@ -52,16 +83,40 @@ pub struct VerificationToken {
     pub created_at: DateTime<Utc>,
 }
 
+// Manual `Debug`: the hash preimage is a live single-use token.
+impl std::fmt::Debug for VerificationToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerificationToken")
+            .field("token_hash", &"[redacted]")
+            .field("user_id", &self.user_id)
+            .field("expires_at", &self.expires_at)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
 /// Single-use password reset token entity.
 ///
 /// Intentionally does NOT derive `Serialize` to prevent `token_hash`
 /// from leaking across API responses.
-#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
+#[derive(Clone, FromRow, PartialEq, Eq)]
 pub struct PasswordResetToken {
     pub token_hash: Vec<u8>,
     pub user_id: Uuid,
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+}
+
+// Manual `Debug`: the hash preimage is a live single-use token.
+impl std::fmt::Debug for PasswordResetToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasswordResetToken")
+            .field("token_hash", &"[redacted]")
+            .field("user_id", &self.user_id)
+            .field("expires_at", &self.expires_at)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
 }
 
 pub const OUTBOX_STATUS_PENDING: &str = "pending";
@@ -76,7 +131,7 @@ pub const EMAIL_TYPE_PASSWORD_RESET: &str = "password_reset";
 ///
 /// Guarantees at-least-once email delivery across application crashes
 /// and transient network failures by capturing dispatches inside the database transaction.
-#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
+#[derive(Clone, FromRow, PartialEq, Eq)]
 pub struct EmailOutbox {
     pub id: Uuid,
     pub recipient: String,
@@ -88,6 +143,24 @@ pub struct EmailOutbox {
     pub created_at: DateTime<Utc>,
     pub sent_at: Option<DateTime<Utc>>,
     pub error_log: Option<String>,
+}
+
+// Manual `Debug`: `payload` carries raw single-use tokens; never log the row verbatim.
+impl std::fmt::Debug for EmailOutbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmailOutbox")
+            .field("id", &self.id)
+            .field("recipient", &self.recipient)
+            .field("email_type", &self.email_type)
+            .field("payload", &"[redacted]")
+            .field("status", &self.status)
+            .field("retry_count", &self.retry_count)
+            .field("next_retry_at", &self.next_retry_at)
+            .field("created_at", &self.created_at)
+            .field("sent_at", &self.sent_at)
+            .field("error_log", &self.error_log)
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -141,5 +214,65 @@ mod tests {
         assert_eq!(outbox.retry_count, 0);
         assert_eq!(outbox.sent_at, None);
         assert_eq!(outbox.error_log, None);
+    }
+
+    #[test]
+    fn db_entities_debug_redacts_secrets() {
+        let now = Utc::now();
+        let user = User {
+            id: Uuid::new_v4(),
+            email: "alice@example.com".to_string(),
+            password_hash: "argon2id$v=19$m=65536,t=3,p=4$salt$hash".to_string(),
+            email_verified: true,
+            created_at: now,
+            updated_at: now,
+        };
+        let rendered = format!("{user:?}");
+        assert!(!rendered.contains("argon2id"));
+        assert!(rendered.contains("alice@example.com"));
+
+        let session = Session {
+            id: Uuid::new_v4(),
+            user_id: user.id,
+            token_hash: "deadbeef".to_string(),
+            created_at: now,
+            last_active_at: now,
+            absolute_expires_at: now,
+            session_type: "cookie".to_string(),
+            csrf_token: Some("csrf-secret".to_string()),
+        };
+        let rendered = format!("{session:?}");
+        assert!(!rendered.contains("deadbeef"));
+        assert!(!rendered.contains("csrf-secret"));
+
+        let token = VerificationToken {
+            token_hash: vec![0xAA, 0xBB],
+            user_id: user.id,
+            expires_at: now,
+            created_at: now,
+        };
+        assert!(!format!("{token:?}").contains("AA"));
+
+        let reset = PasswordResetToken {
+            token_hash: vec![0xCC, 0xDD],
+            user_id: user.id,
+            expires_at: now,
+            created_at: now,
+        };
+        assert!(!format!("{reset:?}").contains("CC"));
+
+        let outbox = EmailOutbox {
+            id: Uuid::new_v4(),
+            recipient: "user@example.com".to_string(),
+            email_type: EMAIL_TYPE_VERIFICATION.to_string(),
+            payload: serde_json::json!({"token": "raw-single-use-token"}),
+            status: OUTBOX_STATUS_PENDING.to_string(),
+            retry_count: 0,
+            next_retry_at: now,
+            created_at: now,
+            sent_at: None,
+            error_log: None,
+        };
+        assert!(!format!("{outbox:?}").contains("raw-single-use-token"));
     }
 }

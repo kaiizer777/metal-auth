@@ -421,8 +421,9 @@ impl SessionService {
         })?;
 
         // Serialize with reset_password's purge: the reset tx locks this row via
-        // `UPDATE users ... WHERE id` before deleting sessions, so whichever tx
-        // locks first wins. Reset-first leaves zero rows for the DELETE below.
+        // `UPDATE users ... WHERE id` (src/auth/service.rs:437) before deleting
+        // sessions, so whichever tx locks first wins. Reset-first leaves zero
+        // rows for the DELETE below.
         sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
             .bind(old_session.user_id)
             .execute(&mut *tx)

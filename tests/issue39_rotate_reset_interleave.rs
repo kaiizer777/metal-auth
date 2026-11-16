@@ -66,7 +66,8 @@ async fn seed_user_with_session_and_reset_token(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rotate_concurrent_with_reset_leaves_zero_live_sessions() {
     let Some(app) = common::setup_test_app().await else {
-        panic!("DATABASE_URL must be set: issue-39 regression test needs a live DB");
+        eprintln!("SKIP: DB-backed tests need DATABASE_URL");
+        return;
     };
     let pool = &app.pool;
     let state = &app.state;
@@ -123,7 +124,8 @@ async fn rotate_concurrent_with_reset_leaves_zero_live_sessions() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rotate_after_committed_reset_stays_closed() {
     let Some(app) = common::setup_test_app().await else {
-        panic!("DATABASE_URL must be set: issue-39 regression test needs a live DB");
+        eprintln!("SKIP: DB-backed tests need DATABASE_URL");
+        return;
     };
     let pool = &app.pool;
     let state = &app.state;
@@ -161,7 +163,8 @@ async fn rotate_after_committed_reset_stays_closed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rotate_waits_on_user_row_before_delete() {
     let Some(app) = common::setup_test_app().await else {
-        panic!("DATABASE_URL must be set: issue-39 regression test needs a live DB");
+        eprintln!("SKIP: DB-backed tests need DATABASE_URL");
+        return;
     };
     let pool = &app.pool;
     let state = &app.state;
@@ -179,13 +182,23 @@ async fn rotate_waits_on_user_row_before_delete() {
         .await
         .expect("guard lock acquired");
 
+    // Correlate the gate to this test's own waiter backend so a stray
+    // FOR UPDATE from another backend can never satisfy it.
+    let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<i32>();
     let rotate_state = state.clone();
+    let rotate_pool = app.pool.clone();
     let rotate_handle = tokio::spawn(async move {
+        let waiter_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&rotate_pool)
+            .await
+            .expect("backend pid readable");
+        pid_tx.send(waiter_pid).expect("pid receiver lives");
         rotate_state
             .session_service
             .rotate_session(&old_raw, None, None)
             .await
     });
+    let waiter_pid = pid_rx.await.expect("waiter reports its backend pid");
 
     // The in-flight rotate backend must show up blocked inside its explicit
     // SELECT ... FOR UPDATE. Pre-fix rotate never issues that statement, so
@@ -193,8 +206,9 @@ async fn rotate_waits_on_user_row_before_delete() {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let waiting: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM pg_stat_activity WHERE query LIKE 'SELECT id FROM users%FOR UPDATE' AND datname = current_database() AND wait_event_type = 'Lock'",
+            "SELECT COUNT(*) FROM pg_stat_activity WHERE query LIKE 'SELECT id FROM users%FOR UPDATE' AND datname = current_database() AND wait_event_type = 'Lock' AND pid = $1",
         )
+        .bind(waiter_pid)
         .fetch_one(pool)
         .await
         .expect("pg_stat_activity must be readable");
@@ -212,4 +226,87 @@ async fn rotate_waits_on_user_row_before_delete() {
         .await
         .expect("rotate task joins")
         .expect("rotate succeeds once the user-row lock releases");
+}
+
+/// Guard-branch pin: rotate blocks on the user-row lock, the sessions vanish
+/// underneath it while it waits, and it must fail closed (SessionNotFound)
+/// with zero live sessions once the guard releases. Pre-fix rotate never
+/// emits SELECT ... FOR UPDATE, so the wait-gate deadline expires and this
+/// test fails instead of passing by accident.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rotate_blocked_by_guard_then_purged_fails_closed() {
+    let Some(app) = common::setup_test_app().await else {
+        eprintln!("SKIP: DB-backed tests need DATABASE_URL");
+        return;
+    };
+    let pool = &app.pool;
+    let state = &app.state;
+
+    let (user_id, old_raw, _, _) = seed_user_with_session_and_reset_token(&app).await;
+
+    let mut guard_tx = pool.begin().await.expect("guard tx begins");
+    sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        .bind(user_id)
+        .execute(&mut *guard_tx)
+        .await
+        .expect("guard lock acquired");
+
+    let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<i32>();
+    let rotate_state = state.clone();
+    let rotate_pool = app.pool.clone();
+    let rotate_handle = tokio::spawn(async move {
+        let waiter_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&rotate_pool)
+            .await
+            .expect("backend pid readable");
+        pid_tx.send(waiter_pid).expect("pid receiver lives");
+        rotate_state
+            .session_service
+            .rotate_session(&old_raw, None, None)
+            .await
+    });
+    let waiter_pid = pid_rx.await.expect("waiter reports its backend pid");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity WHERE query LIKE 'SELECT id FROM users%FOR UPDATE' AND datname = current_database() AND wait_event_type = 'Lock' AND pid = $1",
+        )
+        .bind(waiter_pid)
+        .fetch_one(pool)
+        .await
+        .expect("pg_stat_activity must be readable");
+        if waiting > 0 {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("ISSUE39: rotate never waited on the user-row lock before deleting");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Purge the sessions inside the guard while rotate is still blocked, then
+    // release it: rotate must observe the missing row and fail closed.
+    sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&mut *guard_tx)
+        .await
+        .expect("guard purges sessions");
+    guard_tx.commit().await.expect("guard tx commits");
+
+    let err = rotate_handle
+        .await
+        .expect("rotate task joins")
+        .expect_err("rotate blocked behind a purge must fail closed");
+    assert!(
+        matches!(err, AppError::SessionNotFound),
+        "ISSUE39: rotate after guard purge failed open with {err:?}"
+    );
+
+    let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .expect("session count readable");
+    assert_eq!(live, 0, "ISSUE39: live session survived the guard purge");
 }

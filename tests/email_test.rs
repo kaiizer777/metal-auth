@@ -514,3 +514,58 @@ fn build_reset_url_formatting() {
         "https://auth.example.com/auth/password/reset?token=token%20with%20spaces%2Bsymbols"
     );
 }
+
+// Echoes the payload token inside its error: the dispatch log must carry the
+// redacted marker, never the raw secret.
+struct TokenEchoSender;
+
+#[async_trait]
+impl metal_auth::EmailSender for TokenEchoSender {
+    async fn send_verification_email(
+        &self,
+        payload: VerificationEmailPayload,
+    ) -> Result<(), metal_auth::DynError> {
+        Err(Box::new(std::io::Error::other(format!(
+            "smtp refused token={} for {}",
+            payload.token, payload.to
+        ))))
+    }
+
+    async fn send_password_reset_email(
+        &self,
+        _payload: PasswordResetEmailPayload,
+    ) -> Result<(), metal_auth::DynError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn hook_error_echoing_token_is_redacted_from_logs() {
+    let _guard = LOG_LOCK.lock().await;
+    init_logs();
+    clear_logs();
+    let sender: SharedEmailSender = Arc::new(TokenEchoSender);
+    let dispatcher = EmailDispatcher::new(Some(sender), Duration::from_secs(10));
+
+    let secret = "zx9-chatty-secret-token";
+    let payload = VerificationEmailPayload {
+        user_id: Uuid::new_v4(),
+        to: "user@example.com".into(),
+        token: secret.into(),
+        url: format!("https://example.com/auth/verify/email?token={secret}"),
+        expires_at: Utc::now(),
+    };
+    let handle = dispatcher
+        .dispatch_verification(payload)
+        .await
+        .expect("should return handle");
+    handle.await.unwrap();
+
+    let logs = log_text();
+    assert!(logs.contains("email dispatch failed"));
+    assert!(
+        !logs.contains(secret),
+        "raw token leaked into dispatch logs"
+    );
+    assert!(logs.contains("token=[REDACTED]"));
+}

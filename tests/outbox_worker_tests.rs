@@ -10,7 +10,9 @@ use metal_auth::db::outbox::{
     claim_pending_outbox, cleanup_sent_outbox, get_outbox_by_id, insert_outbox,
     recover_stale_processing,
 };
-use metal_auth::email::outbox::{OutboxWorkerConfig, process_outbox_batch};
+use metal_auth::email::outbox::{
+    OutboxWorkerConfig, process_outbox_batch, run_outbox_worker_until,
+};
 use metal_auth::email::test_utils::CapturingEmailSender;
 use metal_auth::{EmailDispatcher, SharedEmailSender};
 use serde_json::json;
@@ -615,4 +617,103 @@ async fn test_outbox_retention_cleanup() {
         .bind(pending_row.id)
         .execute(&app.pool)
         .await;
+}
+
+// Fails only our own recipient with a token-echoing error; foreign rows swept
+// into the same batch must still deliver so parallel binaries are unaffected.
+struct SelectiveEchoSender {
+    fail_recipient: String,
+}
+
+#[async_trait::async_trait]
+impl metal_auth::EmailSender for SelectiveEchoSender {
+    async fn send_verification_email(
+        &self,
+        payload: metal_auth::VerificationEmailPayload,
+    ) -> Result<(), metal_auth::DynError> {
+        if payload.to == self.fail_recipient {
+            return Err(Box::new(std::io::Error::other(format!(
+                "smtp refused token={} for {}",
+                payload.token, payload.to
+            ))));
+        }
+        Ok(())
+    }
+
+    async fn send_password_reset_email(
+        &self,
+        _payload: metal_auth::PasswordResetEmailPayload,
+    ) -> Result<(), metal_auth::DynError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_outbox_error_log_redacts_echoed_token() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let secret = format!("zx9-outbox-secret-{}", uuid::Uuid::new_v4());
+    let recipient = format!("echo_{}@example.com", uuid::Uuid::new_v4());
+    let payload = json!({
+        "user_id": uuid::Uuid::new_v4(),
+        "to": recipient,
+        "token": secret,
+        "url": format!("https://example.com/verify?token={secret}"),
+        "expires_at": chrono::Utc::now()
+    });
+    let row = insert_outbox(&app.pool, &recipient, "verification", payload)
+        .await
+        .expect("insert outbox");
+
+    let sender = Arc::new(SelectiveEchoSender {
+        fail_recipient: recipient.clone(),
+    });
+    let dispatcher = EmailDispatcher::new(
+        Some(Arc::clone(&sender) as SharedEmailSender),
+        Duration::from_secs(5),
+    );
+    let _ = dispatcher.flush_outbox(&app.pool).await;
+
+    let stored = get_outbox_by_id(&app.pool, row.id)
+        .await
+        .expect("get outbox")
+        .expect("own row present");
+    assert_ne!(stored.status, OUTBOX_STATUS_SENT, "echo sender must fail");
+    let error_log = stored.error_log.expect("failed delivery records error_log");
+    assert!(
+        !error_log.contains(&secret),
+        "raw token leaked into error_log"
+    );
+    assert!(error_log.contains("token=[REDACTED]"));
+
+    let _ = sqlx::query("DELETE FROM email_outbox WHERE id = $1")
+        .bind(row.id)
+        .execute(&app.pool)
+        .await;
+}
+
+#[tokio::test]
+async fn test_outbox_worker_until_stops_on_shutdown() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let worker = tokio::spawn(run_outbox_worker_until(
+        app.pool.clone(),
+        None,
+        Duration::from_millis(50),
+        OutboxWorkerConfig::default(),
+        Arc::new(tokio::sync::Notify::new()),
+        shutdown_rx,
+    ));
+    shutdown_tx.send(true).expect("signal shutdown");
+    tokio::time::timeout(Duration::from_secs(10), worker)
+        .await
+        .expect("worker stops after shutdown signal")
+        .expect("worker join");
 }

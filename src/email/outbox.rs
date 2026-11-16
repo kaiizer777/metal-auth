@@ -10,7 +10,7 @@ use crate::db::models::{EMAIL_TYPE_PASSWORD_RESET, EMAIL_TYPE_VERIFICATION, Emai
 use crate::db::outbox::{
     claim_pending_outbox, mark_outbox_failed, mark_outbox_sent, record_outbox_retry,
 };
-use crate::email::hook::SharedEmailSender;
+use crate::email::hook::{SharedEmailSender, sanitize_error_str, sanitize_sender_error};
 use crate::email::payload::{PasswordResetEmailPayload, VerificationEmailPayload};
 
 /// Configuration parameters for the outbox worker polling loop and retry policy.
@@ -111,140 +111,140 @@ async fn deliver_single_message(
     timeout: Duration,
     config: &OutboxWorkerConfig,
 ) {
-    let result = match msg.email_type.as_str() {
+    // Destructure to move `payload` instead of cloning it; only scalars are kept.
+    let EmailOutbox {
+        id,
+        email_type,
+        payload,
+        retry_count,
+        ..
+    } = msg;
+    let result = match email_type.as_str() {
         EMAIL_TYPE_VERIFICATION => {
-            match serde_json::from_value::<VerificationEmailPayload>(msg.payload.clone()) {
+            match serde_json::from_value::<VerificationEmailPayload>(payload) {
                 Ok(payload) => {
                     tokio::time::timeout(timeout, sender.send_verification_email(payload)).await
                 }
                 Err(e) => {
-                    let err_msg = format!("corrupt verification payload: {e}");
-                    error!(op = "outbox_delivery", id = %msg.id, err = %err_msg);
-                    match mark_outbox_failed(pool, msg.id, &err_msg).await {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            warn!(op = "outbox_delivery", id = %msg.id, "outbox lease expired; claim lost before marking failed")
-                        }
-                        Err(e) => {
-                            error!(op = "outbox_delivery", id = %msg.id, err = %e, "database error marking outbox as failed")
-                        }
-                    }
+                    // Serde errors carry no payload bytes, but sanitize at the
+                    // persistence boundary anyway so `error_log` never depends on it.
+                    let err_msg = sanitize_error_str(&format!("corrupt verification payload: {e}"));
+                    error!(op = "outbox_delivery", id = %id, err = %err_msg);
+                    mark_failed(pool, id, &err_msg).await;
                     return;
                 }
             }
         }
         EMAIL_TYPE_PASSWORD_RESET => {
-            match serde_json::from_value::<PasswordResetEmailPayload>(msg.payload.clone()) {
+            match serde_json::from_value::<PasswordResetEmailPayload>(payload) {
                 Ok(payload) => {
                     tokio::time::timeout(timeout, sender.send_password_reset_email(payload)).await
                 }
                 Err(e) => {
-                    let err_msg = format!("corrupt password reset payload: {e}");
-                    error!(op = "outbox_delivery", id = %msg.id, err = %err_msg);
-                    match mark_outbox_failed(pool, msg.id, &err_msg).await {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            warn!(op = "outbox_delivery", id = %msg.id, "outbox lease expired; claim lost before marking failed")
-                        }
-                        Err(e) => {
-                            error!(op = "outbox_delivery", id = %msg.id, err = %e, "database error marking outbox as failed")
-                        }
-                    }
+                    let err_msg =
+                        sanitize_error_str(&format!("corrupt password reset payload: {e}"));
+                    error!(op = "outbox_delivery", id = %id, err = %err_msg);
+                    mark_failed(pool, id, &err_msg).await;
                     return;
                 }
             }
         }
         unknown => {
-            let err_msg = format!("unknown email type: {unknown}");
-            error!(op = "outbox_delivery", id = %msg.id, err = %err_msg);
-            match mark_outbox_failed(pool, msg.id, &err_msg).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    warn!(op = "outbox_delivery", id = %msg.id, "outbox lease expired; claim lost before marking failed")
-                }
-                Err(e) => {
-                    error!(op = "outbox_delivery", id = %msg.id, err = %e, "database error marking outbox as failed")
-                }
-            }
+            let err_msg = sanitize_error_str(&format!("unknown email type: {unknown}"));
+            error!(op = "outbox_delivery", id = %id, err = %err_msg);
+            mark_failed(pool, id, &err_msg).await;
             return;
         }
     };
 
     match result {
-        Ok(Ok(())) => match mark_outbox_sent(pool, msg.id).await {
+        Ok(Ok(())) => match mark_outbox_sent(pool, id).await {
             Ok(true) => {
-                info!(op = "outbox_delivery", id = %msg.id, email_type = %msg.email_type, "outbox email sent")
+                info!(op = "outbox_delivery", id = %id, email_type = %email_type, "outbox email sent")
             }
             Ok(false) => {
-                warn!(op = "outbox_delivery", id = %msg.id, "outbox lease expired; claim lost before completion")
+                warn!(op = "outbox_delivery", id = %id, "outbox lease expired; claim lost before completion")
             }
             Err(e) => {
-                error!(op = "outbox_delivery", id = %msg.id, err = %e, "database error marking sent")
+                error!(op = "outbox_delivery", id = %id, err = %e, "database error marking sent")
             }
         },
         Ok(Err(send_err)) => {
-            let err_msg = format!("send error: {send_err}");
-            handle_delivery_failure(pool, msg, &err_msg, config).await;
+            let err_msg = format!("send error: {}", sanitize_sender_error(&send_err));
+            handle_delivery_failure(pool, id, retry_count, &err_msg, config).await;
         }
         Err(_elapsed) => {
             let err_msg = "send timed out".to_string();
-            handle_delivery_failure(pool, msg, &err_msg, config).await;
+            handle_delivery_failure(pool, id, retry_count, &err_msg, config).await;
+        }
+    }
+}
+
+// Shared terminal-failure path: persists a sanitized `error_log` and logs it.
+async fn mark_failed(pool: &PgPool, id: uuid::Uuid, err_msg: &str) {
+    match mark_outbox_failed(pool, id, err_msg).await {
+        Ok(true) => {}
+        Ok(false) => {
+            warn!(op = "outbox_delivery", id = %id, "outbox lease expired; claim lost before marking failed")
+        }
+        Err(e) => {
+            error!(op = "outbox_delivery", id = %id, err = %e, "database error marking outbox as failed")
         }
     }
 }
 
 async fn handle_delivery_failure(
     pool: &PgPool,
-    msg: EmailOutbox,
+    id: uuid::Uuid,
+    retry_count: i32,
     err_msg: &str,
     config: &OutboxWorkerConfig,
 ) {
-    let next_retry_count = msg.retry_count + 1;
+    let next_retry_count = retry_count + 1;
     if next_retry_count >= config.max_retries as i32 {
         error!(
             op = "outbox_delivery",
-            id = %msg.id,
+            id = %id,
             retries = next_retry_count,
             err = %err_msg,
             "outbox delivery exhausted max retries; marked failed"
         );
-        match mark_outbox_failed(pool, msg.id, err_msg).await {
+        match mark_outbox_failed(pool, id, err_msg).await {
             Ok(true) => {}
             Ok(false) => warn!(
                 op = "outbox_delivery",
-                id = %msg.id,
+                id = %id,
                 "outbox lease expired; claim lost before marking failed"
             ),
             Err(e) => error!(
                 op = "outbox_delivery",
-                id = %msg.id,
+                id = %id,
                 err = %e,
                 "database error marking outbox as failed"
             ),
         }
     } else {
-        let backoff =
-            calculate_backoff(msg.retry_count, config.initial_backoff, config.max_backoff);
+        let backoff = calculate_backoff(retry_count, config.initial_backoff, config.max_backoff);
         let next_retry_at =
             Utc::now() + ChronoDuration::from_std(backoff).unwrap_or(ChronoDuration::seconds(300));
         warn!(
             op = "outbox_delivery",
-            id = %msg.id,
+            id = %id,
             retries = next_retry_count,
             backoff_secs = backoff.as_secs(),
             err = %err_msg,
             "outbox delivery failed; scheduled retry with exponential backoff"
         );
-        match record_outbox_retry(pool, msg.id, next_retry_at, err_msg).await {
+        match record_outbox_retry(pool, id, next_retry_at, err_msg).await {
             Ok(true) => {}
             Ok(false) => warn!(
                 op = "outbox_delivery",
-                id = %msg.id,
+                id = %id,
                 "outbox lease expired; claim lost before recording retry"
             ),
             Err(e) => error!(
                 op = "outbox_delivery",
-                id = %msg.id,
+                id = %id,
                 err = %e,
                 "database error recording outbox retry"
             ),
@@ -272,13 +272,31 @@ async fn drain_outbox_batches(
     }
 }
 
-/// Spawns the background outbox polling loop.
+/// Runs the background outbox polling loop until the process ends.
+///
+/// Prefer [`run_outbox_worker_until`] when the host supports graceful
+/// shutdown; this wrapper never signals shutdown so the loop is infinite.
 pub async fn run_outbox_worker(
     pool: PgPool,
     sender: Option<SharedEmailSender>,
     timeout: Duration,
     config: OutboxWorkerConfig,
     notify: Arc<tokio::sync::Notify>,
+) {
+    let (_shutdown_guard, shutdown) = tokio::sync::watch::channel(false);
+    run_outbox_worker_until(pool, sender, timeout, config, notify, shutdown).await;
+}
+
+/// Same as [`run_outbox_worker`], but each loop iteration also watches
+/// `shutdown`: sending any value (or dropping the sender) breaks the loop
+/// after the in-flight drain completes, so no claimed message is abandoned.
+pub async fn run_outbox_worker_until(
+    pool: PgPool,
+    sender: Option<SharedEmailSender>,
+    timeout: Duration,
+    config: OutboxWorkerConfig,
+    notify: Arc<tokio::sync::Notify>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     if let Err(e) = crate::db::outbox::recover_stale_processing(&pool).await {
         error!(err = %e, "failed to recover stale outbox processing records on startup");
@@ -294,6 +312,9 @@ pub async fn run_outbox_worker(
         tokio::select! {
             _ = tokio::time::sleep(config.poll_interval) => {}
             _ = notify.notified() => {}
+            _ = shutdown.changed() => {
+                break;
+            }
         }
 
         drain_outbox_batches(&pool, &sender, timeout, &config).await;

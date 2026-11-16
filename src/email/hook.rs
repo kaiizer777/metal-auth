@@ -40,10 +40,12 @@ pub type SharedEmailSender = Arc<dyn EmailSender>;
 /// `token_type=`) are left alone. Returns the input unchanged when no marker
 /// is present, so non-secret errors pass through unmodified.
 pub fn sanitize_sender_error(err: &DynError) -> String {
-    sanitize_error_text(&err.to_string())
+    sanitize_error_str(&err.to_string())
 }
 
-fn sanitize_error_text(raw: &str) -> String {
+/// [`sanitize_sender_error`] over an already-rendered message: use for
+/// outbox-internal `error_log` strings assembled from untrusted parts.
+pub fn sanitize_error_str(raw: &str) -> String {
     // ASCII-only lowering preserves byte indices, so marker offsets found in
     // `lowered` are valid slice boundaries in `raw` (markers are pure ASCII).
     let lowered = raw.to_ascii_lowercase();

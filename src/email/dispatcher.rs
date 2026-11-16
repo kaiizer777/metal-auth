@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use tracing::{Instrument, error, info_span, warn};
 
-use crate::email::hook::{DynError, SharedEmailSender};
+use crate::email::hook::{DynError, SharedEmailSender, sanitize_sender_error};
 use crate::email::outbox::OutboxWorkerConfig;
 use crate::email::payload::{PasswordResetEmailPayload, VerificationEmailPayload};
 
@@ -145,15 +145,19 @@ impl EmailDispatcher {
         self.notify.notify_one();
     }
 
-    /// Test helper to synchronously drain and process all due outbox messages.
-    pub async fn flush_outbox(&self, pool: &sqlx::PgPool) -> Result<usize, sqlx::Error> {
-        crate::email::outbox::process_outbox_batch(
+    /// Synchronously drains and processes all due outbox messages.
+    ///
+    /// Test helper in practice; unlike the detached dispatch paths this is a
+    /// typed boundary — DB failures surface as [`crate::AppError`] (wire
+    /// envelope) instead of raw [`sqlx::Error`].
+    pub async fn flush_outbox(&self, pool: &sqlx::PgPool) -> Result<usize, crate::AppError> {
+        Ok(crate::email::outbox::process_outbox_batch(
             pool,
             &self.sender,
             self.timeout,
             &self.outbox_config,
         )
-        .await
+        .await?)
     }
 
     /// Returns a reference to the configured email sender, if any.
@@ -185,7 +189,10 @@ impl EmailDispatcher {
     /// Dispatches a verification email payload.
     ///
     /// Delivery runs on a detached Tokio task bounded by the configured timeout, so the
-    /// caller never observes mailer latency. Send failures are logged, never returned.
+    /// caller never observes mailer latency. Send failures are logged (sanitized),
+    /// never returned — the log-only contract is intentional. HTTP callers observe
+    /// delivery health via the outbox table and the `AppError::EmailDispatch*`
+    /// envelope codes, not via this return value.
     ///
     /// Returns the task handle; dropping it detaches the task.
     ///
@@ -265,7 +272,9 @@ fn log_send_result(
 ) {
     match result {
         Err(_elapsed) => error!(op, "email dispatch timed out"),
-        Ok(Err(e)) => error!(op, err = %e, "email dispatch failed"),
+        // Sender errors are untrusted: redact before logging so a chatty
+        // sender cannot leak tokens into tracing output.
+        Ok(Err(e)) => error!(op, err = %sanitize_sender_error(&e), "email dispatch failed"),
         Ok(Ok(())) => {}
     }
 }

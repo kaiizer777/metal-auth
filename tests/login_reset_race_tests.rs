@@ -1,4 +1,4 @@
-﻿//! Regression tests for issue #37: in-flight login must not mint an active
+//! Regression tests for issue #37: in-flight login must not mint an active
 //! session after a concurrent password reset.
 //!
 //! Deterministic interleaving: complete the credential check, commit a reset,
@@ -343,6 +343,90 @@ async fn stale_credential_http_login_rejected_and_cookie_purged() {
     assert_eq!(dead.code.as_deref(), Some("SESSION_NOT_FOUND"));
 
     // Purge observed at the row level.
+    assert_eq!(active_session_count(&pool, fix.user_id).await, 0);
+    assert_eq!(reset_token_count(&pool, fix.user_id).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_login_vs_reset_leaves_no_live_session() {
+    let Some((router, pool, state)) = setup_live_db().await else {
+        return;
+    };
+    let fix = signup_verify_and_issue_token(&router, &pool).await;
+
+    // Four tasks (3 logins + 1 reset) stay under the 5-connection pool budget.
+    let barrier = Arc::new(tokio::sync::Barrier::new(4));
+    let mut logins = Vec::new();
+    for _ in 0..3 {
+        let router = router.clone();
+        let barrier = Arc::clone(&barrier);
+        let (email, password) = (fix.email.clone(), fix.old_pw.clone());
+        logins.push(tokio::spawn(async move {
+            barrier.wait().await;
+            dispatch(
+                &router,
+                json_request(
+                    Method::POST,
+                    "/auth/login",
+                    json!({"email": email, "password": password}),
+                ),
+            )
+            .await
+        }));
+    }
+    let reset_state = state.clone();
+    let reset_barrier = Arc::clone(&barrier);
+    let (token, new_pw) = (fix.raw_token.clone(), fix.new_pw.clone());
+    let reset = tokio::spawn(async move {
+        reset_barrier.wait().await;
+        reset_state
+            .auth_service
+            .reset_password(&token, &new_pw)
+            .await
+    });
+
+    reset
+        .await
+        .expect("reset task joins")
+        .expect("reset commits");
+
+    let cookie_name = state.config.session.cookie_name.clone();
+    let mut issued = Vec::new();
+    for handle in logins {
+        let out = handle.await.expect("login task joins");
+        assert!(
+            out.status == StatusCode::OK || out.status == StatusCode::UNAUTHORIZED,
+            "unexpected login status {}",
+            out.status
+        );
+        if out.status == StatusCode::OK {
+            issued.push(session_cookie(&out, &cookie_name).expect("200 carries a session cookie"));
+        } else {
+            assert!(
+                out.set_cookies.is_empty(),
+                "rejected login must not mint a session"
+            );
+            // Verify-after-reset fails the password; verify-before-reset
+            // is rejected by the session gate. No other code is acceptable.
+            assert!(
+                out.code.as_deref() == Some("INVALID_CREDENTIALS")
+                    || out.code.as_deref() == Some("SESSION_INVALID"),
+                "unexpected error code {:?}",
+                out.code
+            );
+        }
+    }
+
+    // Every pre-reset mint was purged: no issued cookie opens a session.
+    for raw in &issued {
+        assert_eq!(
+            dispatch(&router, authed_get("/auth/session/me", &cookie_name, raw))
+                .await
+                .status,
+            StatusCode::UNAUTHORIZED,
+            "superseded session survived the reset purge"
+        );
+    }
     assert_eq!(active_session_count(&pool, fix.user_id).await, 0);
     assert_eq!(reset_token_count(&pool, fix.user_id).await, 0);
 }

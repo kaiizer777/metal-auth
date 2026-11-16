@@ -293,6 +293,12 @@ impl AppError {
         }
     }
 
+    /// Reconstruct a typed error from a wire [`ErrorCode`] for status mapping.
+    ///
+    /// Only meaningful for stateless codes (session, CSRF, rate limit, auth);
+    /// every production caller uses those arms. The infra arms synthesize
+    /// placeholder sources that were never observed — never treat their
+    /// `source()` chains as real diagnostics.
     #[must_use]
     pub fn from_code(code: ErrorCode) -> Self {
         match code {
@@ -333,6 +339,17 @@ impl AppError {
     }
 }
 
+/// Upper bound on user-controlled characters emitted into a single log field.
+const MAX_LOG_FIELD_CHARS: usize = 256;
+
+/// Truncate user-controlled input for log fields, always at a char boundary.
+fn truncate_for_log(input: &str) -> &str {
+    match input.char_indices().nth(MAX_LOG_FIELD_CHARS) {
+        Some((idx, _)) => &input[..idx],
+        None => input,
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         match &self {
@@ -356,7 +373,9 @@ impl IntoResponse for AppError {
             Self::PasswordTooLong => tracing::debug!("password too long"),
             Self::PasswordTooCommon => tracing::debug!("password too common"),
             Self::InvalidEmail => tracing::debug!("invalid email format"),
-            Self::ValidationError(msg) => tracing::debug!(msg = %msg, "validation error"),
+            Self::ValidationError(msg) => {
+                tracing::debug!(msg = %truncate_for_log(msg), "validation error")
+            }
             Self::InvalidToken => tracing::debug!("invalid or consumed token"),
             Self::TokenExpired => tracing::debug!("expired token presented"),
             // EmailAlreadyExists is internal-only — never reaches this handler in normal flow
@@ -791,5 +810,60 @@ mod tests {
                 .get(axum::http::header::WWW_AUTHENTICATE)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn from_code_round_trips_every_wire_code() {
+        let codes = [
+            ErrorCode::InvalidConfig,
+            ErrorCode::DatabaseError,
+            ErrorCode::DatabaseUnavailable,
+            ErrorCode::MigrationFailed,
+            ErrorCode::InternalError,
+            ErrorCode::NotFound,
+            ErrorCode::MethodNotAllowed,
+            ErrorCode::InvalidCredentials,
+            ErrorCode::Unauthenticated,
+            ErrorCode::EmailNotVerified,
+            ErrorCode::PasswordTooShort,
+            ErrorCode::PasswordTooLong,
+            ErrorCode::PasswordTooCommon,
+            ErrorCode::InvalidEmail,
+            ErrorCode::ValidationError,
+            ErrorCode::InvalidToken,
+            ErrorCode::TokenExpired,
+            ErrorCode::SessionNotFound,
+            ErrorCode::SessionExpired,
+            ErrorCode::SessionInvalid,
+            ErrorCode::CsrfTokenMissing,
+            ErrorCode::CsrfTokenInvalid,
+            ErrorCode::RateLimitExceeded,
+        ];
+        for code in codes {
+            assert_eq!(AppError::from_code(code).error_code(), code);
+        }
+    }
+
+    #[test]
+    fn email_already_exists_stays_anti_enumerating() {
+        let err = AppError::EmailAlreadyExists;
+        assert_eq!(err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.error_code(), ErrorCode::InternalError);
+        assert_eq!(err.response_message(), "Internal error");
+    }
+
+    #[test]
+    fn truncate_for_log_keeps_short_input() {
+        assert_eq!(truncate_for_log("field required"), "field required");
+        assert_eq!(truncate_for_log(""), "");
+    }
+
+    #[test]
+    fn truncate_for_log_caps_at_char_boundary() {
+        let long = "é".repeat(300);
+        let truncated = truncate_for_log(&long);
+        assert_eq!(truncated.chars().count(), MAX_LOG_FIELD_CHARS);
+        let ascii = "x".repeat(1000);
+        assert_eq!(truncate_for_log(&ascii).len(), MAX_LOG_FIELD_CHARS);
     }
 }

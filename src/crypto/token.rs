@@ -174,13 +174,7 @@ mod tests {
     fn concurrent_generation_yields_unique_tokens() {
         std::thread::scope(|s| {
             let handles: Vec<_> = (0..8)
-                .map(|_| {
-                    s.spawn(|| {
-                        (0..16)
-                            .map(|_| generate_token())
-                            .collect::<Vec<_>>()
-                    })
-                })
+                .map(|_| s.spawn(|| (0..16).map(|_| generate_token()).collect::<Vec<_>>()))
                 .collect();
             let mut seen = std::collections::HashSet::new();
             for handle in handles {

@@ -319,20 +319,12 @@ mod tests {
             })
             .finish();
         let secret = "super-secret-marker-9f3c";
-        tracing::dispatcher::with_default(
-            &tracing::dispatcher::Dispatch::new(subscriber),
-            || {
-                let _ = verify_password(secret, "not-a-valid-phc");
-                let _ = hash_password_with_params(secret, 1, 1, 1);
-            },
-        );
-        let logs = String::from_utf8(
-            buffer
-                .lock()
-                .expect("log buffer poisoned")
-                .clone(),
-        )
-        .expect("logs are UTF-8");
+        tracing::dispatcher::with_default(&tracing::dispatcher::Dispatch::new(subscriber), || {
+            let _ = verify_password(secret, "not-a-valid-phc");
+            let _ = hash_password_with_params(secret, 1, 1, 1);
+        });
+        let logs = String::from_utf8(buffer.lock().expect("log buffer poisoned").clone())
+            .expect("logs are UTF-8");
         assert!(!logs.is_empty(), "expected error logs to be captured");
         assert!(!logs.contains(secret), "error log leaked secret material");
     }

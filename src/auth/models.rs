@@ -88,10 +88,20 @@ impl LoginResponse {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SignupRequest {
     pub email: String,
     pub password: String,
+}
+
+// Manual `Debug`: never render the plaintext password into logs or traces.
+impl std::fmt::Debug for SignupRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignupRequest")
+            .field("email", &self.email)
+            .field("password", &"[redacted]")
+            .finish()
+    }
 }
 
 impl SignupRequest {
@@ -102,10 +112,20 @@ impl SignupRequest {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct LoginRequest {
     pub email: String,
     pub password: String,
+}
+
+// Manual `Debug`: never render the plaintext password into logs or traces.
+impl std::fmt::Debug for LoginRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginRequest")
+            .field("email", &self.email)
+            .field("password", &"[redacted]")
+            .finish()
+    }
 }
 
 impl LoginRequest {
@@ -118,9 +138,18 @@ impl LoginRequest {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct VerifyEmailRequest {
     pub token: String,
+}
+
+// Manual `Debug`: the token is a single-use secret while live.
+impl std::fmt::Debug for VerifyEmailRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifyEmailRequest")
+            .field("token", &"[redacted]")
+            .finish()
+    }
 }
 
 impl VerifyEmailRequest {
@@ -140,10 +169,20 @@ impl PasswordResetRequest {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PasswordResetConfirmRequest {
     pub token: String,
     pub new_password: String,
+}
+
+// Manual `Debug`: never render the token or the plaintext password.
+impl std::fmt::Debug for PasswordResetConfirmRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasswordResetConfirmRequest")
+            .field("token", &"[redacted]")
+            .field("new_password", &"[redacted]")
+            .finish()
+    }
 }
 
 impl PasswordResetConfirmRequest {
@@ -542,5 +581,35 @@ mod tests {
         let resp_no_token = LoginResponse::new(Uuid::nil());
         let debug_no_token = format!("{resp_no_token:?}");
         assert!(debug_no_token.contains("None"));
+    }
+
+    #[test]
+    fn request_debug_redacts_secrets() {
+        let signup = SignupRequest {
+            email: "user@example.com".to_string(),
+            password: "SuperSecret123!".to_string(),
+        };
+        let rendered = format!("{signup:?}");
+        assert!(!rendered.contains("SuperSecret123!"));
+        assert!(rendered.contains("user@example.com"));
+
+        let login = LoginRequest {
+            email: "user@example.com".to_string(),
+            password: "SuperSecret123!".to_string(),
+        };
+        assert!(!format!("{login:?}").contains("SuperSecret123!"));
+
+        let confirm = PasswordResetConfirmRequest {
+            token: "a".repeat(64),
+            new_password: "SuperSecret123!".to_string(),
+        };
+        let rendered = format!("{confirm:?}");
+        assert!(!rendered.contains("SuperSecret123!"));
+        assert!(!rendered.contains(&"a".repeat(64)));
+
+        let verify = VerifyEmailRequest {
+            token: "b".repeat(64),
+        };
+        assert!(!format!("{verify:?}").contains(&"b".repeat(64)));
     }
 }

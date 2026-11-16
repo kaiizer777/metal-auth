@@ -89,8 +89,11 @@ pub fn verify_password(password: &str, phc_hash: &str) -> Result<bool, AppError>
 pub fn generate_dummy_hash(config: &AppConfig) -> Result<String, AppError> {
     let mut dummy_bytes = [0u8; 32];
     OsRng.fill_bytes(&mut dummy_bytes);
-    let dummy_secret = hex::encode(dummy_bytes);
-    hash_password(&dummy_secret, config)
+    let mut dummy_secret = hex::encode(dummy_bytes);
+    super::zeroize_bytes(&mut dummy_bytes);
+    let result = hash_password(&dummy_secret, config);
+    super::zeroize_bytes(dummy_secret.as_mut_vec());
+    result
 }
 
 #[cfg(test)]
@@ -254,5 +257,82 @@ mod tests {
             generate_dummy_hash(&config),
             Err(AppError::Internal)
         ));
+    }
+
+    #[test]
+    fn verify_accepts_hash_from_different_params() {
+        let hash = hash_password_with_params("cross-params-pw", 19456, 2, 1).unwrap();
+        assert!(verify_password("cross-params-pw", &hash).unwrap());
+        assert!(!verify_password("wrong-pw", &hash).unwrap());
+    }
+
+    #[test]
+    fn concurrent_hashing_succeeds_with_unique_salts() {
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    s.spawn(|| {
+                        (0..2)
+                            .map(|_| {
+                                hash_password_with_params("concurrent-pw", 19456, 1, 1)
+                                    .expect("hash failed")
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            let mut seen = std::collections::HashSet::new();
+            for handle in handles {
+                for hash in handle.join().expect("worker panicked") {
+                    assert!(seen.insert(hash), "duplicate hash: salt reuse");
+                }
+            }
+            assert_eq!(seen.len(), 4 * 2);
+        });
+    }
+
+    #[test]
+    fn error_paths_log_no_secret_material() {
+        use std::io;
+        use std::sync::{Arc, Mutex};
+
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("log buffer poisoned")
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt::Subscriber::builder()
+            .with_writer({
+                let buffer = Arc::clone(&buffer);
+                move || Capture(Arc::clone(&buffer))
+            })
+            .finish();
+        let secret = "super-secret-marker-9f3c";
+        tracing::dispatcher::with_default(
+            &tracing::dispatcher::Dispatch::new(subscriber),
+            || {
+                let _ = verify_password(secret, "not-a-valid-phc");
+                let _ = hash_password_with_params(secret, 1, 1, 1);
+            },
+        );
+        let logs = String::from_utf8(
+            buffer
+                .lock()
+                .expect("log buffer poisoned")
+                .clone(),
+        )
+        .expect("logs are UTF-8");
+        assert!(!logs.is_empty(), "expected error logs to be captured");
+        assert!(!logs.contains(secret), "error log leaked secret material");
     }
 }

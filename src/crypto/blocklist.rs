@@ -1316,8 +1316,14 @@ static BLOCKLIST: &[&str] = &[
 ///   Inputs shorter than 8 code points or empty strings will never match any entry.
 /// - **Search Correctness**: For any input $P$, binary search returns `true` if and only if
 ///   $P$ (or its lowercased equivalent) is present in `BLOCKLIST`.
+#[must_use]
 pub fn is_common_password(password: &str) -> bool {
+    // Byte fast-path: fewer than 8 bytes implies fewer than 8 code points.
     if password.len() < 8 {
+        return false;
+    }
+    // Byte length overcounts multibyte input; entries need >= 8 code points.
+    if password.chars().nth(7).is_none() {
         return false;
     }
     if password.chars().any(char::is_uppercase) {
@@ -1435,5 +1441,13 @@ mod tests {
         assert!(is_common_password(last));
         assert!(!is_common_password("0000000"));
         assert!(!is_common_password("zzzzzzzzzzzzzzzz"));
+    }
+
+    #[test]
+    fn byte_length_filter_uses_code_points() {
+        // 7 chars but 28 bytes: too short in code points, must miss.
+        assert!(!is_common_password("🦀🦀🦀🦀🦀🦀🦀"));
+        // 8 chars / 32 bytes: passes the length filter, still not blocklisted.
+        assert!(!is_common_password("🦀🦀🦀🦀🦀🦀🦀🦀"));
     }
 }

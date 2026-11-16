@@ -62,6 +62,43 @@ impl SessionService {
         ip: Option<&str>,
         user_agent: Option<&str>,
     ) -> Result<(Session, String), AppError> {
+        self.create_session_inner(user_id, None, session_type, ip, user_agent)
+            .await
+    }
+
+    /// Session creation gated on credential freshness (issue #37).
+    ///
+    /// `expected_credential_hash` is the Argon2id PHC string verified at login.
+    /// It is compared against the live row under the existing user `FOR UPDATE`
+    /// lock — a cheap string compare, never a re-hash — so a password reset
+    /// committing between verification and insert rejects with
+    /// `InvalidCredentials` instead of minting a stale session.
+    pub async fn create_session_checked(
+        &self,
+        user_id: Uuid,
+        expected_credential_hash: &str,
+        session_type: &str,
+        ip: Option<&str>,
+        user_agent: Option<&str>,
+    ) -> Result<(Session, String), AppError> {
+        self.create_session_inner(
+            user_id,
+            Some(expected_credential_hash),
+            session_type,
+            ip,
+            user_agent,
+        )
+        .await
+    }
+
+    async fn create_session_inner(
+        &self,
+        user_id: Uuid,
+        expected_credential_hash: Option<&str>,
+        session_type: &str,
+        ip: Option<&str>,
+        user_agent: Option<&str>,
+    ) -> Result<(Session, String), AppError> {
         let raw_id = Self::generate_raw_id();
         let token_hash = Self::hash_raw_id(&raw_id);
 
@@ -92,6 +129,22 @@ impl SessionService {
                 tracing::error!(error = %e, "Failed to lock user row for session capacity check");
                 AppError::Database(e)
             })?;
+
+        // Credential freshness: reject a login whose password was superseded
+        // after verification. Same row, same lock — serializes with reset's
+        // `UPDATE users ... WHERE id` commit. Missing row also rejects: no
+        // user-enumerating error variant leaves this path.
+        if let Some(expected) = expected_credential_hash {
+            let current: Option<String> =
+                sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+                    .bind(user_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(AppError::Database)?;
+            if current.as_deref() != Some(expected) {
+                return Err(AppError::InvalidCredentials);
+            }
+        }
 
         // Enforce maximum concurrent active sessions limit per user.
         if self.config.session.max_active_sessions_per_user > 0 {

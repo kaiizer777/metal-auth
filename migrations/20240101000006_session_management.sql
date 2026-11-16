@@ -1,7 +1,9 @@
 -- Migration: Add session lifecycle columns and index for active session lookups.
 -- Phase 4: Session Management additions to the sessions table.
-
-BEGIN;
+--
+-- NOTE: no explicit BEGIN/COMMIT here. `sqlx::migrate!` already wraps each
+-- migration file in a transaction; an explicit BEGIN only warns as a no-op
+-- while COMMIT would close the runner's transaction early.
 
 ALTER TABLE sessions
     ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMPTZ,
@@ -48,5 +50,3 @@ CREATE INDEX IF NOT EXISTS idx_sessions_user_id_active
 -- Ensure user_id index exists (idempotent)
 CREATE INDEX IF NOT EXISTS idx_sessions_user_id
     ON sessions (user_id);
-
-COMMIT;

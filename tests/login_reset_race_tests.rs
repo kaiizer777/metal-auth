@@ -9,7 +9,9 @@ use axum::{
     http::{Method, Request, StatusCode},
 };
 use chrono::{Duration, Utc};
-use metal_auth::{AppError, AppState, Config, crypto::token::generate_token, handler::create_router};
+use metal_auth::{
+    AppError, AppState, Config, crypto::token::generate_token, handler::create_router,
+};
 use serde_json::json;
 use sqlx::Row;
 use tower::ServiceExt;
@@ -124,9 +126,9 @@ async fn in_flight_login_leaves_no_session_after_concurrent_reset() {
     .unwrap();
 
     // In-flight login: credential check passes against the pre-reset hash.
-    let checked_in = state
+    let proof = state
         .auth_service
-        .login(&email, &old_pw)
+        .login_with_proof(&email, &old_pw)
         .await
         .expect("old password verifies before reset");
 
@@ -143,11 +145,15 @@ async fn in_flight_login_leaves_no_session_after_concurrent_reset() {
         Err(AppError::InvalidCredentials)
     ));
 
-    // The in-flight login resumes and attempts session creation.
-    let _ = state
-        .session_service
-        .create_session(checked_in, "cookie", None, None)
-        .await;
+    // The in-flight login resumes: gated session creation must reject the
+    // superseded proof with the same non-enumerating error as a bad password.
+    assert!(matches!(
+        state
+            .session_service
+            .create_session_checked(proof.user_id, &proof.credential_hash, "cookie", None, None)
+            .await,
+        Err(AppError::InvalidCredentials)
+    ));
 
     // Invariant: no live session authorized by the superseded credential.
     assert_eq!(
@@ -155,4 +161,17 @@ async fn in_flight_login_leaves_no_session_after_concurrent_reset() {
         0,
         "concurrent reset must invalidate the in-flight login: stale session created"
     );
+
+    // Fresh login under the new password still mints exactly one session.
+    let fresh = state
+        .auth_service
+        .login_with_proof(&email, &new_pw)
+        .await
+        .expect("new password verifies after reset");
+    state
+        .session_service
+        .create_session_checked(fresh.user_id, &fresh.credential_hash, "cookie", None, None)
+        .await
+        .expect("fresh credential mints a session");
+    assert_eq!(active_session_count(&pool, user_id).await, 1);
 }

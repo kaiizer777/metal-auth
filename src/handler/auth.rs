@@ -200,8 +200,12 @@ pub async fn login(
         }
     }
 
-    let user_id = match state.service.login(&normalized_email, &req.password).await {
-        Ok(uid) => uid,
+    let proof = match state
+        .service
+        .login_with_proof(&normalized_email, &req.password)
+        .await
+    {
+        Ok(proof) => proof,
         Err(e) => {
             tracing::warn!(
                 event = "login_failure",
@@ -212,6 +216,7 @@ pub async fn login(
             return service_error_response(e);
         }
     };
+    let user_id = proof.user_id;
 
     // Reset rate limit attempts upon successful authentication
     if let Some(limiter) = &state.rate_limiter {
@@ -229,8 +234,9 @@ pub async fn login(
 
     if let Some(session_svc) = &state.session_service {
         let (session, raw_id) = match session_svc
-            .create_session(
+            .create_session_checked(
                 user_id,
+                &proof.credential_hash,
                 session_type,
                 Some(&client_ip),
                 user_agent.as_deref(),

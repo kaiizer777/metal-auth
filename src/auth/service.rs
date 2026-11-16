@@ -926,6 +926,8 @@ mod tests {
 
         let email = format!("concurrent_reset_{}@example.com", Uuid::new_v4());
         let config = Arc::clone(&ctx.service.config);
+        // Test-only fixture password, never a production secret.
+        // codeql[rust/hard-coded-cryptographic-value]
         let password_hash = hash_password("SecurePassword123!", &config).unwrap();
 
         let row = sqlx::query(
@@ -952,7 +954,10 @@ mod tests {
 
         // Same token raced concurrently: exactly one DELETE RETURNING wins.
         // Distinct passwords identify the winner via login.
+        // Test-only fixture passwords, never production secrets.
+        // codeql[rust/hard-coded-cryptographic-value]
         let pw_a = "ConcurrentOne123!A";
+        // codeql[rust/hard-coded-cryptographic-value]
         let pw_b = "ConcurrentTwo456!B";
         let (first, second) = tokio::join!(
             ctx.service.reset_password(&raw_token, pw_a),
@@ -985,6 +990,8 @@ mod tests {
 
         let email = format!("dual_reset_{}@example.com", Uuid::new_v4());
         let config = Arc::clone(&ctx.service.config);
+        // Test-only fixture password, never a production secret.
+        // codeql[rust/hard-coded-cryptographic-value]
         let password_hash = hash_password("SecurePassword123!", &config).unwrap();
 
         let row = sqlx::query(
@@ -1015,6 +1022,8 @@ mod tests {
         }
 
         // Same new password on both sides pins a fully deterministic outcome.
+        // Test-only fixture password, never a production secret.
+        // codeql[rust/hard-coded-cryptographic-value]
         let new_password = "DualResetPassword123!";
         let (first, second) = tokio::join!(
             ctx.service.reset_password(&raw_tok1, new_password),
@@ -1240,6 +1249,8 @@ mod tests {
 
         let email = format!("replace_live_{}@example.com", Uuid::new_v4());
         let config = Arc::clone(&ctx.service.config);
+        // Test-only fixture password, never a production secret.
+        // codeql[rust/hard-coded-cryptographic-value]
         let password_hash = hash_password("SecurePassword123!", &config).unwrap();
 
         let row = sqlx::query(
@@ -1285,20 +1296,24 @@ mod tests {
         assert_eq!(cnt, 1, "only the newest reset token must survive");
 
         // Superseded token is dead; newest token resets successfully.
+        // Test-only fixture passwords, never production secrets.
         let stale = ctx
             .service
+            // codeql[rust/hard-coded-cryptographic-value]
             .reset_password(&first_token, "StalePassword123!")
             .await;
         assert!(
             matches!(stale, Err(AppError::InvalidToken)),
-            "superseded token must be invalid: {stale:?}"
+            "superseded token must be invalid"
         );
         ctx.service
+            // codeql[rust/hard-coded-cryptographic-value]
             .reset_password(&second_token, "NewestPassword123!")
             .await
             .unwrap();
         assert_eq!(
             ctx.service
+                // codeql[rust/hard-coded-cryptographic-value]
                 .login(&email, "NewestPassword123!")
                 .await
                 .unwrap(),

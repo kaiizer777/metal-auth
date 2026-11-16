@@ -5,8 +5,8 @@
 //! `reset_password`: the race test asserts zero live sessions in every
 //! interleaving outcome, the serialization test proves rotate holds the
 //! user-row lock across its tx (it must block while a concurrent tx holds it),
-//! and the sequential test pins the reset-won guard branch by construction
-//! (reset commits first, rotate fails closed, nothing survives).
+//! and the sequential test pins the reset-won fail-closed outcome by
+//! construction (reset commits first, rotate fails closed, nothing survives).
 
 mod common;
 
@@ -116,8 +116,12 @@ async fn rotate_concurrent_with_reset_leaves_zero_live_sessions() {
     );
 }
 
+/// Characterization: pins closed behavior post-reset (SessionNotFound, zero
+/// live sessions). NOT a guard-branch regression pin — red/green ownership
+/// belongs to the serialization interleave test, whose pg_stat_activity gate
+/// matches a `SELECT ... FOR UPDATE` the pre-fix code never emits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rotate_after_committed_reset_fails_closed() {
+async fn rotate_after_committed_reset_stays_closed() {
     let Some(app) = common::setup_test_app().await else {
         panic!("DATABASE_URL must be set: issue-39 regression test needs a live DB");
     };
@@ -127,7 +131,7 @@ async fn rotate_after_committed_reset_fails_closed() {
     let (user_id, old_raw, raw_token, new_pw) = seed_user_with_session_and_reset_token(&app).await;
 
     // Reset commits first, so rotate's pre-tx lookup misses the purged row and
-    // the reset-won branch is taken by construction (no scheduler luck).
+    // fails closed by construction (no scheduler luck).
     state
         .auth_service
         .reset_password(&raw_token, &new_pw)

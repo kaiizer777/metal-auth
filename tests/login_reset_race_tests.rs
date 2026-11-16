@@ -145,14 +145,14 @@ async fn in_flight_login_leaves_no_session_after_concurrent_reset() {
         Err(AppError::InvalidCredentials)
     ));
 
-    // The in-flight login resumes: gated session creation must reject the
-    // superseded proof with the same non-enumerating error as a bad password.
+    // The in-flight login resumes: gated session creation rejects the
+    // superseded proof as an invalidated session, distinct from a bad password.
     assert!(matches!(
         state
             .session_service
             .create_session_checked(proof.user_id, &proof.credential_hash, "cookie", None, None)
             .await,
-        Err(AppError::InvalidCredentials)
+        Err(AppError::SessionInvalid)
     ));
 
     // Invariant: no live session authorized by the superseded credential.

@@ -9,6 +9,7 @@ use axum::{
 use uuid::Uuid;
 
 use crate::{
+    db::models::Session,
     error::{AppError, ErrorCode},
     session::{bearer::read_bearer_token, cookie::read_session_cookie},
     state::AppState,
@@ -38,6 +39,21 @@ where
     }
 }
 
+impl<S> FromRequestParts<S> for Session
+where
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<Self>()
+            .cloned()
+            .ok_or_else(|| AppError::from_code(ErrorCode::SessionNotFound))
+    }
+}
+
 /// Axum middleware enforcing session authentication via cookie or bearer token.
 pub async fn require_auth(
     State(state): State<AppState>,
@@ -52,11 +68,14 @@ pub async fn require_auth(
 
     let auth_user = AuthUser {
         user_id: session.user_id,
-        session_hash: session.token_hash,
-        session_type: session.session_type,
+        session_hash: session.token_hash.clone(),
+        session_type: session.session_type.clone(),
     };
 
+    // Share the validated row with handlers (e.g. GET /auth/session) so they
+    // don't re-SELECT the same session `require_auth` just checked and touched.
     req.extensions_mut().insert(auth_user);
+    req.extensions_mut().insert(session);
     Ok(next.run(req).await)
 }
 

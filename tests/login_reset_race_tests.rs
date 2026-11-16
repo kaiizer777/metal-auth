@@ -1,12 +1,14 @@
-//! Regression tests for issue #37: in-flight login must not mint an active
+﻿//! Regression tests for issue #37: in-flight login must not mint an active
 //! session after a concurrent password reset.
 //!
 //! Deterministic interleaving: complete the credential check, commit a reset,
 //! then attempt session creation. Pre-fix this leaves a live session behind.
 
+use std::sync::Arc;
+
 use axum::{
     body::Body,
-    http::{Method, Request, StatusCode},
+    http::{Method, Request, StatusCode, header},
 };
 use chrono::{Duration, Utc};
 use metal_auth::{
@@ -80,6 +82,112 @@ async fn active_session_count(pool: &sqlx::PgPool, user_id: Uuid) -> i64 {
         .fetch_one(pool)
         .await
         .unwrap()
+}
+
+async fn reset_token_count(pool: &sqlx::PgPool, user_id: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM password_reset_tokens WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+struct HttpOutcome {
+    status: StatusCode,
+    set_cookies: Vec<String>,
+    code: Option<String>,
+}
+
+async fn dispatch(router: &axum::Router, req: Request<Body>) -> HttpOutcome {
+    let resp = router.clone().oneshot(req).await.expect("router dispatch");
+    let status = resp.status();
+    let set_cookies = resp
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok().map(str::to_owned))
+        .collect();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap_or_default();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    let code = json.get("code").and_then(|c| c.as_str()).map(str::to_owned);
+    HttpOutcome {
+        status,
+        set_cookies,
+        code,
+    }
+}
+
+fn session_cookie(outcome: &HttpOutcome, name: &str) -> Option<String> {
+    outcome.set_cookies.iter().find_map(|h| {
+        let (k, v) = h.split(';').next()?.trim().split_once('=')?;
+        (k == name).then(|| v.to_owned())
+    })
+}
+
+fn authed_get(uri: &str, cookie_name: &str, raw: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .header(header::COOKIE, format!("{cookie_name}={raw}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+struct RaceFixture {
+    email: String,
+    old_pw: String,
+    new_pw: String,
+    user_id: Uuid,
+    raw_token: String,
+}
+
+async fn signup_verify_and_issue_token(router: &axum::Router, pool: &sqlx::PgPool) -> RaceFixture {
+    let email = format!("race_{}@example.com", Uuid::new_v4());
+    let old_pw = format!("OldSecret_{}_P@ssw0rd!", Uuid::new_v4());
+    let new_pw = format!("NewSecret_{}_P@ssw0rd!", Uuid::new_v4());
+
+    let signup = json_request(
+        Method::POST,
+        "/auth/signup",
+        json!({"email": email, "password": old_pw}),
+    );
+    assert_eq!(
+        router.clone().oneshot(signup).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let user_id: Uuid = sqlx::query("SELECT id FROM users WHERE email = $1")
+        .bind(&email)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .get("id");
+    sqlx::query("UPDATE users SET email_verified = true WHERE id = $1")
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let (raw_token, token_hash) = generate_token();
+    sqlx::query(
+        "INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
+    )
+    .bind(token_hash.as_slice())
+    .bind(user_id)
+    .bind(Utc::now() + Duration::hours(1))
+    .execute(pool)
+    .await
+    .unwrap();
+
+    RaceFixture {
+        email,
+        old_pw,
+        new_pw,
+        user_id,
+        raw_token,
+    }
 }
 
 #[tokio::test]
@@ -174,4 +282,67 @@ async fn in_flight_login_leaves_no_session_after_concurrent_reset() {
         .await
         .expect("fresh credential mints a session");
     assert_eq!(active_session_count(&pool, user_id).await, 1);
+}
+
+#[tokio::test]
+async fn stale_credential_http_login_rejected_and_cookie_purged() {
+    let Some((router, pool, state)) = setup_live_db().await else {
+        return;
+    };
+    let fix = signup_verify_and_issue_token(&router, &pool).await;
+    let cookie_name = state.config.session.cookie_name.clone();
+
+    // Baseline: old credential logs in over HTTP; the cookie opens the session endpoint.
+    let login = dispatch(
+        &router,
+        json_request(
+            Method::POST,
+            "/auth/login",
+            json!({"email": fix.email, "password": fix.old_pw}),
+        ),
+    )
+    .await;
+    assert_eq!(login.status, StatusCode::OK);
+    let raw = session_cookie(&login, &cookie_name).expect("login mints a session cookie");
+    assert_eq!(
+        dispatch(&router, authed_get("/auth/session/me", &cookie_name, &raw))
+            .await
+            .status,
+        StatusCode::OK
+    );
+
+    // Reset commits: new hash stored, all sessions and tokens purged.
+    state
+        .auth_service
+        .reset_password(&fix.raw_token, &fix.new_pw)
+        .await
+        .expect("reset commits");
+
+    // Stale credential over HTTP: 401 with no replacement cookie and no new session row.
+    // Verify precedes the session gate in the handler, so a superseded password
+    // surfaces as INVALID_CREDENTIALS; SESSION_INVALID is unreachable by sequencing.
+    let stale = dispatch(
+        &router,
+        json_request(
+            Method::POST,
+            "/auth/login",
+            json!({"email": fix.email, "password": fix.old_pw}),
+        ),
+    )
+    .await;
+    assert_eq!(stale.status, StatusCode::UNAUTHORIZED);
+    assert!(
+        stale.set_cookies.is_empty(),
+        "rejected login must not mint a session"
+    );
+    assert_eq!(stale.code.as_deref(), Some("INVALID_CREDENTIALS"));
+
+    // Pre-reset cookie is dead: the purged row surfaces as SESSION_NOT_FOUND.
+    let dead = dispatch(&router, authed_get("/auth/session/me", &cookie_name, &raw)).await;
+    assert_eq!(dead.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(dead.code.as_deref(), Some("SESSION_NOT_FOUND"));
+
+    // Purge observed at the row level.
+    assert_eq!(active_session_count(&pool, fix.user_id).await, 0);
+    assert_eq!(reset_token_count(&pool, fix.user_id).await, 0);
 }

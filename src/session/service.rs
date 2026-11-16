@@ -420,6 +420,18 @@ impl SessionService {
             AppError::Database(e)
         })?;
 
+        // Serialize with reset_password's purge: the reset tx locks this row via
+        // `UPDATE users ... WHERE id` before deleting sessions, so whichever tx
+        // locks first wins. Reset-first leaves zero rows for the DELETE below.
+        sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+            .bind(old_session.user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "Failed to lock user row for session rotation");
+                AppError::Database(e)
+            })?;
+
         // Atomically delete old session; must affect exactly 1 row to prevent replay/duplicate rotation
         let delete_res = sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
             .bind(&old_hash)

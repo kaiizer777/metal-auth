@@ -2952,28 +2952,24 @@ async fn test_invalidate_all_user_sessions_waits_on_user_row() {
         .await
         .expect("guard lock acquired");
 
-    // Correlate the gate to this test's own waiter backend so a stray
-    // FOR UPDATE from another backend can never satisfy it.
-    let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<i32>();
-    let revoke_pool = ctx.pool.clone();
-    let revoke_handle = tokio::spawn(async move {
-        let waiter_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-            .fetch_one(&revoke_pool)
-            .await
-            .expect("backend pid readable");
-        pid_tx.send(waiter_pid).expect("pid receiver lives");
-        session_service.invalidate_all_user_sessions(user_id).await
-    });
-    let waiter_pid = pid_rx.await.expect("waiter reports its backend pid");
+    // Gate on the guard backend: the worker runs revoke-all on a pooled
+    // connection whose pid the test cannot observe, but the guard tx
+    // connection is held by this test, so its pid is a stable blocker id.
+    let guard_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *guard_tx)
+        .await
+        .expect("guard backend pid readable");
+    let revoke_handle =
+        tokio::spawn(async move { session_service.invalidate_all_user_sessions(user_id).await });
 
     // Pre-fix revoke-all never issues SELECT ... FOR UPDATE, so no backend
     // ever blocks and the deadline expires instead of passing by accident.
     let deadline = Instant::now() + std::time::Duration::from_secs(15);
     loop {
         let waiting: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM pg_stat_activity WHERE query LIKE 'SELECT id FROM users%FOR UPDATE' AND datname = current_database() AND wait_event_type = 'Lock' AND pid = $1",
+            "SELECT COUNT(*) FROM pg_stat_activity WHERE query LIKE 'SELECT id FROM users%FOR UPDATE' AND datname = current_database() AND wait_event_type = 'Lock' AND $1 = ANY (pg_blocking_pids(pid))",
         )
-        .bind(waiter_pid)
+        .bind(guard_pid)
         .fetch_one(&ctx.pool)
         .await
         .expect("pg_stat_activity must be readable");

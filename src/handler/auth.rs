@@ -21,6 +21,7 @@ use crate::{
     auth::service::AuthServiceImpl,
     config::Config,
     error::{AppError, ErrorCode, ErrorResponse},
+    handler::untrusted_client_ip,
     ratelimit::{RateLimiter, rate_limit_key},
     session::{
         SessionService,
@@ -112,6 +113,27 @@ fn service_error_response(err: AppError) -> Response {
     err.into_response()
 }
 
+/// Attach session + CSRF cookies to a cookie-login response.
+///
+/// Fails closed: a cookie that cannot encode (server-side bug — tokens are hex)
+/// becomes a 500 via `AppError::Internal`, never an empty `Set-Cookie`.
+fn attach_login_cookies(
+    mut response: Response,
+    cfg: &Config,
+    raw_id: &str,
+    csrf_token: Option<&str>,
+) -> Result<Response, AppError> {
+    response
+        .headers_mut()
+        .insert(header::SET_COOKIE, set_session_cookie(cfg, raw_id)?);
+    if let Some(csrf) = csrf_token {
+        response
+            .headers_mut()
+            .append(header::SET_COOKIE, set_csrf_cookie(cfg, csrf)?);
+    }
+    Ok(response)
+}
+
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 /// POST /auth/signup
@@ -163,11 +185,8 @@ pub async fn login(
         return service_error_response(e);
     }
 
-    let client_ip = headers
-        .get("x-forwarded-for")
-        .or_else(|| headers.get("x-real-ip"))
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or(s).trim())
+    // Spoofable unless a trusted proxy strips these headers; audit/rate-limit use only.
+    let client_ip = untrusted_client_ip(&headers)
         .unwrap_or("127.0.0.1")
         .to_string();
 
@@ -191,8 +210,7 @@ pub async fn login(
             let cooldown = state
                 .config
                 .as_ref()
-                .map(|c| c.rate_limit.login_cooldown_secs)
-                .unwrap_or(900);
+                .map_or(900, |c| c.rate_limit.login_cooldown_secs);
             if let Ok(val) = header::HeaderValue::from_str(&cooldown.to_string()) {
                 resp.headers_mut().insert(header::RETRY_AFTER, val);
             }
@@ -227,8 +245,7 @@ pub async fn login(
     let is_bearer = headers
         .get("x-auth-type")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.eq_ignore_ascii_case("bearer"))
-        .unwrap_or(false);
+        .is_some_and(|s| s.eq_ignore_ascii_case("bearer"));
 
     let session_type = if is_bearer { "bearer" } else { "cookie" };
 
@@ -262,18 +279,17 @@ pub async fn login(
             )
                 .into_response()
         } else {
-            let mut response = (StatusCode::OK, Json(LoginResponse::new(user_id))).into_response();
+            let response = (StatusCode::OK, Json(LoginResponse::new(user_id))).into_response();
             if let Some(cfg) = &state.config {
-                response.headers_mut().insert(
-                    header::SET_COOKIE,
-                    set_session_cookie(raw_id.as_str(), cfg.as_ref()),
-                );
-                if let Some(ref csrf) = session.csrf_token {
-                    response.headers_mut().append(
-                        header::SET_COOKIE,
-                        set_csrf_cookie(csrf.as_str(), cfg.as_ref()),
-                    );
-                }
+                return match attach_login_cookies(
+                    response,
+                    cfg.as_ref(),
+                    raw_id.as_str(),
+                    session.csrf_token.as_deref(),
+                ) {
+                    Ok(resp) => resp,
+                    Err(e) => service_error_response(e),
+                };
             }
             response
         }
@@ -289,8 +305,7 @@ pub async fn logout(State(state): State<AuthHandlerState>, headers: HeaderMap) -
     let cookie_name = state
         .config
         .as_ref()
-        .map(|c| c.session.cookie_name.as_str())
-        .unwrap_or("sid");
+        .map_or("sid", |c| c.session.cookie_name.as_str());
 
     let raw_id_opt =
         read_session_cookie(&headers, cookie_name).or_else(|| read_bearer_token(&headers));
@@ -311,9 +326,13 @@ pub async fn logout(State(state): State<AuthHandlerState>, headers: HeaderMap) -
 
     let mut response = StatusCode::NO_CONTENT.into_response();
     if let Some(ref cfg) = state.config {
+        let clear_cookie = match clear_session_cookie(cfg.as_ref()) {
+            Ok(hv) => hv,
+            Err(e) => return service_error_response(e),
+        };
         response
             .headers_mut()
-            .insert(header::SET_COOKIE, clear_session_cookie(cfg.as_ref()));
+            .insert(header::SET_COOKIE, clear_cookie);
     }
     response
 }

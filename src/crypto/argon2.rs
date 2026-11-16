@@ -92,7 +92,8 @@ pub fn generate_dummy_hash(config: &AppConfig) -> Result<String, AppError> {
     let mut dummy_secret = hex::encode(dummy_bytes);
     super::zeroize_bytes(&mut dummy_bytes);
     let result = hash_password(&dummy_secret, config);
-    super::zeroize_bytes(dummy_secret.as_mut_vec());
+    // SAFETY: zero bytes are valid UTF-8, so the string stays well-formed.
+    super::zeroize_bytes(unsafe { dummy_secret.as_mut_vec() });
     result
 }
 

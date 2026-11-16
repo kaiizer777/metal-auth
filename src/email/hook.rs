@@ -31,14 +31,16 @@ pub trait EmailSender: Send + Sync {
 /// A shared reference-counted handle to a thread-safe [`EmailSender`].
 pub type SharedEmailSender = Arc<dyn EmailSender>;
 
-/// Redacts `token=` assignments from a sender error before it is logged or
-/// persisted to the outbox `error_log`.
+/// Redacts token values from a sender error before it is logged or persisted
+/// to the outbox `error_log`.
 ///
-/// Matches the key ASCII-case-insensitively (`token=`, `Token=`, `auth_token=`)
-/// and replaces the value up to the next `&`, `#`, whitespace, quote, `;`,
-/// or end of input with `[REDACTED]`. Keys merely containing the substring (e.g.
-/// `token_type=`) are left alone. Returns the input unchanged when no marker
-/// is present, so non-secret errors pass through unmodified.
+/// Covers `token=` assignments (ASCII-case-insensitive: `token=`, `Token=`,
+/// `auth_token=`; value runs to the next `&`, `#`, whitespace, quote, `;`,
+/// or end of input) and JSON string pairs (`"token": "<value>"`, quote style
+/// and whitespace around `:` tolerated). Keys merely containing the substring
+/// (e.g. `token_type=`, `"token_type":`) are left alone. Returns the input
+/// unchanged when no marker is present, so non-secret errors pass through
+/// unmodified.
 pub fn sanitize_sender_error(err: &DynError) -> String {
     sanitize_error_str(&err.to_string())
 }
@@ -46,8 +48,12 @@ pub fn sanitize_sender_error(err: &DynError) -> String {
 /// [`sanitize_sender_error`] over an already-rendered message: use for
 /// outbox-internal `error_log` strings assembled from untrusted parts.
 pub fn sanitize_error_str(raw: &str) -> String {
-    // ASCII-only lowering preserves byte indices, so marker offsets found in
-    // `lowered` are valid slice boundaries in `raw` (markers are pure ASCII).
+    redact_json_token(redact_token_assignments(raw))
+}
+
+// `token=`-assignment pass. ASCII-only lowering preserves byte indices, so
+// marker offsets found in `lowered` are valid slice boundaries in `raw`.
+fn redact_token_assignments(raw: &str) -> String {
     let lowered = raw.to_ascii_lowercase();
     let bytes = raw.as_bytes();
     let mut out = String::with_capacity(raw.len());
@@ -71,6 +77,59 @@ pub fn sanitize_error_str(raw: &str) -> String {
         kept_from = end;
     }
     out.push_str(&raw[kept_from..]);
+    out
+}
+
+// `"token": "<value>"` JSON pass. The closing quote in the `"token"` match
+// excludes `"token_type"`-style keys; `token=`-adjacent quotes were already
+// consumed by the assignment pass above.
+fn redact_json_token(stage: String) -> String {
+    let lowered = stage.to_ascii_lowercase();
+    let bytes = stage.as_bytes();
+    let mut out = String::with_capacity(stage.len());
+    let mut kept_from = 0;
+    let mut search_from = 0;
+    while let Some(rel) = lowered[search_from..].find("\"token\"") {
+        let key_at = search_from + rel;
+        if key_at < kept_from {
+            search_from = key_at + 1;
+            continue;
+        }
+        let mut cursor = key_at + "\"token\"".len();
+        while cursor < bytes.len() && matches!(bytes[cursor], b' ' | b'\t' | b'\r' | b'\n') {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || bytes[cursor] != b':' {
+            search_from = key_at + 1;
+            continue;
+        }
+        cursor += 1;
+        while cursor < bytes.len() && matches!(bytes[cursor], b' ' | b'\t' | b'\r' | b'\n') {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || !matches!(bytes[cursor], b'"' | b'\'') {
+            search_from = key_at + 1;
+            continue;
+        }
+        let quote = bytes[cursor];
+        let value_at = cursor + 1;
+        let mut end = value_at;
+        while end < bytes.len() && bytes[end] != quote {
+            end += 1;
+        }
+        out.push_str(&stage[kept_from..value_at]);
+        out.push_str("[REDACTED]");
+        if end < bytes.len() {
+            out.push(quote as char);
+            kept_from = end + 1;
+            search_from = kept_from;
+        } else {
+            // Unterminated string: fail closed, drop the trailing secret bytes.
+            kept_from = stage.len();
+            search_from = stage.len();
+        }
+    }
+    out.push_str(&stage[kept_from..]);
     out
 }
 
@@ -109,6 +168,23 @@ mod tests {
         );
         let err = boxed("connection refused");
         assert_eq!(sanitize_sender_error(&err), "connection refused");
+    }
+
+    #[test]
+    fn redacts_json_token_shape() {
+        let err = boxed(r#"smtp rejected {"token":"supersecret123"} for user"#);
+        assert_eq!(
+            sanitize_sender_error(&err),
+            r#"smtp rejected {"token":"[REDACTED]"} for user"#
+        );
+        let err = boxed(r#"fail {"Token" : 'abc', "token_type": "bearer"} end"#);
+        assert_eq!(
+            sanitize_sender_error(&err),
+            r#"fail {"Token" : '[REDACTED]', "token_type": "bearer"} end"#
+        );
+        // Non-string JSON values are not secrets to redact.
+        let err = boxed(r#"fail {"token": 42} end"#);
+        assert_eq!(sanitize_sender_error(&err), r#"fail {"token": 42} end"#);
     }
 
     #[test]

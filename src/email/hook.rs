@@ -35,8 +35,8 @@ pub type SharedEmailSender = Arc<dyn EmailSender>;
 /// persisted to the outbox `error_log`.
 ///
 /// Matches the key ASCII-case-insensitively (`token=`, `Token=`, `auth_token=`)
-/// and replaces the value up to the next `&`, whitespace, quote, `;`, or end
-/// of input with `[REDACTED]`. Keys merely containing the substring (e.g.
+/// and replaces the value up to the next `&`, `#`, whitespace, quote, `;`,
+/// or end of input with `[REDACTED]`. Keys merely containing the substring (e.g.
 /// `token_type=`) are left alone. Returns the input unchanged when no marker
 /// is present, so non-secret errors pass through unmodified.
 pub fn sanitize_sender_error(err: &DynError) -> String {
@@ -63,7 +63,7 @@ pub fn sanitize_error_str(raw: &str) -> String {
         while end < bytes.len()
             && !matches!(
                 bytes[end],
-                b'&' | b' ' | b'\t' | b'\r' | b'\n' | b'"' | b'\'' | b';'
+                b'&' | b' ' | b'\t' | b'\r' | b'\n' | b'"' | b'\'' | b';' | b'#'
             )
         {
             end += 1;
@@ -117,6 +117,11 @@ mod tests {
         assert_eq!(
             sanitize_sender_error(&err),
             "get https://example.com/reset?token=[REDACTED]#frag failed"
+        );
+        let err = boxed("fail token=abc#token=xyz end");
+        assert_eq!(
+            sanitize_sender_error(&err),
+            "fail token=[REDACTED]#token=[REDACTED] end"
         );
     }
 }

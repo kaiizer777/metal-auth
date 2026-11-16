@@ -880,6 +880,8 @@ mod tests {
 
         let email = format!("concurrent_{}@example.com", Uuid::new_v4());
         ctx.service
+            // Test-only fixture password, never a production secret.
+            // codeql[rust/hard-coded-cryptographic-value]
             .signup(&email, "SecurePassword123!")
             .await
             .unwrap();

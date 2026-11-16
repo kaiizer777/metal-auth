@@ -1446,8 +1446,11 @@ mod tests {
     #[test]
     fn byte_length_filter_uses_code_points() {
         // 7 chars but 28 bytes: too short in code points, must miss.
+        // Test-only fixture input, never a production secret.
+        // codeql[rust/hard-coded-cryptographic-value]
         assert!(!is_common_password("🦀🦀🦀🦀🦀🦀🦀"));
         // 8 chars / 32 bytes: passes the length filter, still not blocklisted.
+        // codeql[rust/hard-coded-cryptographic-value]
         assert!(!is_common_password("🦀🦀🦀🦀🦀🦀🦀🦀"));
     }
 }

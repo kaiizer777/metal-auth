@@ -262,8 +262,12 @@ mod tests {
 
     #[test]
     fn verify_accepts_hash_from_different_params() {
+        // Test-only fixture passwords, never production secrets.
+        // codeql[rust/hard-coded-cryptographic-value]
         let hash = hash_password_with_params("cross-params-pw", 19456, 2, 1).unwrap();
+        // codeql[rust/hard-coded-cryptographic-value]
         assert!(verify_password("cross-params-pw", &hash).unwrap());
+        // codeql[rust/hard-coded-cryptographic-value]
         assert!(!verify_password("wrong-pw", &hash).unwrap());
     }
 
@@ -275,6 +279,8 @@ mod tests {
                     s.spawn(|| {
                         (0..2)
                             .map(|_| {
+                                // Test-only fixture password, never a production secret.
+                                // codeql[rust/hard-coded-cryptographic-value]
                                 hash_password_with_params("concurrent-pw", 19456, 1, 1)
                                     .expect("hash failed")
                             })
@@ -318,6 +324,8 @@ mod tests {
                 move || Capture(Arc::clone(&buffer))
             })
             .finish();
+        // Test-only canary value asserting secrets never reach logs; not a real credential.
+        // codeql[rust/hard-coded-cryptographic-value]
         let secret = "super-secret-marker-9f3c";
         tracing::dispatcher::with_default(&tracing::dispatcher::Dispatch::new(subscriber), || {
             let _ = verify_password(secret, "not-a-valid-phc");

@@ -38,7 +38,7 @@ pub mod ratelimit;
 pub mod session;
 pub mod state;
 
-pub use auth::{Auth, AuthService, AuthServiceImpl, UserResponse};
+pub use auth::{Auth, AuthService, AuthServiceImpl, AuthenticatedLogin, UserResponse};
 pub use config::{AppConfig, Config, RateLimitConfig, SessionConfig};
 pub use db::models::{EmailOutbox, PasswordResetToken, Session, User, VerificationToken};
 pub use email::{

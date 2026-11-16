@@ -39,6 +39,16 @@ pub trait AuthService: Send + Sync {
     async fn reset_password(&self, token: &str, new_password: &str) -> AppResult<()>;
 }
 
+/// Proof of a successful credential check: the user id plus the exact Argon2id
+/// PHC string that was verified. Session creation compares this snapshot
+/// against the live row under `FOR UPDATE`; a mismatch means a concurrent
+/// password change superseded the check and the session must not be minted.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedLogin {
+    pub user_id: Uuid,
+    pub credential_hash: String,
+}
+
 pub struct AuthServiceImpl {
     pool: PgPool,
     pub config: Arc<AppConfig>,
@@ -180,6 +190,20 @@ impl AuthServiceImpl {
     /// Anti-enumeration: always runs Argon2 verify even when email not found.
     /// Timing delta between "wrong password" and "unknown email" must be negligible.
     pub async fn login(&self, email: &str, password: &str) -> AppResult<Uuid> {
+        Ok(self.login_with_proof(email, password).await?.user_id)
+    }
+
+    /// Authenticate and return the user id plus the verified credential snapshot.
+    ///
+    /// The snapshot lets session creation re-check credential freshness inside
+    /// the user-row lock (cheap string compare, no Argon2 under the lock), so a
+    /// password reset committing between verification and session insert cannot
+    /// be bypassed. Argon2 work stays outside any lock, as before.
+    pub async fn login_with_proof(
+        &self,
+        email: &str,
+        password: &str,
+    ) -> AppResult<AuthenticatedLogin> {
         let normalized_email = email.trim().to_lowercase();
 
         let maybe_user =
@@ -205,6 +229,9 @@ impl AuthServiceImpl {
                 let hash: String = row.get("password_hash");
                 let email_verified: bool = row.get("email_verified");
 
+                // Snapshot reused as the freshness proof after verify; compared as a
+                // string inside the session lock, never re-hashed there.
+                let credential_hash = hash.clone();
                 let pw = password.to_string();
                 let valid = tokio::task::spawn_blocking(move || verify_password(&pw, &hash))
                     .await
@@ -218,7 +245,10 @@ impl AuthServiceImpl {
                     return Err(AppError::EmailNotVerified);
                 }
 
-                Ok(user_id)
+                Ok(AuthenticatedLogin {
+                    user_id,
+                    credential_hash,
+                })
             }
         }
     }

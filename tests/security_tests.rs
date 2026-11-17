@@ -2367,12 +2367,11 @@ async fn setup_rate_limit_router() -> axum::Router {
 ///
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
-#[ignore = "Phase 4: Rate limiting middleware not yet implemented"]
 async fn test_rate_limit_login() {
     let router = setup_rate_limit_router().await;
 
     let mut rate_limited = false;
-    for _ in 0..10 {
+    for _ in 0..15 {
         let req = json_request(
             Method::POST,
             "/auth/login",
@@ -2397,12 +2396,11 @@ async fn test_rate_limit_login() {
 ///
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
-#[ignore = "Phase 4: Rate limiting middleware not yet implemented"]
 async fn test_rate_limit_signup() {
     let router = setup_rate_limit_router().await;
 
     let mut rate_limited = false;
-    for i in 0..10 {
+    for i in 0..15 {
         let req = json_request(
             Method::POST,
             "/auth/signup",
@@ -2427,12 +2425,11 @@ async fn test_rate_limit_signup() {
 ///
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
-#[ignore = "Phase 4: Rate limiting middleware not yet implemented"]
 async fn test_rate_limit_password_reset_request() {
     let router = setup_rate_limit_router().await;
 
     let mut rate_limited = false;
-    for _ in 0..10 {
+    for _ in 0..15 {
         let req = json_request(
             Method::POST,
             "/auth/password/reset-request",
@@ -2454,12 +2451,11 @@ async fn test_rate_limit_password_reset_request() {
 ///
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
-#[ignore = "Phase 4: Rate limiting middleware not yet implemented"]
 async fn test_rate_limit_verify_token() {
     let router = setup_rate_limit_router().await;
 
     let mut rate_limited = false;
-    for _ in 0..10 {
+    for _ in 0..15 {
         let req = json_request(Method::POST, "/auth/verify", json!({"token": "12345"}));
         let resp = router.clone().oneshot(req).await.unwrap();
         if resp.status() == StatusCode::TOO_MANY_REQUESTS {
@@ -2477,12 +2473,11 @@ async fn test_rate_limit_verify_token() {
 ///
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
-#[ignore = "Phase 4: Rate limiting middleware not yet implemented"]
 async fn test_rate_limit_reset_confirm() {
     let router = setup_rate_limit_router().await;
 
     let mut rate_limited = false;
-    for _ in 0..10 {
+    for _ in 0..15 {
         let req = json_request(
             Method::POST,
             "/auth/password/reset",

@@ -22,7 +22,7 @@ use crate::{
     config::Config,
     error::{AppError, ErrorCode, ErrorResponse},
     handler::untrusted_client_ip,
-    ratelimit::{RateLimiter, rate_limit_key},
+    ratelimit::RateLimiter,
     session::{
         SessionService,
         bearer::read_bearer_token,
@@ -134,6 +134,25 @@ fn attach_login_cookies(
     Ok(response)
 }
 
+/// Extract client IP from proxy headers, falling back to 127.0.0.1.
+///
+/// Spoofable unless a trusted proxy strips these headers; audit/rate-limit use only.
+fn extract_client_ip(headers: &HeaderMap) -> String {
+    untrusted_client_ip(headers)
+        .unwrap_or("127.0.0.1")
+        .to_string()
+}
+
+/// Construct HTTP 429 response with Retry-After header derived from limiter cooldown.
+fn rate_limit_response(err: AppError, limiter: &RateLimiter) -> Response {
+    let mut resp = service_error_response(err);
+    let cooldown = limiter.cooldown_secs();
+    if let Ok(val) = header::HeaderValue::from_str(&cooldown.to_string()) {
+        resp.headers_mut().insert(header::RETRY_AFTER, val);
+    }
+    resp
+}
+
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 /// POST /auth/signup
@@ -141,12 +160,27 @@ fn attach_login_cookies(
 /// Anti-enumeration: always returns 200 regardless of duplicate email.
 pub async fn signup(
     State(state): State<AuthHandlerState>,
+    headers: HeaderMap,
     body: Result<Json<SignupRequest>, JsonRejection>,
 ) -> Response {
     let Json(req) = match body {
         Ok(b) => b,
         Err(e) => return json_rejection_response(e),
     };
+
+    let client_ip = extract_client_ip(&headers);
+    let normalized_email = req.email.trim().to_lowercase();
+
+    if let Some(limiter) = &state.rate_limiter {
+        if let Err(e) = limiter.check_dual(&client_ip, &normalized_email) {
+            tracing::warn!(
+                event = "rate_limit_exceeded",
+                ip = %client_ip,
+                key_prefix = "signup",
+            );
+            return rate_limit_response(e, limiter);
+        }
+    }
 
     if let Err(e) = req.validate(&state.service.config) {
         return service_error_response(e);
@@ -185,10 +219,7 @@ pub async fn login(
         return service_error_response(e);
     }
 
-    // Spoofable unless a trusted proxy strips these headers; audit/rate-limit use only.
-    let client_ip = untrusted_client_ip(&headers)
-        .unwrap_or("127.0.0.1")
-        .to_string();
+    let client_ip = extract_client_ip(&headers);
 
     let user_agent = headers
         .get(header::USER_AGENT)
@@ -199,22 +230,13 @@ pub async fn login(
 
     // Pre-credential rate limit check prevents account existence timing oracles
     if let Some(limiter) = &state.rate_limiter {
-        let key = rate_limit_key(&client_ip, &normalized_email);
-        if let Err(e) = limiter.check_rate_limit(&key) {
+        if let Err(e) = limiter.check_dual(&client_ip, &normalized_email) {
             tracing::warn!(
                 event = "rate_limit_exceeded",
                 ip = %client_ip,
                 key_prefix = "login",
             );
-            let mut resp = service_error_response(e);
-            let cooldown = state
-                .config
-                .as_ref()
-                .map_or(900, |c| c.rate_limit.login_cooldown_secs);
-            if let Ok(val) = header::HeaderValue::from_str(&cooldown.to_string()) {
-                resp.headers_mut().insert(header::RETRY_AFTER, val);
-            }
-            return resp;
+            return rate_limit_response(e, limiter);
         }
     }
 
@@ -236,10 +258,9 @@ pub async fn login(
     };
     let user_id = proof.user_id;
 
-    // Reset rate limit attempts upon successful authentication
+    // Reset rate limit attempts upon successful authentication for account only
     if let Some(limiter) = &state.rate_limiter {
-        let key = rate_limit_key(&client_ip, &normalized_email);
-        limiter.reset(&key);
+        limiter.reset_account(&normalized_email);
     }
 
     let is_bearer = headers
@@ -342,8 +363,21 @@ pub async fn logout(State(state): State<AuthHandlerState>, headers: HeaderMap) -
 /// Consumes a 64-char hex email verification token.
 pub async fn verify_email(
     State(state): State<AuthHandlerState>,
+    headers: HeaderMap,
     body: Result<Json<VerifyEmailRequest>, JsonRejection>,
 ) -> Response {
+    let client_ip = extract_client_ip(&headers);
+    if let Some(limiter) = &state.rate_limiter {
+        if let Err(e) = limiter.check_ip(&client_ip) {
+            tracing::warn!(
+                event = "rate_limit_exceeded",
+                ip = %client_ip,
+                key_prefix = "verify",
+            );
+            return rate_limit_response(e, limiter);
+        }
+    }
+
     let Json(req) = match body {
         Ok(b) => b,
         Err(e) => return json_rejection_response(e),
@@ -364,12 +398,27 @@ pub async fn verify_email(
 /// Anti-enumeration: always returns 200 regardless of account existence.
 pub async fn request_password_reset(
     State(state): State<AuthHandlerState>,
+    headers: HeaderMap,
     body: Result<Json<PasswordResetRequest>, JsonRejection>,
 ) -> Response {
     let Json(req) = match body {
         Ok(b) => b,
         Err(e) => return json_rejection_response(e),
     };
+
+    let client_ip = extract_client_ip(&headers);
+    let normalized_email = req.email.trim().to_lowercase();
+
+    if let Some(limiter) = &state.rate_limiter {
+        if let Err(e) = limiter.check_dual(&client_ip, &normalized_email) {
+            tracing::warn!(
+                event = "rate_limit_exceeded",
+                ip = %client_ip,
+                key_prefix = "password_reset_request",
+            );
+            return rate_limit_response(e, limiter);
+        }
+    }
 
     if let Err(e) = req.validate() {
         return service_error_response(e);
@@ -392,8 +441,21 @@ pub async fn request_password_reset(
 /// Consumes a reset token and sets a new password.
 pub async fn reset_password(
     State(state): State<AuthHandlerState>,
+    headers: HeaderMap,
     body: Result<Json<PasswordResetConfirmRequest>, JsonRejection>,
 ) -> Response {
+    let client_ip = extract_client_ip(&headers);
+    if let Some(limiter) = &state.rate_limiter {
+        if let Err(e) = limiter.check_ip(&client_ip) {
+            tracing::warn!(
+                event = "rate_limit_exceeded",
+                ip = %client_ip,
+                key_prefix = "password_reset",
+            );
+            return rate_limit_response(e, limiter);
+        }
+    }
+
     let Json(req) = match body {
         Ok(b) => b,
         Err(e) => return json_rejection_response(e),
@@ -472,7 +534,7 @@ mod tests {
             password: "short".to_string(),
         };
 
-        let resp = signup(State(state), Ok(Json(payload))).await;
+        let resp = signup(State(state), HeaderMap::new(), Ok(Json(payload))).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
@@ -487,7 +549,7 @@ mod tests {
             token: "not-a-valid-hex-token".to_string(),
         };
 
-        let resp = verify_email(State(state), Ok(Json(payload))).await;
+        let resp = verify_email(State(state), HeaderMap::new(), Ok(Json(payload))).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
@@ -502,7 +564,7 @@ mod tests {
             email: "invalid-email".to_string(),
         };
 
-        let resp = request_password_reset(State(state), Ok(Json(payload))).await;
+        let resp = request_password_reset(State(state), HeaderMap::new(), Ok(Json(payload))).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
@@ -518,7 +580,7 @@ mod tests {
             new_password: "ValidPassword123!".to_string(),
         };
 
-        let resp = reset_password(State(state), Ok(Json(payload))).await;
+        let resp = reset_password(State(state), HeaderMap::new(), Ok(Json(payload))).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
@@ -635,5 +697,115 @@ mod tests {
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
         let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(err.code, ErrorCode::RateLimitExceeded);
+    }
+
+    #[tokio::test]
+    async fn signup_handler_rate_limits_dual_key() {
+        let mut state = create_test_state();
+        let limiter = Arc::new(RateLimiter::with_config(crate::config::RateLimitConfig {
+            enabled: true,
+            max_attempts: 1,
+            window_secs: 60,
+            login_cooldown_secs: 300,
+        }));
+        state.rate_limiter = Some(limiter);
+
+        let payload = SignupRequest {
+            email: "victim@example.com".to_string(),
+            password: "ValidUniqPassword2026!".to_string(),
+        };
+
+        let _ = signup(
+            State(state.clone()),
+            HeaderMap::new(),
+            Ok(Json(payload.clone())),
+        )
+        .await;
+
+        let resp = signup(State(state), HeaderMap::new(), Ok(Json(payload))).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn verify_email_handler_rate_limits_ip() {
+        let mut state = create_test_state();
+        let limiter = Arc::new(RateLimiter::with_config(crate::config::RateLimitConfig {
+            enabled: true,
+            max_attempts: 1,
+            window_secs: 60,
+            login_cooldown_secs: 300,
+        }));
+        state.rate_limiter = Some(limiter);
+
+        let payload = VerifyEmailRequest {
+            token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+        };
+
+        let _ = verify_email(
+            State(state.clone()),
+            HeaderMap::new(),
+            Ok(Json(payload.clone())),
+        )
+        .await;
+
+        let resp = verify_email(State(state), HeaderMap::new(), Ok(Json(payload))).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn request_password_reset_handler_rate_limits_dual_key() {
+        let mut state = create_test_state();
+        let limiter = Arc::new(RateLimiter::with_config(crate::config::RateLimitConfig {
+            enabled: true,
+            max_attempts: 1,
+            window_secs: 60,
+            login_cooldown_secs: 300,
+        }));
+        state.rate_limiter = Some(limiter);
+
+        let payload = PasswordResetRequest {
+            email: "target@example.com".to_string(),
+        };
+
+        let _ = request_password_reset(
+            State(state.clone()),
+            HeaderMap::new(),
+            Ok(Json(payload.clone())),
+        )
+        .await;
+
+        let resp = request_password_reset(State(state), HeaderMap::new(), Ok(Json(payload))).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn reset_password_handler_rate_limits_ip() {
+        let mut state = create_test_state();
+        let limiter = Arc::new(RateLimiter::with_config(crate::config::RateLimitConfig {
+            enabled: true,
+            max_attempts: 1,
+            window_secs: 60,
+            login_cooldown_secs: 300,
+        }));
+        state.rate_limiter = Some(limiter);
+
+        let payload = PasswordResetConfirmRequest {
+            token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            new_password: "ValidPassword123!".to_string(),
+        };
+
+        let _ = reset_password(
+            State(state.clone()),
+            HeaderMap::new(),
+            Ok(Json(payload.clone())),
+        )
+        .await;
+
+        let resp = reset_password(State(state), HeaderMap::new(), Ok(Json(payload))).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().contains_key(header::RETRY_AFTER));
     }
 }

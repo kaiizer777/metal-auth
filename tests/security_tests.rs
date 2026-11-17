@@ -1615,13 +1615,44 @@ async fn test_no_secrets_in_tracing_logs() {
         "/auth/verify",
         json!({"token": raw_verify_token}),
     );
-    let resp5 = ctx.router.oneshot(req5).await.unwrap();
+    let resp5 = ctx.router.clone().oneshot(req5).await.unwrap();
     assert_eq!(resp5.status(), StatusCode::OK);
+
+    // 6. Logout request with canary token to verify structured audit telemetry
+    let canary_bearer_token = format!("canary_bearer_{}", Uuid::new_v4());
+    let req6 = Request::builder()
+        .method(Method::POST)
+        .uri("/auth/logout")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {canary_bearer_token}"),
+        )
+        .header("x-forwarded-for", "198.51.100.42")
+        .body(Body::empty())
+        .unwrap();
+    let resp6 = ctx.router.oneshot(req6).await.unwrap();
+    assert_eq!(resp6.status(), StatusCode::OK);
 
     let logs = log_scope.text();
     assert!(
         !logs.is_empty(),
         "Log buffer should have captured tracing events from requests"
+    );
+    assert!(
+        logs.contains("logout"),
+        "Tracing logs must record structured logout event: {logs}"
+    );
+    assert!(
+        logs.contains("password_reset_request"),
+        "Tracing logs must record structured password_reset_request event: {logs}"
+    );
+    assert!(
+        logs.contains("signup_request"),
+        "Tracing logs must record structured signup_request event: {logs}"
+    );
+    assert!(
+        !logs.contains(&canary_bearer_token),
+        "Canary raw bearer session token leaked in tracing logs: {logs}"
     );
     assert!(
         !logs.contains(&secret_pw),

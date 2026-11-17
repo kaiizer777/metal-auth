@@ -1,6 +1,6 @@
 mod common;
 
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use common::*;
 use serde_json::json;
 
@@ -505,4 +505,383 @@ async fn test_journey_case_insensitive_email_uniqueness() {
         .await;
     assert_eq!(login_new.status(), StatusCode::OK);
     assert_eq!(login_new.json()["user_id"], user_id.to_string());
+}
+
+/// Scenario 5: ASVS L1 Security Baseline & Defense-in-Depth Journey
+///
+/// Verifies:
+/// 1. ASVS L1 security headers (HSTS, nosniff, DENY, CSP, Referrer-Policy, Cache-Control: no-store, Pragma: no-cache)
+///    are injected on all authentication responses.
+/// 2. Botnet account trip: multiple distinct IPs targeting one account trips account-level rate limit.
+/// 3. IP spray trip: single IP targeting multiple distinct accounts trips IP-level rate limit.
+/// 4. Rate-limited 429 responses contain the standard `Retry-After` header.
+/// 5. Successful login resets ONLY `account:<email>` and preserves `ip:<ip>` limit.
+/// 6. CSRF protection on `/auth/logout` strictly rejects missing/invalid tokens when session cookie is present.
+#[tokio::test]
+async fn test_journey_security_baseline_defense_in_depth() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    // 1. ASVS L1 Security Headers & Cache-Control on authentication endpoints
+    let signup_resp = app
+        .post_json(
+            ENDPOINT_SIGNUP,
+            json!({
+                "email": dynamic_email(),
+                "password": "ValidStrongPassword2026!"
+            }),
+        )
+        .await;
+    assert_eq!(signup_resp.status(), StatusCode::OK);
+    assert_eq!(
+        signup_resp.header("x-content-type-options"),
+        Some("nosniff"),
+        "must enforce nosniff header"
+    );
+    assert_eq!(
+        signup_resp.header("x-frame-options"),
+        Some("DENY"),
+        "must enforce frame DENY"
+    );
+    assert_eq!(
+        signup_resp.header("content-security-policy"),
+        Some("default-src 'self'"),
+        "must enforce default CSP"
+    );
+    assert_eq!(
+        signup_resp.header("referrer-policy"),
+        Some("strict-origin-when-cross-origin"),
+        "must enforce referrer policy"
+    );
+    assert_eq!(
+        signup_resp.header("strict-transport-security"),
+        Some("max-age=63072000; includeSubDomains; preload"),
+        "must enforce HSTS"
+    );
+    assert_eq!(
+        signup_resp.header("cache-control"),
+        Some("no-store"),
+        "must enforce Cache-Control: no-store on auth endpoints"
+    );
+    assert_eq!(
+        signup_resp.header("pragma"),
+        Some("no-cache"),
+        "must enforce Pragma: no-cache on auth endpoints"
+    );
+
+    // 2. Botnet Account Trip: Multiple distinct IPs targeting the same account
+    let botnet_target = dynamic_email();
+    for i in 1..=10 {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", format!("203.0.113.{i}").parse().unwrap());
+        let req = json_request_with_headers(
+            Method::POST,
+            ENDPOINT_SIGNUP,
+            json!({
+                "email": botnet_target,
+                "password": "ValidStrongPassword2026!"
+            }),
+            headers,
+        );
+        let resp = app.dispatch(req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "botnet attempt {i} within limit must be allowed"
+        );
+    }
+
+    // 11th request from a brand new IP (203.0.113.11) targeting the same account trips account limit
+    let mut headers = HeaderMap::new();
+    headers.insert("x-forwarded-for", "203.0.113.11".parse().unwrap());
+    let req = json_request_with_headers(
+        Method::POST,
+        ENDPOINT_SIGNUP,
+        json!({
+            "email": botnet_target,
+            "password": "ValidStrongPassword2026!"
+        }),
+        headers,
+    );
+    let resp = app.dispatch(req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "11th request against same account from new IP must trip account rate limit"
+    );
+    assert!(
+        resp.header("retry-after").is_some(),
+        "429 response must contain Retry-After header"
+    );
+
+    // 3. IP Spray Trip: Single IP targeting multiple distinct accounts
+    let spray_ip = "198.51.100.88";
+    for i in 1..=10 {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", spray_ip.parse().unwrap());
+        let req = json_request_with_headers(
+            Method::POST,
+            ENDPOINT_SIGNUP,
+            json!({
+                "email": format!("spray_{i}_{}@example.com", dynamic_email()),
+                "password": "ValidStrongPassword2026!"
+            }),
+            headers,
+        );
+        let resp = app.dispatch(req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "IP spray attempt {i} within limit must be allowed"
+        );
+    }
+
+    // 11th request from the same IP against another fresh account trips IP limit
+    let mut headers = HeaderMap::new();
+    headers.insert("x-forwarded-for", spray_ip.parse().unwrap());
+    let req = json_request_with_headers(
+        Method::POST,
+        ENDPOINT_SIGNUP,
+        json!({
+            "email": format!("spray_overflow_{}@example.com", dynamic_email()),
+            "password": "ValidStrongPassword2026!"
+        }),
+        headers,
+    );
+    let resp = app.dispatch(req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "11th request from same IP must trip IP rate limit"
+    );
+    assert!(
+        resp.header("retry-after").is_some(),
+        "429 response must contain Retry-After header"
+    );
+
+    // 4. Successful login resets ONLY account:<email> and preserves ip:<ip>
+    let user_email = dynamic_email();
+    let user_pw = "ValidSecurePass2026!";
+
+    let _ = app
+        .post_json(
+            ENDPOINT_SIGNUP,
+            json!({
+                "email": user_email,
+                "password": user_pw
+            }),
+        )
+        .await;
+
+    let v_token = app
+        .email_sender
+        .verification_calls()
+        .into_iter()
+        .find(|c| c.to == user_email)
+        .expect("verification email dispatched")
+        .token;
+
+    let verify_res = app
+        .post_json(ENDPOINT_VERIFY, json!({ "token": v_token }))
+        .await;
+    assert_eq!(verify_res.status(), StatusCode::OK);
+
+    let test_ip = "192.0.2.144";
+
+    // Consume 8 attempts from test_ip targeting user_email with wrong password
+    for _ in 1..=8 {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", test_ip.parse().unwrap());
+        let req = json_request_with_headers(
+            Method::POST,
+            ENDPOINT_LOGIN,
+            json!({
+                "email": user_email,
+                "password": "WrongPassword123!"
+            }),
+            headers,
+        );
+        let resp = app.dispatch(req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // Login successfully from test_ip with valid password
+    let mut headers = HeaderMap::new();
+    headers.insert("x-forwarded-for", test_ip.parse().unwrap());
+    let req = json_request_with_headers(
+        Method::POST,
+        ENDPOINT_LOGIN,
+        json!({
+            "email": user_email,
+            "password": user_pw
+        }),
+        headers,
+    );
+    let login_res = app.dispatch(req).await;
+    assert_eq!(login_res.status(), StatusCode::OK);
+
+    // Invariant check 1: Account limit was reset on successful login, so 8 fresh attempts from a different IP succeed without 429
+    let other_ip = "192.0.2.200";
+    for _ in 1..=8 {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", other_ip.parse().unwrap());
+        let req = json_request_with_headers(
+            Method::POST,
+            ENDPOINT_LOGIN,
+            json!({
+                "email": user_email,
+                "password": "WrongPassword123!"
+            }),
+            headers,
+        );
+        let resp = app.dispatch(req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // Invariant check 2: IP limit on test_ip was NOT reset!
+    // test_ip had 8 failed + 1 successful = 9 attempts.
+    // 2 more attempts from test_ip must trip the IP rate limit (9 + 2 = 11 > 10).
+    for attempt in 1..=2 {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", test_ip.parse().unwrap());
+        let req = json_request_with_headers(
+            Method::POST,
+            ENDPOINT_LOGIN,
+            json!({
+                "email": dynamic_email(),
+                "password": "WrongPassword123!"
+            }),
+            headers,
+        );
+        let resp = app.dispatch(req).await;
+        if attempt == 2 {
+            assert_eq!(
+                resp.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "IP rate limit must be preserved across successful login"
+            );
+        }
+    }
+
+    // 5. CSRF Enforcement on /auth/logout
+    let cookie_user = dynamic_email();
+    let cookie_pw = "ValidCookiePass2026!";
+    let _ = app
+        .post_json(
+            ENDPOINT_SIGNUP,
+            json!({
+                "email": cookie_user,
+                "password": cookie_pw
+            }),
+        )
+        .await;
+
+    let v_token2 = app
+        .email_sender
+        .verification_calls()
+        .into_iter()
+        .find(|c| c.to == cookie_user)
+        .expect("verification email dispatched")
+        .token;
+
+    let _ = app
+        .post_json(ENDPOINT_VERIFY, json!({ "token": v_token2 }))
+        .await;
+
+    let login_resp = app
+        .post_json(
+            ENDPOINT_LOGIN,
+            json!({
+                "email": cookie_user,
+                "password": cookie_pw
+            }),
+        )
+        .await;
+    assert_eq!(login_resp.status(), StatusCode::OK);
+
+    let session_cookie_name = &app.state.config.session.cookie_name;
+    let session_cookie = login_resp
+        .headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .find_map(|v| {
+            let s = v.to_str().ok()?;
+            if s.starts_with(&format!("{session_cookie_name}=")) {
+                Some(s.split(';').next()?.to_string())
+            } else {
+                None
+            }
+        })
+        .expect("session cookie set on login");
+
+    let csrf_cookie_val = login_resp
+        .headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .find_map(|v| {
+            let s = v.to_str().ok()?;
+            if s.starts_with("csrf_token=") {
+                Some(
+                    s.split(';')
+                        .next()?
+                        .trim_start_matches("csrf_token=")
+                        .to_string(),
+                )
+            } else {
+                None
+            }
+        })
+        .expect("csrf cookie set on login");
+
+    // Case A: Missing CSRF header with session cookie -> 403 Forbidden
+    let mut headers_no_csrf = HeaderMap::new();
+    headers_no_csrf.insert(
+        header::COOKIE,
+        format!("{session_cookie}; csrf_token={csrf_cookie_val}")
+            .parse()
+            .unwrap(),
+    );
+    let req_a = empty_request_with_headers(Method::POST, "/auth/logout", headers_no_csrf);
+    let resp_a = app.dispatch(req_a).await;
+    assert_eq!(
+        resp_a.status(),
+        StatusCode::FORBIDDEN,
+        "logout with session cookie but missing csrf header must return 403"
+    );
+
+    // Case B: Tampered/invalid length CSRF header with session cookie -> 403 Forbidden
+    let mut headers_bad_csrf = HeaderMap::new();
+    headers_bad_csrf.insert(
+        header::COOKIE,
+        format!("{session_cookie}; csrf_token={csrf_cookie_val}")
+            .parse()
+            .unwrap(),
+    );
+    headers_bad_csrf.insert("x-csrf-token", "tampered_bad_token".parse().unwrap());
+    let req_b = empty_request_with_headers(Method::POST, "/auth/logout", headers_bad_csrf);
+    let resp_b = app.dispatch(req_b).await;
+    assert_eq!(
+        resp_b.status(),
+        StatusCode::FORBIDDEN,
+        "logout with tampered csrf header must return 403"
+    );
+
+    // Case C: Valid CSRF header and session cookie -> 200 OK
+    let mut headers_valid = HeaderMap::new();
+    headers_valid.insert(
+        header::COOKIE,
+        format!("{session_cookie}; csrf_token={csrf_cookie_val}")
+            .parse()
+            .unwrap(),
+    );
+    headers_valid.insert("x-csrf-token", csrf_cookie_val.parse().unwrap());
+    let req_c = empty_request_with_headers(Method::POST, "/auth/logout", headers_valid);
+    let resp_c = app.dispatch(req_c).await;
+    assert_eq!(
+        resp_c.status(),
+        StatusCode::OK,
+        "logout with valid session cookie and matching csrf token must succeed"
+    );
 }

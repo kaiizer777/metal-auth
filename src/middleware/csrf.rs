@@ -36,17 +36,17 @@ pub async fn csrf_middleware(
         return Ok(next.run(req).await);
     }
 
-    // Requests presenting neither ambient cookies nor CSRF headers carry no ambient authority.
-    if !has_session_cookie && !has_csrf_cookie && !has_csrf_header {
-        return Ok(next.run(req).await);
-    }
-
     // 2. Safe methods bypass verification and ensure a CSRF cookie is present.
     if matches!(
         req.method(),
         &Method::GET | &Method::HEAD | &Method::OPTIONS | &Method::TRACE
     ) {
         return Ok(maybe_attach_csrf_cookie(req, next, &state).await);
+    }
+
+    // Requests presenting neither ambient cookies nor CSRF headers carry no ambient authority.
+    if !has_session_cookie && !has_csrf_cookie && !has_csrf_header {
+        return Ok(next.run(req).await);
     }
 
     // 3. Mutating methods (POST, PUT, PATCH, DELETE) require matching cookie and header.

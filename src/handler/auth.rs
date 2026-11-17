@@ -208,13 +208,16 @@ pub async fn signup(
     let normalized_email = req.email.trim().to_lowercase();
 
     if let Some(limiter) = &state.rate_limiter {
-        if let Err(e) = limiter.check_dual(&client_ip, &normalized_email) {
-            tracing::warn!(
-                event = "rate_limit_exceeded",
-                ip = %client_ip,
-                key_prefix = "signup",
-            );
-            return rate_limit_response(e, limiter);
+        match limiter.check_dual(&client_ip, &normalized_email) {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::warn!(
+                    event = "rate_limit_exceeded",
+                    ip = %client_ip,
+                    key_prefix = "signup",
+                );
+                return rate_limit_response(e, limiter);
+            }
         }
     }
 
@@ -266,13 +269,16 @@ pub async fn login(
 
     // Pre-credential rate limit check prevents account existence timing oracles
     if let Some(limiter) = &state.rate_limiter {
-        if let Err(e) = limiter.check_dual(&client_ip, &normalized_email) {
-            tracing::warn!(
-                event = "rate_limit_exceeded",
-                ip = %client_ip,
-                key_prefix = "login",
-            );
-            return rate_limit_response(e, limiter);
+        match limiter.check_dual(&client_ip, &normalized_email) {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::warn!(
+                    event = "rate_limit_exceeded",
+                    ip = %client_ip,
+                    key_prefix = "login",
+                );
+                return rate_limit_response(e, limiter);
+            }
         }
     }
 
@@ -417,13 +423,16 @@ pub async fn verify_email(
 ) -> Response {
     let client_ip = extract_client_ip(&headers);
     if let Some(limiter) = &state.rate_limiter {
-        if let Err(e) = limiter.check_ip(&client_ip) {
-            tracing::warn!(
-                event = "rate_limit_exceeded",
-                ip = %client_ip,
-                key_prefix = "verify",
-            );
-            return rate_limit_response(e, limiter);
+        match limiter.check_ip(&client_ip) {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::warn!(
+                    event = "rate_limit_exceeded",
+                    ip = %client_ip,
+                    key_prefix = "verify",
+                );
+                return rate_limit_response(e, limiter);
+            }
         }
     }
 
@@ -459,13 +468,16 @@ pub async fn request_password_reset(
     let normalized_email = req.email.trim().to_lowercase();
 
     if let Some(limiter) = &state.rate_limiter {
-        if let Err(e) = limiter.check_dual(&client_ip, &normalized_email) {
-            tracing::warn!(
-                event = "rate_limit_exceeded",
-                ip = %client_ip,
-                key_prefix = "password_reset_request",
-            );
-            return rate_limit_response(e, limiter);
+        match limiter.check_dual(&client_ip, &normalized_email) {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::warn!(
+                    event = "rate_limit_exceeded",
+                    ip = %client_ip,
+                    key_prefix = "password_reset_request",
+                );
+                return rate_limit_response(e, limiter);
+            }
         }
     }
 
@@ -507,13 +519,16 @@ pub async fn reset_password(
 ) -> Response {
     let client_ip = extract_client_ip(&headers);
     if let Some(limiter) = &state.rate_limiter {
-        if let Err(e) = limiter.check_ip(&client_ip) {
-            tracing::warn!(
-                event = "rate_limit_exceeded",
-                ip = %client_ip,
-                key_prefix = "password_reset",
-            );
-            return rate_limit_response(e, limiter);
+        match limiter.check_ip(&client_ip) {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::warn!(
+                    event = "rate_limit_exceeded",
+                    ip = %client_ip,
+                    key_prefix = "password_reset",
+                );
+                return rate_limit_response(e, limiter);
+            }
         }
     }
 

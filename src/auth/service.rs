@@ -43,10 +43,20 @@ pub trait AuthService: Send + Sync {
 /// PHC string that was verified. Session creation compares this snapshot
 /// against the live row under `FOR UPDATE`; a mismatch means a concurrent
 /// password change superseded the check and the session must not be minted.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AuthenticatedLogin {
     pub user_id: Uuid,
     pub credential_hash: String,
+}
+
+// Manual `Debug`: the snapshot is a live credential authenticator.
+impl std::fmt::Debug for AuthenticatedLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthenticatedLogin")
+            .field("user_id", &self.user_id)
+            .field("credential_hash", &"[redacted]")
+            .finish()
+    }
 }
 
 pub struct AuthServiceImpl {
@@ -215,13 +225,18 @@ impl AuthServiceImpl {
 
         match maybe_user {
             None => {
-                // Anti-enumeration: run dummy verify to consume equivalent CPU time
+                // Anti-enumeration: run dummy verify to consume equivalent CPU time.
+                // A JoinError here (panic/cancel) still maps to InvalidCredentials:
+                // the timing signal is best-effort, the error signal is exact.
                 let dummy_hash = self.dummy_hash.clone();
                 let pw = password.to_string();
-                let _ = tokio::task::spawn_blocking(move || {
+                if let Err(join_err) = tokio::task::spawn_blocking(move || {
                     let _ = verify_password(&pw, &dummy_hash);
                 })
-                .await;
+                .await
+                {
+                    tracing::debug!(err = %join_err, "dummy password verify task failed");
+                }
                 Err(AppError::InvalidCredentials)
             }
             Some(row) => {
@@ -357,6 +372,31 @@ impl AuthServiceImpl {
 
             let mut tx = self.pool.begin().await.map_err(AppError::Database)?;
 
+            // Serialize concurrent issuance for this user: the row lock orders
+            // racing requests so the second DELETE observes the first INSERT,
+            // preserving the single-live-token policy. Held through commit.
+            let locked = sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+                .bind(user_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(AppError::Database)?;
+            if locked.is_none() {
+                let _ = tx.rollback().await;
+                return Ok(());
+            }
+
+            // Single-live-token policy: revoke all prior tokens for this user
+            // before issuing a fresh one, so N rapid requests leave exactly one
+            // valid token instead of N simultaneously valid live tokens.
+            if let Err(e) = sqlx::query("DELETE FROM password_reset_tokens WHERE user_id = $1")
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await
+            {
+                let _ = tx.rollback().await;
+                return Err(AppError::Database(e));
+            }
+
             let insert_res = sqlx::query(
                 "INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
             )
@@ -432,6 +472,19 @@ impl AuthServiceImpl {
             .map_err(|_| AppError::Internal)??;
 
         let mut tx = self.pool.begin().await.map_err(AppError::Database)?;
+
+        // Serialize concurrent resets for this user: the lock orders two
+        // simultaneously consumed tokens deterministically instead of racing
+        // the final `UPDATE users` (last-writer-wins on identical cost).
+        let locked = sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(AppError::Database)?;
+        if locked.is_none() {
+            let _ = tx.rollback().await;
+            return Err(AppError::InvalidToken);
+        }
 
         let update_res =
             sqlx::query("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2")
@@ -533,6 +586,17 @@ mod tests {
         assert!(matches!(res, Err(AppError::Config(_))));
     }
 
+    #[test]
+    fn authenticated_login_debug_redacts_credential_hash() {
+        let proof = AuthenticatedLogin {
+            user_id: Uuid::new_v4(),
+            credential_hash: "argon2id$v=19$m=65536,t=3,p=4$salt$hash".to_string(),
+        };
+        let rendered = format!("{proof:?}");
+        assert!(!rendered.contains("argon2id"));
+        assert!(rendered.contains("[redacted]"));
+    }
+
     #[derive(Clone, Default)]
     struct ArcCapturingSender {
         verification_calls: Arc<Mutex<Vec<VerificationEmailPayload>>>,
@@ -617,6 +681,11 @@ mod tests {
         pool: PgPool,
         sender: ArcCapturingSender,
         _guard: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    // Unique generated password per call: no hard-coded credential material in tests.
+    fn fixture_password() -> String {
+        format!("Fixture-{}-Aa1!", Uuid::new_v4().simple())
     }
 
     async fn setup_db_context() -> Option<DbTestContext> {
@@ -821,6 +890,175 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_double_consume_verification_token() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+
+        let email = format!("concurrent_{}@example.com", Uuid::new_v4());
+        ctx.service
+            // Test-only fixture password, never a production secret.
+            // codeql[rust/hard-coded-cryptographic-value]
+            .signup(&email, "SecurePassword123!")
+            .await
+            .unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ctx.sender.sent.notified(),
+        )
+        .await
+        .expect("verification email must be dispatched");
+
+        let token = {
+            let calls = ctx.sender.verification_calls.lock().unwrap();
+            let call = calls
+                .iter()
+                .find(|c| c.to == email)
+                .expect("token dispatched");
+            call.token.clone()
+        };
+
+        // Both consumers race the same DELETE RETURNING: exactly one wins.
+        let (first, second) = tokio::join!(
+            ctx.service.verify_email(&token),
+            ctx.service.verify_email(&token)
+        );
+        let oks = usize::from(first.is_ok()) + usize::from(second.is_ok());
+        assert_eq!(oks, 1, "exactly one concurrent consume must succeed");
+        for res in [&first, &second] {
+            if let Err(e) = res {
+                assert!(
+                    matches!(e, AppError::InvalidToken),
+                    "loser must see InvalidToken, got: {e:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_double_consume_reset_token() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+
+        let email = format!("concurrent_reset_{}@example.com", Uuid::new_v4());
+        let config = Arc::clone(&ctx.service.config);
+        let password_hash = hash_password(&fixture_password(), &config).unwrap();
+
+        let row = sqlx::query(
+            "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true) RETURNING id",
+        )
+        .bind(&email)
+        .bind(&password_hash)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+        let user_id: Uuid = row.get("id");
+
+        let (raw_token, token_hash) = generate_token();
+        let future_time = Utc::now() + chrono::Duration::hours(1);
+        sqlx::query(
+            "INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
+        )
+        .bind(&token_hash[..])
+        .bind(user_id)
+        .bind(future_time)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+
+        // Same token raced concurrently: exactly one DELETE RETURNING wins.
+        // Distinct passwords identify the winner via login.
+        let pw_a = fixture_password();
+        let pw_b = fixture_password();
+        let (first, second) = tokio::join!(
+            ctx.service.reset_password(&raw_token, &pw_a),
+            ctx.service.reset_password(&raw_token, &pw_b)
+        );
+        let oks = usize::from(first.is_ok()) + usize::from(second.is_ok());
+        assert_eq!(oks, 1, "exactly one concurrent reset must succeed");
+        for res in [&first, &second] {
+            if let Err(e) = res {
+                assert!(
+                    matches!(e, AppError::InvalidToken),
+                    "loser must see InvalidToken, got: {e:?}"
+                );
+            }
+        }
+
+        let login_a = ctx.service.login(&email, &pw_a).await.is_ok();
+        let login_b = ctx.service.login(&email, &pw_b).await.is_ok();
+        assert!(
+            login_a ^ login_b,
+            "exactly one of the two passwords must verify"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_dual_reset_tokens_serialized() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+
+        let email = format!("dual_reset_{}@example.com", Uuid::new_v4());
+        let config = Arc::clone(&ctx.service.config);
+        let password_hash = hash_password(&fixture_password(), &config).unwrap();
+
+        let row = sqlx::query(
+            "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true) RETURNING id",
+        )
+        .bind(&email)
+        .bind(&password_hash)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+        let user_id: Uuid = row.get("id");
+
+        // Two distinct valid tokens: both DELETEs target different rows, so both
+        // consumes succeed; FOR UPDATE serializes the final UPDATEs.
+        let (raw_tok1, hash1) = generate_token();
+        let (raw_tok2, hash2) = generate_token();
+        let future_time = Utc::now() + chrono::Duration::hours(1);
+        for h in [&hash1, &hash2] {
+            sqlx::query(
+                "INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
+            )
+            .bind(&h[..])
+            .bind(user_id)
+            .bind(future_time)
+            .execute(&ctx.pool)
+            .await
+            .unwrap();
+        }
+
+        // Same new password on both sides pins a fully deterministic outcome.
+        let new_password = fixture_password();
+        let (first, second) = tokio::join!(
+            ctx.service.reset_password(&raw_tok1, &new_password),
+            ctx.service.reset_password(&raw_tok2, &new_password)
+        );
+        assert!(
+            first.is_ok() && second.is_ok(),
+            "both distinct-token consumes must succeed: {first:?} / {second:?}"
+        );
+
+        // No tokens survive and the single final password verifies.
+        let count_row =
+            sqlx::query("SELECT COUNT(*) as cnt FROM password_reset_tokens WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(&ctx.pool)
+                .await
+                .unwrap();
+        let cnt: i64 = count_row.get("cnt");
+        assert_eq!(cnt, 0, "no reset tokens must survive concurrent consume");
+        assert_eq!(
+            ctx.service.login(&email, &new_password).await.unwrap(),
+            user_id
+        );
+    }
+
+    #[tokio::test]
     async fn test_token_expiry_rejection() {
         let Some(ctx) = setup_db_context().await else {
             return;
@@ -1010,6 +1248,120 @@ mod tests {
         // Login with new password succeeds
         let new_login = ctx.service.login(&email, new_password).await;
         assert_eq!(new_login.unwrap(), user_id);
+    }
+
+    #[tokio::test]
+    async fn request_password_reset_replaces_prior_live_token() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+
+        let email = format!("replace_live_{}@example.com", Uuid::new_v4());
+        let config = Arc::clone(&ctx.service.config);
+        let password_hash = hash_password(&fixture_password(), &config).unwrap();
+
+        let row = sqlx::query(
+            "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true) RETURNING id",
+        )
+        .bind(&email)
+        .bind(&password_hash)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+        let user_id: Uuid = row.get("id");
+
+        // Two sequential reset requests; each dispatch is awaited in turn.
+        ctx.service.request_password_reset(&email).await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ctx.sender.sent.notified(),
+        )
+        .await
+        .expect("first reset email must be dispatched");
+        ctx.service.request_password_reset(&email).await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ctx.sender.sent.notified(),
+        )
+        .await
+        .expect("second reset email must be dispatched");
+
+        let (first_token, second_token) = {
+            let calls = ctx.sender.reset_calls.lock().unwrap();
+            assert_eq!(calls.len(), 2, "both requests must dispatch");
+            (calls[0].token.clone(), calls[1].token.clone())
+        };
+
+        // Exactly one live token survives: the latest.
+        let count_row =
+            sqlx::query("SELECT COUNT(*) as cnt FROM password_reset_tokens WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(&ctx.pool)
+                .await
+                .unwrap();
+        let cnt: i64 = count_row.get("cnt");
+        assert_eq!(cnt, 1, "only the newest reset token must survive");
+
+        // Superseded token is dead; newest token resets successfully.
+        let stale_password = fixture_password();
+        let newest_password = fixture_password();
+        let stale = ctx
+            .service
+            .reset_password(&first_token, &stale_password)
+            .await;
+        assert!(
+            matches!(stale, Err(AppError::InvalidToken)),
+            "superseded token must be invalid"
+        );
+        ctx.service
+            .reset_password(&second_token, &newest_password)
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.service.login(&email, &newest_password).await.unwrap(),
+            user_id
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_reset_issuance_leaves_single_live_token() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+
+        let email = format!("race_issue_{}@example.com", Uuid::new_v4());
+        let config = Arc::clone(&ctx.service.config);
+        let password_hash = hash_password(&fixture_password(), &config).unwrap();
+
+        let row = sqlx::query(
+            "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true) RETURNING id",
+        )
+        .bind(&email)
+        .bind(&password_hash)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+        let user_id: Uuid = row.get("id");
+
+        // Racing issuance: the per-user row lock serializes the DELETE/INSERT
+        // pairs, so only one token survives instead of two live tokens.
+        let (first, second) = tokio::join!(
+            ctx.service.request_password_reset(&email),
+            ctx.service.request_password_reset(&email)
+        );
+        assert!(
+            first.is_ok() && second.is_ok(),
+            "both racing requests must succeed: {first:?} / {second:?}"
+        );
+
+        let count_row =
+            sqlx::query("SELECT COUNT(*) as cnt FROM password_reset_tokens WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(&ctx.pool)
+                .await
+                .unwrap();
+        let cnt: i64 = count_row.get("cnt");
+        assert_eq!(cnt, 1, "concurrent issuance must leave one live token");
     }
 
     #[tokio::test]

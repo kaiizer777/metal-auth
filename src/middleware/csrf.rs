@@ -83,8 +83,14 @@ pub async fn maybe_attach_csrf_cookie(
         let mut csrf_bytes = [0u8; 32];
         OsRng.fill_bytes(&mut csrf_bytes);
         let csrf_token = hex::encode(csrf_bytes);
-        let cookie_hv = set_csrf_cookie(csrf_token.as_str(), &state.config);
-        response.headers_mut().append("set-cookie", cookie_hv);
+        // Hex always encodes; on failure skip issuance (fail closed — later
+        // mutating requests get 403 CsrfTokenMissing) rather than sending empty.
+        match set_csrf_cookie(&state.config, csrf_token.as_str()) {
+            Ok(cookie_hv) => {
+                response.headers_mut().append("set-cookie", cookie_hv);
+            }
+            Err(e) => tracing::error!(event = "csrf_cookie_build_failed", error = %e),
+        }
     }
 
     response

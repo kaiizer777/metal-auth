@@ -149,7 +149,7 @@ async fn test_login_bearer_response_returns_token_in_json() {
     let token = resp.json["token"]
         .as_str()
         .expect("bearer token string in json");
-    assert_eq!(token.len(), 32, "raw session ID must be 32-character hex");
+    assert_eq!(token.len(), 64, "raw session ID must be 64-character hex");
     assert!(resp.json["user_id"].is_string());
 }
 

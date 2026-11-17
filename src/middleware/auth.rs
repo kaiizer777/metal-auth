@@ -9,6 +9,7 @@ use axum::{
 use uuid::Uuid;
 
 use crate::{
+    db::models::Session,
     error::{AppError, ErrorCode},
     session::{bearer::read_bearer_token, cookie::read_session_cookie},
     state::AppState,
@@ -38,6 +39,21 @@ where
     }
 }
 
+impl<S> FromRequestParts<S> for Session
+where
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<Self>()
+            .cloned()
+            .ok_or_else(|| AppError::from_code(ErrorCode::SessionNotFound))
+    }
+}
+
 /// Axum middleware enforcing session authentication via cookie or bearer token.
 pub async fn require_auth(
     State(state): State<AppState>,
@@ -52,11 +68,14 @@ pub async fn require_auth(
 
     let auth_user = AuthUser {
         user_id: session.user_id,
-        session_hash: session.token_hash,
-        session_type: session.session_type,
+        session_hash: session.token_hash.clone(),
+        session_type: session.session_type.clone(),
     };
 
+    // Share the validated row with handlers (e.g. GET /auth/session) so they
+    // don't re-SELECT the same session `require_auth` just checked and touched.
     req.extensions_mut().insert(auth_user);
+    req.extensions_mut().insert(session);
     Ok(next.run(req).await)
 }
 
@@ -105,6 +124,41 @@ mod tests {
         assert_eq!(result.user_id, user_id);
         assert_eq!(result.session_hash, "hash123");
         assert_eq!(result.session_type, "cookie");
+    }
+
+    #[tokio::test]
+    async fn test_session_extractor_missing_extension() {
+        let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
+        let (mut parts, _) = req.into_parts();
+        let result = Session::from_request_parts(&mut parts, &()).await;
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("missing Session extension must be rejected"),
+        };
+        assert!(matches!(err, AppError::SessionNotFound));
+        assert_eq!(err.status_code(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_session_extractor_present_extension() {
+        let now = chrono::Utc::now();
+        let expected = Session {
+            id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            token_hash: "d".repeat(64),
+            created_at: now,
+            last_active_at: now,
+            absolute_expires_at: now,
+            session_type: "cookie".to_string(),
+            csrf_token: None,
+        };
+
+        let mut req = Request::builder().uri("/test").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(expected.clone());
+
+        let (mut parts, _) = req.into_parts();
+        let session = Session::from_request_parts(&mut parts, &()).await.unwrap();
+        assert_eq!(session, expected);
     }
 
     #[tokio::test]

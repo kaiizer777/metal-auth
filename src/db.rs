@@ -186,6 +186,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn init_pool_error_never_renders_db_password() {
+        // Guard: connection failures must not echo the URL password.
+        let options = DbPoolOptions {
+            max_connections: 1,
+            min_connections: 0,
+            acquire_timeout: Duration::from_secs(2),
+            max_retries: 0,
+            ..Default::default()
+        };
+        let err = init_pool_with_options("postgres://user:S3cret-pw@localhost:1/db", options)
+            .await
+            .unwrap_err();
+        let rendered = format!("{err:?}");
+        assert!(
+            !rendered.contains("S3cret-pw"),
+            "pool error leaked credentials: {rendered}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_init_pool_with_options_zero_max_connections() {
         let options = DbPoolOptions {
             max_connections: 0,

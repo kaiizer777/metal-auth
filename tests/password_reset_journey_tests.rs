@@ -468,11 +468,31 @@ async fn test_journey_password_reset_multi_token_invalidation() {
         "two consecutive reset requests must generate distinct tokens"
     );
 
-    // Outstanding token count in DB should be 2
+    // Single-live-token policy: the second request revokes the first, so only
+    // the newest token survives.
     let token_count_pre = count_reset_tokens_for_user(&app.pool, user_uuid)
         .await
         .expect("count reset tokens");
-    assert_eq!(token_count_pre, 2, "user should have 2 active reset tokens");
+    assert_eq!(
+        token_count_pre, 1,
+        "only the newest reset token must survive"
+    );
+
+    // Superseded token_A is already dead before any consume.
+    let reset_a_early_res = app
+        .post_json(
+            ENDPOINT_RESET_PASSWORD,
+            json!({
+                "token": token_a,
+                "new_password": attempted_password_a
+            }),
+        )
+        .await;
+    assert_eq!(reset_a_early_res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        reset_a_early_res.error_code(),
+        Some(ErrorCode::InvalidToken)
+    );
 
     // 4. Consume token_B to reset password to new_password_b
     let reset_b_res = app

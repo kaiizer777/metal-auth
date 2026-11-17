@@ -1,4 +1,4 @@
-use axum::Router;
+use axum::{Router, http::HeaderMap};
 use tower_http::trace::TraceLayer;
 
 use crate::{error::AppError, state::AppState};
@@ -13,6 +13,21 @@ pub use session::routes as session_routes;
 
 async fn fallback_not_found() -> AppError {
     AppError::NotFound
+}
+
+/// Best-effort client IP for audit logs and rate-limit keys only.
+///
+/// `X-Forwarded-For`/`X-Real-IP` are client-controlled unless an
+/// upstream proxy strips them, so treat the result as untrusted: never use it
+/// for auth decisions. Takes the leftmost entry (original client per convention)
+/// and falls back to `None` when no header is present.
+pub(crate) fn untrusted_client_ip(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("x-forwarded-for")
+        .or_else(|| headers.get("x-real-ip"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or(s).trim())
+        .filter(|s| !s.is_empty())
 }
 
 pub fn create_router(state: AppState) -> Result<Router, AppError> {
@@ -127,6 +142,24 @@ mod tests {
 
         let resp = router.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn untrusted_client_ip_takes_leftmost_entry() {
+        use axum::http::HeaderValue;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("1.2.3.4, 5.6.7.8"),
+        );
+        assert_eq!(untrusted_client_ip(&headers), Some("1.2.3.4"));
+
+        let empty = HeaderMap::new();
+        assert_eq!(untrusted_client_ip(&empty), None);
+
+        let mut blank = HeaderMap::new();
+        blank.insert("x-real-ip", HeaderValue::from_static("   "));
+        assert_eq!(untrusted_client_ip(&blank), None);
     }
 
     #[tokio::test]

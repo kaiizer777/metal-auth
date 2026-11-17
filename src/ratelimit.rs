@@ -34,8 +34,15 @@ impl RateLimiter {
     }
 
     /// Construct a new rate limiter with the provided configuration.
+    ///
+    /// An enabled config must have passed [`RateLimitConfig::validate`]; a
+    /// disabled config must be re-validated before it is ever re-enabled.
     #[must_use]
     pub fn with_config(config: RateLimitConfig) -> Self {
+        debug_assert!(
+            !config.enabled || config.validate().is_ok(),
+            "enabled RateLimitConfig must be validated before use"
+        );
         Self {
             windows: Arc::new(DashMap::new()),
             config,
@@ -120,6 +127,10 @@ impl RateLimiter {
     }
 
     /// Spawn a background task periodically pruning expired keys.
+    ///
+    /// Holds only a [`std::sync::Weak`] reference: the loop exits on its own
+    /// once every strong `Arc` (e.g. the owning `AppState`) is dropped, so no
+    /// `JoinHandle` bookkeeping or explicit shutdown is required.
     pub fn start_cleanup_task(self: Arc<Self>, window: Duration) {
         if tokio::runtime::Handle::try_current().is_err() {
             tracing::warn!(
@@ -129,13 +140,18 @@ impl RateLimiter {
             return;
         }
 
+        let weak = Arc::downgrade(&self);
+        drop(self);
         tokio::spawn(async move {
             loop {
                 sleep(window).await;
-                self.cleanup(window);
+                let Some(limiter) = weak.upgrade() else {
+                    break;
+                };
+                limiter.cleanup(window);
                 tracing::debug!(
                     event = "rate_limiter_cleanup",
-                    remaining_keys = self.windows.len()
+                    remaining_keys = limiter.windows.len()
                 );
             }
         });
@@ -269,5 +285,44 @@ mod tests {
     fn start_cleanup_task_does_not_panic_outside_tokio_runtime() {
         let limiter = Arc::new(RateLimiter::new());
         limiter.start_cleanup_task(Duration::from_secs(60));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_hammer_admits_exactly_max() {
+        let config = RateLimitConfig {
+            enabled: true,
+            max_attempts: 10,
+            window_secs: 60,
+            login_cooldown_secs: 60,
+        };
+        let limiter = RateLimiter::with_config(config);
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let limiter = limiter.clone();
+            handles.push(tokio::spawn(async move {
+                let mut admitted = 0u32;
+                for _ in 0..20 {
+                    if limiter.check_rate_limit("hammer_key").is_ok() {
+                        admitted += 1;
+                    }
+                }
+                admitted
+            }));
+        }
+        let mut total = 0u32;
+        for handle in handles {
+            total += handle.await.expect("worker must not panic");
+        }
+        assert_eq!(total, 10);
+    }
+
+    #[tokio::test]
+    async fn cleanup_task_exits_once_limiter_dropped() {
+        let limiter = Arc::new(RateLimiter::new());
+        let weak = Arc::downgrade(&limiter);
+        Arc::clone(&limiter).start_cleanup_task(Duration::from_millis(10));
+        drop(limiter);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(weak.upgrade().is_none());
     }
 }

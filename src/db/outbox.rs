@@ -90,7 +90,9 @@ pub async fn recover_stale_processing(pool: &PgPool) -> Result<u64, sqlx::Error>
 /// Purges successfully sent outbox messages older than the retention duration.
 ///
 /// Only rows with `status = 'sent'` and `sent_at < NOW() - retention_window` are removed.
-/// Pending, processing, and failed records are never deleted.
+/// Pending, processing, and failed records are never deleted. The explicit
+/// `sent_at IS NOT NULL` guard keeps a future writer that marks `sent` without
+/// a timestamp from accumulating undeletable rows.
 pub async fn cleanup_sent_outbox<'e, E>(
     executor: E,
     retention_window: Duration,
@@ -103,7 +105,7 @@ where
     let result = sqlx::query(
         r#"
         DELETE FROM email_outbox
-        WHERE status = $1 AND sent_at < $2
+        WHERE status = $1 AND sent_at IS NOT NULL AND sent_at < $2
         "#,
     )
     .bind(OUTBOX_STATUS_SENT)
@@ -537,6 +539,47 @@ mod tests {
             .expect("row exists");
         assert_eq!(row.status, OUTBOX_STATUS_PROCESSING);
         assert!(row.next_retry_at > Utc::now());
+
+        let _ = sqlx::query("DELETE FROM email_outbox WHERE id = $1")
+            .bind(row_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_sent_outbox_ignores_null_sent_at() {
+        let _guard = DB_OUTBOX_TEST_MUTEX.lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+
+        // A `sent` row with NULL `sent_at` (possible only via a future writer)
+        // must survive retention cleanup instead of lingering undeleted.
+        let row_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO email_outbox (id, recipient, email_type, payload, status, retry_count, next_retry_at, sent_at)
+            VALUES ($1, $2, 'verification', '{}'::jsonb, $3, 0, NOW(), NULL)
+            "#,
+        )
+        .bind(row_id)
+        .bind(format!("null_sent_{}@example.com", row_id))
+        .bind(OUTBOX_STATUS_SENT)
+        .execute(&pool)
+        .await
+        .expect("insert sent row with NULL sent_at");
+
+        // 7-day window: only the NULL-`sent_at` semantics are under test;
+        // no live `sent` row (including other suites' rows) may be touched.
+        let _ = cleanup_sent_outbox(&pool, Duration::from_secs(7 * 24 * 3600))
+            .await
+            .expect("cleanup sent outbox");
+
+        let row = get_outbox_by_id(&pool, row_id)
+            .await
+            .expect("fetch row")
+            .expect("NULL sent_at row must survive cleanup");
+        assert_eq!(row.status, OUTBOX_STATUS_SENT);
 
         let _ = sqlx::query("DELETE FROM email_outbox WHERE id = $1")
             .bind(row_id)

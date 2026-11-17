@@ -257,11 +257,18 @@ async fn drain_outbox_batches(
     sender: &Option<SharedEmailSender>,
     timeout: Duration,
     config: &OutboxWorkerConfig,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
+        // Always finish the claimed batch; only then check shutdown before
+        // claiming another. Under a large backlog an unconditional drain would
+        // delay exit indefinitely, but an already-signalled shutdown must not
+        // abandon the in-flight batch either.
         match process_outbox_batch(pool, sender, timeout, config).await {
             Ok(count) if count >= config.batch_size as usize => {
-                continue;
+                if shutdown.has_changed().unwrap_or(true) {
+                    break;
+                }
             }
             Ok(_) => break,
             Err(e) => {
@@ -306,7 +313,7 @@ pub async fn run_outbox_worker_until(
     }
 
     // Drain existing pending records immediately on startup before sleeping
-    drain_outbox_batches(&pool, &sender, timeout, &config).await;
+    drain_outbox_batches(&pool, &sender, timeout, &config, &shutdown).await;
 
     loop {
         tokio::select! {
@@ -317,7 +324,7 @@ pub async fn run_outbox_worker_until(
             }
         }
 
-        drain_outbox_batches(&pool, &sender, timeout, &config).await;
+        drain_outbox_batches(&pool, &sender, timeout, &config, &shutdown).await;
         if let Err(e) = crate::db::outbox::cleanup_sent_outbox(&pool, config.sent_retention).await {
             error!(err = %e, "failed to cleanup sent outbox records");
         }
@@ -757,7 +764,8 @@ mod tests {
             ..OutboxWorkerConfig::default()
         };
 
-        drain_outbox_batches(&pool, &sender, Duration::from_secs(1), &config).await;
+        let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+        drain_outbox_batches(&pool, &sender, Duration::from_secs(1), &config, &shutdown).await;
 
         for id in &ids {
             let row = crate::db::outbox::get_outbox_by_id(&pool, *id)
@@ -766,6 +774,117 @@ mod tests {
                 .unwrap();
             assert_eq!(row.status, crate::db::models::OUTBOX_STATUS_SENT);
         }
+
+        let _ = sqlx::query("DELETE FROM email_outbox WHERE id = ANY($1)")
+            .bind(&ids)
+            .execute(&pool)
+            .await;
+    }
+
+    #[derive(Default)]
+    struct GatedShutdownSender {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        sends: std::sync::Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::email::hook::EmailSender for GatedShutdownSender {
+        async fn send_verification_email(
+            &self,
+            _payload: VerificationEmailPayload,
+        ) -> Result<(), crate::email::hook::DynError> {
+            *self.sends.lock().unwrap() += 1;
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+        async fn send_password_reset_email(
+            &self,
+            _payload: PasswordResetEmailPayload,
+        ) -> Result<(), crate::email::hook::DynError> {
+            *self.sends.lock().unwrap() += 1;
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_stops_claiming_after_shutdown() {
+        let _guard = DB_OUTBOX_TEST_MUTEX.lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+
+        let mut ids = Vec::new();
+        for i in 0..2 {
+            let id = uuid::Uuid::new_v4();
+            let recipient = format!("shutdown_{i}_{}@example.com", id);
+            let payload = serde_json::json!({
+                "user_id": uuid::Uuid::new_v4(),
+                "to": recipient,
+                "token": "tok",
+                "url": "https://example.com",
+                "expires_at": chrono::Utc::now()
+            });
+            sqlx::query(
+                r#"
+                INSERT INTO email_outbox (id, recipient, email_type, payload, status, retry_count, next_retry_at)
+                VALUES ($1, $2, 'verification', $3, $4, 0, NOW())
+                "#,
+            )
+            .bind(id)
+            .bind(&recipient)
+            .bind(payload)
+            .bind(crate::db::models::OUTBOX_STATUS_PENDING)
+            .execute(&pool)
+            .await
+            .expect("insert outbox row");
+            ids.push(id);
+        }
+
+        let sender = Arc::new(GatedShutdownSender::default());
+        let gated: Option<SharedEmailSender> = Some(sender.clone());
+        let config = OutboxWorkerConfig {
+            batch_size: 1,
+            ..OutboxWorkerConfig::default()
+        };
+        let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+
+        // Signal shutdown while the first delivery is in flight: the drain
+        // must finish that batch but never claim the second row.
+        let drain_pool = pool.clone();
+        let drain = tokio::spawn(async move {
+            drain_outbox_batches(
+                &drain_pool,
+                &gated,
+                Duration::from_secs(5),
+                &config,
+                &shutdown,
+            )
+            .await;
+        });
+        tokio::time::timeout(Duration::from_secs(5), sender.entered.notified())
+            .await
+            .expect("first delivery must start");
+        shutdown_tx.send(true).expect("signal shutdown");
+        sender.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .expect("drain must exit")
+            .expect("drain task panicked");
+
+        assert_eq!(*sender.sends.lock().unwrap(), 1);
+        let pending = crate::db::outbox::get_outbox_by_id(&pool, ids[1])
+            .await
+            .expect("fetch row")
+            .unwrap();
+        assert_eq!(
+            pending.status,
+            crate::db::models::OUTBOX_STATUS_PENDING,
+            "second batch must stay unclaimed after shutdown"
+        );
 
         let _ = sqlx::query("DELETE FROM email_outbox WHERE id = ANY($1)")
             .bind(&ids)

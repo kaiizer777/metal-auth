@@ -65,14 +65,28 @@ fn redact_token_assignments(raw: &str) -> String {
         let value_at = marker_at + "token=".len();
         out.push_str(&raw[kept_from..value_at]);
         out.push_str("[REDACTED]");
+        // Quoted values may embed delimiters, so consume through the matching
+        // close quote instead of stopping at it. Unterminated quotes fail
+        // closed by dropping the trailing bytes.
         let mut end = value_at;
-        while end < bytes.len()
-            && !matches!(
-                bytes[end],
-                b'&' | b' ' | b'\t' | b'\r' | b'\n' | b'"' | b'\'' | b';' | b'#'
-            )
-        {
+        if end < bytes.len() && matches!(bytes[end], b'"' | b'\'') {
+            let quote = bytes[end];
             end += 1;
+            while end < bytes.len() && bytes[end] != quote {
+                end += 1;
+            }
+            if end < bytes.len() {
+                end += 1;
+            }
+        } else {
+            while end < bytes.len()
+                && !matches!(
+                    bytes[end],
+                    b'&' | b' ' | b'\t' | b'\r' | b'\n' | b'"' | b'\'' | b';' | b'#'
+                )
+            {
+                end += 1;
+            }
         }
         kept_from = end;
     }
@@ -116,6 +130,11 @@ fn redact_json_token(stage: String) -> String {
         let mut end = value_at;
         while end < bytes.len() && bytes[end] != quote {
             end += 1;
+            // A backslash escapes the next byte, so an escaped quote is value
+            // content rather than the string terminator.
+            if bytes[end - 1] == b'\\' && end < bytes.len() {
+                end += 1;
+            }
         }
         out.push_str(&stage[kept_from..value_at]);
         out.push_str("[REDACTED]");
@@ -199,5 +218,26 @@ mod tests {
             sanitize_sender_error(&err),
             "fail token=[REDACTED]#token=[REDACTED] end"
         );
+    }
+
+    #[test]
+    fn redacts_quoted_assignment_values_in_full() {
+        let err = boxed(r#"smtp rejected token="super secret;tok" for user"#);
+        let redacted = sanitize_sender_error(&err);
+        assert!(!redacted.contains("super secret;tok"));
+        assert_eq!(redacted, r#"smtp rejected token=[REDACTED] for user"#);
+        let err = boxed("smtp rejected token='super secret&tok' for user");
+        let redacted = sanitize_sender_error(&err);
+        assert!(!redacted.contains("super secret&tok"));
+        assert_eq!(redacted, "smtp rejected token=[REDACTED] for user");
+    }
+
+    #[test]
+    fn redacts_json_token_with_escaped_quote() {
+        let err = boxed(r#"smtp failed {"token": "ab\"cd-secret"} end"#);
+        let redacted = sanitize_sender_error(&err);
+        assert!(!redacted.contains("ab"));
+        assert!(!redacted.contains("cd-secret"));
+        assert_eq!(redacted, r#"smtp failed {"token": "[REDACTED]"} end"#);
     }
 }

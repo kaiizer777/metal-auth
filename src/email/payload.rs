@@ -78,20 +78,18 @@ fn redact_params(params: &str) -> String {
 }
 
 fn redact_url_token(url: &str) -> Cow<'_, str> {
-    let (base, query, fragment) = match url.split_once('?') {
-        Some((base, rest)) => {
-            let (query, fragment) = match rest.split_once('#') {
-                Some((q, f)) => (Some(q), Some(f)),
-                None => (Some(rest), None),
-            };
-            (base, query, fragment)
-        }
-        // No query string: a fragment may still carry a token, so fall
-        // through to fragment handling instead of returning borrowed.
-        None => match url.split_once('#') {
-            Some((base, f)) => (base, None, Some(f)),
-            None => return Cow::Borrowed(url),
-        },
+    // Split the fragment first: everything after the first `#` is fragment,
+    // so a `?` there must never be parsed as a query string (and a token in
+    // the head must never be copied verbatim into the redacted output).
+    let (head, fragment) = match url.split_once('#') {
+        Some((h, f)) => (h, Some(f)),
+        None => (url, None),
+    };
+    let (base, query) = match head.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        // No query string and no fragment: nothing to redact.
+        None if fragment.is_none() => return Cow::Borrowed(url),
+        None => (head, None),
     };
 
     let mut result = String::with_capacity(url.len() + 16);
@@ -104,8 +102,10 @@ fn redact_url_token(url: &str) -> Cow<'_, str> {
         result.push('#');
         // Builders never emit fragments; a bare fragment is unclassifiable, so
         // redact it fail-closed while param-style fragments get key redaction.
+        // A `?` inside the fragment also separates params for this purpose so
+        // `frag?token=...` cannot smuggle a token past key matching.
         if f.contains('=') {
-            result.push_str(&redact_params(f));
+            result.push_str(&redact_params(&f.replace('?', "&")));
         } else if !f.is_empty() {
             result.push_str(REDACTED);
         }
@@ -198,6 +198,23 @@ mod tests {
             redact_url_token("https://example.com/auth/verify"),
             Cow::Borrowed(_)
         ));
+    }
+
+    #[test]
+    fn redact_url_token_fragment_token_with_query() {
+        // Query and fragment tokens are both redacted.
+        assert_eq!(
+            redact_url_token("https://example.com/reset?next=/home&token=qsecret#token=fsecret"),
+            "https://example.com/reset?next=/home&token=[REDACTED]#token=[REDACTED]"
+        );
+        // `#` before `?`: the `?` belongs to the fragment, never the query.
+        let redacted =
+            redact_url_token("https://example.com/reset#token=fsecret?token=qsecret").to_string();
+        assert!(!redacted.contains("fsecret"));
+        assert!(!redacted.contains("qsecret"));
+        // `?`-smuggled token behind a non-param fragment prefix.
+        let redacted = redact_url_token("https://example.com/reset#frag?token=sneaky").to_string();
+        assert!(!redacted.contains("sneaky"));
     }
 
     #[test]

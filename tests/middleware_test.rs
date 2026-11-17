@@ -471,3 +471,36 @@ async fn test_csrf_bearer_bypass_fails_downstream_auth_with_invalid_token() {
     let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
     assert_eq!(err.code, ErrorCode::SessionNotFound);
 }
+
+#[tokio::test]
+async fn test_create_router_mounts_security_headers_and_cache_control() {
+    let state = dummy_app_state();
+    let app = metal_auth::handler::create_router(state).expect("create_router");
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/auth/signup")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    let h = resp.headers();
+    assert_eq!(
+        h.get(header::STRICT_TRANSPORT_SECURITY).unwrap(),
+        "max-age=63072000; includeSubDomains; preload"
+    );
+    assert_eq!(h.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+    assert_eq!(h.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+    assert_eq!(
+        h.get(header::CONTENT_SECURITY_POLICY).unwrap(),
+        "default-src 'self'"
+    );
+    assert_eq!(
+        h.get(header::REFERRER_POLICY).unwrap(),
+        "strict-origin-when-cross-origin"
+    );
+    assert_eq!(h.get(header::CACHE_CONTROL).unwrap(), "no-store");
+    assert_eq!(h.get(header::PRAGMA).unwrap(), "no-cache");
+}

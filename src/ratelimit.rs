@@ -12,6 +12,9 @@ use crate::{
     error::{AppError, ErrorCode},
 };
 
+/// Default maximum entries maintained in the rate limiter before admission rejection.
+pub const DEFAULT_MAX_ENTRIES: usize = 100_000;
+
 /// Per-key sliding-window state.
 #[derive(Debug)]
 struct WindowEntry {
@@ -24,6 +27,7 @@ struct WindowEntry {
 pub struct RateLimiter {
     windows: Arc<DashMap<String, WindowEntry>>,
     config: RateLimitConfig,
+    max_entries: usize,
 }
 
 impl RateLimiter {
@@ -33,12 +37,18 @@ impl RateLimiter {
         Self::with_config(RateLimitConfig::default())
     }
 
-    /// Construct a new rate limiter with the provided configuration.
+    /// Construct a new rate limiter with the provided configuration and default capacity.
     ///
     /// An enabled config must have passed [`RateLimitConfig::validate`]; a
     /// disabled config must be re-validated before it is ever re-enabled.
     #[must_use]
     pub fn with_config(config: RateLimitConfig) -> Self {
+        Self::with_config_and_capacity(config, DEFAULT_MAX_ENTRIES)
+    }
+
+    /// Construct a new rate limiter with explicit configuration and maximum capacity.
+    #[must_use]
+    pub fn with_config_and_capacity(config: RateLimitConfig, max_entries: usize) -> Self {
         debug_assert!(
             !config.enabled || config.validate().is_ok(),
             "enabled RateLimitConfig must be validated before use"
@@ -46,6 +56,7 @@ impl RateLimiter {
         Self {
             windows: Arc::new(DashMap::new()),
             config,
+            max_entries,
         }
     }
 
@@ -58,13 +69,19 @@ impl RateLimiter {
         cooldown: Option<Duration>,
     ) -> Result<(), AppError> {
         let now = Instant::now();
-        let mut entry = self
-            .windows
-            .entry(key.to_string())
-            .or_insert_with(|| WindowEntry {
-                attempts: Vec::new(),
-                locked_until: None,
-            });
+        let mut entry = if let Some(existing) = self.windows.get_mut(key) {
+            existing
+        } else {
+            if self.windows.len() >= self.max_entries {
+                return Err(AppError::from_code(ErrorCode::RateLimitExceeded));
+            }
+            self.windows
+                .entry(key.to_string())
+                .or_insert_with(|| WindowEntry {
+                    attempts: Vec::new(),
+                    locked_until: None,
+                })
+        };
 
         if let Some(locked_until) = entry.locked_until {
             if now < locked_until {
@@ -92,6 +109,11 @@ impl RateLimiter {
         self.check_internal(key, max, window, None).is_ok()
     }
 
+    /// Return the configured cooldown period in seconds for 429 Retry-After headers.
+    pub fn cooldown_secs(&self) -> u64 {
+        self.config.login_cooldown_secs
+    }
+
     /// Check rate limit against configured rules and enforce cooldown on exceed.
     pub fn check_rate_limit(&self, key: &str) -> Result<(), AppError> {
         if !self.config.enabled {
@@ -104,6 +126,47 @@ impl RateLimiter {
             self.config.window(),
             Some(self.config.cooldown()),
         )
+    }
+
+    /// Check rate limit for an IP address.
+    pub fn check_ip(&self, ip: &str) -> Result<(), AppError> {
+        if !self.config.enabled {
+            return Ok(());
+        }
+        let key = format!("ip:{ip}");
+        self.check_internal(
+            &key,
+            self.config.max_attempts,
+            self.config.window(),
+            Some(self.config.cooldown()),
+        )
+    }
+
+    /// Check rate limit for an account identifier (normalized email).
+    pub fn check_account(&self, account: &str) -> Result<(), AppError> {
+        if !self.config.enabled {
+            return Ok(());
+        }
+        let key = format!("account:{account}");
+        self.check_internal(
+            &key,
+            self.config.max_attempts,
+            self.config.window(),
+            Some(self.config.cooldown()),
+        )
+    }
+
+    /// Evaluate dual-key rate limit: checks IP first, then account.
+    pub fn check_dual(&self, ip: &str, account: &str) -> Result<(), AppError> {
+        self.check_ip(ip)?;
+        self.check_account(account)?;
+        Ok(())
+    }
+
+    /// Reset rate limit counter for an account only, leaving IP counters intact.
+    pub fn reset_account(&self, account: &str) {
+        let key = format!("account:{account}");
+        self.windows.remove(&key);
     }
 
     /// Reset all rate limit counters and lockouts for a specific key.

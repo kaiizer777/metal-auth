@@ -151,6 +151,21 @@ fn json_request(method: Method, uri: &str, body: serde_json::Value) -> Request<B
         .unwrap()
 }
 
+fn json_request_with_ip(
+    method: Method,
+    uri: &str,
+    ip: &str,
+    body: serde_json::Value,
+) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-forwarded-for", ip)
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
 fn dynamic_test_password() -> String {
     format!("SecPass!_{}", Uuid::new_v4())
 }
@@ -1631,7 +1646,7 @@ async fn test_no_secrets_in_tracing_logs() {
         .body(Body::empty())
         .unwrap();
     let resp6 = ctx.router.oneshot(req6).await.unwrap();
-    assert_eq!(resp6.status(), StatusCode::OK);
+    assert_eq!(resp6.status(), StatusCode::NO_CONTENT);
 
     let logs = log_scope.text();
     assert!(
@@ -1647,8 +1662,8 @@ async fn test_no_secrets_in_tracing_logs() {
         "Tracing logs must record structured password_reset_request event: {logs}"
     );
     assert!(
-        logs.contains("signup_request"),
-        "Tracing logs must record structured signup_request event: {logs}"
+        logs.contains("signup"),
+        "Tracing logs must record structured signup event: {logs}"
     );
     assert!(
         !logs.contains(&canary_bearer_token),
@@ -2558,23 +2573,25 @@ async fn test_login_timing_parity_unknown_vs_wrong() {
     const MEASURED: usize = 10;
 
     // Warmup both paths to stabilise Argon2 state and OS scheduler.
-    for _ in 0..WARMUP {
-        ctx.state
-            .rate_limiter
-            .reset(&metal_auth::rate_limit_key("127.0.0.1", &email));
-        let req = json_request(
+    for i in 0..WARMUP {
+        let ip_wrong = format!("198.51.100.{}", i * 2 + 1);
+        ctx.state.rate_limiter.reset_account(&email);
+        ctx.state.rate_limiter.reset(&format!("ip:{ip_wrong}"));
+        let req = json_request_with_ip(
             Method::POST,
             "/auth/login",
+            &ip_wrong,
             json!({"email": email, "password": wrong_password.clone()}),
         );
         let _ = ctx.router.clone().oneshot(req).await.unwrap();
 
-        ctx.state
-            .rate_limiter
-            .reset(&metal_auth::rate_limit_key("127.0.0.1", &unknown_email));
-        let req = json_request(
+        let ip_unknown = format!("198.51.100.{}", i * 2 + 2);
+        ctx.state.rate_limiter.reset_account(&unknown_email);
+        ctx.state.rate_limiter.reset(&format!("ip:{ip_unknown}"));
+        let req = json_request_with_ip(
             Method::POST,
             "/auth/login",
+            &ip_unknown,
             json!({"email": unknown_email.clone(), "password": wrong_password.clone()}),
         );
         let _ = ctx.router.clone().oneshot(req).await.unwrap();
@@ -2584,27 +2601,29 @@ async fn test_login_timing_parity_unknown_vs_wrong() {
     let mut durations_wrong: Vec<std::time::Duration> = Vec::with_capacity(MEASURED);
     let mut durations_unknown: Vec<std::time::Duration> = Vec::with_capacity(MEASURED);
 
-    for _ in 0..MEASURED {
-        ctx.state
-            .rate_limiter
-            .reset(&metal_auth::rate_limit_key("127.0.0.1", &email));
+    for i in 0..MEASURED {
+        let ip_wrong = format!("198.51.100.{}", (WARMUP + i) * 2 + 1);
+        ctx.state.rate_limiter.reset_account(&email);
+        ctx.state.rate_limiter.reset(&format!("ip:{ip_wrong}"));
         let t = std::time::Instant::now();
-        let req = json_request(
+        let req = json_request_with_ip(
             Method::POST,
             "/auth/login",
+            &ip_wrong,
             json!({"email": email, "password": wrong_password.clone()}),
         );
         let resp = ctx.router.clone().oneshot(req).await.unwrap();
         durations_wrong.push(t.elapsed());
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        ctx.state
-            .rate_limiter
-            .reset(&metal_auth::rate_limit_key("127.0.0.1", &unknown_email));
+        let ip_unknown = format!("198.51.100.{}", (WARMUP + i) * 2 + 2);
+        ctx.state.rate_limiter.reset_account(&unknown_email);
+        ctx.state.rate_limiter.reset(&format!("ip:{ip_unknown}"));
         let t = std::time::Instant::now();
-        let req = json_request(
+        let req = json_request_with_ip(
             Method::POST,
             "/auth/login",
+            &ip_unknown,
             json!({"email": unknown_email.clone(), "password": wrong_password.clone()}),
         );
         let resp = ctx.router.clone().oneshot(req).await.unwrap();

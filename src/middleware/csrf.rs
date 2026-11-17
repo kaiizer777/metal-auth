@@ -50,14 +50,28 @@ pub async fn csrf_middleware(
 
     match (csrf_cookie_val, csrf_header_val) {
         (Some(cookie_val), Some(header_val)) => {
-            let cookie_bytes = cookie_val.as_bytes();
-            let header_bytes = header_val.as_bytes();
+            let cookie_trim = cookie_val.trim();
+            let header_trim = header_val.trim();
 
-            let ct_eq: bool = if cookie_bytes.len() == header_bytes.len() {
-                cookie_bytes.ct_eq(header_bytes).into()
-            } else {
-                false
-            };
+            if cookie_trim.is_empty() || header_trim.is_empty() {
+                return Err(AppError::from_code(ErrorCode::CsrfTokenMissing));
+            }
+
+            // Enforce expected token length (32 or 64 hex characters) and length parity
+            if cookie_trim.len() != header_trim.len()
+                || (cookie_trim.len() != 32 && cookie_trim.len() != 64)
+            {
+                tracing::warn!(
+                    event = "csrf_mismatch",
+                    reason = "invalid_or_mismatched_token_length"
+                );
+                return Err(AppError::from_code(ErrorCode::CsrfTokenInvalid));
+            }
+
+            let cookie_bytes = cookie_trim.as_bytes();
+            let header_bytes = header_trim.as_bytes();
+
+            let ct_eq: bool = cookie_bytes.ct_eq(header_bytes).into();
 
             if !ct_eq {
                 tracing::warn!(event = "csrf_mismatch");
@@ -302,5 +316,65 @@ mod tests {
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
         let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(err.code, ErrorCode::CsrfTokenInvalid);
+    }
+
+    #[tokio::test]
+    async fn empty_tokens_in_cookie_and_header_rejected_as_missing() {
+        let state = test_app_state();
+        let app = test_router(state);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/test")
+            .header("cookie", "csrf_token=")
+            .header("x-csrf-token", "")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err.code, ErrorCode::CsrfTokenMissing);
+    }
+
+    #[tokio::test]
+    async fn whitespace_tokens_rejected_as_missing() {
+        let state = test_app_state();
+        let app = test_router(state);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/test")
+            .header("cookie", "csrf_token=   ")
+            .header("x-csrf-token", "   ")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err.code, ErrorCode::CsrfTokenMissing);
+    }
+
+    #[tokio::test]
+    async fn sixty_four_char_matching_tokens_pass() {
+        let state = test_app_state();
+        let app = test_router(state);
+
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/test")
+            .header("cookie", format!("csrf_token={token}"))
+            .header("x-csrf-token", token)
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
     }
 }

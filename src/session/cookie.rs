@@ -69,18 +69,38 @@ impl SessionCookieSource for Config {
 }
 
 /// Tokens placed in cookies are hex by construction; anything else is a bug.
+/// Semicolons split `Set-Cookie` values, so they are rejected explicitly even
+/// though they are ASCII graphic.
 fn valid_token_chars(token: &str) -> bool {
-    !token.is_empty() && token.bytes().all(|b| b.is_ascii_graphic())
+    !token.is_empty() && token.bytes().all(|b| b.is_ascii_graphic() && b != b';')
 }
 
-/// Cookie names follow RFC 6265 `token`: printable ASCII minus separators.
-/// `Config::validate` enforces this too; builders re-check defensively so an
-/// unvalidated `SessionConfig` can never produce a splittable `Set-Cookie`.
+/// Cookie names follow RFC 6265 `token`: letters, digits, and
+/// `!#$%&'*+-.^_`|~` only. `Config::validate` enforces this too; builders
+/// re-check defensively so an unvalidated `SessionConfig` can never produce
+/// a splittable `Set-Cookie`.
 fn valid_cookie_name(name: &str) -> bool {
     !name.is_empty()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_graphic() && !matches!(b, b';' | b'=' | b','))
+        && name.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 /// Build a session cookie `Set-Cookie` header value, failing closed on invalid content.
@@ -334,6 +354,29 @@ mod tests {
         };
         assert!(set_session_cookie(&sc, "rawtoken123").is_err());
         assert!(clear_session_cookie(&sc).is_err());
+    }
+
+    #[test]
+    fn rejects_token_with_semicolon() {
+        let cfg = test_config();
+        assert!(set_session_cookie(&cfg, "abc;HttpOnly").is_err());
+        assert!(set_csrf_cookie(&cfg, "tok;en").is_err());
+    }
+
+    #[test]
+    fn rejects_cookie_name_with_rfc6265_separators() {
+        // `'` is a valid RFC 6265 tchar, so it is intentionally absent here.
+        for name in [
+            "a/b", "a:b", "a\"b", "a(b)", "a)b", "a,b", "a=b", "a b", "a@b", "a[b]", "a]b", "a{b}",
+            "a}b", "a?b", "a\\b", "a<b", "a>b",
+        ] {
+            let sc = SessionConfig {
+                cookie_name: name.into(),
+                ..Default::default()
+            };
+            assert!(set_session_cookie(&sc, "rawtoken123").is_err(), "{name}");
+            assert!(clear_session_cookie(&sc).is_err(), "{name}");
+        }
     }
 
     #[test]

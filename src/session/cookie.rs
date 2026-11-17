@@ -69,10 +69,14 @@ impl SessionCookieSource for Config {
 }
 
 /// Tokens placed in cookies are hex by construction; anything else is a bug.
-/// Semicolons split `Set-Cookie` values, so they are rejected explicitly even
-/// though they are ASCII graphic.
+/// Values must be RFC 6265 `cookie-octet` (`%x21 / %x23-2B / %x2D-3A /
+/// %x3C-5B / %x5D-7E`): graphic ASCII minus `"`, `,`, `;`, `\`, which would
+/// split or re-quote the `Set-Cookie` value.
 fn valid_token_chars(token: &str) -> bool {
-    !token.is_empty() && token.bytes().all(|b| b.is_ascii_graphic() && b != b';')
+    !token.is_empty()
+        && token
+            .bytes()
+            .all(|b| matches!(b, 0x21 | 0x23..=0x2B | 0x2D..=0x3A | 0x3C..=0x5B | 0x5D..=0x7E))
 }
 
 /// Cookie names follow RFC 6265 `token`: letters, digits, and
@@ -361,6 +365,15 @@ mod tests {
         let cfg = test_config();
         assert!(set_session_cookie(&cfg, "abc;HttpOnly").is_err());
         assert!(set_csrf_cookie(&cfg, "tok;en").is_err());
+    }
+
+    #[test]
+    fn rejects_non_cookie_octet_delimiters() {
+        let cfg = test_config();
+        for token in ["ab\"cd", "ab,cd", "ab\\cd"] {
+            assert!(set_session_cookie(&cfg, token).is_err(), "{token}");
+            assert!(set_csrf_cookie(&cfg, token).is_err(), "{token}");
+        }
     }
 
     #[test]

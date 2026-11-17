@@ -254,7 +254,9 @@ mod tests {
             expires_at: now,
             created_at: now,
         };
-        assert!(!format!("{token:?}").contains("AA"));
+        let rendered_token = format!("{token:?}");
+        assert!(!rendered_token.contains("[170, 187]"));
+        assert!(rendered_token.contains("token_hash: \"[redacted]\""));
 
         let reset = PasswordResetToken {
             token_hash: vec![0xCC, 0xDD],
@@ -262,7 +264,9 @@ mod tests {
             expires_at: now,
             created_at: now,
         };
-        assert!(!format!("{reset:?}").contains("CC"));
+        let rendered_reset = format!("{reset:?}");
+        assert!(!rendered_reset.contains("[204, 221]"));
+        assert!(rendered_reset.contains("token_hash: \"[redacted]\""));
 
         let outbox = EmailOutbox {
             id: Uuid::new_v4(),

@@ -504,3 +504,23 @@ async fn test_create_router_mounts_security_headers_and_cache_control() {
     assert_eq!(h.get(header::CACHE_CONTROL).unwrap(), "no-store");
     assert_eq!(h.get(header::PRAGMA).unwrap(), "no-cache");
 }
+
+#[tokio::test]
+async fn test_logout_with_session_cookie_requires_csrf() {
+    let state = dummy_app_state();
+    let app = metal_auth::handler::create_router(state.clone()).expect("create_router");
+
+    // Cookie session without CSRF header must be rejected with 403 CsrfTokenMissing
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/auth/logout")
+        .header(
+            header::COOKIE,
+            format!("{}=dummy-session-id", state.config.session.cookie_name),
+        )
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}

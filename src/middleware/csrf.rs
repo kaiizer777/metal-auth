@@ -29,7 +29,15 @@ pub async fn csrf_middleware(
     // (require_auth prefers the cookie) and must still pass the CSRF check.
     let has_session_cookie =
         read_session_cookie(req.headers(), &state.config.session.cookie_name).is_some();
+    let has_csrf_cookie = read_session_cookie(req.headers(), "csrf_token").is_some();
+    let has_csrf_header = req.headers().contains_key("x-csrf-token");
+
     if has_bearer_token(req.headers()) && !has_session_cookie {
+        return Ok(next.run(req).await);
+    }
+
+    // Requests presenting neither ambient cookies nor CSRF headers carry no ambient authority.
+    if !has_session_cookie && !has_csrf_cookie && !has_csrf_header {
         return Ok(next.run(req).await);
     }
 

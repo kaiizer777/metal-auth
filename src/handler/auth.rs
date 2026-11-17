@@ -59,12 +59,48 @@ pub fn routes(service: Arc<AuthServiceImpl>) -> Router {
 }
 
 pub fn routes_with_app_state(state: AppState) -> Router {
-    routes_with_state(AuthHandlerState {
+    let handler_state = AuthHandlerState {
         service: Arc::clone(&state.auth_service),
         session_service: Some(Arc::clone(&state.session_service)),
         rate_limiter: Some(Arc::clone(&state.rate_limiter)),
         config: Some(Arc::new(state.config.clone())),
-    })
+    };
+
+    let csrf_routes = Router::new()
+        .route(
+            "/logout",
+            axum::routing::post(logout).fallback(method_not_allowed),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::middleware::csrf_middleware,
+        ))
+        .with_state(handler_state.clone());
+
+    let public_routes = Router::new()
+        .route(
+            "/signup",
+            axum::routing::post(signup).fallback(method_not_allowed),
+        )
+        .route(
+            "/login",
+            axum::routing::post(login).fallback(method_not_allowed),
+        )
+        .route(
+            "/verify",
+            axum::routing::post(verify_email).fallback(method_not_allowed),
+        )
+        .route(
+            "/password/reset-request",
+            axum::routing::post(request_password_reset).fallback(method_not_allowed),
+        )
+        .route(
+            "/password/reset",
+            axum::routing::post(reset_password).fallback(method_not_allowed),
+        )
+        .with_state(handler_state);
+
+    public_routes.merge(csrf_routes)
 }
 
 pub fn routes_with_state(state: AuthHandlerState) -> Router {
@@ -323,6 +359,19 @@ pub async fn login(
 ///
 /// Revokes session on server side and clears the session cookie.
 pub async fn logout(State(state): State<AuthHandlerState>, headers: HeaderMap) -> Response {
+    let client_ip = extract_client_ip(&headers);
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown");
+
+    tracing::info!(
+        target: "security_event",
+        event = "logout",
+        ip = %client_ip,
+        user_agent = %user_agent,
+    );
+
     let cookie_name = state
         .config
         .as_ref()
@@ -423,6 +472,18 @@ pub async fn request_password_reset(
     if let Err(e) = req.validate() {
         return service_error_response(e);
     }
+
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown");
+
+    tracing::info!(
+        target: "security_event",
+        event = "password_reset_requested",
+        ip = %client_ip,
+        user_agent = %user_agent,
+    );
 
     match state.service.request_password_reset(&req.email).await {
         Ok(()) => (

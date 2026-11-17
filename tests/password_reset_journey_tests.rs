@@ -24,12 +24,13 @@ async fn test_journey_password_reset_full_lifecycle() {
 
     // 1. Register and verify user
     let signup_res = app
-        .post_json(
+        .post_json_with_ip(
             ENDPOINT_SIGNUP,
             json!({
                 "email": email,
                 "password": old_password
             }),
+            &dynamic_ip(),
         )
         .await;
     assert_eq!(signup_res.status(), StatusCode::OK);
@@ -39,18 +40,23 @@ async fn test_journey_password_reset_full_lifecycle() {
         .verification_token_for(&email)
         .expect("verification token dispatched");
     let verify_res = app
-        .post_json(ENDPOINT_VERIFY, json!({ "token": verify_token }))
+        .post_json_with_ip(
+            ENDPOINT_VERIFY,
+            json!({ "token": verify_token }),
+            &dynamic_ip(),
+        )
         .await;
     assert_eq!(verify_res.status(), StatusCode::OK);
 
     // Verify initial login succeeds with old password
     let initial_login_res = app
-        .post_json(
+        .post_json_with_ip(
             ENDPOINT_LOGIN,
             json!({
                 "email": email,
                 "password": old_password
             }),
+            &dynamic_ip(),
         )
         .await;
     assert_eq!(initial_login_res.status(), StatusCode::OK);
@@ -61,7 +67,11 @@ async fn test_journey_password_reset_full_lifecycle() {
 
     // 2. Request password reset via POST /auth/password/reset-request
     let reset_req_res = app
-        .post_json(ENDPOINT_FORGOT_PASSWORD, json!({ "email": email }))
+        .post_json_with_ip(
+            ENDPOINT_FORGOT_PASSWORD,
+            json!({ "email": email }),
+            &dynamic_ip(),
+        )
         .await;
     assert_eq!(reset_req_res.status(), StatusCode::OK);
     assert_eq!(
@@ -103,12 +113,13 @@ async fn test_journey_password_reset_full_lifecycle() {
 
     // 4. Submit new password via POST /auth/password/reset
     let reset_res = app
-        .post_json(
+        .post_json_with_ip(
             ENDPOINT_RESET_PASSWORD,
             json!({
                 "token": reset_token_from_url,
                 "new_password": new_password
             }),
+            &dynamic_ip(),
         )
         .await;
     assert_eq!(reset_res.status(), StatusCode::OK);
@@ -142,12 +153,13 @@ async fn test_journey_password_reset_full_lifecycle() {
 
     // 5. Attempt login with old password -> 401 Unauthorized (INVALID_CREDENTIALS)
     let old_login_res = app
-        .post_json(
+        .post_json_with_ip(
             ENDPOINT_LOGIN,
             json!({
                 "email": email,
                 "password": old_password
             }),
+            &dynamic_ip(),
         )
         .await;
     assert_eq!(old_login_res.status(), StatusCode::UNAUTHORIZED);
@@ -158,12 +170,13 @@ async fn test_journey_password_reset_full_lifecycle() {
 
     // 6. Attempt login with new password -> 200 OK with user_id
     let new_login_res = app
-        .post_json(
+        .post_json_with_ip(
             ENDPOINT_LOGIN,
             json!({
                 "email": email,
                 "password": new_password
             }),
+            &dynamic_ip(),
         )
         .await;
     assert_eq!(new_login_res.status(), StatusCode::OK);
@@ -184,12 +197,13 @@ async fn test_journey_password_reset_invalid_or_expired_token() {
 
     // 1. Register and verify user
     let signup_res = app
-        .post_json(
+        .post_json_with_ip(
             ENDPOINT_SIGNUP,
             json!({
                 "email": email,
                 "password": initial_password
             }),
+            &dynamic_ip(),
         )
         .await;
     assert_eq!(signup_res.status(), StatusCode::OK);
@@ -199,17 +213,22 @@ async fn test_journey_password_reset_invalid_or_expired_token() {
         .verification_token_for(&email)
         .expect("verification token dispatched");
     let verify_res = app
-        .post_json(ENDPOINT_VERIFY, json!({ "token": verify_token }))
+        .post_json_with_ip(
+            ENDPOINT_VERIFY,
+            json!({ "token": verify_token }),
+            &dynamic_ip(),
+        )
         .await;
     assert_eq!(verify_res.status(), StatusCode::OK);
 
     let login_res = app
-        .post_json(
+        .post_json_with_ip(
             ENDPOINT_LOGIN,
             json!({
                 "email": email,
                 "password": initial_password
             }),
+            &dynamic_ip(),
         )
         .await;
     assert_eq!(login_res.status(), StatusCode::OK);
@@ -222,12 +241,13 @@ async fn test_journey_password_reset_invalid_or_expired_token() {
     // 2. Attempt reset with invalid/tampered token -> 400 Bad Request (INVALID_TOKEN)
     let invalid_token = "deadbeef".repeat(8);
     let invalid_res = app
-        .post_json(
+        .post_json_with_ip(
             ENDPOINT_RESET_PASSWORD,
             json!({
                 "token": invalid_token,
                 "new_password": replacement_password_1
             }),
+            &dynamic_ip(),
         )
         .await;
     assert_eq!(invalid_res.status(), StatusCode::BAD_REQUEST);
@@ -235,12 +255,13 @@ async fn test_journey_password_reset_invalid_or_expired_token() {
 
     // Malformed length token -> 400 Bad Request (INVALID_TOKEN)
     let malformed_res = app
-        .post_json(
+        .post_json_with_ip(
             ENDPOINT_RESET_PASSWORD,
             json!({
                 "token": "malformed_short_token",
                 "new_password": replacement_password_1
             }),
+            &dynamic_ip(),
         )
         .await;
     assert_eq!(malformed_res.status(), StatusCode::BAD_REQUEST);
@@ -248,7 +269,11 @@ async fn test_journey_password_reset_invalid_or_expired_token() {
 
     // 3. Request reset, expire token in DB using expire_reset_tokens_for_user, attempt reset -> 400 Bad Request (TOKEN_EXPIRED)
     let reset_req_1 = app
-        .post_json(ENDPOINT_FORGOT_PASSWORD, json!({ "email": email }))
+        .post_json_with_ip(
+            ENDPOINT_FORGOT_PASSWORD,
+            json!({ "email": email }),
+            &dynamic_ip(),
+        )
         .await;
     assert_eq!(reset_req_1.status(), StatusCode::OK);
 
@@ -262,12 +287,13 @@ async fn test_journey_password_reset_invalid_or_expired_token() {
         .expect("expire reset tokens in DB");
 
     let expired_res = app
-        .post_json(
+        .post_json_with_ip(
             ENDPOINT_RESET_PASSWORD,
             json!({
                 "token": token_1,
                 "new_password": replacement_password_1
             }),
+            &dynamic_ip(),
         )
         .await;
     assert_eq!(expired_res.status(), StatusCode::BAD_REQUEST);
@@ -275,12 +301,13 @@ async fn test_journey_password_reset_invalid_or_expired_token() {
 
     // Invariant: password remains unchanged after expired token rejection; initial password still works
     let post_expired_login = app
-        .post_json(
+        .post_json_with_ip(
             ENDPOINT_LOGIN,
             json!({
                 "email": email,
                 "password": initial_password
             }),
+            &dynamic_ip(),
         )
         .await;
     assert_eq!(
@@ -291,7 +318,11 @@ async fn test_journey_password_reset_invalid_or_expired_token() {
 
     // 4. Successfully reset password with valid token, then attempt to replay/reuse the same token -> 400 Bad Request
     let reset_req_2 = app
-        .post_json(ENDPOINT_FORGOT_PASSWORD, json!({ "email": email }))
+        .post_json_with_ip(
+            ENDPOINT_FORGOT_PASSWORD,
+            json!({ "email": email }),
+            &dynamic_ip(),
+        )
         .await;
     assert_eq!(reset_req_2.status(), StatusCode::OK);
 
@@ -302,12 +333,13 @@ async fn test_journey_password_reset_invalid_or_expired_token() {
 
     // First consumption succeeds
     let valid_reset_res = app
-        .post_json(
+        .post_json_with_ip(
             ENDPOINT_RESET_PASSWORD,
             json!({
                 "token": token_2,
                 "new_password": replacement_password_1
             }),
+            &dynamic_ip(),
         )
         .await;
     assert_eq!(valid_reset_res.status(), StatusCode::OK);
@@ -318,12 +350,13 @@ async fn test_journey_password_reset_invalid_or_expired_token() {
 
     // Replay attempt with the exact same consumed token -> 400 Bad Request (INVALID_TOKEN)
     let replay_res = app
-        .post_json(
+        .post_json_with_ip(
             ENDPOINT_RESET_PASSWORD,
             json!({
                 "token": token_2,
                 "new_password": replacement_password_2
             }),
+            &dynamic_ip(),
         )
         .await;
     assert_eq!(replay_res.status(), StatusCode::BAD_REQUEST);
@@ -337,12 +370,13 @@ async fn test_journey_password_reset_invalid_or_expired_token() {
 
     // Login succeeds with replacement_password_1, not initial or replacement_password_2
     let login_replacement_1 = app
-        .post_json(
+        .post_json_with_ip(
             ENDPOINT_LOGIN,
             json!({
                 "email": email,
                 "password": replacement_password_1
             }),
+            &dynamic_ip(),
         )
         .await;
     assert_eq!(login_replacement_1.status(), StatusCode::OK);
@@ -368,9 +402,10 @@ async fn test_journey_password_reset_nonexistent_email_enumeration() {
 
     // 2. Request forgot-password for nonexistent email
     let reset_req_res = app
-        .post_json(
+        .post_json_with_ip(
             ENDPOINT_FORGOT_PASSWORD,
             json!({ "email": nonexistent_email }),
+            &dynamic_ip(),
         )
         .await;
 
@@ -408,12 +443,13 @@ async fn test_journey_password_reset_multi_token_invalidation() {
 
     // 1. Register and verify user
     let signup_res = app
-        .post_json(
+        .post_json_with_ip(
             ENDPOINT_SIGNUP,
             json!({
                 "email": email,
                 "password": initial_password
             }),
+            &dynamic_ip(),
         )
         .await;
     assert_eq!(signup_res.status(), StatusCode::OK);
@@ -423,17 +459,22 @@ async fn test_journey_password_reset_multi_token_invalidation() {
         .verification_token_for(&email)
         .expect("verification token dispatched");
     let verify_res = app
-        .post_json(ENDPOINT_VERIFY, json!({ "token": verify_token }))
+        .post_json_with_ip(
+            ENDPOINT_VERIFY,
+            json!({ "token": verify_token }),
+            &dynamic_ip(),
+        )
         .await;
     assert_eq!(verify_res.status(), StatusCode::OK);
 
     let initial_login = app
-        .post_json(
+        .post_json_with_ip(
             ENDPOINT_LOGIN,
             json!({
                 "email": email,
                 "password": initial_password
             }),
+            &dynamic_ip(),
         )
         .await;
     assert_eq!(initial_login.status(), StatusCode::OK);
@@ -445,7 +486,11 @@ async fn test_journey_password_reset_multi_token_invalidation() {
 
     // 2. First password reset request -> captures token_A
     let req_a_res = app
-        .post_json(ENDPOINT_FORGOT_PASSWORD, json!({ "email": email }))
+        .post_json_with_ip(
+            ENDPOINT_FORGOT_PASSWORD,
+            json!({ "email": email }),
+            &dynamic_ip(),
+        )
         .await;
     assert_eq!(req_a_res.status(), StatusCode::OK);
 
@@ -455,7 +500,11 @@ async fn test_journey_password_reset_multi_token_invalidation() {
 
     // 3. Second password reset request -> captures token_B
     let req_b_res = app
-        .post_json(ENDPOINT_FORGOT_PASSWORD, json!({ "email": email }))
+        .post_json_with_ip(
+            ENDPOINT_FORGOT_PASSWORD,
+            json!({ "email": email }),
+            &dynamic_ip(),
+        )
         .await;
     assert_eq!(req_b_res.status(), StatusCode::OK);
 
@@ -480,12 +529,13 @@ async fn test_journey_password_reset_multi_token_invalidation() {
 
     // Superseded token_A is already dead before any consume.
     let reset_a_early_res = app
-        .post_json(
+        .post_json_with_ip(
             ENDPOINT_RESET_PASSWORD,
             json!({
                 "token": token_a,
                 "new_password": attempted_password_a
             }),
+            &dynamic_ip(),
         )
         .await;
     assert_eq!(reset_a_early_res.status(), StatusCode::BAD_REQUEST);
@@ -496,12 +546,13 @@ async fn test_journey_password_reset_multi_token_invalidation() {
 
     // 4. Consume token_B to reset password to new_password_b
     let reset_b_res = app
-        .post_json(
+        .post_json_with_ip(
             ENDPOINT_RESET_PASSWORD,
             json!({
                 "token": token_b,
                 "new_password": new_password_b
             }),
+            &dynamic_ip(),
         )
         .await;
     assert_eq!(reset_b_res.status(), StatusCode::OK);
@@ -510,12 +561,13 @@ async fn test_journey_password_reset_multi_token_invalidation() {
     // 5. Invariant: Resetting password invalidates all outstanding tokens for this user
     // Attempting to consume token_A must be rejected with 400 Bad Request (INVALID_TOKEN)
     let reset_a_res = app
-        .post_json(
+        .post_json_with_ip(
             ENDPOINT_RESET_PASSWORD,
             json!({
                 "token": token_a,
                 "new_password": attempted_password_a
             }),
+            &dynamic_ip(),
         )
         .await;
     assert_eq!(reset_a_res.status(), StatusCode::BAD_REQUEST);
@@ -532,34 +584,37 @@ async fn test_journey_password_reset_multi_token_invalidation() {
 
     // 6. Verify login behavior: new_password_b succeeds, initial_password and attempted_password_a fail
     let login_b_res = app
-        .post_json(
+        .post_json_with_ip(
             ENDPOINT_LOGIN,
             json!({
                 "email": email,
                 "password": new_password_b
             }),
+            &dynamic_ip(),
         )
         .await;
     assert_eq!(login_b_res.status(), StatusCode::OK);
 
     let login_old_res = app
-        .post_json(
+        .post_json_with_ip(
             ENDPOINT_LOGIN,
             json!({
                 "email": email,
                 "password": initial_password
             }),
+            &dynamic_ip(),
         )
         .await;
     assert_eq!(login_old_res.status(), StatusCode::UNAUTHORIZED);
 
     let login_attempted_a_res = app
-        .post_json(
+        .post_json_with_ip(
             ENDPOINT_LOGIN,
             json!({
                 "email": email,
                 "password": attempted_password_a
             }),
+            &dynamic_ip(),
         )
         .await;
     assert_eq!(login_attempted_a_res.status(), StatusCode::UNAUTHORIZED);

@@ -121,6 +121,22 @@ impl TestApp {
         self.dispatch(req).await
     }
 
+    /// Dispatches a JSON POST request with an explicit client IP (`x-forwarded-for`).
+    pub async fn post_json_with_ip(
+        &self,
+        uri: &str,
+        body: serde_json::Value,
+        ip: &str,
+    ) -> TestResponse {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            ip.parse().expect("valid x-forwarded-for header"),
+        );
+        let req = json_request_with_headers(Method::POST, uri, body, headers);
+        self.dispatch(req).await
+    }
+
     /// Dispatches an empty POST request (e.g. for logout or verify).
     pub async fn post_empty(&self, uri: &str) -> TestResponse {
         let req = empty_request(Method::POST, uri);
@@ -205,6 +221,16 @@ pub fn dynamic_email() -> String {
 /// Generates a valid randomized dynamic password satisfying OWASP password policies.
 pub fn dynamic_password() -> String {
     format!("JourneyPass!_{}", Uuid::new_v4())
+}
+
+/// Generates a randomized, unique client IP address in TEST-NET-2 (198.51.100.0/24) to avoid rate limit collisions.
+pub fn dynamic_ip() -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static IP_COUNTER: AtomicU32 = AtomicU32::new(1);
+    let count = IP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let b = ((count >> 8) & 0xff) as u8;
+    let c = (count & 0xff) as u8;
+    format!("198.51.{b}.{c}")
 }
 
 /// DB query helper: counts total rows in the `users` table.

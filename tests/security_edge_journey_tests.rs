@@ -625,7 +625,7 @@ async fn test_journey_security_baseline_defense_in_depth() {
             Method::POST,
             ENDPOINT_SIGNUP,
             json!({
-                "email": format!("spray_{i}_{}@example.com", dynamic_email()),
+                "email": format!("spray_{i}_{}", dynamic_email()),
                 "password": "ValidStrongPassword2026!"
             }),
             headers,
@@ -645,7 +645,7 @@ async fn test_journey_security_baseline_defense_in_depth() {
         Method::POST,
         ENDPOINT_SIGNUP,
         json!({
-            "email": format!("spray_overflow_{}@example.com", dynamic_email()),
+            "email": format!("spray_overflow_{}", dynamic_email()),
             "password": "ValidStrongPassword2026!"
         }),
         headers,
@@ -868,7 +868,7 @@ async fn test_journey_security_baseline_defense_in_depth() {
         "logout with tampered csrf header must return 403"
     );
 
-    // Case C: Valid CSRF header and session cookie -> 200 OK
+    // Case C: Valid CSRF header and session cookie -> 204 No Content
     let mut headers_valid = HeaderMap::new();
     headers_valid.insert(
         header::COOKIE,
@@ -881,7 +881,7 @@ async fn test_journey_security_baseline_defense_in_depth() {
     let resp_c = app.dispatch(req_c).await;
     assert_eq!(
         resp_c.status(),
-        StatusCode::OK,
+        StatusCode::NO_CONTENT,
         "logout with valid session cookie and matching csrf token must succeed"
     );
 }

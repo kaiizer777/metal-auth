@@ -372,6 +372,19 @@ impl AuthServiceImpl {
 
             let mut tx = self.pool.begin().await.map_err(AppError::Database)?;
 
+            // Serialize concurrent issuance for this user: the row lock orders
+            // racing requests so the second DELETE observes the first INSERT,
+            // preserving the single-live-token policy. Held through commit.
+            let locked = sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+                .bind(user_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(AppError::Database)?;
+            if locked.is_none() {
+                let _ = tx.rollback().await;
+                return Ok(());
+            }
+
             // Single-live-token policy: revoke all prior tokens for this user
             // before issuing a fresh one, so N rapid requests leave exactly one
             // valid token instead of N simultaneously valid live tokens.
@@ -1308,6 +1321,47 @@ mod tests {
             ctx.service.login(&email, &newest_password).await.unwrap(),
             user_id
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_reset_issuance_leaves_single_live_token() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+
+        let email = format!("race_issue_{}@example.com", Uuid::new_v4());
+        let config = Arc::clone(&ctx.service.config);
+        let password_hash = hash_password(&fixture_password(), &config).unwrap();
+
+        let row = sqlx::query(
+            "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true) RETURNING id",
+        )
+        .bind(&email)
+        .bind(&password_hash)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+        let user_id: Uuid = row.get("id");
+
+        // Racing issuance: the per-user row lock serializes the DELETE/INSERT
+        // pairs, so only one token survives instead of two live tokens.
+        let (first, second) = tokio::join!(
+            ctx.service.request_password_reset(&email),
+            ctx.service.request_password_reset(&email)
+        );
+        assert!(
+            first.is_ok() && second.is_ok(),
+            "both racing requests must succeed: {first:?} / {second:?}"
+        );
+
+        let count_row =
+            sqlx::query("SELECT COUNT(*) as cnt FROM password_reset_tokens WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(&ctx.pool)
+                .await
+                .unwrap();
+        let cnt: i64 = count_row.get("cnt");
+        assert_eq!(cnt, 1, "concurrent issuance must leave one live token");
     }
 
     #[tokio::test]

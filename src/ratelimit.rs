@@ -388,4 +388,109 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(weak.upgrade().is_none());
     }
+
+    #[test]
+    fn test_rate_limit_dual_keying_independence() {
+        let config = RateLimitConfig {
+            enabled: true,
+            max_attempts: 2,
+            window_secs: 60,
+            login_cooldown_secs: 60,
+        };
+        let limiter = RateLimiter::with_config(config);
+
+        // IP limit exhaustion
+        assert!(limiter.check_ip("192.168.1.1").is_ok());
+        assert!(limiter.check_ip("192.168.1.1").is_ok());
+        assert!(limiter.check_ip("192.168.1.1").is_err());
+
+        // Different IP is unaffected
+        assert!(limiter.check_ip("192.168.1.2").is_ok());
+
+        // Account limit exhaustion
+        assert!(limiter.check_account("victim@example.com").is_ok());
+        assert!(limiter.check_account("victim@example.com").is_ok());
+        assert!(limiter.check_account("victim@example.com").is_err());
+
+        // Different account is unaffected
+        assert!(limiter.check_account("other@example.com").is_ok());
+
+        // check_dual checks IP first then account
+        // 192.168.1.1 is already exhausted -> rejects at IP stage
+        assert!(
+            limiter
+                .check_dual("192.168.1.1", "fresh@example.com")
+                .is_err()
+        );
+        // 192.168.1.3 has capacity, but victim@example.com is exhausted -> rejects at account stage
+        assert!(
+            limiter
+                .check_dual("192.168.1.3", "victim@example.com")
+                .is_err()
+        );
+        // 192.168.1.3 and fresh@example.com both have capacity -> ok
+        assert!(
+            limiter
+                .check_dual("192.168.1.3", "fresh@example.com")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_rate_limit_reset_account_leaves_ip_intact() {
+        let config = RateLimitConfig {
+            enabled: true,
+            max_attempts: 1,
+            window_secs: 60,
+            login_cooldown_secs: 60,
+        };
+        let limiter = RateLimiter::with_config(config);
+
+        let ip = "10.0.0.1";
+        let email = "user@example.com";
+
+        assert!(limiter.check_dual(ip, email).is_ok());
+        // Both IP and account now tripped
+        assert!(limiter.check_ip(ip).is_err());
+        assert!(limiter.check_account(email).is_err());
+
+        // Invariant: reset_account ONLY resets account, NEVER IP
+        limiter.reset_account(email);
+        assert!(limiter.check_account(email).is_ok());
+        assert!(limiter.check_ip(ip).is_err());
+    }
+
+    #[test]
+    fn test_rate_limit_max_entries_admission_rejection() {
+        let config = RateLimitConfig {
+            enabled: true,
+            max_attempts: 5,
+            window_secs: 60,
+            login_cooldown_secs: 60,
+        };
+        let limiter = RateLimiter::with_config_and_capacity(config, 2);
+
+        // Fill capacity with 2 keys
+        assert!(limiter.check_ip("1.1.1.1").is_ok());
+        assert!(limiter.check_ip("2.2.2.2").is_ok());
+
+        // Existing keys can still be accessed and evaluated
+        assert!(limiter.check_ip("1.1.1.1").is_ok());
+
+        // 3rd new key must be rejected due to capacity bounds
+        let err = limiter.check_ip("3.3.3.3").unwrap_err();
+        assert_eq!(err.status_code(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn test_rate_limit_cooldown_secs_accessor() {
+        let config = RateLimitConfig {
+            enabled: true,
+            max_attempts: 5,
+            window_secs: 60,
+            login_cooldown_secs: 750,
+        };
+        let limiter = RateLimiter::with_config(config);
+        assert_eq!(limiter.cooldown_secs(), 750);
+    }
 }

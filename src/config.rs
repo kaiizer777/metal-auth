@@ -563,7 +563,10 @@ pub(crate) fn parse_allowed_headers_str(raw: &str) -> Vec<String> {
         .map(String::from)
         .collect();
 
-    if !headers.iter().any(|h| h.eq_ignore_ascii_case("x-csrf-token")) {
+    if !headers
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case("x-csrf-token"))
+    {
         headers.push("X-CSRF-Token".to_string());
     }
 
@@ -2427,7 +2430,11 @@ mod tests {
     #[test]
     fn default_allowed_headers_includes_csrf_token() {
         let headers = default_allowed_headers();
-        assert!(headers.iter().any(|h| h.eq_ignore_ascii_case("x-csrf-token")));
+        assert!(
+            headers
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case("x-csrf-token"))
+        );
     }
 
     #[test]

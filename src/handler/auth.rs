@@ -67,10 +67,8 @@ pub fn routes_with_app_state(state: AppState) -> Router {
         config: Some(Arc::new(state.config.clone())),
     };
 
-    let csrf_layer = axum::middleware::from_fn_with_state(
-        state.clone(),
-        crate::middleware::csrf_middleware,
-    );
+    let csrf_layer =
+        axum::middleware::from_fn_with_state(state.clone(), crate::middleware::csrf_middleware);
     let csrf_routes = Router::new()
         .route(
             "/logout",
@@ -868,12 +866,7 @@ mod tests {
 
         let mut headers1 = HeaderMap::new();
         headers1.insert("x-forwarded-for", "198.51.100.1".parse().unwrap());
-        let _ = signup(
-            State(state.clone()),
-            headers1,
-            Ok(Json(payload.clone())),
-        )
-        .await;
+        let _ = signup(State(state.clone()), headers1, Ok(Json(payload.clone()))).await;
 
         // Distinct IP with the same email must be rate limited by account key
         let mut headers2 = HeaderMap::new();
@@ -943,12 +936,8 @@ mod tests {
 
         let mut headers1 = HeaderMap::new();
         headers1.insert("x-forwarded-for", "198.51.100.10".parse().unwrap());
-        let _ = request_password_reset(
-            State(state.clone()),
-            headers1,
-            Ok(Json(payload.clone())),
-        )
-        .await;
+        let _ =
+            request_password_reset(State(state.clone()), headers1, Ok(Json(payload.clone()))).await;
 
         // Distinct IP with same email must hit reset_account rate limit
         let mut headers2 = HeaderMap::new();
@@ -1008,8 +997,16 @@ mod tests {
             .collect();
 
         assert_eq!(cookies.len(), 2);
-        assert!(cookies.iter().any(|c| c.contains("sid=") && c.contains("Max-Age=0")));
-        assert!(cookies.iter().any(|c| c.contains("csrf_token=") && c.contains("Max-Age=0")));
+        assert!(
+            cookies
+                .iter()
+                .any(|c| c.contains("sid=") && c.contains("Max-Age=0"))
+        );
+        assert!(
+            cookies
+                .iter()
+                .any(|c| c.contains("csrf_token=") && c.contains("Max-Age=0"))
+        );
     }
 
     #[tokio::test]

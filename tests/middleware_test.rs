@@ -538,7 +538,10 @@ async fn test_cors_preflight_allows_csrf_token_header() {
         .uri("/auth/logout")
         .header(header::ORIGIN, "https://app.example.com")
         .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
-        .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "x-csrf-token, content-type")
+        .header(
+            header::ACCESS_CONTROL_REQUEST_HEADERS,
+            "x-csrf-token, content-type",
+        )
         .body(Body::empty())
         .unwrap();
 

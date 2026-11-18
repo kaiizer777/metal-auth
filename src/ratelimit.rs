@@ -164,7 +164,11 @@ impl RateLimiter {
     /// Return maximum remaining cooldown between IP and account keys.
     pub fn remaining_cooldown_dual(&self, ip: &str, account: &str) -> Option<u64> {
         let ip_key = format!("ip:{ip}");
-        let bounded_account = if account.len() > 255 { &account[..255] } else { account };
+        let bounded_account = if account.len() > 255 {
+            &account[..255]
+        } else {
+            account
+        };
         let acct_key = format!("account:{bounded_account}");
         self.remaining_cooldown_dual_key(&ip_key, &acct_key)
     }
@@ -202,7 +206,11 @@ impl RateLimiter {
         if !self.config.enabled {
             return Ok(());
         }
-        let bounded_account = if account.len() > 255 { &account[..255] } else { account };
+        let bounded_account = if account.len() > 255 {
+            &account[..255]
+        } else {
+            account
+        };
         let key = format!("account:{bounded_account}");
         self.check_internal(
             &key,
@@ -218,7 +226,11 @@ impl RateLimiter {
             return Ok(());
         }
         let ip_key = format!("ip:{ip}");
-        let bounded_account = if account.len() > 255 { &account[..255] } else { account };
+        let bounded_account = if account.len() > 255 {
+            &account[..255]
+        } else {
+            account
+        };
         let acct_key = format!("reset_account:{bounded_account}");
         self.check_dual_keys(&ip_key, &acct_key)
     }
@@ -226,7 +238,11 @@ impl RateLimiter {
     /// Evaluate dual-key rate limit: checks IP first, then account.
     pub fn check_dual(&self, ip: &str, account: &str) -> Result<(), AppError> {
         let ip_key = format!("ip:{ip}");
-        let bounded_account = if account.len() > 255 { &account[..255] } else { account };
+        let bounded_account = if account.len() > 255 {
+            &account[..255]
+        } else {
+            account
+        };
         let acct_key = format!("account:{bounded_account}");
         self.check_dual_keys(&ip_key, &acct_key)
     }
@@ -262,7 +278,11 @@ impl RateLimiter {
 
     /// Reset rate limit counter for an account only, leaving IP counters intact.
     pub fn reset_account(&self, account: &str) {
-        let bounded_account = if account.len() > 255 { &account[..255] } else { account };
+        let bounded_account = if account.len() > 255 {
+            &account[..255]
+        } else {
+            account
+        };
         let key = format!("account:{bounded_account}");
         self.reset(&key);
     }

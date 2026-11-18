@@ -468,7 +468,10 @@ mod tests {
         assert!(s.contains("SameSite=Strict"));
         assert!(s.contains("Path=/"));
         assert!(s.contains("Secure"));
-        assert!(!s.contains("HttpOnly"), "Clear CSRF cookie must not be HttpOnly");
+        assert!(
+            !s.contains("HttpOnly"),
+            "Clear CSRF cookie must not be HttpOnly"
+        );
 
         let cookie2 = clear_csrf_cookie(&cfg.session).expect("clear csrf cookie encodes");
         assert_eq!(cookie, cookie2);

@@ -169,6 +169,10 @@ impl OAuthProvider for GitHubProvider {
             .client
             .get(&self.user_url)
             .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header(
+                reqwest::header::USER_AGENT,
+                crate::oauth::provider::USER_AGENT,
+            )
             .bearer_auth(&tokens.access_token)
             .send()
             .await
@@ -192,6 +196,10 @@ impl OAuthProvider for GitHubProvider {
             .client
             .get(&self.emails_url)
             .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header(
+                reqwest::header::USER_AGENT,
+                crate::oauth::provider::USER_AGENT,
+            )
             .bearer_auth(&tokens.access_token)
             .send()
             .await
@@ -223,3 +231,327 @@ impl OAuthProvider for GitHubProvider {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn test_github_config() -> ProviderConfig {
+        ProviderConfig {
+            client_id: "github-id".to_string(),
+            client_secret: "github-secret".to_string(),
+            redirect_uri: "https://app.example.com/auth/github/callback".to_string(),
+            redirect_url: "https://app.example.com/auth/github/callback".to_string(),
+            scopes: vec![],
+            enabled: true,
+            team_id: None,
+            key_id: None,
+            private_key: None,
+        }
+    }
+
+    #[test]
+    fn test_github_auth_url_parameters() {
+        let p = GitHubProvider::new(&test_github_config(), reqwest::Client::new()).unwrap();
+        let auth_url = p.auth_url("state123", "challenge123");
+
+        let url = reqwest::Url::parse(&auth_url).expect("valid auth url");
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("github.com"));
+        assert_eq!(url.path(), "/login/oauth/authorize");
+
+        let q: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(q.get("client_id").map(|s| s.as_str()), Some("github-id"));
+        assert_eq!(
+            q.get("redirect_uri").map(|s| s.as_str()),
+            Some("https://app.example.com/auth/github/callback")
+        );
+        assert_eq!(
+            q.get("scope").map(|s| s.as_str()),
+            Some("read:user user:email")
+        );
+        assert_eq!(q.get("state").map(|s| s.as_str()), Some("state123"));
+        assert_eq!(
+            q.get("code_challenge").map(|s| s.as_str()),
+            Some("challenge123")
+        );
+        assert_eq!(
+            q.get("code_challenge_method").map(|s| s.as_str()),
+            Some("S256")
+        );
+
+        // Custom scopes override defaults
+        let mut custom_cfg = test_github_config();
+        custom_cfg.scopes = vec!["read:user".to_string()];
+        let p_custom = GitHubProvider::new(&custom_cfg, reqwest::Client::new()).unwrap();
+        let custom_url = reqwest::Url::parse(&p_custom.auth_url("s", "c")).unwrap();
+        let custom_q: HashMap<_, _> = custom_url.query_pairs().into_owned().collect();
+        assert_eq!(custom_q.get("scope").map(|s| s.as_str()), Some("read:user"));
+    }
+
+    #[test]
+    fn test_resolve_github_email_combinations() {
+        // 1. Primary and verified present
+        let emails1 = vec![
+            GitHubEmail {
+                email: "other@example.com".to_string(),
+                primary: false,
+                verified: true,
+            },
+            GitHubEmail {
+                email: "primary@example.com".to_string(),
+                primary: true,
+                verified: true,
+            },
+        ];
+        let (email, verified) = resolve_github_email(None, &emails1);
+        assert_eq!(email, "primary@example.com");
+        assert!(verified);
+
+        // 2. Public email matches a verified secondary email
+        let emails2 = vec![GitHubEmail {
+            email: "pub@example.com".to_string(),
+            primary: false,
+            verified: true,
+        }];
+        let (email, verified) = resolve_github_email(Some("pub@example.com"), &emails2);
+        assert_eq!(email, "pub@example.com");
+        assert!(verified);
+
+        // 3. Public email exists but is not verified
+        let emails3 = vec![GitHubEmail {
+            email: "pub@example.com".to_string(),
+            primary: false,
+            verified: false,
+        }];
+        let (email, verified) = resolve_github_email(Some("pub@example.com"), &emails3);
+        assert_eq!(email, "pub@example.com");
+        assert!(!verified);
+
+        // 4. No emails
+        let (email, verified) = resolve_github_email(None, &[]);
+        assert_eq!(email, "");
+        assert!(!verified);
+    }
+
+    #[tokio::test]
+    async fn test_github_exchange_and_userinfo_with_hidden_email() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/login/oauth/access_token"))
+            .and(header("Accept", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "gh-at-999",
+                "token_type": "bearer",
+                "scope": "read:user,user:email"
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/user"))
+            .and(header("Authorization", "Bearer gh-at-999"))
+            .and(header("User-Agent", "metal-auth"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 583231,
+                "login": "octocat",
+                "name": "The Octocat",
+                "avatar_url": "https://avatars.githubusercontent.com/u/583231",
+                "email": null
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/user/emails"))
+            .and(header("Authorization", "Bearer gh-at-999"))
+            .and(header("User-Agent", "metal-auth"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "email": "secondary@example.com",
+                    "primary": false,
+                    "verified": true,
+                    "visibility": null
+                },
+                {
+                    "email": "hidden-primary@example.com",
+                    "primary": true,
+                    "verified": true,
+                    "visibility": "private"
+                }
+            ])))
+            .mount(&server)
+            .await;
+
+        let token_endpoint = format!("{}/login/oauth/access_token", server.uri());
+        let user_endpoint = format!("{}/user", server.uri());
+        let emails_endpoint = format!("{}/user/emails", server.uri());
+
+        let p = GitHubProvider::with_endpoints(
+            &test_github_config(),
+            reqwest::Client::new(),
+            GITHUB_AUTH_ENDPOINT,
+            &token_endpoint,
+            &user_endpoint,
+            &emails_endpoint,
+        )
+        .unwrap();
+
+        let tok = p.exchange_code("gh_code", "gh_verifier").await.unwrap();
+        assert_eq!(tok.access_token, "gh-at-999");
+
+        let user = p.fetch_user_info(&tok).await.unwrap();
+        assert_eq!(user.provider_id, "github");
+        assert_eq!(user.provider_user_id, "583231");
+        assert_eq!(user.email, "hidden-primary@example.com");
+        assert!(user.email_verified);
+        assert_eq!(user.name.as_deref(), Some("The Octocat"));
+        assert_eq!(
+            user.avatar_url.as_deref(),
+            Some("https://avatars.githubusercontent.com/u/583231")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_github_name_fallback_and_unverified_email() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/user"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 100,
+                "login": "monalisa",
+                "name": "",
+                "email": null
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/user/emails"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "email": "unverified@example.com",
+                    "primary": true,
+                    "verified": false
+                }
+            ])))
+            .mount(&server)
+            .await;
+
+        let p = GitHubProvider::with_endpoints(
+            &test_github_config(),
+            reqwest::Client::new(),
+            GITHUB_AUTH_ENDPOINT,
+            format!("{}/token", server.uri()),
+            format!("{}/user", server.uri()),
+            format!("{}/user/emails", server.uri()),
+        )
+        .unwrap();
+
+        let tok = TokenResponse {
+            access_token: "token123".to_string(),
+            token_type: "bearer".to_string(),
+            refresh_token: None,
+            expires_in: None,
+            id_token: None,
+            raw: HashMap::new(),
+        };
+
+        let user = p.fetch_user_info(&tok).await.unwrap();
+        assert_eq!(user.name.as_deref(), Some("monalisa"));
+        assert_eq!(user.email, "");
+        assert!(!user.email_verified);
+    }
+
+    #[tokio::test]
+    async fn test_github_errors() {
+        let server = MockServer::start().await;
+
+        // 1. Invalid id in userinfo (id == 0)
+        Mock::given(method("GET"))
+            .and(path("/user-bad-id"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 0,
+                "login": "bad"
+            })))
+            .mount(&server)
+            .await;
+
+        let p_bad_id = GitHubProvider::with_endpoints(
+            &test_github_config(),
+            reqwest::Client::new(),
+            GITHUB_AUTH_ENDPOINT,
+            format!("{}/token", server.uri()),
+            format!("{}/user-bad-id", server.uri()),
+            format!("{}/emails", server.uri()),
+        )
+        .unwrap();
+
+        let tok = TokenResponse {
+            access_token: "token123".to_string(),
+            token_type: "bearer".to_string(),
+            refresh_token: None,
+            expires_in: None,
+            id_token: None,
+            raw: HashMap::new(),
+        };
+
+        let err = p_bad_id.fetch_user_info(&tok).await.unwrap_err();
+        assert!(matches!(err, AppError::OAuthProviderError));
+
+        // 2. User info 403
+        Mock::given(method("GET"))
+            .and(path("/user-403"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let p_403 = GitHubProvider::with_endpoints(
+            &test_github_config(),
+            reqwest::Client::new(),
+            GITHUB_AUTH_ENDPOINT,
+            format!("{}/token", server.uri()),
+            format!("{}/user-403", server.uri()),
+            format!("{}/emails", server.uri()),
+        )
+        .unwrap();
+
+        let err = p_403.fetch_user_info(&tok).await.unwrap_err();
+        assert!(matches!(err, AppError::OAuthProviderError));
+
+        // 3. Emails 500
+        Mock::given(method("GET"))
+            .and(path("/user-ok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 123,
+                "login": "ok"
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/emails-500"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let p_emails_err = GitHubProvider::with_endpoints(
+            &test_github_config(),
+            reqwest::Client::new(),
+            GITHUB_AUTH_ENDPOINT,
+            format!("{}/token", server.uri()),
+            format!("{}/user-ok", server.uri()),
+            format!("{}/emails-500", server.uri()),
+        )
+        .unwrap();
+
+        let err = p_emails_err.fetch_user_info(&tok).await.unwrap_err();
+        assert!(matches!(err, AppError::OAuthProviderError));
+    }
+}
+

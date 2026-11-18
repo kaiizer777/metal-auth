@@ -26,6 +26,8 @@ use crate::{
 /// host-only cookies cannot be read across origins by client JavaScript. Operators must
 /// configure `SESSION_COOKIE_DOMAIN` (e.g. `.example.com`) in [`crate::config::SessionConfig`]
 /// so that frontend JavaScript can read the `csrf_token` cookie and submit it in the `X-CSRF-Token` header.
+/// Additionally, `SESSION_COOKIE_PATH` must encompass both the frontend document application and the auth
+/// API routes (typically `/`) so browsers expose the cookie to frontend JavaScript.
 ///
 /// # Invariant: CSRF Cookie Removal on Invalidation
 /// CSRF token cookie expiration (`Set-Cookie: csrf_token=; Max-Age=0`) must strictly be associated

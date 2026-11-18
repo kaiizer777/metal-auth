@@ -1181,6 +1181,16 @@ async fn test_rate_limit_reset_on_success() {
         .await;
     assert_eq!(ok_resp.status(), StatusCode::OK);
 
+    // IP rate limit budget remains exhausted immediately following successful login
+    let diff_account_resp = app
+        .post_json_with_ip(
+            "/auth/login",
+            json!({ "email": "other_user@example.com", "password": "WrongPassword123!" }),
+            &client_ip,
+        )
+        .await;
+    assert_eq!(diff_account_resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
     // Reset IP rate limiter to isolate account-level rate limit reset verification
     app.state.rate_limiter.reset(&format!("ip:{client_ip}"));
 

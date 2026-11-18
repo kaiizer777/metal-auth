@@ -260,6 +260,12 @@ impl RateLimiter {
         self.config.login_cooldown_secs
     }
 
+    /// Return the current number of tracked rate limit keys.
+    #[must_use]
+    pub fn entry_count(&self) -> usize {
+        self.entry_count.load(Ordering::Acquire)
+    }
+
     /// Return remaining lockout duration in seconds (minimum 1s) if key is actively locked out.
     pub fn remaining_cooldown(&self, key: &str) -> Option<u64> {
         let entry = self.windows.get(key)?;
@@ -409,7 +415,7 @@ impl RateLimiter {
     /// Prune expired entries, bounded by `limit` total removals if specified.
     pub fn reclaim_expired_bounded(
         &self,
-        fallback_window: Duration,
+        _fallback_window: Duration,
         now: Instant,
         limit: Option<usize>,
     ) -> usize {
@@ -427,11 +433,7 @@ impl RateLimiter {
                 entry.locked_until = None;
                 entry.attempts.clear();
             }
-            let win = if entry.window.is_zero() {
-                fallback_window
-            } else {
-                entry.window
-            };
+            let win = entry.window;
             entry.attempts.retain(|&t| now.duration_since(t) < win);
             if entry.attempts.is_empty() {
                 removed += 1;
@@ -876,7 +878,7 @@ mod tests {
     #[test]
     fn test_rate_limit_unicode_email_does_not_panic() {
         let limiter = RateLimiter::new();
-        let unicode_email = format!("{}🦀@example.com", "u".repeat(250));
+        let unicode_email = format!("{}\u{1F980}@example.com", "u".repeat(254));
         assert!(limiter.check_account(&unicode_email).is_ok());
         assert!(limiter.check_dual("127.0.0.1", &unicode_email).is_ok());
         assert!(
@@ -914,22 +916,20 @@ mod tests {
 
     #[test]
     fn test_retry_after_fractional_ceiling() {
-        let config = RateLimitConfig {
-            enabled: true,
-            max_attempts: 1,
-            window_secs: 60,
-            login_cooldown_secs: 5,
+        let now = Instant::now();
+        let mut entry = WindowEntry {
+            attempts: Vec::new(),
+            locked_until: Some(now + Duration::from_millis(1800)),
+            window: Duration::from_secs(60),
         };
-        let limiter = RateLimiter::with_config(config);
-        assert!(limiter.check_rate_limit("cd").is_ok());
-        assert!(limiter.check_ip("10.0.0.1").is_ok());
-        let rej = limiter.check_ip("10.0.0.1").unwrap_err();
-        match rej {
-            RateLimitRejection::Lockout(secs) => {
-                assert!((4..=5).contains(&secs));
-            }
-            _ => panic!("expected lockout"),
-        }
+        let rej = RateLimiter::evaluate_entry(
+            &mut entry,
+            now,
+            5,
+            Duration::from_secs(60),
+            Some(Duration::from_secs(5)),
+        );
+        assert_eq!(rej.unwrap_err(), RateLimitRejection::Lockout(2));
     }
 
     #[test]
@@ -957,8 +957,16 @@ mod tests {
         let res2 = limiter.check_dual("192.0.2.2", "another@example.com");
         assert_eq!(res2.unwrap_err(), RateLimitRejection::CapacityExhausted);
 
-        // 192.0.2.2 still exists in the map
+        // 192.0.2.2 still exists in the map and the provisional attempt was popped
         assert!(limiter.windows.contains_key("ip:192.0.2.2"));
+        assert_eq!(limiter.windows.get("ip:192.0.2.2").unwrap().attempts.len(), 1);
+    }
+
+    #[test]
+    fn test_reclaim_preserves_explicit_duration_zero() {
+        let limiter = RateLimiter::with_config_and_capacity(RateLimitConfig::default(), 1);
+        assert!(limiter.allow("a", 1, Duration::ZERO));
+        assert!(limiter.allow("b", 1, Duration::ZERO));
     }
 
     #[test]

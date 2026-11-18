@@ -208,6 +208,10 @@ pub async fn signup(
         Err(e) => return json_rejection_response(e),
     };
 
+    if let Err(e) = req.validate(&state.service.config) {
+        return service_error_response(e);
+    }
+
     let client_ip = extract_client_ip(&headers);
     let normalized_email = req.email.trim().to_lowercase();
 
@@ -223,10 +227,6 @@ pub async fn signup(
                 return rate_limit_response(rejection);
             }
         }
-    }
-
-    if let Err(e) = req.validate(&state.service.config) {
-        return service_error_response(e);
     }
 
     match state.service.signup(&req.email, &req.password).await {
@@ -478,6 +478,10 @@ pub async fn request_password_reset(
         Err(e) => return json_rejection_response(e),
     };
 
+    if let Err(e) = req.validate() {
+        return service_error_response(e);
+    }
+
     let client_ip = extract_client_ip(&headers);
     let normalized_email = req.email.trim().to_lowercase();
 
@@ -493,10 +497,6 @@ pub async fn request_password_reset(
                 return rate_limit_response(rejection);
             }
         }
-    }
-
-    if let Err(e) = req.validate() {
-        return service_error_response(e);
     }
 
     let user_agent = headers
@@ -1003,5 +1003,36 @@ mod tests {
         let body = to_bytes(post_resp.into_body(), 1024).await.unwrap();
         let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(err.code, ErrorCode::CsrfTokenMissing);
+    }
+
+    #[tokio::test]
+    async fn signup_validation_runs_before_rate_limiter() {
+        let mut state = create_test_state();
+        let limiter = Arc::new(RateLimiter::new());
+        state.rate_limiter = Some(Arc::clone(&limiter));
+
+        let payload = SignupRequest {
+            email: "valid@example.com".to_string(),
+            password: "short".to_string(),
+        };
+
+        let resp = signup(State(state), HeaderMap::new(), Ok(Json(payload))).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(limiter.entry_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn request_password_reset_validation_runs_before_rate_limiter() {
+        let mut state = create_test_state();
+        let limiter = Arc::new(RateLimiter::new());
+        state.rate_limiter = Some(Arc::clone(&limiter));
+
+        let payload = PasswordResetRequest {
+            email: "invalid-email".to_string(),
+        };
+
+        let resp = request_password_reset(State(state), HeaderMap::new(), Ok(Json(payload))).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(limiter.entry_count(), 0);
     }
 }

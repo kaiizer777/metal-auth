@@ -791,8 +791,14 @@ pub struct SessionConfig {
     /// In split-host or cross-subdomain architectures (e.g. frontend on `app.example.com` calling
     /// an API on `api.example.com`), configure `SESSION_COOKIE_DOMAIN` (e.g. `.example.com`) so that
     /// client-side JavaScript can read the `csrf_token` cookie for Double Submit Cookie verification.
+    ///
+    /// The `csrf_token` cookie uses `SESSION_COOKIE_PATH`. Browsers expose it to frontend JavaScript
+    /// only when the frontend document path matches that cookie path. Keep `SESSION_COOKIE_PATH` at
+    /// `/` (the default) for this setup.
     #[serde(default)]
     pub cookie_domain: Option<String>,
+    /// Cookie path for session and CSRF cookies. Must match the frontend document root (typically `/`)
+    /// so CSRF double-submit cookies are accessible to the browser client.
     #[serde(default = "default_cookie_path")]
     pub cookie_path: String,
     #[serde(default = "default_cookie_same_site")]

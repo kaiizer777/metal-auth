@@ -548,20 +548,36 @@ async fn test_cors_preflight_allows_csrf_token_header() {
     let resp = app.oneshot(req).await.unwrap();
     assert!(resp.status().is_success() || resp.status() == StatusCode::NO_CONTENT);
 
-    let allow_headers = resp
-        .headers()
+    let h = resp.headers();
+    assert_eq!(
+        h.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+        "https://app.example.com"
+    );
+    assert_eq!(
+        h.get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS).unwrap(),
+        "true"
+    );
+
+    let allow_headers_raw = h
         .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
         .expect("access-control-allow-headers present")
         .to_str()
-        .unwrap()
-        .to_lowercase();
+        .unwrap();
+
+    let allowed: Vec<String> = allow_headers_raw
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .collect();
 
     assert!(
-        allow_headers.contains("x-csrf-token"),
+        allowed.iter().any(|h| h == "x-csrf-token"),
         "allowed headers must include x-csrf-token"
     );
+    assert!(
+        allowed.iter().any(|h| h == "content-type"),
+        "allowed headers must include content-type"
+    );
 
-    let h = resp.headers();
     assert_eq!(
         h.get(header::STRICT_TRANSPORT_SECURITY).unwrap(),
         "max-age=63072000; includeSubDomains; preload"
@@ -579,4 +595,51 @@ async fn test_cors_preflight_allows_csrf_token_header() {
 
     assert!(h.get(header::CACHE_CONTROL).is_none());
     assert!(h.get(header::PRAGMA).is_none());
+}
+
+#[tokio::test]
+async fn test_exact_path_segment_matching_in_security_headers() {
+    let state = dummy_app_state();
+    let app = metal_auth::handler::create_router(state).expect("create_router");
+
+    let req_non_auth = Request::builder()
+        .method(Method::GET)
+        .uri("/authors")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp_non_auth = app.clone().oneshot(req_non_auth).await.unwrap();
+    let h_non_auth = resp_non_auth.headers();
+    assert_eq!(
+        h_non_auth.get(header::STRICT_TRANSPORT_SECURITY).unwrap(),
+        "max-age=63072000; includeSubDomains; preload"
+    );
+    assert!(
+        h_non_auth.get(header::CACHE_CONTROL).is_none(),
+        "/authors must not receive Cache-Control: no-store"
+    );
+    assert!(
+        h_non_auth.get(header::PRAGMA).is_none(),
+        "/authors must not receive Pragma: no-cache"
+    );
+
+    let req_auth = Request::builder()
+        .method(Method::POST)
+        .uri("/auth/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+
+    let resp_auth = app.oneshot(req_auth).await.unwrap();
+    let h_auth = resp_auth.headers();
+    assert_eq!(
+        h_auth.get(header::CACHE_CONTROL).unwrap(),
+        "no-store",
+        "/auth/login must receive Cache-Control: no-store"
+    );
+    assert_eq!(
+        h_auth.get(header::PRAGMA).unwrap(),
+        "no-cache",
+        "/auth/login must receive Pragma: no-cache"
+    );
 }

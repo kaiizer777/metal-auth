@@ -167,18 +167,14 @@ impl std::fmt::Debug for EmailOutbox {
     }
 }
 
-/// External federated identity linked to a user.
+/// Domain model for an external federated identity linked to a user.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, FromRow)]
 pub struct OAuthAccount {
     pub id: Uuid,
     pub user_id: Uuid,
     pub provider_id: String,
     pub provider_user_id: String,
-    pub email: Option<String>,
-    pub email_verified: bool,
-    pub access_token: Option<String>,
-    pub refresh_token: Option<String>,
-    pub token_expires_at: Option<DateTime<Utc>>,
+    pub email: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -310,19 +306,14 @@ mod tests {
             user_id,
             provider_id: "google".to_string(),
             provider_user_id: "google-123".to_string(),
-            email: Some("user@example.com".to_string()),
-            email_verified: true,
-            access_token: Some("secret_access".to_string()),
-            refresh_token: Some("secret_refresh".to_string()),
-            token_expires_at: Some(now),
+            email: "user@example.com".to_string(),
             created_at: now,
             updated_at: now,
         };
 
         assert_eq!(account.provider_id, "google");
         assert_eq!(account.provider_user_id, "google-123");
-        assert_eq!(account.email.as_deref(), Some("user@example.com"));
-        assert!(account.email_verified);
+        assert_eq!(account.email, "user@example.com");
 
         let json = serde_json::to_string(&account).expect("serialize oauth account");
         let deserialized: OAuthAccount =

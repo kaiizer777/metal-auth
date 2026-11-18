@@ -10,5 +10,11 @@
 //! - External token exchange, profile mapping, and account linking against [`User`](crate::User).
 //!
 pub mod pkce;
+pub mod state;
 
 pub use pkce::{PKCEChallenge, compute_challenge, generate_pkce, verify_pkce};
+pub use state::{
+    OAuthStatePayload, build_clear_state_cookie, build_clear_state_cookie_header,
+    build_state_cookie, build_state_cookie_header, create_state_cookie_value, extract_state_cookie,
+    generate_state_token, validate_state,
+};

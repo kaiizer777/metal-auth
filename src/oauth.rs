@@ -21,7 +21,7 @@ pub use provider::{
     TokenResponse, UserInfo, build_oauth_http_client, create_provider,
 };
 pub use state::{
-    OAuthStatePayload, build_clear_state_cookie, build_clear_state_cookie_header,
-    build_state_cookie, build_state_cookie_header, create_state_cookie_value, extract_state_cookie,
-    generate_state_token, validate_state,
+    OAuthStateManager, OAuthStatePayload, build_clear_state_cookie,
+    build_clear_state_cookie_header, build_state_cookie, build_state_cookie_header,
+    create_state_cookie_value, extract_state_cookie, generate_state_token, validate_state,
 };

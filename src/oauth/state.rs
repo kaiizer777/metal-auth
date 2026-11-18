@@ -178,6 +178,96 @@ pub fn extract_state_cookie<'a>(headers: &'a HeaderMap, cookie_name: &str) -> Op
     None
 }
 
+/// State manager bundling OAuth state configuration and helper methods.
+#[derive(Debug, Clone)]
+pub struct OAuthStateManager {
+    pub cookie_name: String,
+    pub cookie_path: String,
+    pub state_ttl: std::time::Duration,
+    pub state_secret: String,
+    pub cookie_secure: bool,
+}
+
+impl OAuthStateManager {
+    #[must_use]
+    pub fn new(cfg: &crate::config::OAuthConfig, cookie_secure: bool) -> Self {
+        Self {
+            cookie_name: cfg.state_cookie_name.clone(),
+            cookie_path: cfg.state_cookie_path.clone(),
+            state_ttl: cfg.state_ttl,
+            state_secret: cfg.state_secret.clone(),
+            cookie_secure,
+        }
+    }
+
+    pub fn create_state(
+        &self,
+        provider_id: &str,
+        code_verifier: &str,
+        redirect_url: Option<String>,
+    ) -> Result<(String, String), AppError> {
+        let token = generate_state_token();
+        let expires_at = Utc::now()
+            + chrono::Duration::from_std(self.state_ttl)
+                .unwrap_or_else(|_| chrono::Duration::minutes(10));
+        let payload = OAuthStatePayload {
+            token: token.clone(),
+            provider_id: provider_id.to_string(),
+            code_verifier: code_verifier.to_string(),
+            redirect_url,
+            expires_at,
+        };
+        let cookie_val = create_state_cookie_value(&payload, self.state_secret.as_bytes())?;
+        let set_cookie_str = build_state_cookie(
+            &self.cookie_name,
+            &cookie_val,
+            &self.cookie_path,
+            self.state_ttl.as_secs(),
+            self.cookie_secure,
+        );
+        Ok((token, set_cookie_str))
+    }
+
+    pub fn validate(
+        &self,
+        cookie_header: &str,
+        state_param: &str,
+        provider_id: &str,
+    ) -> Result<OAuthStatePayload, AppError> {
+        let cookie_val = if cookie_header.contains('=') {
+            cookie_header
+                .split(';')
+                .find_map(|pair| {
+                    let (name, val) = pair.trim().split_once('=')?;
+                    if name == self.cookie_name {
+                        Some(val)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(cookie_header)
+        } else {
+            cookie_header
+        };
+
+        validate_state(
+            cookie_val,
+            state_param,
+            provider_id,
+            self.state_secret.as_bytes(),
+        )
+    }
+
+    #[must_use]
+    pub fn build_clear_cookie(&self) -> String {
+        build_clear_state_cookie(&self.cookie_name, &self.cookie_path, self.cookie_secure)
+    }
+
+    pub fn build_clear_cookie_header(&self) -> Result<HeaderValue, AppError> {
+        build_clear_state_cookie_header(&self.cookie_name, &self.cookie_path, self.cookie_secure)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,5 +414,28 @@ mod tests {
         let extracted = extract_state_cookie(&headers, "oauth_state");
         assert_eq!(extracted, Some("val123"));
         assert_eq!(extract_state_cookie(&headers, "nonexistent"), None);
+    }
+
+    #[test]
+    fn test_oauth_state_manager_lifecycle() {
+        let mut cfg = crate::config::OAuthConfig::default();
+        cfg.state_secret = "01234567890123456789012345678901".to_string();
+        let mgr = OAuthStateManager::new(&cfg, false);
+
+        let (state_token, set_cookie) = mgr
+            .create_state("google", "pkce_verifier_val", Some("/profile".to_string()))
+            .expect("create state");
+        assert!(set_cookie.contains("oauth_state="));
+
+        // Validate using full Cookie header string
+        let payload = mgr
+            .validate(&set_cookie, &state_token, "google")
+            .expect("validate state");
+        assert_eq!(payload.provider_id, "google");
+        assert_eq!(payload.code_verifier, "pkce_verifier_val");
+        assert_eq!(payload.redirect_url, Some("/profile".to_string()));
+
+        let clear_cookie = mgr.build_clear_cookie();
+        assert!(clear_cookie.contains("Max-Age=0"));
     }
 }

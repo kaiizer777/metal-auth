@@ -23,11 +23,14 @@ use crate::{
     config::Config,
     error::{AppError, ErrorCode, ErrorResponse},
     handler::untrusted_client_ip,
-    ratelimit::RateLimiter,
+    ratelimit::{RateLimitRejection, RateLimiter},
     session::{
         SessionService,
         bearer::read_bearer_token,
-        cookie::{clear_session_cookie, read_session_cookie, set_csrf_cookie, set_session_cookie},
+        cookie::{
+            clear_csrf_cookie, clear_session_cookie, read_session_cookie, set_csrf_cookie,
+            set_session_cookie,
+        },
     },
     state::AppState,
 };
@@ -178,22 +181,11 @@ fn extract_client_ip(headers: &HeaderMap) -> String {
         .to_string()
 }
 
-/// Construct HTTP 429 response with dynamic Retry-After header derived from remaining cooldown.
-/// Omitted if rejection occurred due to capacity saturation rather than an active lockout.
-fn rate_limit_response(
-    err: AppError,
-    limiter: &RateLimiter,
-    ip: Option<&str>,
-    account_key: Option<&str>,
-) -> Response {
-    let mut resp = service_error_response(err);
-    let cooldown = match (ip, account_key) {
-        (Some(ip), Some(acct)) => limiter.remaining_cooldown_dual_key(&format!("ip:{ip}"), acct),
-        (Some(ip), None) => limiter.remaining_cooldown(&format!("ip:{ip}")),
-        (None, Some(acct)) => limiter.remaining_cooldown(acct),
-        (None, None) => None,
-    };
-    if let Some(secs) = cooldown
+/// Construct HTTP 429 response with dynamic Retry-After header derived from rejection reason.
+/// Omitted if rejection occurred due to capacity saturation or attempt limit without lockout.
+fn rate_limit_response(rejection: RateLimitRejection) -> Response {
+    let mut resp = service_error_response(AppError::RateLimitExceeded);
+    if let Some(secs) = rejection.retry_after()
         && let Ok(val) = header::HeaderValue::from_str(&secs.to_string())
     {
         resp.headers_mut().insert(header::RETRY_AFTER, val);
@@ -218,27 +210,17 @@ pub async fn signup(
 
     let client_ip = extract_client_ip(&headers);
     let normalized_email = req.email.trim().to_lowercase();
-    let email_key = if normalized_email.len() > 255 {
-        &normalized_email[..255]
-    } else {
-        &normalized_email
-    };
 
     if let Some(limiter) = &state.rate_limiter {
-        match limiter.check_dual(&client_ip, email_key) {
+        match limiter.check_dual(&client_ip, &normalized_email) {
             Ok(()) => {}
-            Err(e) => {
+            Err(rejection) => {
                 tracing::warn!(
                     event = "rate_limit_exceeded",
                     ip = %client_ip,
                     key_prefix = "signup",
                 );
-                return rate_limit_response(
-                    e,
-                    limiter,
-                    Some(&client_ip),
-                    Some(&format!("account:{email_key}")),
-                );
+                return rate_limit_response(rejection);
             }
         }
     }
@@ -288,28 +270,18 @@ pub async fn login(
         .map(str::to_string);
 
     let normalized_email = req.email.trim().to_lowercase();
-    let email_key = if normalized_email.len() > 255 {
-        &normalized_email[..255]
-    } else {
-        &normalized_email
-    };
 
     // Pre-credential rate limit check prevents account existence timing oracles
     if let Some(limiter) = &state.rate_limiter {
-        match limiter.check_dual(&client_ip, email_key) {
+        match limiter.check_dual(&client_ip, &normalized_email) {
             Ok(()) => {}
-            Err(e) => {
+            Err(rejection) => {
                 tracing::warn!(
                     event = "rate_limit_exceeded",
                     ip = %client_ip,
                     key_prefix = "login",
                 );
-                return rate_limit_response(
-                    e,
-                    limiter,
-                    Some(&client_ip),
-                    Some(&format!("account:{email_key}")),
-                );
+                return rate_limit_response(rejection);
             }
         }
     }
@@ -393,29 +365,6 @@ pub async fn login(
     }
 }
 
-fn clear_csrf_cookie(
-    sc: &impl crate::session::cookie::SessionCookieSource,
-) -> Result<header::HeaderValue, AppError> {
-    let mut parts = vec![
-        "csrf_token=".to_string(),
-        "Max-Age=0".to_string(),
-        "Expires=Thu, 01 Jan 1970 00:00:00 GMT".to_string(),
-        format!("Path={}", sc.cookie_path()),
-        "SameSite=Strict".to_string(),
-    ];
-    if sc.cookie_secure() {
-        parts.push("Secure".to_string());
-    }
-    if let Some(domain) = sc.cookie_domain() {
-        parts.push(format!("Domain={}", domain));
-    }
-
-    header::HeaderValue::from_str(&parts.join("; ")).map_err(|_| {
-        tracing::error!(event = "cookie_build_failed", kind = "csrf_clear");
-        AppError::Internal
-    })
-}
-
 /// POST /auth/logout
 ///
 /// Revokes session on server side and clears the session cookie.
@@ -441,17 +390,19 @@ pub async fn logout(State(state): State<AuthHandlerState>, headers: HeaderMap) -
     let raw_id_opt =
         read_session_cookie(&headers, cookie_name).or_else(|| read_bearer_token(&headers));
 
-    if let Some(ref raw_id) = raw_id_opt {
-        if let Some(ref session_svc) = state.session_service {
-            match session_svc.invalidate_session(raw_id).await {
-                Ok(()) => {}
-                Err(e) => return service_error_response(e),
-            }
+    let Some(ref raw_id) = raw_id_opt else {
+        // Unauthenticated logout: return 204 without revoking credentials or clearing cookies.
+        // Emitting Set-Cookie on unauthenticated requests enables cross-site cookie deletion attacks.
+        return StatusCode::NO_CONTENT.into_response();
+    };
+
+    if let Some(ref session_svc) = state.session_service {
+        match session_svc.invalidate_session(raw_id).await {
+            Ok(()) => {}
+            Err(e) => return service_error_response(e),
         }
-        if let Err(e) = state.service.logout(raw_id).await {
-            return service_error_response(e);
-        }
-    } else if let Err(e) = state.service.logout("").await {
+    }
+    if let Err(e) = state.service.logout(raw_id).await {
         return service_error_response(e);
     }
 
@@ -488,13 +439,13 @@ pub async fn verify_email(
     if let Some(limiter) = &state.rate_limiter {
         match limiter.check_ip(&client_ip) {
             Ok(()) => {}
-            Err(e) => {
+            Err(rejection) => {
                 tracing::warn!(
                     event = "rate_limit_exceeded",
                     ip = %client_ip,
                     key_prefix = "verify",
                 );
-                return rate_limit_response(e, limiter, Some(&client_ip), None);
+                return rate_limit_response(rejection);
             }
         }
     }
@@ -529,27 +480,17 @@ pub async fn request_password_reset(
 
     let client_ip = extract_client_ip(&headers);
     let normalized_email = req.email.trim().to_lowercase();
-    let email_key = if normalized_email.len() > 255 {
-        &normalized_email[..255]
-    } else {
-        &normalized_email
-    };
 
     if let Some(limiter) = &state.rate_limiter {
-        match limiter.check_password_reset(&client_ip, email_key) {
+        match limiter.check_password_reset(&client_ip, &normalized_email) {
             Ok(()) => {}
-            Err(e) => {
+            Err(rejection) => {
                 tracing::warn!(
                     event = "rate_limit_exceeded",
                     ip = %client_ip,
                     key_prefix = "password_reset_request",
                 );
-                return rate_limit_response(
-                    e,
-                    limiter,
-                    Some(&client_ip),
-                    Some(&format!("reset_account:{email_key}")),
-                );
+                return rate_limit_response(rejection);
             }
         }
     }
@@ -594,13 +535,13 @@ pub async fn reset_password(
     if let Some(limiter) = &state.rate_limiter {
         match limiter.check_ip(&client_ip) {
             Ok(()) => {}
-            Err(e) => {
+            Err(rejection) => {
                 tracing::warn!(
                     event = "rate_limit_exceeded",
                     ip = %client_ip,
                     key_prefix = "password_reset",
                 );
-                return rate_limit_response(e, limiter, Some(&client_ip), None);
+                return rate_limit_response(rejection);
             }
         }
     }
@@ -986,7 +927,9 @@ mod tests {
         let config = Config::default();
         state.config = Some(Arc::new(config));
 
-        let resp = logout(State(state), HeaderMap::new()).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, "sid=mock_session_id".parse().unwrap());
+        let resp = logout(State(state), headers).await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
         let cookies: Vec<_> = resp
@@ -1010,9 +953,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn logout_unauthenticated_does_not_clear_cookies() {
+        let mut state = create_test_state();
+        let config = Config::default();
+        state.config = Some(Arc::new(config));
+
+        let resp = logout(State(state), HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(!resp.headers().contains_key(header::SET_COOKIE));
+    }
+
+    #[tokio::test]
     async fn logout_unsupported_methods_return_405() {
         use tower::ServiceExt;
-        let app = routes(create_test_state().service);
+        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/test").unwrap();
+        let app_state = AppState::with_configs_and_dispatcher(
+            pool,
+            Config::default(),
+            Arc::new(AppConfig::default()),
+            None,
+        )
+        .expect("valid test AppState");
+        let app = routes_with_app_state(app_state);
+
         for method in [
             axum::http::Method::PUT,
             axum::http::Method::DELETE,
@@ -1021,11 +984,24 @@ mod tests {
             let req = axum::http::Request::builder()
                 .method(method)
                 .uri("/logout")
+                .header(header::COOKIE, "sid=mock_session_id")
                 .body(axum::body::Body::empty())
                 .unwrap();
             let resp = app.clone().oneshot(req).await.unwrap();
             assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
             assert_eq!(resp.headers().get(header::ALLOW).unwrap(), "POST");
         }
+
+        let post_req = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/logout")
+            .header(header::COOKIE, "sid=mock_session_id")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let post_resp = app.oneshot(post_req).await.unwrap();
+        assert_eq!(post_resp.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(post_resp.into_body(), 1024).await.unwrap();
+        let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err.code, ErrorCode::CsrfTokenMissing);
     }
 }

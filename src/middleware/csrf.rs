@@ -292,8 +292,8 @@ mod tests {
         let req = Request::builder()
             .method(Method::POST)
             .uri("/test")
-            .header("cookie", "csrf_token=token_aaa")
-            .header("x-csrf-token", "token_bbb")
+            .header("cookie", "csrf_token=0123456789abcdef0123456789abcdef")
+            .header("x-csrf-token", "fedcba9876543210fedcba9876543210")
             .body(Body::empty())
             .unwrap();
 

@@ -42,6 +42,19 @@ pub enum ErrorCode {
     CsrfTokenMissing,
     CsrfTokenInvalid,
     RateLimitExceeded,
+    // Phase 6 — OAuth / Social Login
+    #[serde(rename = "OAUTH_STATE_INVALID")]
+    OAuthStateInvalid,
+    #[serde(rename = "OAUTH_CODE_INVALID")]
+    OAuthCodeInvalid,
+    #[serde(rename = "OAUTH_EMAIL_UNVERIFIED")]
+    OAuthEmailUnverified,
+    #[serde(rename = "OAUTH_PROVIDER_ERROR")]
+    OAuthProviderError,
+    #[serde(rename = "OAUTH_ACCOUNT_LINK_CONFLICT")]
+    OAuthAccountLinkConflict,
+    #[serde(rename = "OAUTH_PROVIDER_NOT_FOUND")]
+    OAuthProviderNotFound,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,6 +196,25 @@ pub enum AppError {
 
     #[error("rate limit exceeded")]
     RateLimitExceeded,
+
+    // Phase 6 — OAuth / Social Login
+    #[error("invalid oauth state")]
+    OAuthStateInvalid,
+
+    #[error("oauth code is invalid")]
+    OAuthCodeInvalid,
+
+    #[error("oauth provider email is not verified")]
+    OAuthEmailUnverified,
+
+    #[error("oauth provider error")]
+    OAuthProviderError,
+
+    #[error("cannot link oauth identity to unverified local account")]
+    OAuthAccountLinkConflict,
+
+    #[error("oauth provider not found")]
+    OAuthProviderNotFound,
 }
 
 impl AppError {
@@ -218,7 +250,19 @@ impl AppError {
             Self::CsrfTokenMissing => ErrorCode::CsrfTokenMissing,
             Self::CsrfTokenInvalid => ErrorCode::CsrfTokenInvalid,
             Self::RateLimitExceeded => ErrorCode::RateLimitExceeded,
+            // Phase 6
+            Self::OAuthStateInvalid => ErrorCode::OAuthStateInvalid,
+            Self::OAuthCodeInvalid => ErrorCode::OAuthCodeInvalid,
+            Self::OAuthEmailUnverified => ErrorCode::OAuthEmailUnverified,
+            Self::OAuthProviderError => ErrorCode::OAuthProviderError,
+            Self::OAuthAccountLinkConflict => ErrorCode::OAuthAccountLinkConflict,
+            Self::OAuthProviderNotFound => ErrorCode::OAuthProviderNotFound,
         }
+    }
+
+    #[must_use]
+    pub fn code(&self) -> ErrorCode {
+        self.error_code()
     }
 
     #[must_use]
@@ -242,9 +286,16 @@ impl AppError {
             | Self::SessionExpired
             | Self::SessionInvalid => StatusCode::UNAUTHORIZED,
             // 403
-            Self::EmailNotVerified | Self::CsrfTokenMissing | Self::CsrfTokenInvalid => {
-                StatusCode::FORBIDDEN
-            }
+            Self::EmailNotVerified
+            | Self::CsrfTokenMissing
+            | Self::CsrfTokenInvalid
+            | Self::OAuthStateInvalid => StatusCode::FORBIDDEN,
+            // 404
+            Self::OAuthProviderNotFound => StatusCode::NOT_FOUND,
+            // 409
+            Self::OAuthAccountLinkConflict => StatusCode::CONFLICT,
+            // 502
+            Self::OAuthProviderError => StatusCode::BAD_GATEWAY,
             // 429
             Self::RateLimitExceeded => StatusCode::TOO_MANY_REQUESTS,
             // 400
@@ -254,7 +305,9 @@ impl AppError {
             | Self::InvalidEmail
             | Self::ValidationError(_)
             | Self::InvalidToken
-            | Self::TokenExpired => StatusCode::BAD_REQUEST,
+            | Self::TokenExpired
+            | Self::OAuthCodeInvalid
+            | Self::OAuthEmailUnverified => StatusCode::BAD_REQUEST,
         }
     }
 
@@ -290,6 +343,15 @@ impl AppError {
             Self::CsrfTokenMissing => "CSRF token is missing",
             Self::CsrfTokenInvalid => "CSRF token is invalid",
             Self::RateLimitExceeded => "Too many requests, please try again later",
+            // Phase 6
+            Self::OAuthStateInvalid => "invalid oauth state",
+            Self::OAuthCodeInvalid => "oauth code is invalid",
+            Self::OAuthEmailUnverified => "oauth provider email is not verified",
+            Self::OAuthProviderNotFound => "oauth provider not found",
+            Self::OAuthAccountLinkConflict => {
+                "cannot link oauth identity to unverified local account"
+            }
+            Self::OAuthProviderError => "oauth provider error",
         }
     }
 
@@ -330,6 +392,13 @@ impl AppError {
             ErrorCode::CsrfTokenMissing => Self::CsrfTokenMissing,
             ErrorCode::CsrfTokenInvalid => Self::CsrfTokenInvalid,
             ErrorCode::RateLimitExceeded => Self::RateLimitExceeded,
+            // Phase 6
+            ErrorCode::OAuthStateInvalid => Self::OAuthStateInvalid,
+            ErrorCode::OAuthCodeInvalid => Self::OAuthCodeInvalid,
+            ErrorCode::OAuthEmailUnverified => Self::OAuthEmailUnverified,
+            ErrorCode::OAuthProviderError => Self::OAuthProviderError,
+            ErrorCode::OAuthAccountLinkConflict => Self::OAuthAccountLinkConflict,
+            ErrorCode::OAuthProviderNotFound => Self::OAuthProviderNotFound,
         }
     }
 
@@ -388,6 +457,13 @@ impl IntoResponse for AppError {
                 tracing::debug!("csrf validation failure")
             }
             Self::RateLimitExceeded => tracing::warn!("rate limit exceeded"),
+            // Phase 6
+            Self::OAuthStateInvalid => tracing::warn!("oauth state validation failed"),
+            Self::OAuthCodeInvalid => tracing::warn!("oauth code invalid"),
+            Self::OAuthEmailUnverified => tracing::warn!("oauth email unverified"),
+            Self::OAuthProviderError => tracing::error!("oauth provider error"),
+            Self::OAuthAccountLinkConflict => tracing::warn!("oauth account link conflict"),
+            Self::OAuthProviderNotFound => tracing::debug!("oauth provider not found"),
         }
 
         let status = self.status_code();
@@ -448,6 +524,26 @@ mod tests {
             (ErrorCode::ValidationError, "\"VALIDATION_ERROR\""),
             (ErrorCode::InvalidToken, "\"INVALID_TOKEN\""),
             (ErrorCode::TokenExpired, "\"TOKEN_EXPIRED\""),
+            // Phase 4
+            (ErrorCode::SessionNotFound, "\"SESSION_NOT_FOUND\""),
+            (ErrorCode::SessionExpired, "\"SESSION_EXPIRED\""),
+            (ErrorCode::SessionInvalid, "\"SESSION_INVALID\""),
+            (ErrorCode::CsrfTokenMissing, "\"CSRF_TOKEN_MISSING\""),
+            (ErrorCode::CsrfTokenInvalid, "\"CSRF_TOKEN_INVALID\""),
+            (ErrorCode::RateLimitExceeded, "\"RATE_LIMIT_EXCEEDED\""),
+            // Phase 6
+            (ErrorCode::OAuthStateInvalid, "\"OAUTH_STATE_INVALID\""),
+            (ErrorCode::OAuthCodeInvalid, "\"OAUTH_CODE_INVALID\""),
+            (ErrorCode::OAuthEmailUnverified, "\"OAUTH_EMAIL_UNVERIFIED\""),
+            (ErrorCode::OAuthProviderError, "\"OAUTH_PROVIDER_ERROR\""),
+            (
+                ErrorCode::OAuthAccountLinkConflict,
+                "\"OAUTH_ACCOUNT_LINK_CONFLICT\"",
+            ),
+            (
+                ErrorCode::OAuthProviderNotFound,
+                "\"OAUTH_PROVIDER_NOT_FOUND\"",
+            ),
         ];
 
         for (code, expected_json) in cases {
@@ -656,6 +752,43 @@ mod tests {
                 ErrorCode::RateLimitExceeded,
                 "Too many requests, please try again later",
             ),
+            // Phase 6 — OAuth
+            (
+                AppError::OAuthStateInvalid,
+                StatusCode::FORBIDDEN,
+                ErrorCode::OAuthStateInvalid,
+                "invalid oauth state",
+            ),
+            (
+                AppError::OAuthCodeInvalid,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::OAuthCodeInvalid,
+                "oauth code is invalid",
+            ),
+            (
+                AppError::OAuthEmailUnverified,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::OAuthEmailUnverified,
+                "oauth provider email is not verified",
+            ),
+            (
+                AppError::OAuthProviderNotFound,
+                StatusCode::NOT_FOUND,
+                ErrorCode::OAuthProviderNotFound,
+                "oauth provider not found",
+            ),
+            (
+                AppError::OAuthAccountLinkConflict,
+                StatusCode::CONFLICT,
+                ErrorCode::OAuthAccountLinkConflict,
+                "cannot link oauth identity to unverified local account",
+            ),
+            (
+                AppError::OAuthProviderError,
+                StatusCode::BAD_GATEWAY,
+                ErrorCode::OAuthProviderError,
+                "oauth provider error",
+            ),
         ];
 
         for (err, expected_status, expected_code, expected_msg) in test_cases {
@@ -838,9 +971,42 @@ mod tests {
             ErrorCode::CsrfTokenMissing,
             ErrorCode::CsrfTokenInvalid,
             ErrorCode::RateLimitExceeded,
+            // Phase 6
+            ErrorCode::OAuthStateInvalid,
+            ErrorCode::OAuthCodeInvalid,
+            ErrorCode::OAuthEmailUnverified,
+            ErrorCode::OAuthProviderError,
+            ErrorCode::OAuthAccountLinkConflict,
+            ErrorCode::OAuthProviderNotFound,
         ];
         for code in codes {
             assert_eq!(AppError::from_code(code).error_code(), code);
+        }
+    }
+
+    #[test]
+    fn test_oauth_error_codes_wire_serialization_and_envelope() {
+        let cases = [
+            (ErrorCode::OAuthStateInvalid, "OAUTH_STATE_INVALID", StatusCode::FORBIDDEN),
+            (ErrorCode::OAuthCodeInvalid, "OAUTH_CODE_INVALID", StatusCode::BAD_REQUEST),
+            (ErrorCode::OAuthEmailUnverified, "OAUTH_EMAIL_UNVERIFIED", StatusCode::BAD_REQUEST),
+            (ErrorCode::OAuthProviderError, "OAUTH_PROVIDER_ERROR", StatusCode::BAD_GATEWAY),
+            (ErrorCode::OAuthAccountLinkConflict, "OAUTH_ACCOUNT_LINK_CONFLICT", StatusCode::CONFLICT),
+            (ErrorCode::OAuthProviderNotFound, "OAUTH_PROVIDER_NOT_FOUND", StatusCode::NOT_FOUND),
+        ];
+
+        for (code, expected_wire, expected_status) in cases {
+            let json = serde_json::to_string(&code).expect("serialize error code");
+            assert_eq!(json, format!("\"{expected_wire}\""));
+
+            let app_err = AppError::from_code(code);
+            assert_eq!(app_err.code(), code);
+            assert_eq!(app_err.status_code(), expected_status);
+
+            let resp = ErrorResponse::from(&app_err);
+            let resp_json = serde_json::to_string(&resp).expect("serialize ErrorResponse");
+            assert!(resp_json.contains(&format!("\"code\":\"{expected_wire}\"")));
+            assert!(resp_json.contains("\"message\":"));
         }
     }
 

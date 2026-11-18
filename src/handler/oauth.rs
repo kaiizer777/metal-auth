@@ -368,16 +368,25 @@ pub async fn link_account(
     Path(provider): Path<String>,
     headers: HeaderMap,
     Json(req): Json<LinkRequest>,
-) -> Result<Json<OAuthAccount>, AppError> {
+) -> Result<Response, AppError> {
     if !SUPPORTED_PROVIDERS.contains(&provider.as_str()) {
         return Err(AppError::OAuthProviderNotFound);
     }
     let cookie_header = headers.get(header::COOKIE).and_then(|v| v.to_str().ok());
-    let account = state
+    let account = match state
         .oauth_service
         .link_account_identity(user_id, &provider, &req.code, &req.state, cookie_header)
-        .await?;
-    Ok(Json(account))
+        .await
+    {
+        Ok(acc) => acc,
+        Err(e) => return Ok(oauth_error_response(&state, e)),
+    };
+    let clear_cookie = state.oauth_service.clear_state_cookie();
+    let mut resp = Json(account).into_response();
+    if let Ok(hv) = header::HeaderValue::from_str(&clear_cookie) {
+        resp.headers_mut().append(header::SET_COOKIE, hv);
+    }
+    Ok(resp)
 }
 
 /// POST /auth/oauth/{provider}/unlink (and /api/auth/oauth/{provider}/unlink)

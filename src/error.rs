@@ -312,7 +312,7 @@ impl AppError {
     }
 
     #[must_use]
-    pub fn response_message(&self) -> &'static str {
+    pub fn response_message(&self) -> &str {
         match self {
             Self::Config(_) => "Invalid configuration",
             Self::Database(_) => "Database error",
@@ -333,7 +333,13 @@ impl AppError {
             Self::PasswordTooLong => "Password exceeds the maximum length requirement",
             Self::PasswordTooCommon => "Password is too common, please choose a stronger password",
             Self::InvalidEmail => "Invalid email address",
-            Self::ValidationError(_) => "Invalid request body",
+            Self::ValidationError(msg) => {
+                if msg.is_empty() {
+                    "Invalid request body"
+                } else {
+                    msg.as_str()
+                }
+            }
             Self::InvalidToken => "Invalid or already used token",
             Self::TokenExpired => "Token has expired",
             // Phase 4
@@ -690,6 +696,12 @@ mod tests {
             ),
             (
                 AppError::ValidationError("field required".into()),
+                StatusCode::BAD_REQUEST,
+                ErrorCode::ValidationError,
+                "field required",
+            ),
+            (
+                AppError::ValidationError("".into()),
                 StatusCode::BAD_REQUEST,
                 ErrorCode::ValidationError,
                 "Invalid request body",

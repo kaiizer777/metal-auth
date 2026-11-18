@@ -9,6 +9,6 @@
 //! - Authorization code grant flow state machine with PKCE (RFC 7636) verification.
 //! - External token exchange, profile mapping, and account linking against [`User`](crate::User).
 //!
-//! ## Boundaries & Constraints
-//! - Extensions in this module must integrate via [`AuthService`](crate::AuthService) rather than
-//!   directly manipulating database state or bypassing password/email verification invariants.
+pub mod pkce;
+
+pub use pkce::{PKCEChallenge, compute_challenge, generate_pkce, verify_pkce};

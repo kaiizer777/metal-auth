@@ -1133,7 +1133,10 @@ impl std::fmt::Debug for ProviderConfig {
             .field("enabled", &self.enabled)
             .field("team_id", &self.team_id)
             .field("key_id", &self.key_id)
-            .field("private_key", &self.private_key.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "private_key",
+                &self.private_key.as_ref().map(|_| "[REDACTED]"),
+            )
             .finish()
     }
 }
@@ -1144,7 +1147,6 @@ pub struct OAuthConfig {
     pub state_cookie_name: String,
     pub state_cookie_path: String,
     pub state_ttl: Duration,
-    pub state_ttl_secs: u64,
     pub state_secret: String,
     pub callback_base_url: String,
 }
@@ -1156,7 +1158,6 @@ impl std::fmt::Debug for OAuthConfig {
             .field("state_cookie_name", &self.state_cookie_name)
             .field("state_cookie_path", &self.state_cookie_path)
             .field("state_ttl", &self.state_ttl)
-            .field("state_ttl_secs", &self.state_ttl_secs)
             .field("state_secret", &"[REDACTED]")
             .field("callback_base_url", &self.callback_base_url)
             .finish()
@@ -1170,7 +1171,6 @@ impl Default for OAuthConfig {
             state_cookie_name: DEFAULT_OAUTH_STATE_COOKIE_NAME.to_string(),
             state_cookie_path: DEFAULT_OAUTH_STATE_COOKIE_PATH.to_string(),
             state_ttl: Duration::from_secs(DEFAULT_OAUTH_STATE_TTL_SECS),
-            state_ttl_secs: DEFAULT_OAUTH_STATE_TTL_SECS,
             state_secret: String::new(),
             callback_base_url: String::new(),
         }
@@ -1179,12 +1179,13 @@ impl Default for OAuthConfig {
 
 impl OAuthConfig {
     #[must_use]
+    pub fn state_ttl_secs(&self) -> u64 {
+        self.state_ttl.as_secs()
+    }
+
+    #[must_use]
     pub fn ttl(&self) -> Duration {
-        if self.state_ttl.as_secs() > 0 {
-            self.state_ttl
-        } else {
-            Duration::from_secs(self.state_ttl_secs)
-        }
+        self.state_ttl
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -1252,9 +1253,18 @@ impl OAuthConfig {
                     }
                 } else if name == "apple" {
                     let has_secret = !provider.client_secret.trim().is_empty();
-                    let has_p8 = provider.team_id.as_deref().is_some_and(|s| !s.trim().is_empty())
-                        && provider.key_id.as_deref().is_some_and(|s| !s.trim().is_empty())
-                        && provider.private_key.as_deref().is_some_and(|s| !s.trim().is_empty());
+                    let has_p8 = provider
+                        .team_id
+                        .as_deref()
+                        .is_some_and(|s| !s.trim().is_empty())
+                        && provider
+                            .key_id
+                            .as_deref()
+                            .is_some_and(|s| !s.trim().is_empty())
+                        && provider
+                            .private_key
+                            .as_deref()
+                            .is_some_and(|s| !s.trim().is_empty());
 
                     if !has_secret && !has_p8 {
                         return Err(ConfigError::InvalidValue {
@@ -2728,18 +2738,16 @@ mod tests {
     fn test_oauth_config_validation_ttl_bounds() {
         let mut oauth = OAuthConfig {
             state_ttl: Duration::from_secs(59),
-            state_ttl_secs: 59,
             ..Default::default()
         };
         assert!(oauth.validate().is_err());
 
         oauth.state_ttl = Duration::from_secs(3601);
-        oauth.state_ttl_secs = 3601;
         assert!(oauth.validate().is_err());
 
         oauth.state_ttl = Duration::from_secs(600);
-        oauth.state_ttl_secs = 600;
         assert!(oauth.validate().is_ok());
+        assert_eq!(oauth.state_ttl_secs(), 600);
     }
 
     #[test]

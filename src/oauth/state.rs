@@ -89,7 +89,12 @@ pub fn validate_state(
         serde_json::from_slice(&payload_bytes).map_err(|_| AppError::OAuthStateInvalid)?;
 
     if payload.token.len() != incoming_state.len()
-        || payload.token.as_bytes().ct_eq(incoming_state.as_bytes()).unwrap_u8() != 1
+        || payload
+            .token
+            .as_bytes()
+            .ct_eq(incoming_state.as_bytes())
+            .unwrap_u8()
+            != 1
     {
         return Err(AppError::OAuthStateInvalid);
     }
@@ -114,9 +119,8 @@ pub fn build_state_cookie(
     max_age_secs: u64,
     secure: bool,
 ) -> String {
-    let mut cookie = format!(
-        "{name}={value}; Path={path}; Max-Age={max_age_secs}; HttpOnly; SameSite=Lax"
-    );
+    let mut cookie =
+        format!("{name}={value}; Path={path}; Max-Age={max_age_secs}; HttpOnly; SameSite=Lax");
     if secure {
         cookie.push_str("; Secure");
     }
@@ -163,10 +167,10 @@ pub fn extract_state_cookie<'a>(headers: &'a HeaderMap, cookie_name: &str) -> Op
     for cookie_header in headers.get_all(axum::http::header::COOKIE) {
         if let Ok(cookie_str) = cookie_header.to_str() {
             for pair in cookie_str.split(';') {
-                let mut parts = pair.trim().splitn(2, '=');
-                match (parts.next(), parts.next()) {
-                    (Some(name), Some(val)) if name == cookie_name => return Some(val),
-                    _ => {}
+                if let Some((name, val)) = pair.trim().split_once('=')
+                    && name == cookie_name
+                {
+                    return Some(val);
                 }
             }
         }
@@ -285,7 +289,9 @@ mod tests {
 
         let cookie_val =
             create_state_cookie_value(&payload, TEST_SECRET).expect("create state cookie");
-        assert!(validate_state(&cookie_val, "attacker_state_token", "google", TEST_SECRET).is_err());
+        assert!(
+            validate_state(&cookie_val, "attacker_state_token", "google", TEST_SECRET).is_err()
+        );
     }
 
     #[test]

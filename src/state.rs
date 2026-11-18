@@ -7,6 +7,7 @@ use crate::{
     config::{AppConfig, Config},
     email::{dispatcher::EmailDispatcher, hook::SharedEmailSender},
     error::AppError,
+    oauth::OAuthService,
     ratelimit::RateLimiter,
     session::SessionService,
 };
@@ -37,6 +38,7 @@ pub struct AppState {
     pub email_dispatcher: Option<Arc<EmailDispatcher>>,
     pub session_service: Arc<SessionService>,
     pub rate_limiter: Arc<RateLimiter>,
+    pub oauth_service: Arc<OAuthService>,
 }
 
 impl AppState {
@@ -62,6 +64,11 @@ impl AppState {
     pub fn with_auth_service(mut self, service: Arc<AuthServiceImpl>) -> Self {
         self.auth_config = Arc::clone(&service.config);
         self.auth_service = service;
+        self
+    }
+
+    pub fn with_oauth_service(mut self, service: Arc<OAuthService>) -> Self {
+        self.oauth_service = service;
         self
     }
 
@@ -95,6 +102,11 @@ impl AppState {
         )?);
 
         let session_service = Arc::new(SessionService::new(pool.clone(), Arc::new(config.clone())));
+        let oauth_service = Arc::new(OAuthService::new(
+            pool.clone(),
+            Arc::new(config.clone()),
+            Arc::clone(&session_service),
+        )?);
         let rate_limiter = Arc::new(RateLimiter::with_config(config.rate_limit.clone()));
         if config.rate_limit.enabled {
             match tokio::runtime::Handle::try_current() {
@@ -118,6 +130,7 @@ impl AppState {
             email_dispatcher,
             session_service,
             rate_limiter,
+            oauth_service,
         })
     }
 

@@ -10,6 +10,7 @@ pub mod github;
 pub mod google;
 pub mod pkce;
 pub mod provider;
+pub mod service;
 pub mod state;
 
 pub use apple::AppleProvider;
@@ -20,6 +21,7 @@ pub use provider::{
     OAUTH_BODY_LIMIT, OAuthProvider, OAuthTokenResponse, OAuthUserInfo, SUPPORTED_PROVIDERS,
     TokenResponse, UserInfo, build_oauth_http_client, create_provider,
 };
+pub use service::{OAuthCallbackResult, OAuthService};
 pub use state::{
     OAuthStateManager, OAuthStatePayload, build_clear_state_cookie,
     build_clear_state_cookie_header, build_state_cookie, build_state_cookie_header,

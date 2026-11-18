@@ -244,6 +244,21 @@ impl AuthServiceImpl {
                 let hash: String = row.get("password_hash");
                 let email_verified: bool = row.get("email_verified");
 
+                // Accounts created via OAuth have an empty or unusable password sentinel.
+                // Execute dummy Argon2id verification to eliminate timing differences.
+                if hash.is_empty() || hash.starts_with("$unusable$") {
+                    let dummy_hash = self.dummy_hash.clone();
+                    let pw = password.to_string();
+                    if let Err(join_err) = tokio::task::spawn_blocking(move || {
+                        let _ = verify_password(&pw, &dummy_hash);
+                    })
+                    .await
+                    {
+                        tracing::debug!(err = %join_err, "dummy password verify task failed");
+                    }
+                    return Err(AppError::InvalidCredentials);
+                }
+
                 // Snapshot reused as the freshness proof after verify; compared as a
                 // string inside the session lock, never re-hashed there.
                 let credential_hash = hash.clone();

@@ -1171,9 +1171,39 @@ async fn test_rate_limit_reset_on_success() {
         assert_eq!(fail_attempt.status(), StatusCode::UNAUTHORIZED);
     }
 
-    // Control account: prove that exceeding max_attempts across distinct IPs
-    // causes account-level rate limiting (429 Too Many Requests) without resetting.
+    // Successful login for primary account resets its account-level counter
+    let ok_resp = app
+        .post_json_with_ip(
+            "/auth/login",
+            json!({ "email": email, "password": password }),
+            &client_ip,
+        )
+        .await;
+    assert_eq!(ok_resp.status(), StatusCode::OK);
+
+    // Reset IP rate limiter to isolate account-level rate limit reset verification
+    app.state.rate_limiter.reset(&format!("ip:{client_ip}"));
+
+    // Subsequent failure starts from 1, does NOT trigger 429
+    let fail_resp = app
+        .post_json_with_ip(
+            "/auth/login",
+            json!({ "email": email, "password": "WrongPassword123!" }),
+            &client_ip,
+        )
+        .await;
+    assert_eq!(fail_resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_account_rate_limiting_across_distinct_ips() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
     let (ctrl_email, ctrl_password) = create_and_verify_user(&app).await;
+    let max = app.state.config.rate_limit.max_attempts;
     app.state.rate_limiter.reset_account(&ctrl_email);
 
     for _ in 0..max {
@@ -1197,29 +1227,6 @@ async fn test_rate_limit_reset_on_success() {
         )
         .await;
     assert_eq!(blocked_ctrl.status(), StatusCode::TOO_MANY_REQUESTS);
-
-    // Successful login for primary account resets its account-level counter
-    let ok_resp = app
-        .post_json_with_ip(
-            "/auth/login",
-            json!({ "email": email, "password": password }),
-            &client_ip,
-        )
-        .await;
-    assert_eq!(ok_resp.status(), StatusCode::OK);
-
-    // Reset IP rate limiter to isolate account-level rate limit reset verification
-    app.state.rate_limiter.reset(&format!("ip:{client_ip}"));
-
-    // Subsequent failure starts from 1, does NOT trigger 429
-    let fail_resp = app
-        .post_json_with_ip(
-            "/auth/login",
-            json!({ "email": email, "password": "WrongPassword123!" }),
-            &client_ip,
-        )
-        .await;
-    assert_eq!(fail_resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[derive(Clone, Default)]

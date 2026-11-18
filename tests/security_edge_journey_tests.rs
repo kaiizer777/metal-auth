@@ -3,6 +3,7 @@ mod common;
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use common::*;
 use serde_json::json;
+use uuid::Uuid;
 
 const ENDPOINT_SIGNUP: &str = "/auth/signup";
 const ENDPOINT_VERIFY: &str = "/auth/verify";
@@ -530,7 +531,7 @@ async fn test_journey_security_baseline_defense_in_depth() {
             ENDPOINT_SIGNUP,
             json!({
                 "email": dynamic_email(),
-                "password": "ValidStrongPassword2026!"
+                "password": dynamic_password()
             }),
         )
         .await;
@@ -573,6 +574,7 @@ async fn test_journey_security_baseline_defense_in_depth() {
 
     // 2. Botnet Account Trip: Multiple distinct IPs targeting the same account
     let botnet_target = dynamic_email();
+    let botnet_pw = dynamic_password();
     for i in 1..=10 {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", format!("203.0.113.{i}").parse().unwrap());
@@ -581,7 +583,7 @@ async fn test_journey_security_baseline_defense_in_depth() {
             ENDPOINT_SIGNUP,
             json!({
                 "email": botnet_target,
-                "password": "ValidStrongPassword2026!"
+                "password": botnet_pw.clone()
             }),
             headers,
         );
@@ -601,7 +603,7 @@ async fn test_journey_security_baseline_defense_in_depth() {
         ENDPOINT_SIGNUP,
         json!({
             "email": botnet_target,
-            "password": "ValidStrongPassword2026!"
+            "password": botnet_pw
         }),
         headers,
     );
@@ -626,7 +628,7 @@ async fn test_journey_security_baseline_defense_in_depth() {
             ENDPOINT_SIGNUP,
             json!({
                 "email": format!("spray_{i}_{}", dynamic_email()),
-                "password": "ValidStrongPassword2026!"
+                "password": dynamic_password()
             }),
             headers,
         );
@@ -646,7 +648,7 @@ async fn test_journey_security_baseline_defense_in_depth() {
         ENDPOINT_SIGNUP,
         json!({
             "email": format!("spray_overflow_{}", dynamic_email()),
-            "password": "ValidStrongPassword2026!"
+            "password": dynamic_password()
         }),
         headers,
     );
@@ -663,7 +665,7 @@ async fn test_journey_security_baseline_defense_in_depth() {
 
     // 4. Successful login resets ONLY account:<email> and preserves ip:<ip>
     let user_email = dynamic_email();
-    let user_pw = "ValidSecurePass2026!";
+    let user_pw = dynamic_password();
 
     let _ = app
         .post_json(
@@ -699,7 +701,7 @@ async fn test_journey_security_baseline_defense_in_depth() {
             ENDPOINT_LOGIN,
             json!({
                 "email": user_email,
-                "password": "WrongPassword123!"
+                "password": format!("WrongPass!_{}", Uuid::new_v4())
             }),
             headers,
         );
@@ -732,7 +734,7 @@ async fn test_journey_security_baseline_defense_in_depth() {
             ENDPOINT_LOGIN,
             json!({
                 "email": user_email,
-                "password": "WrongPassword123!"
+                "password": format!("WrongPass!_{}", Uuid::new_v4())
             }),
             headers,
         );
@@ -751,7 +753,7 @@ async fn test_journey_security_baseline_defense_in_depth() {
             ENDPOINT_LOGIN,
             json!({
                 "email": dynamic_email(),
-                "password": "WrongPassword123!"
+                "password": format!("WrongPass!_{}", Uuid::new_v4())
             }),
             headers,
         );
@@ -767,13 +769,13 @@ async fn test_journey_security_baseline_defense_in_depth() {
 
     // 5. CSRF Enforcement on /auth/logout
     let cookie_user = dynamic_email();
-    let cookie_pw = "ValidCookiePass2026!";
+    let cookie_pw = dynamic_password();
     let _ = app
         .post_json(
             ENDPOINT_SIGNUP,
             json!({
                 "email": cookie_user,
-                "password": cookie_pw
+                "password": cookie_pw.clone()
             }),
         )
         .await;

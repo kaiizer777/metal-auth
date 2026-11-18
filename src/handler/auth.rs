@@ -195,10 +195,10 @@ fn rate_limit_response(
         (None, Some(acct)) => limiter.remaining_cooldown(acct),
         (None, None) => None,
     };
-    if let Some(secs) = cooldown {
-        if let Ok(val) = header::HeaderValue::from_str(&secs.to_string()) {
-            resp.headers_mut().insert(header::RETRY_AFTER, val);
-        }
+    if let Some(secs) = cooldown
+        && let Ok(val) = header::HeaderValue::from_str(&secs.to_string())
+    {
+        resp.headers_mut().insert(header::RETRY_AFTER, val);
     }
     resp
 }

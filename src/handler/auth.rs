@@ -9,6 +9,7 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},
+    handler::Handler,
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -22,11 +23,14 @@ use crate::{
     config::Config,
     error::{AppError, ErrorCode, ErrorResponse},
     handler::untrusted_client_ip,
-    ratelimit::{RateLimiter, rate_limit_key},
+    ratelimit::{RateLimitRejection, RateLimiter},
     session::{
         SessionService,
         bearer::read_bearer_token,
-        cookie::{clear_session_cookie, read_session_cookie, set_csrf_cookie, set_session_cookie},
+        cookie::{
+            clear_csrf_cookie, clear_session_cookie, read_session_cookie, set_csrf_cookie,
+            set_session_cookie,
+        },
     },
     state::AppState,
 };
@@ -59,12 +63,46 @@ pub fn routes(service: Arc<AuthServiceImpl>) -> Router {
 }
 
 pub fn routes_with_app_state(state: AppState) -> Router {
-    routes_with_state(AuthHandlerState {
+    let handler_state = AuthHandlerState {
         service: Arc::clone(&state.auth_service),
         session_service: Some(Arc::clone(&state.session_service)),
         rate_limiter: Some(Arc::clone(&state.rate_limiter)),
         config: Some(Arc::new(state.config.clone())),
-    })
+    };
+
+    let csrf_layer =
+        axum::middleware::from_fn_with_state(state.clone(), crate::middleware::csrf_middleware);
+    let csrf_routes = Router::new()
+        .route(
+            "/logout",
+            axum::routing::post(logout.layer(csrf_layer)).fallback(method_not_allowed),
+        )
+        .with_state(handler_state.clone());
+
+    let public_routes = Router::new()
+        .route(
+            "/signup",
+            axum::routing::post(signup).fallback(method_not_allowed),
+        )
+        .route(
+            "/login",
+            axum::routing::post(login).fallback(method_not_allowed),
+        )
+        .route(
+            "/verify",
+            axum::routing::post(verify_email).fallback(method_not_allowed),
+        )
+        .route(
+            "/password/reset-request",
+            axum::routing::post(request_password_reset).fallback(method_not_allowed),
+        )
+        .route(
+            "/password/reset",
+            axum::routing::post(reset_password).fallback(method_not_allowed),
+        )
+        .with_state(handler_state);
+
+    public_routes.merge(csrf_routes)
 }
 
 pub fn routes_with_state(state: AuthHandlerState) -> Router {
@@ -134,6 +172,27 @@ fn attach_login_cookies(
     Ok(response)
 }
 
+/// Extract client IP from proxy headers, falling back to 127.0.0.1.
+///
+/// Spoofable unless a trusted proxy strips these headers; audit/rate-limit use only.
+fn extract_client_ip(headers: &HeaderMap) -> String {
+    untrusted_client_ip(headers)
+        .unwrap_or("127.0.0.1")
+        .to_string()
+}
+
+/// Construct HTTP 429 response with dynamic Retry-After header derived from rejection reason.
+/// Omitted if rejection occurred due to capacity saturation or attempt limit without lockout.
+fn rate_limit_response(rejection: RateLimitRejection) -> Response {
+    let mut resp = service_error_response(AppError::RateLimitExceeded);
+    if let Some(secs) = rejection.retry_after()
+        && let Ok(val) = header::HeaderValue::from_str(&secs.to_string())
+    {
+        resp.headers_mut().insert(header::RETRY_AFTER, val);
+    }
+    resp
+}
+
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 /// POST /auth/signup
@@ -141,6 +200,7 @@ fn attach_login_cookies(
 /// Anti-enumeration: always returns 200 regardless of duplicate email.
 pub async fn signup(
     State(state): State<AuthHandlerState>,
+    headers: HeaderMap,
     body: Result<Json<SignupRequest>, JsonRejection>,
 ) -> Response {
     let Json(req) = match body {
@@ -150,6 +210,23 @@ pub async fn signup(
 
     if let Err(e) = req.validate(&state.service.config) {
         return service_error_response(e);
+    }
+
+    let client_ip = extract_client_ip(&headers);
+    let normalized_email = req.email.trim().to_lowercase();
+
+    if let Some(limiter) = &state.rate_limiter {
+        match limiter.check_dual(&client_ip, &normalized_email) {
+            Ok(()) => {}
+            Err(rejection) => {
+                tracing::warn!(
+                    event = "rate_limit_exceeded",
+                    ip = %client_ip,
+                    key_prefix = "signup",
+                );
+                return rate_limit_response(rejection);
+            }
+        }
     }
 
     match state.service.signup(&req.email, &req.password).await {
@@ -185,10 +262,7 @@ pub async fn login(
         return service_error_response(e);
     }
 
-    // Spoofable unless a trusted proxy strips these headers; audit/rate-limit use only.
-    let client_ip = untrusted_client_ip(&headers)
-        .unwrap_or("127.0.0.1")
-        .to_string();
+    let client_ip = extract_client_ip(&headers);
 
     let user_agent = headers
         .get(header::USER_AGENT)
@@ -199,22 +273,16 @@ pub async fn login(
 
     // Pre-credential rate limit check prevents account existence timing oracles
     if let Some(limiter) = &state.rate_limiter {
-        let key = rate_limit_key(&client_ip, &normalized_email);
-        if let Err(e) = limiter.check_rate_limit(&key) {
-            tracing::warn!(
-                event = "rate_limit_exceeded",
-                ip = %client_ip,
-                key_prefix = "login",
-            );
-            let mut resp = service_error_response(e);
-            let cooldown = state
-                .config
-                .as_ref()
-                .map_or(900, |c| c.rate_limit.login_cooldown_secs);
-            if let Ok(val) = header::HeaderValue::from_str(&cooldown.to_string()) {
-                resp.headers_mut().insert(header::RETRY_AFTER, val);
+        match limiter.check_dual(&client_ip, &normalized_email) {
+            Ok(()) => {}
+            Err(rejection) => {
+                tracing::warn!(
+                    event = "rate_limit_exceeded",
+                    ip = %client_ip,
+                    key_prefix = "login",
+                );
+                return rate_limit_response(rejection);
             }
-            return resp;
         }
     }
 
@@ -236,10 +304,9 @@ pub async fn login(
     };
     let user_id = proof.user_id;
 
-    // Reset rate limit attempts upon successful authentication
+    // Reset rate limit attempts upon successful authentication for account only
     if let Some(limiter) = &state.rate_limiter {
-        let key = rate_limit_key(&client_ip, &normalized_email);
-        limiter.reset(&key);
+        limiter.reset_account(&normalized_email);
     }
 
     let is_bearer = headers
@@ -302,6 +369,19 @@ pub async fn login(
 ///
 /// Revokes session on server side and clears the session cookie.
 pub async fn logout(State(state): State<AuthHandlerState>, headers: HeaderMap) -> Response {
+    let client_ip = extract_client_ip(&headers);
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown");
+
+    tracing::info!(
+        target: "security_event",
+        event = "logout",
+        ip = %client_ip,
+        user_agent = %user_agent,
+    );
+
     let cookie_name = state
         .config
         .as_ref()
@@ -310,17 +390,19 @@ pub async fn logout(State(state): State<AuthHandlerState>, headers: HeaderMap) -
     let raw_id_opt =
         read_session_cookie(&headers, cookie_name).or_else(|| read_bearer_token(&headers));
 
-    if let Some(ref raw_id) = raw_id_opt {
-        if let Some(ref session_svc) = state.session_service {
-            match session_svc.invalidate_session(raw_id).await {
-                Ok(()) => {}
-                Err(e) => return service_error_response(e),
-            }
+    let Some(ref raw_id) = raw_id_opt else {
+        // Unauthenticated logout: return 204 without revoking credentials or clearing cookies.
+        // Emitting Set-Cookie on unauthenticated requests enables cross-site cookie deletion attacks.
+        return StatusCode::NO_CONTENT.into_response();
+    };
+
+    if let Some(ref session_svc) = state.session_service {
+        match session_svc.invalidate_session(raw_id).await {
+            Ok(()) => {}
+            Err(e) => return service_error_response(e),
         }
-        if let Err(e) = state.service.logout(raw_id).await {
-            return service_error_response(e);
-        }
-    } else if let Err(e) = state.service.logout("").await {
+    }
+    if let Err(e) = state.service.logout(raw_id).await {
         return service_error_response(e);
     }
 
@@ -332,7 +414,15 @@ pub async fn logout(State(state): State<AuthHandlerState>, headers: HeaderMap) -
         };
         response
             .headers_mut()
-            .insert(header::SET_COOKIE, clear_cookie);
+            .append(header::SET_COOKIE, clear_cookie);
+
+        let clear_csrf = match clear_csrf_cookie(cfg.as_ref()) {
+            Ok(hv) => hv,
+            Err(e) => return service_error_response(e),
+        };
+        response
+            .headers_mut()
+            .append(header::SET_COOKIE, clear_csrf);
     }
     response
 }
@@ -342,8 +432,24 @@ pub async fn logout(State(state): State<AuthHandlerState>, headers: HeaderMap) -
 /// Consumes a 64-char hex email verification token.
 pub async fn verify_email(
     State(state): State<AuthHandlerState>,
+    headers: HeaderMap,
     body: Result<Json<VerifyEmailRequest>, JsonRejection>,
 ) -> Response {
+    let client_ip = extract_client_ip(&headers);
+    if let Some(limiter) = &state.rate_limiter {
+        match limiter.check_ip(&client_ip) {
+            Ok(()) => {}
+            Err(rejection) => {
+                tracing::warn!(
+                    event = "rate_limit_exceeded",
+                    ip = %client_ip,
+                    key_prefix = "verify",
+                );
+                return rate_limit_response(rejection);
+            }
+        }
+    }
+
     let Json(req) = match body {
         Ok(b) => b,
         Err(e) => return json_rejection_response(e),
@@ -364,6 +470,7 @@ pub async fn verify_email(
 /// Anti-enumeration: always returns 200 regardless of account existence.
 pub async fn request_password_reset(
     State(state): State<AuthHandlerState>,
+    headers: HeaderMap,
     body: Result<Json<PasswordResetRequest>, JsonRejection>,
 ) -> Response {
     let Json(req) = match body {
@@ -374,6 +481,35 @@ pub async fn request_password_reset(
     if let Err(e) = req.validate() {
         return service_error_response(e);
     }
+
+    let client_ip = extract_client_ip(&headers);
+    let normalized_email = req.email.trim().to_lowercase();
+
+    if let Some(limiter) = &state.rate_limiter {
+        match limiter.check_password_reset(&client_ip, &normalized_email) {
+            Ok(()) => {}
+            Err(rejection) => {
+                tracing::warn!(
+                    event = "rate_limit_exceeded",
+                    ip = %client_ip,
+                    key_prefix = "password_reset_request",
+                );
+                return rate_limit_response(rejection);
+            }
+        }
+    }
+
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown");
+
+    tracing::info!(
+        target: "security_event",
+        event = "password_reset_requested",
+        ip = %client_ip,
+        user_agent = %user_agent,
+    );
 
     match state.service.request_password_reset(&req.email).await {
         Ok(()) => (
@@ -392,8 +528,24 @@ pub async fn request_password_reset(
 /// Consumes a reset token and sets a new password.
 pub async fn reset_password(
     State(state): State<AuthHandlerState>,
+    headers: HeaderMap,
     body: Result<Json<PasswordResetConfirmRequest>, JsonRejection>,
 ) -> Response {
+    let client_ip = extract_client_ip(&headers);
+    if let Some(limiter) = &state.rate_limiter {
+        match limiter.check_ip(&client_ip) {
+            Ok(()) => {}
+            Err(rejection) => {
+                tracing::warn!(
+                    event = "rate_limit_exceeded",
+                    ip = %client_ip,
+                    key_prefix = "password_reset",
+                );
+                return rate_limit_response(rejection);
+            }
+        }
+    }
+
     let Json(req) = match body {
         Ok(b) => b,
         Err(e) => return json_rejection_response(e),
@@ -469,10 +621,10 @@ mod tests {
         let state = create_test_state();
         let payload = SignupRequest {
             email: "valid@example.com".to_string(),
-            password: "short".to_string(),
+            password: format!("s_{}", uuid::Uuid::new_v4().simple())[..5].to_string(),
         };
 
-        let resp = signup(State(state), Ok(Json(payload))).await;
+        let resp = signup(State(state), HeaderMap::new(), Ok(Json(payload))).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
@@ -487,7 +639,7 @@ mod tests {
             token: "not-a-valid-hex-token".to_string(),
         };
 
-        let resp = verify_email(State(state), Ok(Json(payload))).await;
+        let resp = verify_email(State(state), HeaderMap::new(), Ok(Json(payload))).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
@@ -502,7 +654,7 @@ mod tests {
             email: "invalid-email".to_string(),
         };
 
-        let resp = request_password_reset(State(state), Ok(Json(payload))).await;
+        let resp = request_password_reset(State(state), HeaderMap::new(), Ok(Json(payload))).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
@@ -515,10 +667,10 @@ mod tests {
         let state = create_test_state();
         let payload = PasswordResetConfirmRequest {
             token: "short-token".to_string(),
-            new_password: "ValidPassword123!".to_string(),
+            new_password: format!("ValidPass_{}!", uuid::Uuid::new_v4().simple()),
         };
 
-        let resp = reset_password(State(state), Ok(Json(payload))).await;
+        let resp = reset_password(State(state), HeaderMap::new(), Ok(Json(payload))).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
@@ -635,5 +787,252 @@ mod tests {
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
         let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(err.code, ErrorCode::RateLimitExceeded);
+    }
+
+    #[tokio::test]
+    async fn signup_handler_rate_limits_dual_key() {
+        let mut state = create_test_state();
+        let limiter = Arc::new(RateLimiter::with_config(crate::config::RateLimitConfig {
+            enabled: true,
+            max_attempts: 1,
+            window_secs: 60,
+            login_cooldown_secs: 300,
+        }));
+        state.rate_limiter = Some(limiter);
+
+        let payload = SignupRequest {
+            email: "victim@example.com".to_string(),
+            password: format!("ValidPass_{}!", uuid::Uuid::new_v4().simple()),
+        };
+
+        let mut headers1 = HeaderMap::new();
+        headers1.insert("x-forwarded-for", "198.51.100.1".parse().unwrap());
+        let _ = signup(State(state.clone()), headers1, Ok(Json(payload.clone()))).await;
+
+        // Distinct IP with the same email must be rate limited by account key
+        let mut headers2 = HeaderMap::new();
+        headers2.insert("x-forwarded-for", "198.51.100.2".parse().unwrap());
+        let resp = signup(State(state.clone()), headers2, Ok(Json(payload))).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().contains_key(header::RETRY_AFTER));
+
+        // Same original IP with a different email must be rate limited by IP key
+        let mut headers3 = HeaderMap::new();
+        headers3.insert("x-forwarded-for", "198.51.100.1".parse().unwrap());
+        let payload_other = SignupRequest {
+            email: "other@example.com".to_string(),
+            password: format!("ValidPass_{}!", uuid::Uuid::new_v4().simple()),
+        };
+        let resp_ip = signup(State(state), headers3, Ok(Json(payload_other))).await;
+        assert_eq!(resp_ip.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp_ip.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn verify_email_handler_rate_limits_ip() {
+        let mut state = create_test_state();
+        let limiter = Arc::new(RateLimiter::with_config(crate::config::RateLimitConfig {
+            enabled: true,
+            max_attempts: 1,
+            window_secs: 60,
+            login_cooldown_secs: 300,
+        }));
+        state.rate_limiter = Some(limiter);
+
+        let dynamic_token = format!(
+            "{:032x}{:032x}",
+            uuid::Uuid::new_v4().as_u128(),
+            uuid::Uuid::new_v4().as_u128()
+        );
+        let payload = VerifyEmailRequest {
+            token: dynamic_token,
+        };
+
+        let _ = verify_email(
+            State(state.clone()),
+            HeaderMap::new(),
+            Ok(Json(payload.clone())),
+        )
+        .await;
+
+        let resp = verify_email(State(state), HeaderMap::new(), Ok(Json(payload))).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn request_password_reset_handler_rate_limits_dual_key() {
+        let mut state = create_test_state();
+        let limiter = Arc::new(RateLimiter::with_config(crate::config::RateLimitConfig {
+            enabled: true,
+            max_attempts: 1,
+            window_secs: 60,
+            login_cooldown_secs: 300,
+        }));
+        state.rate_limiter = Some(limiter);
+
+        let payload = PasswordResetRequest {
+            email: "target@example.com".to_string(),
+        };
+
+        let mut headers1 = HeaderMap::new();
+        headers1.insert("x-forwarded-for", "198.51.100.10".parse().unwrap());
+        let _ =
+            request_password_reset(State(state.clone()), headers1, Ok(Json(payload.clone()))).await;
+
+        // Distinct IP with same email must hit reset_account rate limit
+        let mut headers2 = HeaderMap::new();
+        headers2.insert("x-forwarded-for", "198.51.100.11".parse().unwrap());
+        let resp = request_password_reset(State(state), headers2, Ok(Json(payload))).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn reset_password_handler_rate_limits_ip() {
+        let mut state = create_test_state();
+        let limiter = Arc::new(RateLimiter::with_config(crate::config::RateLimitConfig {
+            enabled: true,
+            max_attempts: 1,
+            window_secs: 60,
+            login_cooldown_secs: 300,
+        }));
+        state.rate_limiter = Some(limiter);
+
+        let dynamic_token = format!(
+            "{:032x}{:032x}",
+            uuid::Uuid::new_v4().as_u128(),
+            uuid::Uuid::new_v4().as_u128()
+        );
+        let payload = PasswordResetConfirmRequest {
+            token: dynamic_token,
+            new_password: format!("ValidPass_{}!", uuid::Uuid::new_v4().simple()),
+        };
+
+        let _ = reset_password(
+            State(state.clone()),
+            HeaderMap::new(),
+            Ok(Json(payload.clone())),
+        )
+        .await;
+
+        let resp = reset_password(State(state), HeaderMap::new(), Ok(Json(payload))).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn logout_clears_session_and_csrf_cookies() {
+        let mut state = create_test_state();
+        let config = Config::default();
+        state.config = Some(Arc::new(config));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, "sid=mock_session_id".parse().unwrap());
+        let resp = logout(State(state), headers).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let cookies: Vec<_> = resp
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|h| h.to_str().unwrap().to_string())
+            .collect();
+
+        assert_eq!(cookies.len(), 2);
+        assert!(
+            cookies
+                .iter()
+                .any(|c| c.contains("sid=") && c.contains("Max-Age=0"))
+        );
+        assert!(
+            cookies
+                .iter()
+                .any(|c| c.contains("csrf_token=") && c.contains("Max-Age=0"))
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_unauthenticated_does_not_clear_cookies() {
+        let mut state = create_test_state();
+        let config = Config::default();
+        state.config = Some(Arc::new(config));
+
+        let resp = logout(State(state), HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(!resp.headers().contains_key(header::SET_COOKIE));
+    }
+
+    #[tokio::test]
+    async fn logout_unsupported_methods_return_405() {
+        use tower::ServiceExt;
+        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/test").unwrap();
+        let app_state = AppState::with_configs_and_dispatcher(
+            pool,
+            Config::default(),
+            Arc::new(AppConfig::default()),
+            None,
+        )
+        .expect("valid test AppState");
+        let app = routes_with_app_state(app_state);
+
+        for method in [
+            axum::http::Method::PUT,
+            axum::http::Method::DELETE,
+            axum::http::Method::GET,
+        ] {
+            let req = axum::http::Request::builder()
+                .method(method)
+                .uri("/logout")
+                .header(header::COOKIE, "sid=mock_session_id")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+            assert_eq!(resp.headers().get(header::ALLOW).unwrap(), "POST");
+        }
+
+        let post_req = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/logout")
+            .header(header::COOKIE, "sid=mock_session_id")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let post_resp = app.oneshot(post_req).await.unwrap();
+        assert_eq!(post_resp.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(post_resp.into_body(), 1024).await.unwrap();
+        let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err.code, ErrorCode::CsrfTokenMissing);
+    }
+
+    #[tokio::test]
+    async fn signup_validation_runs_before_rate_limiter() {
+        let mut state = create_test_state();
+        let limiter = Arc::new(RateLimiter::new());
+        state.rate_limiter = Some(Arc::clone(&limiter));
+
+        let payload = SignupRequest {
+            email: "valid@example.com".to_string(),
+            password: format!("s_{}", uuid::Uuid::new_v4().simple())[..5].to_string(),
+        };
+
+        let resp = signup(State(state), HeaderMap::new(), Ok(Json(payload))).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(limiter.entry_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn request_password_reset_validation_runs_before_rate_limiter() {
+        let mut state = create_test_state();
+        let limiter = Arc::new(RateLimiter::new());
+        state.rate_limiter = Some(Arc::clone(&limiter));
+
+        let payload = PasswordResetRequest {
+            email: "invalid-email".to_string(),
+        };
+
+        let resp = request_password_reset(State(state), HeaderMap::new(), Ok(Json(payload))).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(limiter.entry_count(), 0);
     }
 }

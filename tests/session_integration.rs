@@ -1153,34 +1153,90 @@ async fn test_rate_limit_reset_on_success() {
 
     let (email, password) = create_and_verify_user(&app).await;
     let max = app.state.config.rate_limit.max_attempts;
+    let client_ip = dynamic_ip();
 
-    // Fail max - 1 times
+    // Reset rate limiter counters consumed during signup/verification
+    app.state.rate_limiter.reset_account(&email);
+    app.state.rate_limiter.reset(&format!("ip:{client_ip}"));
+
+    // Fail max - 1 times, asserting each produces 401 Unauthorized
     for _ in 0..(max - 1) {
-        let _ = app
-            .post_json(
+        let fail_attempt = app
+            .post_json_with_ip(
                 "/auth/login",
                 json!({ "email": email, "password": "WrongPassword123!" }),
+                &client_ip,
             )
             .await;
+        assert_eq!(fail_attempt.status(), StatusCode::UNAUTHORIZED);
     }
 
-    // Successful login resets the counter
+    // Successful login for primary account resets its account-level counter
     let ok_resp = app
-        .post_json(
+        .post_json_with_ip(
             "/auth/login",
             json!({ "email": email, "password": password }),
+            &client_ip,
         )
         .await;
     assert_eq!(ok_resp.status(), StatusCode::OK);
 
+    // IP rate limit budget remains exhausted immediately following successful login
+    let diff_account_resp = app
+        .post_json_with_ip(
+            "/auth/login",
+            json!({ "email": "other_user@example.com", "password": "WrongPassword123!" }),
+            &client_ip,
+        )
+        .await;
+    assert_eq!(diff_account_resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // Reset IP rate limiter to isolate account-level rate limit reset verification
+    app.state.rate_limiter.reset(&format!("ip:{client_ip}"));
+
     // Subsequent failure starts from 1, does NOT trigger 429
     let fail_resp = app
-        .post_json(
+        .post_json_with_ip(
             "/auth/login",
             json!({ "email": email, "password": "WrongPassword123!" }),
+            &client_ip,
         )
         .await;
     assert_eq!(fail_resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_account_rate_limiting_across_distinct_ips() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let (ctrl_email, ctrl_password) = create_and_verify_user(&app).await;
+    let max = app.state.config.rate_limit.max_attempts;
+    app.state.rate_limiter.reset_account(&ctrl_email);
+
+    for _ in 0..max {
+        let distinct_ip = dynamic_ip();
+        let resp = app
+            .post_json_with_ip(
+                "/auth/login",
+                json!({ "email": ctrl_email, "password": "WrongPassword123!" }),
+                &distinct_ip,
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let fresh_ctrl_ip = dynamic_ip();
+    let blocked_ctrl = app
+        .post_json_with_ip(
+            "/auth/login",
+            json!({ "email": ctrl_email, "password": ctrl_password }),
+            &fresh_ctrl_ip,
+        )
+        .await;
+    assert_eq!(blocked_ctrl.status(), StatusCode::TOO_MANY_REQUESTS);
 }
 
 #[derive(Clone, Default)]

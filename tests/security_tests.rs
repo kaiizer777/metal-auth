@@ -151,6 +151,21 @@ fn json_request(method: Method, uri: &str, body: serde_json::Value) -> Request<B
         .unwrap()
 }
 
+fn json_request_with_ip(
+    method: Method,
+    uri: &str,
+    ip: &str,
+    body: serde_json::Value,
+) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-forwarded-for", ip)
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
 fn dynamic_test_password() -> String {
     format!("SecPass!_{}", Uuid::new_v4())
 }
@@ -1615,13 +1630,46 @@ async fn test_no_secrets_in_tracing_logs() {
         "/auth/verify",
         json!({"token": raw_verify_token}),
     );
-    let resp5 = ctx.router.oneshot(req5).await.unwrap();
+    let resp5 = ctx.router.clone().oneshot(req5).await.unwrap();
     assert_eq!(resp5.status(), StatusCode::OK);
+
+    // 6. Logout request with canary token to verify structured audit telemetry
+    let canary_bearer_token = format!("canary_bearer_{}", Uuid::new_v4());
+    let req6 = Request::builder()
+        .method(Method::POST)
+        .uri("/auth/logout")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {canary_bearer_token}"),
+        )
+        .header("x-forwarded-for", "198.51.100.42")
+        .body(Body::empty())
+        .unwrap();
+    let resp6 = ctx.router.oneshot(req6).await.unwrap();
+    assert_eq!(resp6.status(), StatusCode::NO_CONTENT);
 
     let logs = log_scope.text();
     assert!(
         !logs.is_empty(),
         "Log buffer should have captured tracing events from requests"
+    );
+    assert!(
+        logs.lines()
+            .any(|l| l.contains("security_event") && l.contains("logout")),
+        "Tracing logs must record structured logout event with target security_event: {logs}"
+    );
+    assert!(
+        logs.lines().any(|l| l.contains("security_event")
+            && (l.contains("password_reset_requested") || l.contains("password_reset_request"))),
+        "Tracing logs must record structured password_reset_request event with target security_event: {logs}"
+    );
+    assert!(
+        logs.contains("signup"),
+        "Tracing logs must record structured signup event: {logs}"
+    );
+    assert!(
+        !logs.contains(&canary_bearer_token),
+        "Canary raw bearer session token leaked in tracing logs: {logs}"
     );
     assert!(
         !logs.contains(&secret_pw),
@@ -2367,12 +2415,11 @@ async fn setup_rate_limit_router() -> axum::Router {
 ///
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
-#[ignore = "Phase 4: Rate limiting middleware not yet implemented"]
 async fn test_rate_limit_login() {
     let router = setup_rate_limit_router().await;
 
     let mut rate_limited = false;
-    for _ in 0..10 {
+    for _ in 0..15 {
         let req = json_request(
             Method::POST,
             "/auth/login",
@@ -2397,12 +2444,11 @@ async fn test_rate_limit_login() {
 ///
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
-#[ignore = "Phase 4: Rate limiting middleware not yet implemented"]
 async fn test_rate_limit_signup() {
     let router = setup_rate_limit_router().await;
 
     let mut rate_limited = false;
-    for i in 0..10 {
+    for i in 0..15 {
         let req = json_request(
             Method::POST,
             "/auth/signup",
@@ -2427,12 +2473,11 @@ async fn test_rate_limit_signup() {
 ///
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
-#[ignore = "Phase 4: Rate limiting middleware not yet implemented"]
 async fn test_rate_limit_password_reset_request() {
     let router = setup_rate_limit_router().await;
 
     let mut rate_limited = false;
-    for _ in 0..10 {
+    for _ in 0..15 {
         let req = json_request(
             Method::POST,
             "/auth/password/reset-request",
@@ -2454,12 +2499,11 @@ async fn test_rate_limit_password_reset_request() {
 ///
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
-#[ignore = "Phase 4: Rate limiting middleware not yet implemented"]
 async fn test_rate_limit_verify_token() {
     let router = setup_rate_limit_router().await;
 
     let mut rate_limited = false;
-    for _ in 0..10 {
+    for _ in 0..15 {
         let req = json_request(Method::POST, "/auth/verify", json!({"token": "12345"}));
         let resp = router.clone().oneshot(req).await.unwrap();
         if resp.status() == StatusCode::TOO_MANY_REQUESTS {
@@ -2477,12 +2521,11 @@ async fn test_rate_limit_verify_token() {
 ///
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
-#[ignore = "Phase 4: Rate limiting middleware not yet implemented"]
 async fn test_rate_limit_reset_confirm() {
     let router = setup_rate_limit_router().await;
 
     let mut rate_limited = false;
-    for _ in 0..10 {
+    for _ in 0..15 {
         let req = json_request(
             Method::POST,
             "/auth/password/reset",
@@ -2532,23 +2575,25 @@ async fn test_login_timing_parity_unknown_vs_wrong() {
     const MEASURED: usize = 10;
 
     // Warmup both paths to stabilise Argon2 state and OS scheduler.
-    for _ in 0..WARMUP {
-        ctx.state
-            .rate_limiter
-            .reset(&metal_auth::rate_limit_key("127.0.0.1", &email));
-        let req = json_request(
+    for i in 0..WARMUP {
+        let ip_wrong = format!("198.51.100.{}", i * 2 + 1);
+        ctx.state.rate_limiter.reset_account(&email);
+        ctx.state.rate_limiter.reset(&format!("ip:{ip_wrong}"));
+        let req = json_request_with_ip(
             Method::POST,
             "/auth/login",
+            &ip_wrong,
             json!({"email": email, "password": wrong_password.clone()}),
         );
         let _ = ctx.router.clone().oneshot(req).await.unwrap();
 
-        ctx.state
-            .rate_limiter
-            .reset(&metal_auth::rate_limit_key("127.0.0.1", &unknown_email));
-        let req = json_request(
+        let ip_unknown = format!("198.51.100.{}", i * 2 + 2);
+        ctx.state.rate_limiter.reset_account(&unknown_email);
+        ctx.state.rate_limiter.reset(&format!("ip:{ip_unknown}"));
+        let req = json_request_with_ip(
             Method::POST,
             "/auth/login",
+            &ip_unknown,
             json!({"email": unknown_email.clone(), "password": wrong_password.clone()}),
         );
         let _ = ctx.router.clone().oneshot(req).await.unwrap();
@@ -2558,27 +2603,29 @@ async fn test_login_timing_parity_unknown_vs_wrong() {
     let mut durations_wrong: Vec<std::time::Duration> = Vec::with_capacity(MEASURED);
     let mut durations_unknown: Vec<std::time::Duration> = Vec::with_capacity(MEASURED);
 
-    for _ in 0..MEASURED {
-        ctx.state
-            .rate_limiter
-            .reset(&metal_auth::rate_limit_key("127.0.0.1", &email));
+    for i in 0..MEASURED {
+        let ip_wrong = format!("198.51.100.{}", (WARMUP + i) * 2 + 1);
+        ctx.state.rate_limiter.reset_account(&email);
+        ctx.state.rate_limiter.reset(&format!("ip:{ip_wrong}"));
         let t = std::time::Instant::now();
-        let req = json_request(
+        let req = json_request_with_ip(
             Method::POST,
             "/auth/login",
+            &ip_wrong,
             json!({"email": email, "password": wrong_password.clone()}),
         );
         let resp = ctx.router.clone().oneshot(req).await.unwrap();
         durations_wrong.push(t.elapsed());
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        ctx.state
-            .rate_limiter
-            .reset(&metal_auth::rate_limit_key("127.0.0.1", &unknown_email));
+        let ip_unknown = format!("198.51.100.{}", (WARMUP + i) * 2 + 2);
+        ctx.state.rate_limiter.reset_account(&unknown_email);
+        ctx.state.rate_limiter.reset(&format!("ip:{ip_unknown}"));
         let t = std::time::Instant::now();
-        let req = json_request(
+        let req = json_request_with_ip(
             Method::POST,
             "/auth/login",
+            &ip_unknown,
             json!({"email": unknown_email.clone(), "password": wrong_password.clone()}),
         );
         let resp = ctx.router.clone().oneshot(req).await.unwrap();

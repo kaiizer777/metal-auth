@@ -19,6 +19,20 @@ use crate::{
 };
 
 /// Axum middleware enforcing Double Submit Cookie CSRF protection.
+///
+/// # Split-Host Architecture & Subdomain Scope
+/// By default, cookies are host-only. In split-host or multi-subdomain architectures (e.g.
+/// frontend SPA hosted on `app.example.com` making requests to an API at `api.example.com`),
+/// host-only cookies cannot be read across origins by client JavaScript. Operators must
+/// configure `SESSION_COOKIE_DOMAIN` (e.g. `.example.com`) in [`crate::config::SessionConfig`]
+/// so that frontend JavaScript can read the `csrf_token` cookie and submit it in the `X-CSRF-Token` header.
+/// Additionally, `SESSION_COOKIE_PATH` must encompass both the frontend document application and the auth
+/// API routes (typically `/`) so browsers expose the cookie to frontend JavaScript.
+///
+/// # Invariant: CSRF Cookie Removal on Invalidation
+/// CSRF token cookie expiration (`Set-Cookie: csrf_token=; Max-Age=0`) must strictly be associated
+/// with valid authenticated session invalidation (e.g., successful logout where the session was
+/// authenticated). Unauthenticated requests must never clear cookies, preventing cross-site state destruction.
 pub async fn csrf_middleware(
     State(state): State<AppState>,
     req: Request<Body>,
@@ -29,6 +43,9 @@ pub async fn csrf_middleware(
     // (require_auth prefers the cookie) and must still pass the CSRF check.
     let has_session_cookie =
         read_session_cookie(req.headers(), &state.config.session.cookie_name).is_some();
+    let has_csrf_cookie = read_session_cookie(req.headers(), "csrf_token").is_some();
+    let has_csrf_header = req.headers().contains_key("x-csrf-token");
+
     if has_bearer_token(req.headers()) && !has_session_cookie {
         return Ok(next.run(req).await);
     }
@@ -41,6 +58,11 @@ pub async fn csrf_middleware(
         return Ok(maybe_attach_csrf_cookie(req, next, &state).await);
     }
 
+    // Requests presenting neither ambient cookies nor CSRF headers carry no ambient authority.
+    if !has_session_cookie && !has_csrf_cookie && !has_csrf_header {
+        return Ok(next.run(req).await);
+    }
+
     // 3. Mutating methods (POST, PUT, PATCH, DELETE) require matching cookie and header.
     let csrf_cookie_val = read_session_cookie(req.headers(), "csrf_token");
     let csrf_header_val = req
@@ -50,14 +72,28 @@ pub async fn csrf_middleware(
 
     match (csrf_cookie_val, csrf_header_val) {
         (Some(cookie_val), Some(header_val)) => {
-            let cookie_bytes = cookie_val.as_bytes();
-            let header_bytes = header_val.as_bytes();
+            let cookie_trim = cookie_val.trim();
+            let header_trim = header_val.trim();
 
-            let ct_eq: bool = if cookie_bytes.len() == header_bytes.len() {
-                cookie_bytes.ct_eq(header_bytes).into()
-            } else {
-                false
-            };
+            if cookie_trim.is_empty() || header_trim.is_empty() {
+                return Err(AppError::from_code(ErrorCode::CsrfTokenMissing));
+            }
+
+            // Enforce expected token length (32 or 64 hex characters) and length parity
+            if cookie_trim.len() != header_trim.len()
+                || (cookie_trim.len() != 32 && cookie_trim.len() != 64)
+            {
+                tracing::warn!(
+                    event = "csrf_mismatch",
+                    reason = "invalid_or_mismatched_token_length"
+                );
+                return Err(AppError::from_code(ErrorCode::CsrfTokenInvalid));
+            }
+
+            let cookie_bytes = cookie_trim.as_bytes();
+            let header_bytes = header_trim.as_bytes();
+
+            let ct_eq: bool = cookie_bytes.ct_eq(header_bytes).into();
 
             if !ct_eq {
                 tracing::warn!(event = "csrf_mismatch");
@@ -270,8 +306,8 @@ mod tests {
         let req = Request::builder()
             .method(Method::POST)
             .uri("/test")
-            .header("cookie", "csrf_token=token_aaa")
-            .header("x-csrf-token", "token_bbb")
+            .header("cookie", "csrf_token=0123456789abcdef0123456789abcdef")
+            .header("x-csrf-token", "fedcba9876543210fedcba9876543210")
             .body(Body::empty())
             .unwrap();
 
@@ -302,5 +338,65 @@ mod tests {
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
         let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(err.code, ErrorCode::CsrfTokenInvalid);
+    }
+
+    #[tokio::test]
+    async fn empty_tokens_in_cookie_and_header_rejected_as_missing() {
+        let state = test_app_state();
+        let app = test_router(state);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/test")
+            .header("cookie", "csrf_token=")
+            .header("x-csrf-token", "")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err.code, ErrorCode::CsrfTokenMissing);
+    }
+
+    #[tokio::test]
+    async fn whitespace_tokens_rejected_as_missing() {
+        let state = test_app_state();
+        let app = test_router(state);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/test")
+            .header("cookie", "csrf_token=   ")
+            .header("x-csrf-token", "   ")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err.code, ErrorCode::CsrfTokenMissing);
+    }
+
+    #[tokio::test]
+    async fn sixty_four_char_matching_tokens_pass() {
+        let state = test_app_state();
+        let app = test_router(state);
+
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/test")
+            .header("cookie", format!("csrf_token={token}"))
+            .header("x-csrf-token", token)
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
     }
 }

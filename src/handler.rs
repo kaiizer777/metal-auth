@@ -1,7 +1,7 @@
 use axum::{Router, http::HeaderMap};
 use tower_http::trace::TraceLayer;
 
-use crate::{error::AppError, state::AppState};
+use crate::{error::AppError, middleware::security_headers_middleware, state::AppState};
 
 pub mod auth;
 pub mod cors;
@@ -43,6 +43,7 @@ pub fn create_router(state: AppState) -> Result<Router, AppError> {
         .nest("/auth", auth_router)
         .fallback(fallback_not_found)
         .layer(cors)
+        .layer(axum::middleware::from_fn(security_headers_middleware))
         .layer(TraceLayer::new_for_http()))
 }
 

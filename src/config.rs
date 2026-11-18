@@ -232,6 +232,14 @@ impl Config {
             }
         };
 
+        let allowed_headers = match lookup("ALLOWED_HEADERS") {
+            Ok(val) => parse_allowed_headers_str(&val),
+            Err(std::env::VarError::NotPresent) => default_allowed_headers(),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar("ALLOWED_HEADERS"));
+            }
+        };
+
         let base_url = match lookup("BASE_URL") {
             Ok(val) => val,
             Err(std::env::VarError::NotPresent) => {
@@ -507,10 +515,7 @@ impl Config {
                 .into_iter()
                 .map(String::from)
                 .collect(),
-            allowed_headers: vec!["Authorization", "Content-Type"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            allowed_headers,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             min_connections: DEFAULT_MIN_CONNECTIONS,
             base_url,
@@ -540,6 +545,40 @@ fn parse_allowed_origins_str(raw: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect()
+}
+
+pub(crate) fn default_allowed_headers() -> Vec<String> {
+    vec![
+        "Authorization".to_string(),
+        "Content-Type".to_string(),
+        "X-CSRF-Token".to_string(),
+    ]
+}
+
+pub(crate) fn parse_allowed_headers_str(raw: &str) -> Vec<String> {
+    if raw.trim().is_empty() {
+        return default_allowed_headers();
+    }
+
+    let mut headers: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+
+    if headers.is_empty() {
+        return default_allowed_headers();
+    }
+
+    if !headers
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case("x-csrf-token"))
+    {
+        headers.push("X-CSRF-Token".to_string());
+    }
+
+    headers
 }
 
 // ─── Phase 3 — Auth-specific configuration ───────────────────────────────────
@@ -747,8 +786,19 @@ fn parse_env_bool(
 pub struct SessionConfig {
     #[serde(default = "default_cookie_name")]
     pub cookie_name: String,
+    /// Cookie domain for session and CSRF cookies.
+    ///
+    /// In split-host or cross-subdomain architectures (e.g. frontend on `app.example.com` calling
+    /// an API on `api.example.com`), configure `SESSION_COOKIE_DOMAIN` (e.g. `.example.com`) so that
+    /// client-side JavaScript can read the `csrf_token` cookie for Double Submit Cookie verification.
+    ///
+    /// The `csrf_token` cookie uses `SESSION_COOKIE_PATH`. Browsers expose it to frontend JavaScript
+    /// only when the frontend document path matches that cookie path. Keep `SESSION_COOKIE_PATH` at
+    /// `/` (the default) for this setup.
     #[serde(default)]
     pub cookie_domain: Option<String>,
+    /// Cookie path for session and CSRF cookies. Must match the frontend document root (typically `/`)
+    /// so CSRF double-submit cookies are accessible to the browser client.
     #[serde(default = "default_cookie_path")]
     pub cookie_path: String,
     #[serde(default = "default_cookie_same_site")]
@@ -1034,7 +1084,7 @@ impl Default for Config {
                 "DELETE".into(),
                 "OPTIONS".into(),
             ],
-            allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
+            allowed_headers: default_allowed_headers(),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             min_connections: DEFAULT_MIN_CONNECTIONS,
             base_url: "https://app.example.com".into(),
@@ -1102,7 +1152,7 @@ mod tests {
             port: 3000,
             allowed_origins: vec!["https://app.example.com".into()],
             allowed_methods: vec!["GET".into(), "POST".into()],
-            allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
+            allowed_headers: default_allowed_headers(),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             min_connections: DEFAULT_MIN_CONNECTIONS,
             base_url: "https://app.example.com".into(),
@@ -2394,5 +2444,72 @@ mod tests {
             ..degenerate
         };
         assert!(reenabled.validate().is_err());
+    }
+
+    #[test]
+    fn default_allowed_headers_includes_csrf_token() {
+        let headers = default_allowed_headers();
+        assert!(
+            headers
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case("x-csrf-token"))
+        );
+    }
+
+    #[test]
+    fn parse_allowed_headers_appends_csrf_token_if_missing() {
+        let headers = parse_allowed_headers_str("Authorization, Content-Type, X-Custom");
+        assert_eq!(
+            headers,
+            vec!["Authorization", "Content-Type", "X-Custom", "X-CSRF-Token"]
+        );
+    }
+
+    #[test]
+    fn parse_allowed_headers_preserves_csrf_token_if_already_present() {
+        let headers = parse_allowed_headers_str("Authorization, X-CSRF-Token, Content-Type");
+        assert_eq!(
+            headers,
+            vec!["Authorization", "X-CSRF-Token", "Content-Type"]
+        );
+    }
+
+    #[test]
+    fn parse_allowed_headers_empty_or_whitespace_falls_back_to_defaults() {
+        for empty_val in ["", "   ", " \t\n ", ", ,  ,"] {
+            let headers = parse_allowed_headers_str(empty_val);
+            assert_eq!(
+                headers,
+                default_allowed_headers(),
+                "expected default allowed headers for input '{empty_val}'"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_headers_empty_env_lookup_falls_back_to_defaults() {
+        let cfg = Config::from_lookup(|key| match key {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "ALLOWED_HEADERS" => Ok("   ".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        })
+        .expect("load config with whitespace allowed headers");
+        assert_eq!(cfg.allowed_headers, default_allowed_headers());
+    }
+
+    #[test]
+    fn allowed_headers_loaded_from_env_lookup() {
+        let cfg = Config::from_lookup(|key| match key {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "ALLOWED_HEADERS" => Ok("Authorization, X-Custom-Header".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        })
+        .expect("load config with custom allowed headers");
+        assert_eq!(
+            cfg.allowed_headers,
+            vec!["Authorization", "X-Custom-Header", "X-CSRF-Token"]
+        );
     }
 }

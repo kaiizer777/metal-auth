@@ -251,6 +251,48 @@ pub fn set_csrf_cookie(
     build_csrf_cookie(sc, csrf_token)
 }
 
+/// Build a clear-CSRF cookie `Set-Cookie` header value, expiring the `csrf_token` cookie.
+///
+/// # Security Invariant
+/// Clearing the CSRF cookie must strictly be associated with valid authenticated session
+/// invalidation (e.g. successful logout where credentials were verified). Handlers must never
+/// emit clear-cookie headers on unauthenticated or rejected requests.
+///
+/// # Errors
+///
+/// Returns `AppError::Internal` when the header value cannot be encoded.
+pub fn build_clear_csrf_cookie(sc: &impl SessionCookieSource) -> Result<HeaderValue, AppError> {
+    let mut parts = vec![
+        "csrf_token=".to_string(),
+        "Max-Age=0".to_string(),
+        "Expires=Thu, 01 Jan 1970 00:00:00 GMT".to_string(),
+        format!("Path={}", sc.cookie_path()),
+        "SameSite=Strict".to_string(),
+    ];
+    if sc.cookie_secure() {
+        parts.push("Secure".to_string());
+    }
+    if let Some(domain) = sc.cookie_domain() {
+        parts.push(format!("Domain={}", domain));
+    }
+
+    HeaderValue::from_str(&parts.join("; ")).map_err(|_| {
+        tracing::error!(event = "cookie_build_failed", kind = "clear_csrf");
+        AppError::Internal
+    })
+}
+
+/// Build a `Set-Cookie` header that clears the CSRF token cookie.
+///
+/// See [`build_clear_csrf_cookie`] for security invariants regarding authenticated logout.
+///
+/// # Errors
+///
+/// Returns `AppError::Internal` when the header value cannot be encoded.
+pub fn clear_csrf_cookie(sc: &impl SessionCookieSource) -> Result<HeaderValue, AppError> {
+    build_clear_csrf_cookie(sc)
+}
+
 /// Extract the session cookie value from the `Cookie` header.
 pub fn read_session_cookie(headers: &HeaderMap, cookie_name: &str) -> Option<String> {
     let cookie_header = headers.get("cookie")?.to_str().ok()?;
@@ -418,6 +460,27 @@ mod tests {
         assert!(s.contains("Path=/"));
 
         let cookie2 = set_csrf_cookie(&cfg.session, "csrftoken456").expect("hex token encodes");
+        assert_eq!(cookie, cookie2);
+    }
+
+    #[test]
+    fn test_clear_csrf_cookie() {
+        let cfg = test_config();
+        let cookie = clear_csrf_cookie(&cfg).expect("clear csrf cookie encodes");
+        let s = cookie.to_str().expect("valid ascii");
+
+        assert!(s.contains("csrf_token="));
+        assert!(s.contains("Max-Age=0"));
+        assert!(s.contains("Expires=Thu, 01 Jan 1970 00:00:00 GMT"));
+        assert!(s.contains("SameSite=Strict"));
+        assert!(s.contains("Path=/"));
+        assert!(s.contains("Secure"));
+        assert!(
+            !s.contains("HttpOnly"),
+            "Clear CSRF cookie must not be HttpOnly"
+        );
+
+        let cookie2 = clear_csrf_cookie(&cfg.session).expect("clear csrf cookie encodes");
         assert_eq!(cookie, cookie2);
     }
 

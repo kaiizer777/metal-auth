@@ -1654,12 +1654,12 @@ async fn test_no_secrets_in_tracing_logs() {
         "Log buffer should have captured tracing events from requests"
     );
     assert!(
-        logs.contains("logout"),
-        "Tracing logs must record structured logout event: {logs}"
+        logs.lines().any(|l| l.contains("security_event") && l.contains("logout")),
+        "Tracing logs must record structured logout event with target security_event: {logs}"
     );
     assert!(
-        logs.contains("password_reset_request"),
-        "Tracing logs must record structured password_reset_request event: {logs}"
+        logs.lines().any(|l| l.contains("security_event") && (l.contains("password_reset_requested") || l.contains("password_reset_request"))),
+        "Tracing logs must record structured password_reset_request event with target security_event: {logs}"
     );
     assert!(
         logs.contains("signup"),

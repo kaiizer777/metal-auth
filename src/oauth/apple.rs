@@ -19,6 +19,7 @@ pub const APPLE_TOKEN_ENDPOINT: &str = "https://appleid.apple.com/auth/token";
 pub const APPLE_JWKS_ENDPOINT: &str = "https://appleid.apple.com/auth/keys";
 pub const APPLE_ISSUER: &str = "https://appleid.apple.com";
 pub const APPLE_JWKS_TTL: Duration = Duration::from_secs(86400); // 24 hours
+pub const APPLE_JWKS_REFRESH_COOLDOWN: Duration = Duration::from_secs(300); // 5 minutes
 
 const DEFAULT_SCOPES: &[&str] = &["name", "email"];
 
@@ -57,6 +58,7 @@ struct AppleTokenClaims {
 struct JwksCache {
     keys: HashMap<String, (String, String)>,
     expires_at: Option<Instant>,
+    last_refreshed_at: Option<Instant>,
 }
 
 #[derive(Clone, Debug)]
@@ -154,10 +156,7 @@ impl AppleProvider {
             return Err(AppError::OAuthProviderError);
         }
 
-        let jwks: JwksResponse = resp
-            .json()
-            .await
-            .map_err(|_| AppError::OAuthProviderError)?;
+        let jwks: JwksResponse = crate::oauth::provider::read_json_limited(resp).await?;
 
         let mut keys = HashMap::new();
         for k in jwks.keys {
@@ -169,11 +168,13 @@ impl AppleProvider {
         let mut write_guard = self.cache.write().await;
         write_guard.keys = keys;
         write_guard.expires_at = Some(Instant::now() + APPLE_JWKS_TTL);
+        write_guard.last_refreshed_at = Some(Instant::now());
 
         Ok(())
     }
 
     /// Resolves RSA public key components for `kid`, auto-refreshing cache if missing.
+    /// Enforces a cooldown between refresh attempts on unknown keys to mitigate DoS amplification.
     async fn get_jwks_key(&self, kid: &str) -> Result<(String, String), AppError> {
         {
             let read_guard = self.cache.read().await;
@@ -185,9 +186,15 @@ impl AppleProvider {
             if fresh && let Some(components) = read_guard.keys.get(kid) {
                 return Ok(components.clone());
             }
+
+            if let Some(last_refreshed) = read_guard.last_refreshed_at
+                && Instant::now().duration_since(last_refreshed) < APPLE_JWKS_REFRESH_COOLDOWN
+            {
+                return Err(AppError::OAuthProviderError);
+            }
         }
 
-        // Cache expired or kid unknown: refresh once
+        // Cache expired or kid unknown (and cooldown window elapsed): refresh once
         self.refresh_jwks().await?;
 
         let read_guard = self.cache.read().await;
@@ -298,12 +305,14 @@ impl OAuthProvider for AppleProvider {
             return Err(AppError::OAuthProviderError);
         }
 
-        let verified = normalize_email_verified(token_data.claims.email_verified.as_ref());
+        let email = token_data.claims.email.unwrap_or_default();
+        let verified = normalize_email_verified(token_data.claims.email_verified.as_ref())
+            && !email.trim().is_empty();
 
         Ok(UserInfo {
             provider_id: "apple".to_string(),
             provider_user_id: token_data.claims.sub,
-            email: token_data.claims.email.unwrap_or_default(),
+            email,
             email_verified: verified,
             name: None,
             avatar_url: None,
@@ -551,6 +560,27 @@ mod tests {
             let user = p.fetch_user_info(&tok).await.unwrap();
             assert_eq!(user.email_verified, expected);
         }
+
+        // Empty or missing email evaluates to email_verified: false even if claim is true
+        let empty_email_claims = MockClaims {
+            iss: "https://appleid.apple.com".to_string(),
+            aud: "com.example.app".to_string(),
+            exp: now + 3600,
+            iat: now,
+            sub: "sub123".to_string(),
+            email: Some("   ".to_string()),
+            email_verified: Some(serde_json::Value::Bool(true)),
+        };
+        let empty_tok = TokenResponse {
+            access_token: "at".to_string(),
+            token_type: "Bearer".to_string(),
+            refresh_token: None,
+            expires_in: None,
+            id_token: Some(mint_test_id_token("kid-1", empty_email_claims)),
+            raw: HashMap::new(),
+        };
+        let user_empty = p.fetch_user_info(&empty_tok).await.unwrap();
+        assert!(!user_empty.email_verified);
     }
 
     #[tokio::test]
@@ -605,6 +635,27 @@ mod tests {
         let user = p.fetch_user_info(&tok).await.unwrap();
         assert_eq!(user.provider_user_id, "sub-rotated");
         assert_eq!(user.email, "rotated@example.com");
+
+        // Immediately attempt with unknown kid-3: should fail fast under cooldown without flooding endpoint
+        let claims_flood = MockClaims {
+            iss: "https://appleid.apple.com".to_string(),
+            aud: "com.example.app".to_string(),
+            exp: now + 3600,
+            iat: now,
+            sub: "sub-flood".to_string(),
+            email: Some("flood@example.com".to_string()),
+            email_verified: Some(serde_json::Value::Bool(true)),
+        };
+        let tok_flood = TokenResponse {
+            access_token: "at".to_string(),
+            token_type: "Bearer".to_string(),
+            refresh_token: None,
+            expires_in: None,
+            id_token: Some(mint_test_id_token("kid-3", claims_flood)),
+            raw: HashMap::new(),
+        };
+        let err = p.fetch_user_info(&tok_flood).await.unwrap_err();
+        assert!(matches!(err, AppError::OAuthProviderError));
     }
 
     #[tokio::test]

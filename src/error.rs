@@ -534,7 +534,10 @@ mod tests {
             // Phase 6
             (ErrorCode::OAuthStateInvalid, "\"OAUTH_STATE_INVALID\""),
             (ErrorCode::OAuthCodeInvalid, "\"OAUTH_CODE_INVALID\""),
-            (ErrorCode::OAuthEmailUnverified, "\"OAUTH_EMAIL_UNVERIFIED\""),
+            (
+                ErrorCode::OAuthEmailUnverified,
+                "\"OAUTH_EMAIL_UNVERIFIED\"",
+            ),
             (ErrorCode::OAuthProviderError, "\"OAUTH_PROVIDER_ERROR\""),
             (
                 ErrorCode::OAuthAccountLinkConflict,
@@ -987,12 +990,36 @@ mod tests {
     #[test]
     fn test_oauth_error_codes_wire_serialization_and_envelope() {
         let cases = [
-            (ErrorCode::OAuthStateInvalid, "OAUTH_STATE_INVALID", StatusCode::FORBIDDEN),
-            (ErrorCode::OAuthCodeInvalid, "OAUTH_CODE_INVALID", StatusCode::BAD_REQUEST),
-            (ErrorCode::OAuthEmailUnverified, "OAUTH_EMAIL_UNVERIFIED", StatusCode::BAD_REQUEST),
-            (ErrorCode::OAuthProviderError, "OAUTH_PROVIDER_ERROR", StatusCode::BAD_GATEWAY),
-            (ErrorCode::OAuthAccountLinkConflict, "OAUTH_ACCOUNT_LINK_CONFLICT", StatusCode::CONFLICT),
-            (ErrorCode::OAuthProviderNotFound, "OAUTH_PROVIDER_NOT_FOUND", StatusCode::NOT_FOUND),
+            (
+                ErrorCode::OAuthStateInvalid,
+                "OAUTH_STATE_INVALID",
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                ErrorCode::OAuthCodeInvalid,
+                "OAUTH_CODE_INVALID",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                ErrorCode::OAuthEmailUnverified,
+                "OAUTH_EMAIL_UNVERIFIED",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                ErrorCode::OAuthProviderError,
+                "OAUTH_PROVIDER_ERROR",
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                ErrorCode::OAuthAccountLinkConflict,
+                "OAUTH_ACCOUNT_LINK_CONFLICT",
+                StatusCode::CONFLICT,
+            ),
+            (
+                ErrorCode::OAuthProviderNotFound,
+                "OAUTH_PROVIDER_NOT_FOUND",
+                StatusCode::NOT_FOUND,
+            ),
         ];
 
         for (code, expected_wire, expected_status) in cases {

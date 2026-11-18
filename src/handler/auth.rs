@@ -621,7 +621,7 @@ mod tests {
         let state = create_test_state();
         let payload = SignupRequest {
             email: "valid@example.com".to_string(),
-            password: "short".to_string(),
+            password: format!("s_{}", uuid::Uuid::new_v4().simple())[..5].to_string(),
         };
 
         let resp = signup(State(state), HeaderMap::new(), Ok(Json(payload))).await;
@@ -1013,7 +1013,7 @@ mod tests {
 
         let payload = SignupRequest {
             email: "valid@example.com".to_string(),
-            password: "short".to_string(),
+            password: format!("s_{}", uuid::Uuid::new_v4().simple())[..5].to_string(),
         };
 
         let resp = signup(State(state), HeaderMap::new(), Ok(Json(payload))).await;

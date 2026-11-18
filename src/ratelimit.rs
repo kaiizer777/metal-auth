@@ -959,7 +959,10 @@ mod tests {
 
         // 192.0.2.2 still exists in the map and the provisional attempt was popped
         assert!(limiter.windows.contains_key("ip:192.0.2.2"));
-        assert_eq!(limiter.windows.get("ip:192.0.2.2").unwrap().attempts.len(), 1);
+        assert_eq!(
+            limiter.windows.get("ip:192.0.2.2").unwrap().attempts.len(),
+            1
+        );
     }
 
     #[test]

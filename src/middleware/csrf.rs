@@ -19,6 +19,18 @@ use crate::{
 };
 
 /// Axum middleware enforcing Double Submit Cookie CSRF protection.
+///
+/// # Split-Host Architecture & Subdomain Scope
+/// By default, cookies are host-only. In split-host or multi-subdomain architectures (e.g.
+/// frontend SPA hosted on `app.example.com` making requests to an API at `api.example.com`),
+/// host-only cookies cannot be read across origins by client JavaScript. Operators must
+/// configure `SESSION_COOKIE_DOMAIN` (e.g. `.example.com`) in [`crate::config::SessionConfig`]
+/// so that frontend JavaScript can read the `csrf_token` cookie and submit it in the `X-CSRF-Token` header.
+///
+/// # Invariant: CSRF Cookie Removal on Invalidation
+/// CSRF token cookie expiration (`Set-Cookie: csrf_token=; Max-Age=0`) must strictly be associated
+/// with valid authenticated session invalidation (e.g., successful logout where the session was
+/// authenticated). Unauthenticated requests must never clear cookies, preventing cross-site state destruction.
 pub async fn csrf_middleware(
     State(state): State<AppState>,
     req: Request<Body>,

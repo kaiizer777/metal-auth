@@ -253,6 +253,11 @@ pub fn set_csrf_cookie(
 
 /// Build a clear-CSRF cookie `Set-Cookie` header value, expiring the `csrf_token` cookie.
 ///
+/// # Security Invariant
+/// Clearing the CSRF cookie must strictly be associated with valid authenticated session
+/// invalidation (e.g. successful logout where credentials were verified). Handlers must never
+/// emit clear-cookie headers on unauthenticated or rejected requests.
+///
 /// # Errors
 ///
 /// Returns `AppError::Internal` when the header value cannot be encoded.
@@ -278,6 +283,8 @@ pub fn build_clear_csrf_cookie(sc: &impl SessionCookieSource) -> Result<HeaderVa
 }
 
 /// Build a `Set-Cookie` header that clears the CSRF token cookie.
+///
+/// See [`build_clear_csrf_cookie`] for security invariants regarding authenticated logout.
 ///
 /// # Errors
 ///

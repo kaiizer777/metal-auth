@@ -25,7 +25,7 @@ pub static DB_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// Truncates all authentication and session domain tables with CASCADE.
 pub async fn truncate_tables(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "TRUNCATE TABLE users, sessions, verification_tokens, password_reset_tokens, email_outbox CASCADE",
+        "TRUNCATE TABLE users, sessions, verification_tokens, password_reset_tokens, email_outbox, oauth_accounts CASCADE",
     )
     .execute(pool)
     .await?;

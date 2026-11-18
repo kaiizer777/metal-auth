@@ -136,10 +136,7 @@ impl OAuthService {
                 .create_state(provider_id, &pkce.verifier, redirect_url)?;
         let auth_url = provider.auth_url(&state_token, &pkce.challenge);
 
-        tracing::info!(
-            event = "oauth_initiate",
-            provider = provider_id,
-        );
+        tracing::info!(event = "oauth_initiate", provider = provider_id,);
 
         Ok((auth_url, set_cookie_str))
     }
@@ -176,6 +173,7 @@ impl OAuthService {
     }
 
     /// Handles an incoming OAuth callback returning the full [`OAuthCallbackResult`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn handle_callback_extended(
         &self,
         provider_id: &str,
@@ -201,7 +199,10 @@ impl OAuthService {
             }
         };
 
-        let payload = match self.state_mgr.validate(cookie_header, state_param, provider_id) {
+        let payload = match self
+            .state_mgr
+            .validate(cookie_header, state_param, provider_id)
+        {
             Ok(p) => p,
             Err(e) => {
                 tracing::info!(
@@ -654,35 +655,31 @@ impl OAuthService {
 
     /// Unlinks an external provider, preventing account lockout if no usable password remains.
     pub async fn unlink_account(&self, user_id: Uuid, provider_id: &str) -> Result<(), AppError> {
-        let user = sqlx::query_as::<_, (String,)>(
-            "SELECT password_hash FROM users WHERE id = $1"
-        )
-        .bind(user_id)
-        .fetch_optional(&self.db)
-        .await
-        .map_err(AppError::Database)?
-        .ok_or(AppError::NotFound)?;
+        let user = sqlx::query_as::<_, (String,)>("SELECT password_hash FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(AppError::Database)?
+            .ok_or(AppError::NotFound)?;
 
-        let target_link: Option<(Uuid,)> = sqlx::query_as(
-            "SELECT id FROM oauth_accounts WHERE user_id = $1 AND provider_id = $2"
-        )
-        .bind(user_id)
-        .bind(provider_id)
-        .fetch_optional(&self.db)
-        .await
-        .map_err(AppError::Database)?;
+        let target_link: Option<(Uuid,)> =
+            sqlx::query_as("SELECT id FROM oauth_accounts WHERE user_id = $1 AND provider_id = $2")
+                .bind(user_id)
+                .bind(provider_id)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(AppError::Database)?;
 
         if target_link.is_none() {
             return Err(AppError::NotFound);
         }
 
-        let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM oauth_accounts WHERE user_id = $1"
-        )
-        .bind(user_id)
-        .fetch_one(&self.db)
-        .await
-        .map_err(AppError::Database)?;
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM oauth_accounts WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(&self.db)
+                .await
+                .map_err(AppError::Database)?;
 
         let password_hash = &user.0;
         let has_usable_password =
@@ -712,10 +709,7 @@ impl OAuthService {
     }
 
     /// Lists all external identities linked to the given user.
-    pub async fn list_linked_accounts(
-        &self,
-        user_id: Uuid,
-    ) -> Result<Vec<OAuthAccount>, AppError> {
+    pub async fn list_linked_accounts(&self, user_id: Uuid) -> Result<Vec<OAuthAccount>, AppError> {
         let accounts = sqlx::query_as::<_, OAuthAccount>(
             "SELECT id, user_id, provider_id, provider_user_id, email, created_at, updated_at FROM oauth_accounts WHERE user_id = $1 ORDER BY created_at ASC"
         )
@@ -756,9 +750,7 @@ mod tests {
         }
 
         fn auth_url(&self, state: &str, code_challenge: &str) -> String {
-            format!(
-                "https://mock.provider/auth?state={state}&code_challenge={code_challenge}"
-            )
+            format!("https://mock.provider/auth?state={state}&code_challenge={code_challenge}")
         }
 
         async fn exchange_code(
@@ -872,12 +864,19 @@ mod tests {
         let svc = test_service_with_mock(user_info, false);
 
         // Missing cookie
-        let res = svc.handle_callback("google", "code123", "state123", None).await;
+        let res = svc
+            .handle_callback("google", "code123", "state123", None)
+            .await;
         assert!(matches!(res, Err(AppError::OAuthStateInvalid)));
 
         // Tampered cookie
         let res = svc
-            .handle_callback("google", "code123", "state123", Some("oauth_state=invalid.signature"))
+            .handle_callback(
+                "google",
+                "code123",
+                "state123",
+                Some("oauth_state=invalid.signature"),
+            )
             .await;
         assert!(matches!(res, Err(AppError::OAuthStateInvalid)));
     }
@@ -897,7 +896,13 @@ mod tests {
         let (auth_url, set_cookie) = svc
             .get_authorization_url("google", None)
             .expect("init flow");
-        let state_token = auth_url.split("state=").nth(1).unwrap().split('&').next().unwrap();
+        let state_token = auth_url
+            .split("state=")
+            .nth(1)
+            .unwrap()
+            .split('&')
+            .next()
+            .unwrap();
 
         let res = svc
             .handle_callback("google", "", state_token, Some(&set_cookie))
@@ -920,7 +925,13 @@ mod tests {
         let (auth_url, set_cookie) = svc
             .get_authorization_url("google", None)
             .expect("init flow");
-        let state_token = auth_url.split("state=").nth(1).unwrap().split('&').next().unwrap();
+        let state_token = auth_url
+            .split("state=")
+            .nth(1)
+            .unwrap()
+            .split('&')
+            .next()
+            .unwrap();
 
         // Must reject with 400 OAuthEmailUnverified BEFORE any database queries
         let res = svc

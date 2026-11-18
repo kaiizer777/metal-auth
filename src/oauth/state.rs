@@ -418,8 +418,10 @@ mod tests {
 
     #[test]
     fn test_oauth_state_manager_lifecycle() {
-        let mut cfg = crate::config::OAuthConfig::default();
-        cfg.state_secret = "01234567890123456789012345678901".to_string();
+        let cfg = crate::config::OAuthConfig {
+            state_secret: "01234567890123456789012345678901".to_string(),
+            ..Default::default()
+        };
         let mgr = OAuthStateManager::new(&cfg, false);
 
         let (state_token, set_cookie) = mgr

@@ -523,4 +523,57 @@ async fn test_logout_with_session_cookie_requires_csrf() {
 
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+    let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(err.code, ErrorCode::CsrfTokenMissing);
+}
+
+#[tokio::test]
+async fn test_cors_preflight_allows_csrf_token_header() {
+    let state = dummy_app_state();
+    let app = metal_auth::handler::create_router(state).expect("create_router");
+
+    let req = Request::builder()
+        .method(Method::OPTIONS)
+        .uri("/auth/logout")
+        .header(header::ORIGIN, "https://app.example.com")
+        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+        .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "x-csrf-token, content-type")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert!(resp.status().is_success() || resp.status() == StatusCode::NO_CONTENT);
+
+    let allow_headers = resp
+        .headers()
+        .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+        .expect("access-control-allow-headers present")
+        .to_str()
+        .unwrap()
+        .to_lowercase();
+
+    assert!(
+        allow_headers.contains("x-csrf-token"),
+        "allowed headers must include x-csrf-token"
+    );
+
+    let h = resp.headers();
+    assert_eq!(
+        h.get(header::STRICT_TRANSPORT_SECURITY).unwrap(),
+        "max-age=63072000; includeSubDomains; preload"
+    );
+    assert_eq!(h.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+    assert_eq!(h.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+    assert_eq!(
+        h.get(header::CONTENT_SECURITY_POLICY).unwrap(),
+        "default-src 'self'"
+    );
+    assert_eq!(
+        h.get(header::REFERRER_POLICY).unwrap(),
+        "strict-origin-when-cross-origin"
+    );
+
+    assert!(h.get(header::CACHE_CONTROL).is_none());
+    assert!(h.get(header::PRAGMA).is_none());
 }

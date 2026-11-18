@@ -24,10 +24,12 @@ pub async fn security_headers_middleware(req: Request<Body>, next: Next) -> Resp
         HeaderValue::from_static("nosniff"),
     );
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
-    headers.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static("default-src 'self'"),
-    );
+    if !headers.contains_key(header::CONTENT_SECURITY_POLICY) {
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("default-src 'self'"),
+        );
+    }
     headers.insert(
         header::REFERRER_POLICY,
         HeaderValue::from_static("strict-origin-when-cross-origin"),
@@ -129,5 +131,39 @@ mod tests {
         );
         assert!(h.get(header::CACHE_CONTROL).is_none());
         assert!(h.get(header::PRAGMA).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_preserves_custom_downstream_csp() {
+        let app = Router::new()
+            .route(
+                "/custom-csp",
+                get(|| async {
+                    (
+                        [(
+                            header::CONTENT_SECURITY_POLICY,
+                            "default-src 'none'; frame-ancestors 'none'",
+                        )],
+                        StatusCode::OK,
+                    )
+                }),
+            )
+            .layer(from_fn(security_headers_middleware));
+
+        let req = Request::builder()
+            .uri("/custom-csp")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get(header::CONTENT_SECURITY_POLICY).unwrap(),
+            "default-src 'none'; frame-ancestors 'none'"
+        );
+        assert_eq!(
+            res.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+            "nosniff"
+        );
     }
 }

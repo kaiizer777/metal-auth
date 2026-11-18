@@ -5,8 +5,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
+use axum::http::StatusCode;
 use common::*;
-use metal_auth::{AppError, OAuthProvider, OAuthService, SessionService, TokenResponse, UserInfo};
+use metal_auth::{
+    AppError, ErrorCode, OAuthProvider, OAuthService, SessionService, TokenResponse, UserInfo,
+};
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -443,4 +446,137 @@ async fn test_oauth_link_and_unlink_account_lifecycle() {
         .expect("unlink github with password");
     let accounts_empty = svc.list_linked_accounts(user_id).await.unwrap();
     assert_eq!(accounts_empty.len(), 0);
+}
+
+#[tokio::test]
+async fn test_oauth_unusable_password_login_returns_invalid_credentials() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    truncate_tables(&app.pool).await.expect("truncate");
+
+    let email = dynamic_email();
+    let user_id = Uuid::new_v4();
+
+    // 1. User created via OAuth with sentinel $unusable$oauth$ password hash
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(user_id)
+    .bind(&email)
+    .bind("$unusable$oauth$")
+    .bind(true)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+
+    // Direct auth service login call: executes dummy verification without leaking account state
+    let res = app
+        .state
+        .auth_service
+        .login(&email, "any_attempted_password")
+        .await;
+    assert!(matches!(res, Err(AppError::InvalidCredentials)));
+
+    // HTTP login dispatch check
+    let resp = app
+        .post_json(
+            "/auth/login",
+            serde_json::json!({
+                "email": email,
+                "password": "any_attempted_password"
+            }),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.error_code(), Some(ErrorCode::InvalidCredentials));
+
+    // 2. Also test user with empty password hash
+    let email_empty_hash = dynamic_email();
+    let user_id_2 = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(user_id_2)
+    .bind(&email_empty_hash)
+    .bind("")
+    .bind(true)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+
+    let res_empty = app
+        .state
+        .auth_service
+        .login(&email_empty_hash, "any_attempted_password")
+        .await;
+    assert!(matches!(res_empty, Err(AppError::InvalidCredentials)));
+}
+
+#[tokio::test]
+async fn test_oauth_email_normalization_on_provisioning() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    truncate_tables(&app.pool).await.expect("truncate");
+
+    let mixed_email = format!("MixedCase.{}@EXAMPLE.COM", Uuid::new_v4());
+    let normalized_expected = mixed_email.trim().to_lowercase();
+
+    let google_mock = Arc::new(MockOAuthProvider::new(
+        "google",
+        UserInfo {
+            provider_id: "google".to_string(),
+            provider_user_id: "goog_mixed_sub".to_string(),
+            email: mixed_email.clone(),
+            email_verified: true,
+            name: Some("Mixed Case".to_string()),
+            avatar_url: None,
+        },
+    ));
+
+    let svc = create_test_oauth_service(&app, google_mock, None);
+
+    let (auth_url, set_cookie) = svc
+        .get_authorization_url("google", None)
+        .expect("get auth url");
+    let state_token = extract_state_from_url(&auth_url);
+
+    let res = svc
+        .handle_callback_extended(
+            "google",
+            "valid_code",
+            state_token,
+            Some(&set_cookie),
+            "cookie",
+            None,
+            None,
+        )
+        .await
+        .expect("handle callback");
+
+    assert_eq!(res.user.email, normalized_expected);
+
+    // Verify database row has lowercased email
+    let db_email: (String,) = sqlx::query_as("SELECT email FROM users WHERE id = $1")
+        .bind(res.user.id)
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(db_email.0, normalized_expected);
+
+    let oauth_email: (String,) =
+        sqlx::query_as("SELECT email FROM oauth_accounts WHERE user_id = $1")
+            .bind(res.user.id)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(oauth_email.0, normalized_expected);
+
+    // Verify clear_state_cookie helper on OAuthService
+    let clear_header = svc.clear_state_cookie();
+    assert!(clear_header.contains("Max-Age=0"));
+    assert!(clear_header.contains("oauth_state="));
 }

@@ -101,10 +101,14 @@ impl AppState {
             dispatcher,
         )?);
 
-        let session_service = Arc::new(SessionService::new(pool.clone(), Arc::new(config.clone())));
+        let shared_config = Arc::new(config.clone());
+        let session_service = Arc::new(SessionService::new(
+            pool.clone(),
+            Arc::clone(&shared_config),
+        ));
         let oauth_service = Arc::new(OAuthService::new(
             pool.clone(),
-            Arc::new(config.clone()),
+            shared_config,
             Arc::clone(&session_service),
         )?);
         let rate_limiter = Arc::new(RateLimiter::with_config(config.rate_limit.clone()));

@@ -150,6 +150,18 @@ impl OAuthService {
         self.get_authorization_url(provider_id, redirect_url)
     }
 
+    /// Returns a `Set-Cookie` header value to clear the OAuth state cookie (`Max-Age=0`).
+    #[must_use]
+    pub fn clear_state_cookie(&self) -> String {
+        self.state_mgr.build_clear_cookie()
+    }
+
+    /// Exposes a reference to the internal [`OAuthStateManager`].
+    #[must_use]
+    pub fn state_mgr(&self) -> &OAuthStateManager {
+        &self.state_mgr
+    }
+
     /// Handles an incoming OAuth callback, returning `(Session, User, clear_cookie_header)`.
     pub async fn handle_callback(
         &self,
@@ -273,7 +285,10 @@ impl OAuthService {
             return Err(AppError::OAuthEmailUnverified);
         }
 
-        if user_info.email.trim().is_empty() {
+        let mut user_info = user_info;
+        user_info.email = user_info.email.trim().to_lowercase();
+
+        if user_info.email.is_empty() {
             tracing::info!(
                 event = "oauth_callback_failure",
                 provider = provider_id,
@@ -356,10 +371,11 @@ impl OAuthService {
         }
 
         // Case B: No existing link found; check local account by normalized email
+        let email = user_info.email.trim().to_lowercase();
         let existing_user: Option<User> = sqlx::query_as::<_, User>(
             "SELECT id, email, password_hash, email_verified, created_at, updated_at FROM users WHERE LOWER(email) = LOWER($1)"
         )
-        .bind(&user_info.email)
+        .bind(&email)
         .fetch_optional(&self.db)
         .await
         .map_err(AppError::Database)?;
@@ -371,7 +387,7 @@ impl OAuthService {
             if !existing.email_verified {
                 tracing::warn!(
                     event = "oauth_pre_hijack_prevented",
-                    email = %user_info.email,
+                    email = %email,
                     provider = provider_id,
                     "rejected linking to unverified local account"
                 );
@@ -387,7 +403,7 @@ impl OAuthService {
             .bind(existing.id)
             .bind(provider_id)
             .bind(&user_info.provider_user_id)
-            .bind(&user_info.email)
+            .bind(&email)
             .bind(now)
             .bind(now)
             .execute(&self.db)
@@ -415,7 +431,7 @@ impl OAuthService {
             "INSERT INTO users (id, email, password_hash, email_verified, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6)"
         )
         .bind(user_id)
-        .bind(&user_info.email)
+        .bind(&email)
         .bind(unusable_hash)
         .bind(true)
         .bind(now)
@@ -438,7 +454,7 @@ impl OAuthService {
         .bind(user_id)
         .bind(provider_id)
         .bind(&user_info.provider_user_id)
-        .bind(&user_info.email)
+        .bind(&email)
         .bind(now)
         .bind(now)
         .execute(&mut *tx)
@@ -458,7 +474,7 @@ impl OAuthService {
 
         let new_user = User {
             id: user_id,
-            email: user_info.email.clone(),
+            email: email.clone(),
             password_hash: unusable_hash.to_string(),
             email_verified: true,
             created_at: now,
@@ -502,10 +518,11 @@ impl OAuthService {
         provider_id: &str,
         user_info: &UserInfo,
     ) -> Result<(User, bool, bool), AppError> {
+        let email = user_info.email.trim().to_lowercase();
         let existing: User = sqlx::query_as::<_, User>(
             "SELECT id, email, password_hash, email_verified, created_at, updated_at FROM users WHERE LOWER(email) = LOWER($1)"
         )
-        .bind(&user_info.email)
+        .bind(&email)
         .fetch_optional(&self.db)
         .await
         .map_err(AppError::Database)?
@@ -524,7 +541,7 @@ impl OAuthService {
         .bind(existing.id)
         .bind(provider_id)
         .bind(&user_info.provider_user_id)
-        .bind(&user_info.email)
+        .bind(&email)
         .bind(now)
         .bind(now)
         .execute(&self.db)
@@ -574,11 +591,16 @@ impl OAuthService {
 
         let provider = self.provider(provider_id)?;
         let tokens = provider.exchange_code(code, &payload.code_verifier).await?;
-        let user_info = provider.get_user_info(&tokens).await?;
+        let mut user_info = provider.get_user_info(&tokens).await?;
 
         // 1. Provider email must be verified
         if !user_info.email_verified {
             return Err(AppError::OAuthEmailUnverified);
+        }
+
+        user_info.email = user_info.email.trim().to_lowercase();
+        if user_info.email.is_empty() {
+            return Err(AppError::OAuthProviderError);
         }
 
         // 2. User must exist and have verified status
@@ -624,7 +646,7 @@ impl OAuthService {
             updated_at: now,
         };
 
-        sqlx::query(
+        let insert_res = sqlx::query(
             "INSERT INTO oauth_accounts (id, user_id, provider_id, provider_user_id, email, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7)"
         )
         .bind(row.id)
@@ -635,14 +657,29 @@ impl OAuthService {
         .bind(row.created_at)
         .bind(row.updated_at)
         .execute(&self.db)
-        .await
-        .map_err(|e| {
+        .await;
+
+        if let Err(e) = insert_res {
             if is_unique_violation(&e) {
-                AppError::OAuthAccountLinkConflict
-            } else {
-                AppError::Database(e)
+                // If another request linked this identity concurrently, check if it belongs to this user
+                let link: Option<OAuthAccount> = sqlx::query_as::<_, OAuthAccount>(
+                    "SELECT id, user_id, provider_id, provider_user_id, email, created_at, updated_at FROM oauth_accounts WHERE provider_id = $1 AND provider_user_id = $2"
+                )
+                .bind(provider_id)
+                .bind(&row.provider_user_id)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(AppError::Database)?;
+
+                if let Some(link) = link
+                    && link.user_id == user_id
+                {
+                    return Ok(link);
+                }
+                return Err(AppError::OAuthAccountLinkConflict);
             }
-        })?;
+            return Err(AppError::Database(e));
+        }
 
         tracing::info!(
             event = "oauth_account_linked",
@@ -655,18 +692,23 @@ impl OAuthService {
 
     /// Unlinks an external provider, preventing account lockout if no usable password remains.
     pub async fn unlink_account(&self, user_id: Uuid, provider_id: &str) -> Result<(), AppError> {
-        let user = sqlx::query_as::<_, (String,)>("SELECT password_hash FROM users WHERE id = $1")
-            .bind(user_id)
-            .fetch_optional(&self.db)
-            .await
-            .map_err(AppError::Database)?
-            .ok_or(AppError::NotFound)?;
+        let mut tx = self.db.begin().await.map_err(AppError::Database)?;
+
+        // Acquire exclusive row lock on user record to serialize concurrent unlinking
+        let user = sqlx::query_as::<_, (String,)>(
+            "SELECT password_hash FROM users WHERE id = $1 FOR UPDATE",
+        )
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(AppError::Database)?
+        .ok_or(AppError::NotFound)?;
 
         let target_link: Option<(Uuid,)> =
             sqlx::query_as("SELECT id FROM oauth_accounts WHERE user_id = $1 AND provider_id = $2")
                 .bind(user_id)
                 .bind(provider_id)
-                .fetch_optional(&self.db)
+                .fetch_optional(&mut *tx)
                 .await
                 .map_err(AppError::Database)?;
 
@@ -677,7 +719,7 @@ impl OAuthService {
         let count: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM oauth_accounts WHERE user_id = $1")
                 .bind(user_id)
-                .fetch_one(&self.db)
+                .fetch_one(&mut *tx)
                 .await
                 .map_err(AppError::Database)?;
 
@@ -688,16 +730,18 @@ impl OAuthService {
         // Lockout prevention: user must retain a usable password or at least 1 other linked provider
         if !has_usable_password && count.0 <= 1 {
             return Err(AppError::ValidationError(
-                "Cannot unlink the only login method".to_string(),
+                "Cannot unlink the only authentication method".to_string(),
             ));
         }
 
         sqlx::query("DELETE FROM oauth_accounts WHERE user_id = $1 AND provider_id = $2")
             .bind(user_id)
             .bind(provider_id)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await
             .map_err(AppError::Database)?;
+
+        tx.commit().await.map_err(AppError::Database)?;
 
         tracing::info!(
             event = "oauth_account_unlinked",
@@ -938,5 +982,22 @@ mod tests {
             .handle_callback("google", "valid_code", state_token, Some(&set_cookie))
             .await;
         assert!(matches!(res, Err(AppError::OAuthEmailUnverified)));
+    }
+
+    #[tokio::test]
+    async fn test_clear_state_cookie_and_state_mgr_accessors() {
+        let user_info = UserInfo {
+            provider_id: "google".to_string(),
+            provider_user_id: "goog_123".to_string(),
+            email: "alice@example.com".to_string(),
+            email_verified: true,
+            name: None,
+            avatar_url: None,
+        };
+        let svc = test_service_with_mock(user_info, false);
+        let clear_cookie = svc.clear_state_cookie();
+        assert!(clear_cookie.contains("Max-Age=0"));
+        assert!(clear_cookie.contains("oauth_state="));
+        assert_eq!(svc.state_mgr().cookie_name, "oauth_state");
     }
 }

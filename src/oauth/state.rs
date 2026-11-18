@@ -179,13 +179,25 @@ pub fn extract_state_cookie<'a>(headers: &'a HeaderMap, cookie_name: &str) -> Op
 }
 
 /// State manager bundling OAuth state configuration and helper methods.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OAuthStateManager {
     pub cookie_name: String,
     pub cookie_path: String,
     pub state_ttl: std::time::Duration,
     pub state_secret: String,
     pub cookie_secure: bool,
+}
+
+impl std::fmt::Debug for OAuthStateManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthStateManager")
+            .field("cookie_name", &self.cookie_name)
+            .field("cookie_path", &self.cookie_path)
+            .field("state_ttl", &self.state_ttl)
+            .field("state_secret", &"[REDACTED]")
+            .field("cookie_secure", &self.cookie_secure)
+            .finish()
+    }
 }
 
 impl OAuthStateManager {
@@ -439,5 +451,10 @@ mod tests {
 
         let clear_cookie = mgr.build_clear_cookie();
         assert!(clear_cookie.contains("Max-Age=0"));
+
+        // Verify Debug redacts state_secret
+        let debug_str = format!("{mgr:?}");
+        assert!(debug_str.contains("[REDACTED]"));
+        assert!(!debug_str.contains("01234567890123456789012345678901"));
     }
 }

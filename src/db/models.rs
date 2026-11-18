@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
@@ -166,6 +167,22 @@ impl std::fmt::Debug for EmailOutbox {
     }
 }
 
+/// External federated identity linked to a user.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, FromRow)]
+pub struct OAuthAccount {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub provider_id: String,
+    pub provider_user_id: String,
+    pub email: Option<String>,
+    pub email_verified: bool,
+    pub access_token: Option<String>,
+    pub refresh_token: Option<String>,
+    pub token_expires_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +298,35 @@ mod tests {
             error_log: None,
         };
         assert!(!format!("{outbox:?}").contains("raw-single-use-token"));
+    }
+
+    #[test]
+    fn test_oauth_account_model_serialization_and_fields() {
+        let now = Utc::now();
+        let id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let account = OAuthAccount {
+            id,
+            user_id,
+            provider_id: "google".to_string(),
+            provider_user_id: "google-123".to_string(),
+            email: Some("user@example.com".to_string()),
+            email_verified: true,
+            access_token: Some("secret_access".to_string()),
+            refresh_token: Some("secret_refresh".to_string()),
+            token_expires_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        };
+
+        assert_eq!(account.provider_id, "google");
+        assert_eq!(account.provider_user_id, "google-123");
+        assert_eq!(account.email.as_deref(), Some("user@example.com"));
+        assert!(account.email_verified);
+
+        let json = serde_json::to_string(&account).expect("serialize oauth account");
+        let deserialized: OAuthAccount =
+            serde_json::from_str(&json).expect("deserialize oauth account");
+        assert_eq!(deserialized, account);
     }
 }

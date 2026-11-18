@@ -136,20 +136,20 @@ impl OAuthProvider for GoogleProvider {
             return Err(AppError::OAuthProviderError);
         }
 
-        let profile: GoogleProfile = resp
-            .json()
-            .await
-            .map_err(|_| AppError::OAuthProviderError)?;
+        let profile: GoogleProfile = crate::oauth::provider::read_json_limited(resp).await?;
 
         if profile.sub.trim().is_empty() {
             return Err(AppError::OAuthProviderError);
         }
 
+        let email = profile.email.unwrap_or_default();
+        let verified = profile.email_verified.unwrap_or(false) && !email.trim().is_empty();
+
         Ok(UserInfo {
             provider_id: "google".to_string(),
             provider_user_id: profile.sub,
-            email: profile.email.unwrap_or_default(),
-            email_verified: profile.email_verified.unwrap_or(false),
+            email,
+            email_verified: verified,
             name: profile.name,
             avatar_url: profile.picture,
         })
@@ -410,5 +410,29 @@ mod tests {
         assert_eq!(user.provider_user_id, "123");
         assert_eq!(user.email, "u@example.com");
         assert!(!user.email_verified);
+
+        // 7. Empty or missing email surfaces email_verified: false even if claim is true
+        Mock::given(method("GET"))
+            .and(path("/userinfo-empty-email"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sub": "124",
+                "email": "",
+                "email_verified": true
+            })))
+            .mount(&server)
+            .await;
+
+        let p_empty_email = GoogleProvider::with_endpoints(
+            &test_google_config(),
+            reqwest::Client::new(),
+            GOOGLE_AUTH_ENDPOINT,
+            format!("{}/token", server.uri()),
+            format!("{}/userinfo-empty-email", server.uri()),
+        )
+        .unwrap();
+
+        let user_empty = p_empty_email.fetch_user_info(&dummy_tok).await.unwrap();
+        assert_eq!(user_empty.email, "");
+        assert!(!user_empty.email_verified);
     }
 }

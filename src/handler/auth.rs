@@ -9,6 +9,7 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},
+    handler::Handler,
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -66,15 +67,15 @@ pub fn routes_with_app_state(state: AppState) -> Router {
         config: Some(Arc::new(state.config.clone())),
     };
 
+    let csrf_layer = axum::middleware::from_fn_with_state(
+        state.clone(),
+        crate::middleware::csrf_middleware,
+    );
     let csrf_routes = Router::new()
         .route(
             "/logout",
-            axum::routing::post(logout).fallback(method_not_allowed),
+            axum::routing::post(logout.layer(csrf_layer)).fallback(method_not_allowed),
         )
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            crate::middleware::csrf_middleware,
-        ))
         .with_state(handler_state.clone());
 
     let public_routes = Router::new()
@@ -179,12 +180,25 @@ fn extract_client_ip(headers: &HeaderMap) -> String {
         .to_string()
 }
 
-/// Construct HTTP 429 response with Retry-After header derived from limiter cooldown.
-fn rate_limit_response(err: AppError, limiter: &RateLimiter) -> Response {
+/// Construct HTTP 429 response with dynamic Retry-After header derived from remaining cooldown.
+/// Omitted if rejection occurred due to capacity saturation rather than an active lockout.
+fn rate_limit_response(
+    err: AppError,
+    limiter: &RateLimiter,
+    ip: Option<&str>,
+    account_key: Option<&str>,
+) -> Response {
     let mut resp = service_error_response(err);
-    let cooldown = limiter.cooldown_secs();
-    if let Ok(val) = header::HeaderValue::from_str(&cooldown.to_string()) {
-        resp.headers_mut().insert(header::RETRY_AFTER, val);
+    let cooldown = match (ip, account_key) {
+        (Some(ip), Some(acct)) => limiter.remaining_cooldown_dual_key(&format!("ip:{ip}"), acct),
+        (Some(ip), None) => limiter.remaining_cooldown(&format!("ip:{ip}")),
+        (None, Some(acct)) => limiter.remaining_cooldown(acct),
+        (None, None) => None,
+    };
+    if let Some(secs) = cooldown {
+        if let Ok(val) = header::HeaderValue::from_str(&secs.to_string()) {
+            resp.headers_mut().insert(header::RETRY_AFTER, val);
+        }
     }
     resp
 }
@@ -206,9 +220,14 @@ pub async fn signup(
 
     let client_ip = extract_client_ip(&headers);
     let normalized_email = req.email.trim().to_lowercase();
+    let email_key = if normalized_email.len() > 255 {
+        &normalized_email[..255]
+    } else {
+        &normalized_email
+    };
 
     if let Some(limiter) = &state.rate_limiter {
-        match limiter.check_dual(&client_ip, &normalized_email) {
+        match limiter.check_dual(&client_ip, email_key) {
             Ok(()) => {}
             Err(e) => {
                 tracing::warn!(
@@ -216,7 +235,12 @@ pub async fn signup(
                     ip = %client_ip,
                     key_prefix = "signup",
                 );
-                return rate_limit_response(e, limiter);
+                return rate_limit_response(
+                    e,
+                    limiter,
+                    Some(&client_ip),
+                    Some(&format!("account:{email_key}")),
+                );
             }
         }
     }
@@ -266,10 +290,15 @@ pub async fn login(
         .map(str::to_string);
 
     let normalized_email = req.email.trim().to_lowercase();
+    let email_key = if normalized_email.len() > 255 {
+        &normalized_email[..255]
+    } else {
+        &normalized_email
+    };
 
     // Pre-credential rate limit check prevents account existence timing oracles
     if let Some(limiter) = &state.rate_limiter {
-        match limiter.check_dual(&client_ip, &normalized_email) {
+        match limiter.check_dual(&client_ip, email_key) {
             Ok(()) => {}
             Err(e) => {
                 tracing::warn!(
@@ -277,7 +306,12 @@ pub async fn login(
                     ip = %client_ip,
                     key_prefix = "login",
                 );
-                return rate_limit_response(e, limiter);
+                return rate_limit_response(
+                    e,
+                    limiter,
+                    Some(&client_ip),
+                    Some(&format!("account:{email_key}")),
+                );
             }
         }
     }
@@ -361,6 +395,29 @@ pub async fn login(
     }
 }
 
+fn clear_csrf_cookie(
+    sc: &impl crate::session::cookie::SessionCookieSource,
+) -> Result<header::HeaderValue, AppError> {
+    let mut parts = vec![
+        "csrf_token=".to_string(),
+        "Max-Age=0".to_string(),
+        "Expires=Thu, 01 Jan 1970 00:00:00 GMT".to_string(),
+        format!("Path={}", sc.cookie_path()),
+        "SameSite=Strict".to_string(),
+    ];
+    if sc.cookie_secure() {
+        parts.push("Secure".to_string());
+    }
+    if let Some(domain) = sc.cookie_domain() {
+        parts.push(format!("Domain={}", domain));
+    }
+
+    header::HeaderValue::from_str(&parts.join("; ")).map_err(|_| {
+        tracing::error!(event = "cookie_build_failed", kind = "csrf_clear");
+        AppError::Internal
+    })
+}
+
 /// POST /auth/logout
 ///
 /// Revokes session on server side and clears the session cookie.
@@ -408,7 +465,15 @@ pub async fn logout(State(state): State<AuthHandlerState>, headers: HeaderMap) -
         };
         response
             .headers_mut()
-            .insert(header::SET_COOKIE, clear_cookie);
+            .append(header::SET_COOKIE, clear_cookie);
+
+        let clear_csrf = match clear_csrf_cookie(cfg.as_ref()) {
+            Ok(hv) => hv,
+            Err(e) => return service_error_response(e),
+        };
+        response
+            .headers_mut()
+            .append(header::SET_COOKIE, clear_csrf);
     }
     response
 }
@@ -431,7 +496,7 @@ pub async fn verify_email(
                     ip = %client_ip,
                     key_prefix = "verify",
                 );
-                return rate_limit_response(e, limiter);
+                return rate_limit_response(e, limiter, Some(&client_ip), None);
             }
         }
     }
@@ -466,9 +531,14 @@ pub async fn request_password_reset(
 
     let client_ip = extract_client_ip(&headers);
     let normalized_email = req.email.trim().to_lowercase();
+    let email_key = if normalized_email.len() > 255 {
+        &normalized_email[..255]
+    } else {
+        &normalized_email
+    };
 
     if let Some(limiter) = &state.rate_limiter {
-        match limiter.check_dual(&client_ip, &normalized_email) {
+        match limiter.check_password_reset(&client_ip, email_key) {
             Ok(()) => {}
             Err(e) => {
                 tracing::warn!(
@@ -476,7 +546,12 @@ pub async fn request_password_reset(
                     ip = %client_ip,
                     key_prefix = "password_reset_request",
                 );
-                return rate_limit_response(e, limiter);
+                return rate_limit_response(
+                    e,
+                    limiter,
+                    Some(&client_ip),
+                    Some(&format!("reset_account:{email_key}")),
+                );
             }
         }
     }
@@ -527,7 +602,7 @@ pub async fn reset_password(
                     ip = %client_ip,
                     key_prefix = "password_reset",
                 );
-                return rate_limit_response(e, limiter);
+                return rate_limit_response(e, limiter, Some(&client_ip), None);
             }
         }
     }
@@ -791,16 +866,32 @@ mod tests {
             password: format!("ValidPass_{}!", uuid::Uuid::new_v4().simple()),
         };
 
+        let mut headers1 = HeaderMap::new();
+        headers1.insert("x-forwarded-for", "198.51.100.1".parse().unwrap());
         let _ = signup(
             State(state.clone()),
-            HeaderMap::new(),
+            headers1,
             Ok(Json(payload.clone())),
         )
         .await;
 
-        let resp = signup(State(state), HeaderMap::new(), Ok(Json(payload))).await;
+        // Distinct IP with the same email must be rate limited by account key
+        let mut headers2 = HeaderMap::new();
+        headers2.insert("x-forwarded-for", "198.51.100.2".parse().unwrap());
+        let resp = signup(State(state.clone()), headers2, Ok(Json(payload))).await;
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(resp.headers().contains_key(header::RETRY_AFTER));
+
+        // Same original IP with a different email must be rate limited by IP key
+        let mut headers3 = HeaderMap::new();
+        headers3.insert("x-forwarded-for", "198.51.100.1".parse().unwrap());
+        let payload_other = SignupRequest {
+            email: "other@example.com".to_string(),
+            password: format!("ValidPass_{}!", uuid::Uuid::new_v4().simple()),
+        };
+        let resp_ip = signup(State(state), headers3, Ok(Json(payload_other))).await;
+        assert_eq!(resp_ip.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp_ip.headers().contains_key(header::RETRY_AFTER));
     }
 
     #[tokio::test]
@@ -814,8 +905,13 @@ mod tests {
         }));
         state.rate_limiter = Some(limiter);
 
+        let dynamic_token = format!(
+            "{:032x}{:032x}",
+            uuid::Uuid::new_v4().as_u128(),
+            uuid::Uuid::new_v4().as_u128()
+        );
         let payload = VerifyEmailRequest {
-            token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            token: dynamic_token,
         };
 
         let _ = verify_email(
@@ -845,14 +941,19 @@ mod tests {
             email: "target@example.com".to_string(),
         };
 
+        let mut headers1 = HeaderMap::new();
+        headers1.insert("x-forwarded-for", "198.51.100.10".parse().unwrap());
         let _ = request_password_reset(
             State(state.clone()),
-            HeaderMap::new(),
+            headers1,
             Ok(Json(payload.clone())),
         )
         .await;
 
-        let resp = request_password_reset(State(state), HeaderMap::new(), Ok(Json(payload))).await;
+        // Distinct IP with same email must hit reset_account rate limit
+        let mut headers2 = HeaderMap::new();
+        headers2.insert("x-forwarded-for", "198.51.100.11".parse().unwrap());
+        let resp = request_password_reset(State(state), headers2, Ok(Json(payload))).await;
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(resp.headers().contains_key(header::RETRY_AFTER));
     }
@@ -868,8 +969,13 @@ mod tests {
         }));
         state.rate_limiter = Some(limiter);
 
+        let dynamic_token = format!(
+            "{:032x}{:032x}",
+            uuid::Uuid::new_v4().as_u128(),
+            uuid::Uuid::new_v4().as_u128()
+        );
         let payload = PasswordResetConfirmRequest {
-            token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            token: dynamic_token,
             new_password: format!("ValidPass_{}!", uuid::Uuid::new_v4().simple()),
         };
 
@@ -883,5 +989,46 @@ mod tests {
         let resp = reset_password(State(state), HeaderMap::new(), Ok(Json(payload))).await;
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(resp.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn logout_clears_session_and_csrf_cookies() {
+        let mut state = create_test_state();
+        let config = Config::default();
+        state.config = Some(Arc::new(config));
+
+        let resp = logout(State(state), HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let cookies: Vec<_> = resp
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|h| h.to_str().unwrap().to_string())
+            .collect();
+
+        assert_eq!(cookies.len(), 2);
+        assert!(cookies.iter().any(|c| c.contains("sid=") && c.contains("Max-Age=0")));
+        assert!(cookies.iter().any(|c| c.contains("csrf_token=") && c.contains("Max-Age=0")));
+    }
+
+    #[tokio::test]
+    async fn logout_unsupported_methods_return_405() {
+        use tower::ServiceExt;
+        let app = routes(create_test_state().service);
+        for method in [
+            axum::http::Method::PUT,
+            axum::http::Method::DELETE,
+            axum::http::Method::GET,
+        ] {
+            let req = axum::http::Request::builder()
+                .method(method)
+                .uri("/logout")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+            assert_eq!(resp.headers().get(header::ALLOW).unwrap(), "POST");
+        }
     }
 }

@@ -80,18 +80,20 @@ impl RateLimiter {
             if self.entry_count.load(Ordering::Relaxed) >= self.max_entries {
                 self.reclaim_expired(self.config.window().min(window), now);
             }
-            if self
-                .entry_count
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |val| {
-                    if val < self.max_entries {
-                        Some(val + 1)
-                    } else {
-                        None
-                    }
-                })
-                .is_err()
-            {
-                return Err(AppError::from_code(ErrorCode::RateLimitExceeded));
+            let mut current = self.entry_count.load(Ordering::Acquire);
+            loop {
+                if current >= self.max_entries {
+                    return Err(AppError::from_code(ErrorCode::RateLimitExceeded));
+                }
+                match self.entry_count.compare_exchange_weak(
+                    current,
+                    current + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => current = actual,
+                }
             }
             match self.windows.entry(key.to_string()) {
                 dashmap::mapref::entry::Entry::Occupied(occ) => {

@@ -1,0 +1,279 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+
+use crate::config::ProviderConfig;
+use crate::error::AppError;
+
+pub const SUPPORTED_PROVIDERS: &[&str] = &["google", "github", "apple"];
+pub const OAUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+pub const OAUTH_BODY_LIMIT: usize = 1024 * 1024; // 1 MiB
+pub const USER_AGENT: &str = "metal-auth";
+
+/// Normalized user profile data retrieved from an OAuth provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserInfo {
+    pub provider_id: String,
+    pub provider_user_id: String,
+    pub email: String,
+    pub email_verified: bool,
+    pub name: Option<String>,
+    pub avatar_url: Option<String>,
+}
+
+pub type OAuthUserInfo = UserInfo;
+
+/// Token credentials received from the provider's token exchange endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenResponse {
+    pub access_token: String,
+    pub token_type: String,
+    pub refresh_token: Option<String>,
+    pub expires_in: Option<i64>,
+    pub id_token: Option<String>,
+    #[serde(default)]
+    pub raw: HashMap<String, serde_json::Value>,
+}
+
+pub type OAuthTokenResponse = TokenResponse;
+
+/// Trait defining the contract required for any OAuth2 / OIDC identity provider.
+#[async_trait]
+pub trait OAuthProvider: Send + Sync + std::fmt::Debug {
+    /// Canonical provider slug (e.g. "google", "github", "apple").
+    fn id(&self) -> &'static str;
+
+    /// Constructs the provider authorization URL with PKCE challenge, state, and scopes.
+    fn auth_url(&self, state: &str, code_challenge: &str) -> String;
+
+    /// Alias for `auth_url`.
+    fn get_authorization_url(&self, state: &str, code_challenge: &str) -> String {
+        self.auth_url(state, code_challenge)
+    }
+
+    /// Exchanges an authorization code and PKCE code verifier for tokens.
+    async fn exchange_code(
+        &self,
+        code: &str,
+        code_verifier: &str,
+    ) -> Result<TokenResponse, AppError>;
+
+    /// Retrieves and normalizes user profile information using the granted access/ID tokens.
+    async fn fetch_user_info(&self, tokens: &TokenResponse) -> Result<UserInfo, AppError>;
+
+    /// Alias for `fetch_user_info`.
+    async fn get_user_info(&self, token_response: &TokenResponse) -> Result<UserInfo, AppError> {
+        self.fetch_user_info(token_response).await
+    }
+}
+
+/// Builds an HTTP client configured with bounded timeout and library user-agent.
+pub fn build_oauth_http_client() -> Result<reqwest::Client, AppError> {
+    reqwest::Client::builder()
+        .timeout(OAUTH_HTTP_TIMEOUT)
+        .user_agent(USER_AGENT)
+        .build()
+        .map_err(|_| AppError::OAuthProviderError)
+}
+
+/// Joins configured scopes, falling back to provider defaults.
+pub fn scopes_or_default(configured: &[String], defaults: &[&str]) -> String {
+    if !configured.is_empty() {
+        configured.join(" ")
+    } else {
+        defaults.join(" ")
+    }
+}
+
+/// Sends an HTTP POST form request for token exchange, parsing the JSON token response.
+pub async fn post_token_form(
+    client: &reqwest::Client,
+    endpoint: &str,
+    params: &[(&str, &str)],
+) -> Result<TokenResponse, AppError> {
+    let resp = client
+        .post(endpoint)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .form(params)
+        .send()
+        .await
+        .map_err(|_| AppError::OAuthProviderError)?;
+
+    if !resp.status().is_success() {
+        return Err(AppError::OAuthProviderError);
+    }
+
+    let raw: HashMap<String, serde_json::Value> = resp
+        .json()
+        .await
+        .map_err(|_| AppError::OAuthProviderError)?;
+
+    if let Some(err) = raw.get("error") {
+        if !err.is_null() {
+            return Err(AppError::OAuthProviderError);
+        }
+    }
+
+    Ok(token_from_raw(raw))
+}
+
+/// Parses a token response from a generic JSON map.
+pub fn token_from_raw(raw: HashMap<String, serde_json::Value>) -> TokenResponse {
+    let access_token = raw
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let token_type = raw
+        .get("token_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Bearer")
+        .to_string();
+
+    let refresh_token = raw
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+
+    let id_token = raw
+        .get("id_token")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+
+    let expires_in = raw.get("expires_in").and_then(|v| {
+        v.as_i64()
+            .or_else(|| v.as_u64().map(|u| u as i64))
+            .or_else(|| v.as_f64().map(|f| f as i64))
+            .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+    });
+
+    TokenResponse {
+        access_token,
+        token_type,
+        refresh_token,
+        expires_in,
+        id_token,
+        raw,
+    }
+}
+
+/// Instantiates a concrete OAuth provider strictly matching the locked Big 3.
+/// Deferred (e.g. "microsoft", "discord") or unknown providers return AppError::OAuthProviderNotFound.
+pub fn create_provider(
+    id: &str,
+    cfg: &ProviderConfig,
+    client: reqwest::Client,
+) -> Result<Arc<dyn OAuthProvider>, AppError> {
+    if !cfg.enabled {
+        return Err(AppError::OAuthProviderNotFound);
+    }
+    match id {
+        "google" => Ok(Arc::new(crate::oauth::google::GoogleProvider::new(
+            cfg, client,
+        )?)),
+        "github" => Ok(Arc::new(crate::oauth::github::GitHubProvider::new(
+            cfg, client,
+        )?)),
+        "apple" => Ok(Arc::new(crate::oauth::apple::AppleProvider::new(
+            cfg, client,
+        )?)),
+        _ => Err(AppError::OAuthProviderNotFound),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_provider_cfg(enabled: bool) -> ProviderConfig {
+        ProviderConfig {
+            client_id: "test-client".to_string(),
+            client_secret: "test-secret".to_string(),
+            redirect_uri: "https://app.example.com/callback".to_string(),
+            redirect_url: "https://app.example.com/callback".to_string(),
+            scopes: vec![],
+            enabled,
+            team_id: None,
+            key_id: None,
+            private_key: None,
+        }
+    }
+
+    #[test]
+    fn test_supported_providers_constant() {
+        assert_eq!(SUPPORTED_PROVIDERS, &["google", "github", "apple"]);
+    }
+
+    #[test]
+    fn test_create_provider_supported() {
+        let client = reqwest::Client::new();
+        let cfg = test_provider_cfg(true);
+
+        let google = create_provider("google", &cfg, client.clone()).unwrap();
+        assert_eq!(google.id(), "google");
+
+        let github = create_provider("github", &cfg, client.clone()).unwrap();
+        assert_eq!(github.id(), "github");
+
+        let apple = create_provider("apple", &cfg, client).unwrap();
+        assert_eq!(apple.id(), "apple");
+    }
+
+    #[test]
+    fn test_create_provider_disabled_returns_not_found() {
+        let client = reqwest::Client::new();
+        let cfg = test_provider_cfg(false);
+
+        let err = create_provider("google", &cfg, client).unwrap_err();
+        assert!(matches!(err, AppError::OAuthProviderNotFound));
+    }
+
+    #[test]
+    fn test_create_provider_unsupported_slugs() {
+        let client = reqwest::Client::new();
+        let cfg = test_provider_cfg(true);
+
+        for unknown in &["microsoft", "discord", "facebook", "unknown", ""] {
+            let err = create_provider(unknown, &cfg, client.clone()).unwrap_err();
+            assert!(matches!(err, AppError::OAuthProviderNotFound));
+        }
+    }
+
+    #[test]
+    fn test_token_from_raw_parsing() {
+        let mut raw = HashMap::new();
+        raw.insert("access_token".to_string(), serde_json::json!("tok_123"));
+        raw.insert("token_type".to_string(), serde_json::json!("Bearer"));
+        raw.insert("refresh_token".to_string(), serde_json::json!("ref_456"));
+        raw.insert("id_token".to_string(), serde_json::json!("id_jwt_789"));
+        raw.insert("expires_in".to_string(), serde_json::json!(3600));
+
+        let tok = token_from_raw(raw);
+        assert_eq!(tok.access_token, "tok_123");
+        assert_eq!(tok.token_type, "Bearer");
+        assert_eq!(tok.refresh_token.as_deref(), Some("ref_456"));
+        assert_eq!(tok.id_token.as_deref(), Some("id_jwt_789"));
+        assert_eq!(tok.expires_in, Some(3600));
+
+        // Test string expires_in fallback
+        let mut raw_str = HashMap::new();
+        raw_str.insert("access_token".to_string(), serde_json::json!("tok"));
+        raw_str.insert("expires_in".to_string(), serde_json::json!("7200"));
+        let tok2 = token_from_raw(raw_str);
+        assert_eq!(tok2.expires_in, Some(7200));
+    }
+
+    #[test]
+    fn test_scopes_or_default() {
+        let defaults = &["scope1", "scope2"];
+        assert_eq!(scopes_or_default(&[], defaults), "scope1 scope2");
+
+        let custom = vec!["custom_a".to_string(), "custom_b".to_string()];
+        assert_eq!(scopes_or_default(&custom, defaults), "custom_a custom_b");
+    }
+}
+

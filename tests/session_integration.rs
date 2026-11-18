@@ -1153,31 +1153,38 @@ async fn test_rate_limit_reset_on_success() {
 
     let (email, password) = create_and_verify_user(&app).await;
     let max = app.state.config.rate_limit.max_attempts;
+    let client_ip = "198.51.100.99";
 
     // Fail max - 1 times
     for _ in 0..(max - 1) {
         let _ = app
-            .post_json(
+            .post_json_with_ip(
                 "/auth/login",
                 json!({ "email": email, "password": "WrongPassword123!" }),
+                client_ip,
             )
             .await;
     }
 
     // Successful login resets the counter
     let ok_resp = app
-        .post_json(
+        .post_json_with_ip(
             "/auth/login",
             json!({ "email": email, "password": password }),
+            client_ip,
         )
         .await;
     assert_eq!(ok_resp.status(), StatusCode::OK);
 
+    // Reset IP rate limiter to isolate account-level rate limit reset verification
+    app.state.rate_limiter.reset(&format!("ip:{client_ip}"));
+
     // Subsequent failure starts from 1, does NOT trigger 429
     let fail_resp = app
-        .post_json(
+        .post_json_with_ip(
             "/auth/login",
             json!({ "email": email, "password": "WrongPassword123!" }),
+            client_ip,
         )
         .await;
     assert_eq!(fail_resp.status(), StatusCode::UNAUTHORIZED);

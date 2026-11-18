@@ -1159,18 +1159,46 @@ async fn test_rate_limit_reset_on_success() {
     app.state.rate_limiter.reset_account(&email);
     app.state.rate_limiter.reset(&format!("ip:{client_ip}"));
 
-    // Fail max - 1 times
+    // Fail max - 1 times, asserting each produces 401 Unauthorized
     for _ in 0..(max - 1) {
-        let _ = app
+        let fail_attempt = app
             .post_json_with_ip(
                 "/auth/login",
                 json!({ "email": email, "password": "WrongPassword123!" }),
                 &client_ip,
             )
             .await;
+        assert_eq!(fail_attempt.status(), StatusCode::UNAUTHORIZED);
     }
 
-    // Successful login resets the counter
+    // Control account: prove that exceeding max_attempts across distinct IPs
+    // causes account-level rate limiting (429 Too Many Requests) without resetting.
+    let (ctrl_email, ctrl_password) = create_and_verify_user(&app).await;
+    app.state.rate_limiter.reset_account(&ctrl_email);
+
+    for _ in 0..max {
+        let distinct_ip = dynamic_ip();
+        let resp = app
+            .post_json_with_ip(
+                "/auth/login",
+                json!({ "email": ctrl_email, "password": "WrongPassword123!" }),
+                &distinct_ip,
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let fresh_ctrl_ip = dynamic_ip();
+    let blocked_ctrl = app
+        .post_json_with_ip(
+            "/auth/login",
+            json!({ "email": ctrl_email, "password": ctrl_password }),
+            &fresh_ctrl_ip,
+        )
+        .await;
+    assert_eq!(blocked_ctrl.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // Successful login for primary account resets its account-level counter
     let ok_resp = app
         .post_json_with_ip(
             "/auth/login",

@@ -653,7 +653,7 @@ mod tests {
         let state = create_test_state();
         let payload = PasswordResetConfirmRequest {
             token: "short-token".to_string(),
-            new_password: "ValidPassword123!".to_string(),
+            new_password: format!("ValidPass_{}!", uuid::Uuid::new_v4().simple()),
         };
 
         let resp = reset_password(State(state), HeaderMap::new(), Ok(Json(payload))).await;
@@ -788,7 +788,7 @@ mod tests {
 
         let payload = SignupRequest {
             email: "victim@example.com".to_string(),
-            password: "ValidUniqPassword2026!".to_string(),
+            password: format!("ValidPass_{}!", uuid::Uuid::new_v4().simple()),
         };
 
         let _ = signup(
@@ -870,7 +870,7 @@ mod tests {
 
         let payload = PasswordResetConfirmRequest {
             token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
-            new_password: "ValidPassword123!".to_string(),
+            new_password: format!("ValidPass_{}!", uuid::Uuid::new_v4().simple()),
         };
 
         let _ = reset_password(

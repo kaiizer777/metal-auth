@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use async_trait::async_trait;
 use serde::Deserialize;
 
@@ -79,27 +77,16 @@ impl GitHubProvider {
 }
 
 /// Resolves the user's primary verified email address from the GitHub email list.
-pub fn resolve_github_email(public_email: Option<&str>, emails: &[GitHubEmail]) -> (String, bool) {
-    let mut verified_by_address = HashMap::new();
+/// Strictly requires both `primary == true` and `verified == true`.
+/// Never falls back to secondary or unverified emails.
+pub fn resolve_github_email(_public_email: Option<&str>, emails: &[GitHubEmail]) -> (String, bool) {
     for entry in emails {
-        if entry.email.is_empty() {
+        if entry.email.trim().is_empty() {
             continue;
-        }
-        if entry.verified {
-            verified_by_address.insert(entry.email.as_str(), true);
         }
         if entry.primary && entry.verified {
             return (entry.email.clone(), true);
         }
-    }
-
-    if let Some(pub_email) = public_email
-        && !pub_email.is_empty()
-    {
-        if verified_by_address.get(pub_email).copied().unwrap_or(false) {
-            return (pub_email.to_string(), true);
-        }
-        return (pub_email.to_string(), false);
     }
 
     (String::new(), false)
@@ -120,6 +107,7 @@ impl OAuthProvider for GitHubProvider {
         let scope = scopes_or_default(&self.cfg.scopes, DEFAULT_SCOPES);
 
         let params = [
+            ("response_type", "code"),
             ("client_id", self.cfg.client_id.as_str()),
             ("redirect_uri", redirect_uri.as_str()),
             ("scope", scope.as_str()),
@@ -150,6 +138,7 @@ impl OAuthProvider for GitHubProvider {
             ("client_secret", self.cfg.client_secret.as_str()),
             ("code", code),
             ("redirect_uri", redirect_uri.as_str()),
+            ("grant_type", "authorization_code"),
             ("code_verifier", code_verifier),
         ];
 
@@ -179,10 +168,7 @@ impl OAuthProvider for GitHubProvider {
             return Err(AppError::OAuthProviderError);
         }
 
-        let user: GitHubUser = user_resp
-            .json()
-            .await
-            .map_err(|_| AppError::OAuthProviderError)?;
+        let user: GitHubUser = crate::oauth::provider::read_json_limited(user_resp).await?;
 
         if user.id <= 0 {
             return Err(AppError::OAuthProviderError);
@@ -206,10 +192,8 @@ impl OAuthProvider for GitHubProvider {
             return Err(AppError::OAuthProviderError);
         }
 
-        let emails: Vec<GitHubEmail> = emails_resp
-            .json()
-            .await
-            .map_err(|_| AppError::OAuthProviderError)?;
+        let emails: Vec<GitHubEmail> =
+            crate::oauth::provider::read_json_limited(emails_resp).await?;
 
         let (email, verified) = resolve_github_email(user.email.as_deref(), &emails);
 
@@ -261,6 +245,7 @@ mod tests {
         assert_eq!(url.path(), "/login/oauth/authorize");
 
         let q: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(q.get("response_type").map(|s| s.as_str()), Some("code"));
         assert_eq!(q.get("client_id").map(|s| s.as_str()), Some("github-id"));
         assert_eq!(
             q.get("redirect_uri").map(|s| s.as_str()),
@@ -308,15 +293,15 @@ mod tests {
         assert_eq!(email, "primary@example.com");
         assert!(verified);
 
-        // 2. Public email matches a verified secondary email
+        // 2. Public email matches a verified secondary email (must NOT be treated as verified primary)
         let emails2 = vec![GitHubEmail {
             email: "pub@example.com".to_string(),
             primary: false,
             verified: true,
         }];
         let (email, verified) = resolve_github_email(Some("pub@example.com"), &emails2);
-        assert_eq!(email, "pub@example.com");
-        assert!(verified);
+        assert_eq!(email, "");
+        assert!(!verified);
 
         // 3. Public email exists but is not verified
         let emails3 = vec![GitHubEmail {
@@ -325,7 +310,7 @@ mod tests {
             verified: false,
         }];
         let (email, verified) = resolve_github_email(Some("pub@example.com"), &emails3);
-        assert_eq!(email, "pub@example.com");
+        assert_eq!(email, "");
         assert!(!verified);
 
         // 4. No emails

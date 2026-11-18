@@ -100,6 +100,7 @@ async fn test_oauth_google_end_to_end_flow() {
     let server = MockServer::start().await;
 
     let test_email = dynamic_email();
+    let test_sub = format!("google-user-{}", uuid::Uuid::new_v4());
 
     Mock::given(method("POST"))
         .and(path("/token"))
@@ -115,7 +116,7 @@ async fn test_oauth_google_end_to_end_flow() {
         .and(path("/userinfo"))
         .and(wm_header("Authorization", "Bearer goog-at-test"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "sub": "google-user-001",
+            "sub": &test_sub,
             "email": test_email,
             "email_verified": true,
             "name": "Test Google User"
@@ -205,7 +206,7 @@ async fn test_oauth_google_end_to_end_flow() {
     .await
     .expect("oauth link row created");
     assert_eq!(oauth_row.provider_id, "google");
-    assert_eq!(oauth_row.provider_user_id, "google-user-001");
+    assert_eq!(oauth_row.provider_user_id, test_sub);
 
     // 4. Authenticated request: GET /auth/oauth/accounts
     let req = Request::builder()
@@ -223,7 +224,7 @@ async fn test_oauth_google_end_to_end_flow() {
         serde_json::from_str(&resp.body_str).expect("accounts list json");
     assert_eq!(accounts.len(), 1);
     assert_eq!(accounts[0]["provider_id"], "google");
-    assert_eq!(accounts[0]["provider_user_id"], "google-user-001");
+    assert_eq!(accounts[0]["provider_user_id"], test_sub);
 }
 
 #[tokio::test]
@@ -328,6 +329,7 @@ async fn test_oauth_auto_links_verified_existing_local_user() {
     let server = MockServer::start().await;
 
     let test_email = dynamic_email();
+    let test_sub = format!("google-existing-user-{}", uuid::Uuid::new_v4());
 
     let mut providers: HashMap<String, Arc<dyn OAuthProvider>> = HashMap::new();
     let google_cfg = ProviderConfig {
@@ -384,7 +386,7 @@ async fn test_oauth_auto_links_verified_existing_local_user() {
     Mock::given(method("GET"))
         .and(path("/userinfo"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "sub": "google-existing-user-003",
+            "sub": &test_sub,
             "email": test_email,
             "email_verified": true,
             "name": "Existing User"
@@ -435,7 +437,7 @@ async fn test_oauth_auto_links_verified_existing_local_user() {
     .await
     .unwrap();
     assert_eq!(link.provider_id, "google");
-    assert_eq!(link.provider_user_id, "google-existing-user-003");
+    assert_eq!(link.provider_user_id, test_sub);
 }
 
 #[tokio::test]
@@ -444,6 +446,9 @@ async fn test_oauth_multi_provider_link_and_unlink_lifecycle() {
     let server = MockServer::start().await;
 
     let test_email = dynamic_email();
+    let google_sub = format!("google-multi-{}", uuid::Uuid::new_v4());
+    let github_id: u64 =
+        Utc::now().timestamp_nanos_opt().unwrap_or(0).unsigned_abs() % 900_000_000 + 100_000_000;
 
     // Google mocks
     Mock::given(method("POST"))
@@ -459,7 +464,7 @@ async fn test_oauth_multi_provider_link_and_unlink_lifecycle() {
     Mock::given(method("GET"))
         .and(path("/google/userinfo"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "sub": "google-multi-001",
+            "sub": &google_sub,
             "email": test_email,
             "email_verified": true,
             "name": "Multi User"
@@ -481,7 +486,7 @@ async fn test_oauth_multi_provider_link_and_unlink_lifecycle() {
     Mock::given(method("GET"))
         .and(path("/github/user"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": 998877,
+            "id": github_id,
             "login": "multiverse",
             "email": null
         })))
@@ -603,6 +608,14 @@ async fn test_oauth_multi_provider_link_and_unlink_lifecycle() {
     let resp = app.dispatch(req).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.json()["provider_id"], "github");
+    let state_cleared = resp.headers.get_all(header::SET_COOKIE).iter().any(|v| {
+        let s = v.to_str().unwrap_or("");
+        s.contains("oauth_state=") && s.contains("Max-Age=0")
+    });
+    assert!(
+        state_cleared,
+        "oauth_state cookie must be cleared upon linking"
+    );
 
     // 4. Verify list accounts returns both Google and GitHub
     let req = Request::builder()
@@ -806,6 +819,7 @@ async fn test_oauth_api_alias_routes() {
     let server = MockServer::start().await;
 
     let test_email = dynamic_email();
+    let test_sub = format!("google-alias-{}", uuid::Uuid::new_v4());
 
     Mock::given(method("POST"))
         .and(path("/token"))
@@ -820,7 +834,7 @@ async fn test_oauth_api_alias_routes() {
     Mock::given(method("GET"))
         .and(path("/userinfo"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "sub": "google-alias-001",
+            "sub": &test_sub,
             "email": test_email,
             "email_verified": true,
             "name": "Alias User"

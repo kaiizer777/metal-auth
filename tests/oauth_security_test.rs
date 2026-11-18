@@ -694,11 +694,13 @@ async fn test_security_open_redirect_attempts_rejected() {
         "/back\\slash",
     ];
 
-    for target in hostile_redirects {
+    for (idx, target) in hostile_redirects.iter().enumerate() {
+        let client_ip = format!("192.0.2.{}", idx + 1);
         let uri = format!("/auth/oauth/google?redirect_url={}", percent_encode(target));
         let req = Request::builder()
             .method(Method::GET)
             .uri(&uri)
+            .header("x-forwarded-for", &client_ip)
             .body(Body::empty())
             .unwrap();
         let resp = app.dispatch(req).await;
@@ -711,6 +713,7 @@ async fn test_security_open_redirect_attempts_rejected() {
         let req = Request::builder()
             .method(Method::GET)
             .uri(&callback_uri)
+            .header("x-forwarded-for", &client_ip)
             .header(header::COOKIE, format!("oauth_state={state_cookie}"))
             .body(Body::empty())
             .unwrap();

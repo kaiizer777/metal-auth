@@ -164,10 +164,9 @@ pub fn extract_state_cookie<'a>(headers: &'a HeaderMap, cookie_name: &str) -> Op
         if let Ok(cookie_str) = cookie_header.to_str() {
             for pair in cookie_str.split(';') {
                 let mut parts = pair.trim().splitn(2, '=');
-                if let (Some(name), Some(val)) = (parts.next(), parts.next()) {
-                    if name == cookie_name {
-                        return Some(val);
-                    }
+                match (parts.next(), parts.next()) {
+                    (Some(name), Some(val)) if name == cookie_name => return Some(val),
+                    _ => {}
                 }
             }
         }

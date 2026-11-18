@@ -2726,9 +2726,11 @@ mod tests {
 
     #[test]
     fn test_oauth_config_validation_ttl_bounds() {
-        let mut oauth = OAuthConfig::default();
-        oauth.state_ttl = Duration::from_secs(59);
-        oauth.state_ttl_secs = 59;
+        let mut oauth = OAuthConfig {
+            state_ttl: Duration::from_secs(59),
+            state_ttl_secs: 59,
+            ..Default::default()
+        };
         assert!(oauth.validate().is_err());
 
         oauth.state_ttl = Duration::from_secs(3601);
@@ -2761,8 +2763,10 @@ mod tests {
 
     #[test]
     fn test_oauth_config_validation_provider_keys() {
-        let mut oauth = OAuthConfig::default();
-        oauth.state_secret = "01234567890123456789012345678901".into();
+        let mut oauth = OAuthConfig {
+            state_secret: "01234567890123456789012345678901".into(),
+            ..Default::default()
+        };
         oauth.providers.insert(
             "discord".into(),
             ProviderConfig::new("cid", "sec", "https://app.com/callback", vec![], false),
@@ -2772,8 +2776,10 @@ mod tests {
 
     #[test]
     fn test_oauth_config_validation_provider_required_fields() {
-        let mut oauth = OAuthConfig::default();
-        oauth.state_secret = "01234567890123456789012345678901".into();
+        let mut oauth = OAuthConfig {
+            state_secret: "01234567890123456789012345678901".into(),
+            ..Default::default()
+        };
 
         // Missing client_secret on enabled Google provider
         oauth.providers.insert(
@@ -2816,8 +2822,10 @@ mod tests {
         assert!(!rendered.contains("private-key-secret"));
         assert!(rendered.contains("[REDACTED]"));
 
-        let mut oauth = OAuthConfig::default();
-        oauth.state_secret = "super-secret-oauth-state-key-32b".into();
+        let oauth = OAuthConfig {
+            state_secret: "super-secret-oauth-state-key-32b".into(),
+            ..Default::default()
+        };
         let rendered_oauth = format!("{oauth:?}");
         assert!(!rendered_oauth.contains("super-secret-oauth-state-key-32b"));
         assert!(rendered_oauth.contains("[REDACTED]"));

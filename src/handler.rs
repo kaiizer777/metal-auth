@@ -49,7 +49,16 @@ pub fn create_router(state: AppState) -> Result<Router, AppError> {
         .fallback(fallback_not_found)
         .layer(cors)
         .layer(axum::middleware::from_fn(security_headers_middleware))
-        .layer(TraceLayer::new_for_http()))
+        .layer(TraceLayer::new_for_http().make_span_with(
+            |request: &axum::http::Request<axum::body::Body>| {
+                tracing::debug_span!(
+                    "request",
+                    method = %request.method(),
+                    uri = %request.uri().path(),
+                    version = ?request.version(),
+                )
+            },
+        )))
 }
 
 #[cfg(test)]

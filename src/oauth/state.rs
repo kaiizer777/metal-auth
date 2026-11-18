@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use axum::http::{HeaderMap, HeaderValue};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
@@ -186,6 +189,7 @@ pub struct OAuthStateManager {
     pub state_ttl: std::time::Duration,
     pub state_secret: String,
     pub cookie_secure: bool,
+    consumed_states: Arc<Mutex<HashMap<String, DateTime<Utc>>>>,
 }
 
 impl std::fmt::Debug for OAuthStateManager {
@@ -209,6 +213,7 @@ impl OAuthStateManager {
             state_ttl: cfg.state_ttl,
             state_secret: cfg.state_secret.clone(),
             cookie_secure,
+            consumed_states: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -262,12 +267,48 @@ impl OAuthStateManager {
             cookie_header
         };
 
-        validate_state(
+        let payload = validate_state(
             cookie_val,
             state_param,
             provider_id,
             self.state_secret.as_bytes(),
-        )
+        )?;
+
+        let mut consumed = self
+            .consumed_states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Utc::now();
+        consumed.retain(|_, exp| *exp > now);
+        if consumed.contains_key(&payload.token) {
+            return Err(AppError::OAuthStateInvalid);
+        }
+        consumed.insert(payload.token.clone(), payload.expires_at);
+
+        Ok(payload)
+    }
+
+    /// Checks if a state token has already been marked as consumed.
+    #[must_use]
+    pub fn is_consumed(&self, token: &str) -> bool {
+        let mut consumed = self
+            .consumed_states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Utc::now();
+        consumed.retain(|_, exp| *exp > now);
+        consumed.contains_key(token)
+    }
+
+    /// Manually marks a state token as consumed with an explicit expiration.
+    pub fn mark_consumed(&self, token: &str, expires_at: DateTime<Utc>) {
+        let mut consumed = self
+            .consumed_states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Utc::now();
+        consumed.retain(|_, exp| *exp > now);
+        consumed.insert(token.to_string(), expires_at);
     }
 
     #[must_use]
@@ -448,6 +489,11 @@ mod tests {
         assert_eq!(payload.provider_id, "google");
         assert_eq!(payload.code_verifier, "pkce_verifier_val");
         assert_eq!(payload.redirect_url, Some("/profile".to_string()));
+
+        // Second validation must fail due to replay protection
+        assert!(mgr.is_consumed(&state_token));
+        let replay_err = mgr.validate(&set_cookie, &state_token, "google");
+        assert!(matches!(replay_err, Err(AppError::OAuthStateInvalid)));
 
         let clear_cookie = mgr.build_clear_cookie();
         assert!(clear_cookie.contains("Max-Age=0"));

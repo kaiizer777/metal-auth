@@ -51,6 +51,9 @@ pub struct Config {
     // Phase 4: Session & Rate Limit
     pub session: SessionConfig,
     pub rate_limit: RateLimitConfig,
+
+    // Phase 6: OAuth
+    pub oauth: OAuthConfig,
 }
 
 impl std::fmt::Debug for Config {
@@ -74,6 +77,7 @@ impl std::fmt::Debug for Config {
             .field("outbox_sent_retention", &self.outbox_sent_retention)
             .field("session", &self.session)
             .field("rate_limit", &self.rate_limit)
+            .field("oauth", &self.oauth)
             .finish()
     }
 }
@@ -195,6 +199,7 @@ impl Config {
         }
         self.session.validate()?;
         self.rate_limit.validate()?;
+        self.oauth.validate()?;
         Ok(())
     }
 
@@ -529,6 +534,7 @@ impl Config {
             outbox_sent_retention,
             session,
             rate_limit,
+            oauth: OAuthConfig::default(),
         };
 
         cfg.validate()?;
@@ -1071,6 +1077,199 @@ impl RateLimitConfig {
     }
 }
 
+// ─── Phase 6 — OAuth Config ──────────────────────────────────────────────────
+
+pub const SUPPORTED_PROVIDERS: &[&str] = &["google", "github", "apple"];
+pub const DEFAULT_OAUTH_STATE_COOKIE_NAME: &str = "oauth_state";
+pub const DEFAULT_OAUTH_STATE_COOKIE_PATH: &str = "/";
+pub const DEFAULT_OAUTH_STATE_TTL_SECS: u64 = 600; // 10 minutes
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderConfig {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub redirect_url: String,
+    pub scopes: Vec<String>,
+    pub enabled: bool,
+
+    // Apple-specific credentials for dynamic ES256 client_secret JWT signing
+    pub team_id: Option<String>,
+    pub key_id: Option<String>,
+    pub private_key: Option<String>,
+}
+
+impl ProviderConfig {
+    pub fn new(
+        client_id: impl Into<String>,
+        client_secret: impl Into<String>,
+        redirect_uri: impl Into<String>,
+        scopes: Vec<String>,
+        enabled: bool,
+    ) -> Self {
+        let uri = redirect_uri.into();
+        Self {
+            client_id: client_id.into(),
+            client_secret: client_secret.into(),
+            redirect_url: uri.clone(),
+            redirect_uri: uri,
+            scopes,
+            enabled,
+            team_id: None,
+            key_id: None,
+            private_key: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[REDACTED]")
+            .field("redirect_uri", &self.redirect_uri)
+            .field("redirect_url", &self.redirect_url)
+            .field("scopes", &self.scopes)
+            .field("enabled", &self.enabled)
+            .field("team_id", &self.team_id)
+            .field("key_id", &self.key_id)
+            .field("private_key", &self.private_key.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct OAuthConfig {
+    pub providers: std::collections::HashMap<String, ProviderConfig>,
+    pub state_cookie_name: String,
+    pub state_cookie_path: String,
+    pub state_ttl: Duration,
+    pub state_ttl_secs: u64,
+    pub state_secret: String,
+    pub callback_base_url: String,
+}
+
+impl std::fmt::Debug for OAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthConfig")
+            .field("providers", &self.providers)
+            .field("state_cookie_name", &self.state_cookie_name)
+            .field("state_cookie_path", &self.state_cookie_path)
+            .field("state_ttl", &self.state_ttl)
+            .field("state_ttl_secs", &self.state_ttl_secs)
+            .field("state_secret", &"[REDACTED]")
+            .field("callback_base_url", &self.callback_base_url)
+            .finish()
+    }
+}
+
+impl Default for OAuthConfig {
+    fn default() -> Self {
+        Self {
+            providers: std::collections::HashMap::new(),
+            state_cookie_name: DEFAULT_OAUTH_STATE_COOKIE_NAME.to_string(),
+            state_cookie_path: DEFAULT_OAUTH_STATE_COOKIE_PATH.to_string(),
+            state_ttl: Duration::from_secs(DEFAULT_OAUTH_STATE_TTL_SECS),
+            state_ttl_secs: DEFAULT_OAUTH_STATE_TTL_SECS,
+            state_secret: String::new(),
+            callback_base_url: String::new(),
+        }
+    }
+}
+
+impl OAuthConfig {
+    #[must_use]
+    pub fn ttl(&self) -> Duration {
+        if self.state_ttl.as_secs() > 0 {
+            self.state_ttl
+        } else {
+            Duration::from_secs(self.state_ttl_secs)
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.state_cookie_name.trim().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "oauth.state_cookie_name",
+                reason: "must not be empty",
+            });
+        }
+        if self.state_cookie_path.trim().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "oauth.state_cookie_path",
+                reason: "must not be empty",
+            });
+        }
+        let ttl_secs = self.ttl().as_secs();
+        if !(60..=3600).contains(&ttl_secs) {
+            return Err(ConfigError::InvalidValue {
+                field: "oauth.state_ttl",
+                reason: "must be between 60 and 3600 seconds",
+            });
+        }
+
+        let any_enabled = self.providers.values().any(|p| p.enabled);
+        if any_enabled && self.state_secret.len() < 32 {
+            return Err(ConfigError::InvalidValue {
+                field: "oauth.state_secret",
+                reason: "must be at least 32 bytes when oauth providers are enabled",
+            });
+        }
+
+        for (name, provider) in &self.providers {
+            if !SUPPORTED_PROVIDERS.contains(&name.as_str()) {
+                return Err(ConfigError::InvalidValue {
+                    field: "oauth.providers",
+                    reason: "unsupported provider key; supported providers are google, github, apple",
+                });
+            }
+
+            if provider.enabled {
+                if provider.client_id.trim().is_empty() {
+                    return Err(ConfigError::InvalidValue {
+                        field: "oauth.provider.client_id",
+                        reason: "must not be empty for enabled provider",
+                    });
+                }
+                let uri = if !provider.redirect_uri.trim().is_empty() {
+                    &provider.redirect_uri
+                } else {
+                    &provider.redirect_url
+                };
+                if uri.trim().is_empty() {
+                    return Err(ConfigError::InvalidValue {
+                        field: "oauth.provider.redirect_uri",
+                        reason: "must not be empty for enabled provider",
+                    });
+                }
+
+                if name == "google" || name == "github" {
+                    if provider.client_secret.trim().is_empty() {
+                        return Err(ConfigError::InvalidValue {
+                            field: "oauth.provider.client_secret",
+                            reason: "must not be empty for google/github provider",
+                        });
+                    }
+                } else if name == "apple" {
+                    let has_secret = !provider.client_secret.trim().is_empty();
+                    let has_p8 = provider.team_id.as_deref().is_some_and(|s| !s.trim().is_empty())
+                        && provider.key_id.as_deref().is_some_and(|s| !s.trim().is_empty())
+                        && provider.private_key.as_deref().is_some_and(|s| !s.trim().is_empty());
+
+                    if !has_secret && !has_p8 {
+                        return Err(ConfigError::InvalidValue {
+                            field: "oauth.provider.apple",
+                            reason: "must configure either client_secret or team_id, key_id, and private_key",
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         let cfg = Self {
@@ -1098,6 +1297,7 @@ impl Default for Config {
             outbox_sent_retention: Duration::from_secs(DEFAULT_OUTBOX_SENT_RETENTION_SECS),
             session: SessionConfig::default(),
             rate_limit: RateLimitConfig::default(),
+            oauth: OAuthConfig::default(),
         };
         // Compiled-in defaults must stay deployable: fail fast in debug/test
         // if a future default edit stops validating.
@@ -1166,6 +1366,7 @@ mod tests {
             outbox_sent_retention: Duration::from_secs(DEFAULT_OUTBOX_SENT_RETENTION_SECS),
             session: SessionConfig::default(),
             rate_limit: RateLimitConfig::default(),
+            oauth: OAuthConfig::default(),
         }
     }
 
@@ -2511,5 +2712,114 @@ mod tests {
             cfg.allowed_headers,
             vec!["Authorization", "X-Custom-Header", "X-CSRF-Token"]
         );
+    }
+
+    #[test]
+    fn test_oauth_config_defaults() {
+        let oauth = OAuthConfig::default();
+        assert_eq!(oauth.state_cookie_name, "oauth_state");
+        assert_eq!(oauth.state_cookie_path, "/");
+        assert_eq!(oauth.ttl(), Duration::from_secs(600));
+        assert!(oauth.providers.is_empty());
+        assert!(oauth.validate().is_ok());
+    }
+
+    #[test]
+    fn test_oauth_config_validation_ttl_bounds() {
+        let mut oauth = OAuthConfig::default();
+        oauth.state_ttl = Duration::from_secs(59);
+        oauth.state_ttl_secs = 59;
+        assert!(oauth.validate().is_err());
+
+        oauth.state_ttl = Duration::from_secs(3601);
+        oauth.state_ttl_secs = 3601;
+        assert!(oauth.validate().is_err());
+
+        oauth.state_ttl = Duration::from_secs(600);
+        oauth.state_ttl_secs = 600;
+        assert!(oauth.validate().is_ok());
+    }
+
+    #[test]
+    fn test_oauth_config_validation_secret_length() {
+        let mut oauth = OAuthConfig::default();
+        oauth.providers.insert(
+            "google".into(),
+            ProviderConfig::new("cid", "sec", "https://app.com/callback", vec![], true),
+        );
+        // Empty secret with enabled provider fails
+        assert!(oauth.validate().is_err());
+
+        // Short secret (< 32 bytes) fails
+        oauth.state_secret = "short_secret_under_32_bytes!!".into();
+        assert!(oauth.validate().is_err());
+
+        // Valid secret >= 32 bytes succeeds
+        oauth.state_secret = "01234567890123456789012345678901".into();
+        assert!(oauth.validate().is_ok());
+    }
+
+    #[test]
+    fn test_oauth_config_validation_provider_keys() {
+        let mut oauth = OAuthConfig::default();
+        oauth.state_secret = "01234567890123456789012345678901".into();
+        oauth.providers.insert(
+            "discord".into(),
+            ProviderConfig::new("cid", "sec", "https://app.com/callback", vec![], false),
+        );
+        assert!(oauth.validate().is_err());
+    }
+
+    #[test]
+    fn test_oauth_config_validation_provider_required_fields() {
+        let mut oauth = OAuthConfig::default();
+        oauth.state_secret = "01234567890123456789012345678901".into();
+
+        // Missing client_secret on enabled Google provider
+        oauth.providers.insert(
+            "google".into(),
+            ProviderConfig::new("cid", "", "https://app.com/callback", vec![], true),
+        );
+        assert!(oauth.validate().is_err());
+
+        // Missing client_id
+        oauth.providers.insert(
+            "google".into(),
+            ProviderConfig::new("", "sec", "https://app.com/callback", vec![], true),
+        );
+        assert!(oauth.validate().is_err());
+
+        // Missing redirect_uri
+        oauth.providers.insert(
+            "google".into(),
+            ProviderConfig::new("cid", "sec", "", vec![], true),
+        );
+        assert!(oauth.validate().is_err());
+    }
+
+    #[test]
+    fn test_oauth_config_debug_redacts_secrets() {
+        let provider = ProviderConfig {
+            client_id: "client-id-123".into(),
+            client_secret: "super-secret-key".into(),
+            redirect_uri: "https://example.com/callback".into(),
+            redirect_url: "https://example.com/callback".into(),
+            scopes: vec!["email".into()],
+            enabled: true,
+            team_id: Some("team1".into()),
+            key_id: Some("key1".into()),
+            private_key: Some("private-key-secret".into()),
+        };
+
+        let rendered = format!("{provider:?}");
+        assert!(!rendered.contains("super-secret-key"));
+        assert!(!rendered.contains("private-key-secret"));
+        assert!(rendered.contains("[REDACTED]"));
+
+        let mut oauth = OAuthConfig::default();
+        oauth.state_secret = "super-secret-oauth-state-key-32b".into();
+        let rendered_oauth = format!("{oauth:?}");
+        assert!(!rendered_oauth.contains("super-secret-oauth-state-key-32b"));
+        assert!(rendered_oauth.contains("[REDACTED]"));
     }
 }

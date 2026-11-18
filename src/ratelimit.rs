@@ -18,11 +18,85 @@ use crate::{
 /// Default maximum entries maintained in the rate limiter before admission rejection.
 pub const DEFAULT_MAX_ENTRIES: usize = 100_000;
 
+/// Truncate `s` to at most `max_bytes` without splitting a multi-byte UTF-8 character boundary.
+#[must_use]
+pub fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        s
+    } else {
+        &s[..s.floor_char_boundary(max_bytes)]
+    }
+}
+
+/// Key admission outcome indicating whether a key was newly inserted or already present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyAdmission {
+    /// Key was already present in the rate limiter map.
+    Existing,
+    /// Key was newly inserted as vacant into the rate limiter map.
+    NewlyInserted,
+}
+
+/// Detailed reason for a rate limit rejection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitRejection {
+    /// Active lockout duration in whole seconds (minimum 1s, ceiling rounded).
+    Lockout(u64),
+    /// Attempt limit exceeded for the sliding window without cooldown.
+    Exceeded,
+    /// Maximum capacity of rate limiter entries exceeded.
+    CapacityExhausted,
+}
+
+impl RateLimitRejection {
+    /// Return the `Retry-After` header value in seconds, if applicable.
+    ///
+    /// Omitted for [`RateLimitRejection::CapacityExhausted`] or [`RateLimitRejection::Exceeded`].
+    #[must_use]
+    pub fn retry_after(&self) -> Option<u64> {
+        match self {
+            Self::Lockout(secs) => Some(*secs),
+            Self::Exceeded | Self::CapacityExhausted => None,
+        }
+    }
+
+    /// Return HTTP status code corresponding to this rejection.
+    #[must_use]
+    pub fn status_code(&self) -> axum::http::StatusCode {
+        axum::http::StatusCode::TOO_MANY_REQUESTS
+    }
+
+    /// Return application error code corresponding to this rejection.
+    #[must_use]
+    pub fn error_code(&self) -> ErrorCode {
+        ErrorCode::RateLimitExceeded
+    }
+}
+
+impl std::fmt::Display for RateLimitRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lockout(secs) => write!(f, "rate limit lockout: retry after {secs}s"),
+            Self::Exceeded => write!(f, "rate limit exceeded"),
+            Self::CapacityExhausted => write!(f, "rate limiter capacity exhausted"),
+        }
+    }
+}
+
+impl std::error::Error for RateLimitRejection {}
+
+impl From<RateLimitRejection> for AppError {
+    fn from(_: RateLimitRejection) -> Self {
+        Self::from_code(ErrorCode::RateLimitExceeded)
+    }
+}
+
 /// Per-key sliding-window state.
 #[derive(Debug)]
 struct WindowEntry {
     attempts: Vec<Instant>,
     locked_until: Option<Instant>,
+    window: Duration,
 }
 
 /// In-process sliding-window rate limiter safe for concurrent Tokio tasks.
@@ -65,72 +139,120 @@ impl RateLimiter {
         }
     }
 
-    /// Internal core sliding-window evaluation with optional lockout cooldown.
-    fn check_internal(
-        &self,
-        key: &str,
+    /// Format a bounded account key for rate limiting: `{prefix}:{truncated_account}`.
+    #[must_use]
+    pub fn format_account_key(prefix: &str, account: &str) -> String {
+        let bounded = truncate_utf8(account, 255);
+        format!("{prefix}:{bounded}")
+    }
+
+    /// Evaluate an entry's sliding window and lockout state.
+    fn evaluate_entry(
+        entry: &mut WindowEntry,
+        now: Instant,
         max: u32,
         window: Duration,
         cooldown: Option<Duration>,
-    ) -> Result<(), AppError> {
-        let now = Instant::now();
-        let mut entry = if let Some(existing) = self.windows.get_mut(key) {
-            existing
-        } else {
-            if self.entry_count.load(Ordering::Relaxed) >= self.max_entries {
-                self.reclaim_expired(self.config.window().min(window), now);
-            }
-            let mut current = self.entry_count.load(Ordering::Acquire);
-            loop {
-                if current >= self.max_entries {
-                    return Err(AppError::from_code(ErrorCode::RateLimitExceeded));
-                }
-                match self.entry_count.compare_exchange_weak(
-                    current,
-                    current + 1,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => break,
-                    Err(actual) => current = actual,
-                }
-            }
-            match self.windows.entry(key.to_string()) {
-                dashmap::mapref::entry::Entry::Occupied(occ) => {
-                    self.entry_count.fetch_sub(1, Ordering::Release);
-                    occ.into_ref()
-                }
-                dashmap::mapref::entry::Entry::Vacant(vac) => vac.insert(WindowEntry {
-                    attempts: Vec::new(),
-                    locked_until: None,
-                }),
-            }
-        };
-
+    ) -> Result<(), RateLimitRejection> {
         if let Some(locked_until) = entry.locked_until {
             if now < locked_until {
-                return Err(AppError::from_code(ErrorCode::RateLimitExceeded));
+                let dur = locked_until.duration_since(now);
+                let secs = (dur.as_secs_f64().ceil() as u64).max(1);
+                return Err(RateLimitRejection::Lockout(secs));
             }
             entry.locked_until = None;
             entry.attempts.clear();
         }
 
+        entry.window = window;
         entry.attempts.retain(|&t| now.duration_since(t) < window);
 
         if entry.attempts.len() as u32 >= max {
             if let Some(cd) = cooldown {
                 entry.locked_until = Some(now + cd);
+                let secs = (cd.as_secs_f64().ceil() as u64).max(1);
+                return Err(RateLimitRejection::Lockout(secs));
             }
-            return Err(AppError::from_code(ErrorCode::RateLimitExceeded));
+            return Err(RateLimitRejection::Exceeded);
         }
 
         entry.attempts.push(now);
         Ok(())
     }
 
+    /// Internal core sliding-window evaluation with atomic capacity admission.
+    fn check_internal(
+        &self,
+        key: &str,
+        max: u32,
+        window: Duration,
+        cooldown: Option<Duration>,
+    ) -> (KeyAdmission, Result<(), RateLimitRejection>) {
+        let now = Instant::now();
+
+        // 1. Fast path: check if key is already occupied.
+        // If occupied, this request consumes NO new entry capacity and must NOT be rejected by max_entries.
+        if let Some(mut existing) = self.windows.get_mut(key) {
+            let res = Self::evaluate_entry(&mut existing, now, max, window, cooldown);
+            return (KeyAdmission::Existing, res);
+        }
+
+        // 2. Slow path: key is not yet present.
+        // Before reserving capacity, attempt bounded in-band reclamation if at or above capacity limit.
+        if self.entry_count.load(Ordering::Relaxed) >= self.max_entries {
+            self.reclaim_expired_bounded(self.config.window(), now, Some(128));
+        }
+
+        // 3. Reserve capacity for new entry using CAS loop.
+        let mut current = self.entry_count.load(Ordering::Acquire);
+        loop {
+            if current >= self.max_entries {
+                // Key may have been inserted concurrently while reclaiming.
+                if let Some(mut existing) = self.windows.get_mut(key) {
+                    let res = Self::evaluate_entry(&mut existing, now, max, window, cooldown);
+                    return (KeyAdmission::Existing, res);
+                }
+                return (
+                    KeyAdmission::Existing,
+                    Err(RateLimitRejection::CapacityExhausted),
+                );
+            }
+            match self.entry_count.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+
+        // 4. Insert or admit key into DashMap.
+        let (admission, mut entry) = match self.windows.entry(key.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(occ) => {
+                // Another thread inserted this key in a race; release reserved slot.
+                self.entry_count.fetch_sub(1, Ordering::Release);
+                (KeyAdmission::Existing, occ.into_ref())
+            }
+            dashmap::mapref::entry::Entry::Vacant(vac) => {
+                let entry = vac.insert(WindowEntry {
+                    attempts: Vec::new(),
+                    locked_until: None,
+                    window,
+                });
+                (KeyAdmission::NewlyInserted, entry)
+            }
+        };
+
+        let res = Self::evaluate_entry(&mut entry, now, max, window, cooldown);
+        (admission, res)
+    }
+
     /// Check if an action under `key` is allowed given explicit `max` attempts within `window`.
     pub fn allow(&self, key: &str, max: u32, window: Duration) -> bool {
-        self.check_internal(key, max, window, None).is_ok()
+        let (_, res) = self.check_internal(key, max, window, None);
+        res.is_ok()
     }
 
     /// Return the configured cooldown period in seconds for 429 Retry-After headers.
@@ -144,8 +266,8 @@ impl RateLimiter {
         let locked_until = entry.locked_until?;
         let now = Instant::now();
         if locked_until > now {
-            let remaining = locked_until.duration_since(now).as_secs();
-            Some(remaining.max(1))
+            let dur = locked_until.duration_since(now);
+            Some((dur.as_secs_f64().ceil() as u64).max(1))
         } else {
             None
         }
@@ -166,12 +288,7 @@ impl RateLimiter {
     /// Return maximum remaining cooldown between IP and account keys.
     pub fn remaining_cooldown_dual(&self, ip: &str, account: &str) -> Option<u64> {
         let ip_key = format!("ip:{ip}");
-        let bounded_account = if account.len() > 255 {
-            &account[..255]
-        } else {
-            account
-        };
-        let acct_key = format!("account:{bounded_account}");
+        let acct_key = Self::format_account_key("account", account);
         self.remaining_cooldown_dual_key(&ip_key, &acct_key)
     }
 
@@ -180,98 +297,90 @@ impl RateLimiter {
         if !self.config.enabled {
             return Ok(());
         }
-
-        self.check_internal(
+        let (_, res) = self.check_internal(
             key,
             self.config.max_attempts,
             self.config.window(),
             Some(self.config.cooldown()),
-        )
+        );
+        res.map_err(AppError::from)
     }
 
     /// Check rate limit for an IP address.
-    pub fn check_ip(&self, ip: &str) -> Result<(), AppError> {
+    pub fn check_ip(&self, ip: &str) -> Result<(), RateLimitRejection> {
         if !self.config.enabled {
             return Ok(());
         }
         let key = format!("ip:{ip}");
-        self.check_internal(
+        let (_, res) = self.check_internal(
             &key,
             self.config.max_attempts,
             self.config.window(),
             Some(self.config.cooldown()),
-        )
+        );
+        res
     }
 
     /// Check rate limit for an account identifier (normalized email).
-    pub fn check_account(&self, account: &str) -> Result<(), AppError> {
+    pub fn check_account(&self, account: &str) -> Result<(), RateLimitRejection> {
         if !self.config.enabled {
             return Ok(());
         }
-        let bounded_account = if account.len() > 255 {
-            &account[..255]
-        } else {
-            account
-        };
-        let key = format!("account:{bounded_account}");
-        self.check_internal(
+        let key = Self::format_account_key("account", account);
+        let (_, res) = self.check_internal(
             &key,
             self.config.max_attempts,
             self.config.window(),
             Some(self.config.cooldown()),
-        )
+        );
+        res
     }
 
-    /// Check rate limit for password reset requests (isolated from login attempts).
-    pub fn check_password_reset(&self, ip: &str, account: &str) -> Result<(), AppError> {
-        if !self.config.enabled {
-            return Ok(());
-        }
+    /// Check rate limit for password reset requests.
+    ///
+    /// The account budget (`reset_account:{account}`) is isolated from login attempts,
+    /// while the IP budget (`ip:{ip}`) is intentionally shared across authentication endpoints
+    /// to mitigate distributed flooding.
+    pub fn check_password_reset(&self, ip: &str, account: &str) -> Result<(), RateLimitRejection> {
         let ip_key = format!("ip:{ip}");
-        let bounded_account = if account.len() > 255 {
-            &account[..255]
-        } else {
-            account
-        };
-        let acct_key = format!("reset_account:{bounded_account}");
+        let acct_key = Self::format_account_key("reset_account", account);
         self.check_dual_keys(&ip_key, &acct_key)
     }
 
     /// Evaluate dual-key rate limit: checks IP first, then account.
-    pub fn check_dual(&self, ip: &str, account: &str) -> Result<(), AppError> {
+    pub fn check_dual(&self, ip: &str, account: &str) -> Result<(), RateLimitRejection> {
         let ip_key = format!("ip:{ip}");
-        let bounded_account = if account.len() > 255 {
-            &account[..255]
-        } else {
-            account
-        };
-        let acct_key = format!("account:{bounded_account}");
+        let acct_key = Self::format_account_key("account", account);
         self.check_dual_keys(&ip_key, &acct_key)
     }
 
     /// Internal dual-key evaluation with atomic rollback on capacity failure.
-    fn check_dual_keys(&self, first_key: &str, second_key: &str) -> Result<(), AppError> {
+    fn check_dual_keys(&self, first_key: &str, second_key: &str) -> Result<(), RateLimitRejection> {
         if !self.config.enabled {
             return Ok(());
         }
-        let first_existed = self.windows.contains_key(first_key);
-        self.check_internal(
+        let (first_admission, first_res) = self.check_internal(
             first_key,
             self.config.max_attempts,
             self.config.window(),
             Some(self.config.cooldown()),
-        )?;
+        );
+        first_res?;
 
-        if let Err(e) = self.check_internal(
+        let (_, second_res) = self.check_internal(
             second_key,
             self.config.max_attempts,
             self.config.window(),
             Some(self.config.cooldown()),
-        ) {
-            // If second check failed on capacity rather than active lockout,
-            // roll back first key if it was newly inserted to prevent leak.
-            if !first_existed && self.remaining_cooldown(second_key).is_none() {
-                self.reset(first_key);
+        );
+
+        if let Err(e) = second_res {
+            if e == RateLimitRejection::CapacityExhausted {
+                if first_admission == KeyAdmission::NewlyInserted {
+                    self.reset(first_key);
+                } else if let Some(mut entry) = self.windows.get_mut(first_key) {
+                    entry.attempts.pop();
+                }
             }
             return Err(e);
         }
@@ -280,12 +389,7 @@ impl RateLimiter {
 
     /// Reset rate limit counter for an account only, leaving IP counters intact.
     pub fn reset_account(&self, account: &str) {
-        let bounded_account = if account.len() > 255 {
-            &account[..255]
-        } else {
-            account
-        };
-        let key = format!("account:{bounded_account}");
+        let key = Self::format_account_key("account", account);
         self.reset(&key);
     }
 
@@ -299,19 +403,36 @@ impl RateLimiter {
     /// Synchronously purge stale attempts and empty entries.
     pub fn cleanup(&self, window: Duration) {
         let now = Instant::now();
-        self.reclaim_expired(window, now);
+        self.reclaim_expired_bounded(window, now, None);
     }
 
-    fn reclaim_expired(&self, window: Duration, now: Instant) -> usize {
+    /// Prune expired entries, bounded by `limit` total removals if specified.
+    pub fn reclaim_expired_bounded(
+        &self,
+        fallback_window: Duration,
+        now: Instant,
+        limit: Option<usize>,
+    ) -> usize {
         let mut removed = 0usize;
         self.windows.retain(|_, entry| {
+            if let Some(max_prune) = limit
+                && removed >= max_prune
+            {
+                return true;
+            }
             if let Some(locked_until) = entry.locked_until {
                 if now < locked_until {
                     return true;
                 }
                 entry.locked_until = None;
+                entry.attempts.clear();
             }
-            entry.attempts.retain(|&t| now.duration_since(t) < window);
+            let win = if entry.window.is_zero() {
+                fallback_window
+            } else {
+                entry.window
+            };
+            entry.attempts.retain(|&t| now.duration_since(t) < win);
             if entry.attempts.is_empty() {
                 removed += 1;
                 false
@@ -348,6 +469,7 @@ impl RateLimiter {
                     break;
                 };
                 limiter.cleanup(window);
+                tokio::task::yield_now().await;
                 tracing::debug!(
                     event = "rate_limiter_cleanup",
                     remaining_keys = limiter.windows.len()
@@ -730,5 +852,142 @@ mod tests {
 
         // Password reset budget must remain independent and accessible
         assert!(limiter.check_password_reset("198.51.100.1", email).is_ok());
+    }
+
+    #[test]
+    fn test_truncate_utf8_respects_char_boundaries() {
+        // Multi-byte unicode: 4-byte crab emoji 🦀
+        let s = "a".repeat(254) + "🦀";
+        let truncated = truncate_utf8(&s, 255);
+        assert_eq!(truncated.len(), 254);
+        assert_eq!(truncated, &"a".repeat(254));
+
+        // 3-byte Japanese character '日'
+        let s2 = "b".repeat(253) + "日";
+        let truncated2 = truncate_utf8(&s2, 255);
+        assert_eq!(truncated2.len(), 253);
+
+        // 2-byte accented character 'é'
+        let s3 = "c".repeat(254) + "é";
+        let truncated3 = truncate_utf8(&s3, 255);
+        assert_eq!(truncated3.len(), 254);
+    }
+
+    #[test]
+    fn test_rate_limit_unicode_email_does_not_panic() {
+        let limiter = RateLimiter::new();
+        let unicode_email = format!("{}🦀@example.com", "u".repeat(250));
+        assert!(limiter.check_account(&unicode_email).is_ok());
+        assert!(limiter.check_dual("127.0.0.1", &unicode_email).is_ok());
+        assert!(
+            limiter
+                .check_password_reset("127.0.0.1", &unicode_email)
+                .is_ok()
+        );
+        limiter.reset_account(&unicode_email);
+    }
+
+    #[test]
+    fn test_occupied_key_admission_at_full_capacity() {
+        let config = RateLimitConfig {
+            enabled: true,
+            max_attempts: 5,
+            window_secs: 60,
+            login_cooldown_secs: 60,
+        };
+        // Strict capacity of 2 entries
+        let limiter = RateLimiter::with_config_and_capacity(config, 2);
+
+        // Fill capacity with 2 distinct keys
+        assert!(limiter.check_ip("1.1.1.1").is_ok());
+        assert!(limiter.check_ip("2.2.2.2").is_ok());
+
+        // Key 1.1.1.1 already exists: subsequent evaluations must succeed and not be rejected by max_entries
+        for _ in 0..3 {
+            assert!(limiter.check_ip("1.1.1.1").is_ok());
+        }
+
+        // 3rd new key must be rejected with CapacityExhausted
+        let res = limiter.check_ip("3.3.3.3");
+        assert_eq!(res.unwrap_err(), RateLimitRejection::CapacityExhausted);
+    }
+
+    #[test]
+    fn test_retry_after_fractional_ceiling() {
+        let config = RateLimitConfig {
+            enabled: true,
+            max_attempts: 1,
+            window_secs: 60,
+            login_cooldown_secs: 5,
+        };
+        let limiter = RateLimiter::with_config(config);
+        assert!(limiter.check_rate_limit("cd").is_ok());
+        assert!(limiter.check_ip("10.0.0.1").is_ok());
+        let rej = limiter.check_ip("10.0.0.1").unwrap_err();
+        match rej {
+            RateLimitRejection::Lockout(secs) => {
+                assert!((4..=5).contains(&secs));
+            }
+            _ => panic!("expected lockout"),
+        }
+    }
+
+    #[test]
+    fn test_dual_key_rollback_accuracy_on_capacity_failure() {
+        let config = RateLimitConfig {
+            enabled: true,
+            max_attempts: 5,
+            window_secs: 60,
+            login_cooldown_secs: 60,
+        };
+        // Capacity strictly 1 entry
+        let limiter = RateLimiter::with_config_and_capacity(config, 1);
+
+        // IP is new, account cannot be admitted -> IP rolled back
+        let res = limiter.check_dual("192.0.2.1", "victim@example.com");
+        assert_eq!(res.unwrap_err(), RateLimitRejection::CapacityExhausted);
+
+        // IP slot was released: fresh IP can be admitted
+        assert!(limiter.check_ip("192.0.2.2").is_ok());
+
+        // Now capacity is full (192.0.2.2 occupies the only slot).
+        // 192.0.2.2 already exists. Attempt check_dual with new account.
+        // Account fails with CapacityExhausted.
+        // Existing IP 192.0.2.2 must NOT be deleted, but the attempt pushed by check_dual must be popped.
+        let res2 = limiter.check_dual("192.0.2.2", "another@example.com");
+        assert_eq!(res2.unwrap_err(), RateLimitRejection::CapacityExhausted);
+
+        // 192.0.2.2 still exists in the map
+        assert!(limiter.windows.contains_key("ip:192.0.2.2"));
+    }
+
+    #[test]
+    fn test_shared_ip_budget_across_login_and_password_reset() {
+        let config = RateLimitConfig {
+            enabled: true,
+            max_attempts: 2,
+            window_secs: 60,
+            login_cooldown_secs: 60,
+        };
+        let limiter = RateLimiter::with_config(config);
+        let ip = "198.51.100.99";
+
+        // Consume 1 attempt via check_dual (login)
+        assert!(limiter.check_dual(ip, "user1@example.com").is_ok());
+
+        // Consume 2nd attempt via check_password_reset (reset)
+        assert!(
+            limiter
+                .check_password_reset(ip, "user2@example.com")
+                .is_ok()
+        );
+
+        // 3rd attempt from same IP is locked out across both endpoints
+        assert!(limiter.check_dual(ip, "user3@example.com").is_err());
+        assert!(
+            limiter
+                .check_password_reset(ip, "user4@example.com")
+                .is_err()
+        );
     }
 }

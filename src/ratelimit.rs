@@ -2,7 +2,10 @@
 
 use dashmap::DashMap;
 use std::{
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::time::sleep;
@@ -28,6 +31,7 @@ pub struct RateLimiter {
     windows: Arc<DashMap<String, WindowEntry>>,
     config: RateLimitConfig,
     max_entries: usize,
+    entry_count: Arc<AtomicUsize>,
 }
 
 impl RateLimiter {
@@ -57,6 +61,7 @@ impl RateLimiter {
             windows: Arc::new(DashMap::new()),
             config,
             max_entries,
+            entry_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -72,15 +77,32 @@ impl RateLimiter {
         let mut entry = if let Some(existing) = self.windows.get_mut(key) {
             existing
         } else {
-            if self.windows.len() >= self.max_entries {
+            if self.entry_count.load(Ordering::Relaxed) >= self.max_entries {
+                self.reclaim_expired(self.config.window().min(window), now);
+            }
+            if self
+                .entry_count
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |val| {
+                    if val < self.max_entries {
+                        Some(val + 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_err()
+            {
                 return Err(AppError::from_code(ErrorCode::RateLimitExceeded));
             }
-            self.windows
-                .entry(key.to_string())
-                .or_insert_with(|| WindowEntry {
+            match self.windows.entry(key.to_string()) {
+                dashmap::mapref::entry::Entry::Occupied(occ) => {
+                    self.entry_count.fetch_sub(1, Ordering::Release);
+                    occ.into_ref()
+                }
+                dashmap::mapref::entry::Entry::Vacant(vac) => vac.insert(WindowEntry {
                     attempts: Vec::new(),
                     locked_until: None,
-                })
+                }),
+            }
         };
 
         if let Some(locked_until) = entry.locked_until {
@@ -112,6 +134,39 @@ impl RateLimiter {
     /// Return the configured cooldown period in seconds for 429 Retry-After headers.
     pub fn cooldown_secs(&self) -> u64 {
         self.config.login_cooldown_secs
+    }
+
+    /// Return remaining lockout duration in seconds (minimum 1s) if key is actively locked out.
+    pub fn remaining_cooldown(&self, key: &str) -> Option<u64> {
+        let entry = self.windows.get(key)?;
+        let locked_until = entry.locked_until?;
+        let now = Instant::now();
+        if locked_until > now {
+            let remaining = locked_until.duration_since(now).as_secs();
+            Some(remaining.max(1))
+        } else {
+            None
+        }
+    }
+
+    /// Return maximum remaining cooldown across two full keys.
+    pub fn remaining_cooldown_dual_key(&self, key_a: &str, key_b: &str) -> Option<u64> {
+        let cd_a = self.remaining_cooldown(key_a);
+        let cd_b = self.remaining_cooldown(key_b);
+        match (cd_a, cd_b) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
+    /// Return maximum remaining cooldown between IP and account keys.
+    pub fn remaining_cooldown_dual(&self, ip: &str, account: &str) -> Option<u64> {
+        let ip_key = format!("ip:{ip}");
+        let bounded_account = if account.len() > 255 { &account[..255] } else { account };
+        let acct_key = format!("account:{bounded_account}");
+        self.remaining_cooldown_dual_key(&ip_key, &acct_key)
     }
 
     /// Check rate limit against configured rules and enforce cooldown on exceed.
@@ -147,7 +202,8 @@ impl RateLimiter {
         if !self.config.enabled {
             return Ok(());
         }
-        let key = format!("account:{account}");
+        let bounded_account = if account.len() > 255 { &account[..255] } else { account };
+        let key = format!("account:{bounded_account}");
         self.check_internal(
             &key,
             self.config.max_attempts,
@@ -156,27 +212,76 @@ impl RateLimiter {
         )
     }
 
+    /// Check rate limit for password reset requests (isolated from login attempts).
+    pub fn check_password_reset(&self, ip: &str, account: &str) -> Result<(), AppError> {
+        if !self.config.enabled {
+            return Ok(());
+        }
+        let ip_key = format!("ip:{ip}");
+        let bounded_account = if account.len() > 255 { &account[..255] } else { account };
+        let acct_key = format!("reset_account:{bounded_account}");
+        self.check_dual_keys(&ip_key, &acct_key)
+    }
+
     /// Evaluate dual-key rate limit: checks IP first, then account.
     pub fn check_dual(&self, ip: &str, account: &str) -> Result<(), AppError> {
-        self.check_ip(ip)?;
-        self.check_account(account)?;
+        let ip_key = format!("ip:{ip}");
+        let bounded_account = if account.len() > 255 { &account[..255] } else { account };
+        let acct_key = format!("account:{bounded_account}");
+        self.check_dual_keys(&ip_key, &acct_key)
+    }
+
+    /// Internal dual-key evaluation with atomic rollback on capacity failure.
+    fn check_dual_keys(&self, first_key: &str, second_key: &str) -> Result<(), AppError> {
+        if !self.config.enabled {
+            return Ok(());
+        }
+        let first_existed = self.windows.contains_key(first_key);
+        self.check_internal(
+            first_key,
+            self.config.max_attempts,
+            self.config.window(),
+            Some(self.config.cooldown()),
+        )?;
+
+        if let Err(e) = self.check_internal(
+            second_key,
+            self.config.max_attempts,
+            self.config.window(),
+            Some(self.config.cooldown()),
+        ) {
+            // If second check failed on capacity rather than active lockout,
+            // roll back first key if it was newly inserted to prevent leak.
+            if !first_existed && self.remaining_cooldown(second_key).is_none() {
+                self.reset(first_key);
+            }
+            return Err(e);
+        }
         Ok(())
     }
 
     /// Reset rate limit counter for an account only, leaving IP counters intact.
     pub fn reset_account(&self, account: &str) {
-        let key = format!("account:{account}");
-        self.windows.remove(&key);
+        let bounded_account = if account.len() > 255 { &account[..255] } else { account };
+        let key = format!("account:{bounded_account}");
+        self.reset(&key);
     }
 
     /// Reset all rate limit counters and lockouts for a specific key.
     pub fn reset(&self, key: &str) {
-        self.windows.remove(key);
+        if self.windows.remove(key).is_some() {
+            self.entry_count.fetch_sub(1, Ordering::Release);
+        }
     }
 
     /// Synchronously purge stale attempts and empty entries.
     pub fn cleanup(&self, window: Duration) {
         let now = Instant::now();
+        self.reclaim_expired(window, now);
+    }
+
+    fn reclaim_expired(&self, window: Duration, now: Instant) -> usize {
+        let mut removed = 0usize;
         self.windows.retain(|_, entry| {
             if let Some(locked_until) = entry.locked_until {
                 if now < locked_until {
@@ -185,8 +290,17 @@ impl RateLimiter {
                 entry.locked_until = None;
             }
             entry.attempts.retain(|&t| now.duration_since(t) < window);
-            !entry.attempts.is_empty()
+            if entry.attempts.is_empty() {
+                removed += 1;
+                false
+            } else {
+                true
+            }
         });
+        if removed > 0 {
+            self.entry_count.fetch_sub(removed, Ordering::Release);
+        }
+        removed
     }
 
     /// Spawn a background task periodically pruning expired keys.
@@ -492,5 +606,107 @@ mod tests {
         };
         let limiter = RateLimiter::with_config(config);
         assert_eq!(limiter.cooldown_secs(), 750);
+    }
+
+    #[test]
+    fn test_rate_limit_inband_reclamation_on_capacity_saturation() {
+        let config = RateLimitConfig {
+            enabled: true,
+            max_attempts: 5,
+            window_secs: 60,
+            login_cooldown_secs: 60,
+        };
+        let limiter = RateLimiter::with_config_and_capacity(config, 2);
+
+        // Fill capacity to maximum (2 entries)
+        assert!(limiter.allow("temp1", 5, Duration::from_millis(5)));
+        assert!(limiter.allow("temp2", 5, Duration::from_millis(5)));
+
+        // Sleep to let temp1 and temp2 expire
+        std::thread::sleep(Duration::from_millis(15));
+
+        // Third entry must trigger in-band reclamation and succeed without manual cleanup()
+        assert!(limiter.allow("temp3", 5, Duration::from_millis(5)));
+    }
+
+    #[test]
+    fn test_rate_limit_dual_key_rollback_on_capacity_failure() {
+        let config = RateLimitConfig {
+            enabled: true,
+            max_attempts: 5,
+            window_secs: 60,
+            login_cooldown_secs: 60,
+        };
+        // Capacity strictly 1 entry
+        let limiter = RateLimiter::with_config_and_capacity(config, 1);
+
+        // check_dual tries to insert IP first, then account.
+        // IP succeeds (occupying the only slot), but account fails due to capacity.
+        // IP must be rolled back so the slot is released.
+        let res = limiter.check_dual("192.0.2.1", "victim@example.com");
+        assert!(res.is_err());
+
+        // Slot must not be leaked; another single-key check should be able to acquire it
+        assert!(limiter.check_ip("192.0.2.2").is_ok());
+    }
+
+    #[test]
+    fn test_rate_limit_remaining_cooldown_accuracy() {
+        let config = RateLimitConfig {
+            enabled: true,
+            max_attempts: 1,
+            window_secs: 60,
+            login_cooldown_secs: 300,
+        };
+        let limiter = RateLimiter::with_config(config);
+
+        assert!(limiter.check_rate_limit("cd_test").is_ok());
+        assert!(limiter.remaining_cooldown("cd_test").is_none());
+
+        // Tripping rate limit activates lockout
+        assert!(limiter.check_rate_limit("cd_test").is_err());
+        let remaining = limiter.remaining_cooldown("cd_test");
+        assert!(remaining.is_some());
+        let secs = remaining.unwrap();
+        assert!((298..=300).contains(&secs));
+    }
+
+    #[test]
+    fn test_rate_limit_account_key_bounded() {
+        let config = RateLimitConfig {
+            enabled: true,
+            max_attempts: 5,
+            window_secs: 60,
+            login_cooldown_secs: 60,
+        };
+        let limiter = RateLimiter::with_config(config);
+
+        // Huge 100k string
+        let massive_email = "a".repeat(100_000);
+        assert!(limiter.check_account(&massive_email).is_ok());
+
+        // Stored key must be bounded to prefix + at most 255 bytes
+        for entry in limiter.windows.iter() {
+            assert!(entry.key().len() <= "account:".len() + 255);
+        }
+    }
+
+    #[test]
+    fn test_rate_limit_password_reset_independent_budget() {
+        let config = RateLimitConfig {
+            enabled: true,
+            max_attempts: 1,
+            window_secs: 60,
+            login_cooldown_secs: 300,
+        };
+        let limiter = RateLimiter::with_config(config);
+
+        let email = "victim@example.com";
+        // Trip login account lockout
+        assert!(limiter.check_account(email).is_ok());
+        assert!(limiter.check_account(email).is_err());
+
+        // Password reset budget must remain independent and accessible
+        assert!(limiter.check_password_reset("198.51.100.1", email).is_ok());
     }
 }

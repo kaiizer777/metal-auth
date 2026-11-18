@@ -5,10 +5,12 @@ use crate::{error::AppError, middleware::security_headers_middleware, state::App
 
 pub mod auth;
 pub mod cors;
+pub mod oauth;
 pub mod session;
 
 pub use auth::routes as auth_routes;
 pub use cors::cors_layer;
+pub use oauth::routes as oauth_routes;
 pub use session::routes as session_routes;
 
 async fn fallback_not_found() -> AppError {
@@ -36,11 +38,14 @@ pub fn create_router(state: AppState) -> Result<Router, AppError> {
     state.config.validate().map_err(AppError::Config)?;
     let cors = cors_layer(&state.config)?;
 
-    let auth_router =
-        auth::routes_with_app_state(state.clone()).merge(session::routes(state.clone()));
+    let oauth_router = oauth::routes(state.clone());
+    let auth_router = auth::routes_with_app_state(state.clone())
+        .merge(session::routes(state.clone()))
+        .merge(oauth_router.clone());
 
     Ok(Router::new()
         .nest("/auth", auth_router)
+        .nest("/api/auth", oauth_router)
         .fallback(fallback_not_found)
         .layer(cors)
         .layer(axum::middleware::from_fn(security_headers_middleware))
@@ -181,5 +186,42 @@ mod tests {
 
         let resp = router.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_oauth_routes_mounted_under_auth_and_api_auth() {
+        let cfg = valid_config();
+        let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
+        let state =
+            AppState::with_configs_and_dispatcher(pool, cfg, Arc::new(AppConfig::default()), None)
+                .unwrap();
+        let mut router = create_router(state).unwrap();
+
+        // 1. Canonical /auth/oauth/accounts requires authentication
+        let req1 = Request::builder()
+            .uri("/auth/oauth/accounts")
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap();
+        let resp1 = router.call(req1).await.unwrap();
+        assert_eq!(resp1.status(), StatusCode::UNAUTHORIZED);
+
+        // 2. Alias /api/auth/oauth/accounts requires authentication
+        let req2 = Request::builder()
+            .uri("/api/auth/oauth/accounts")
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap();
+        let resp2 = router.call(req2).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::UNAUTHORIZED);
+
+        // 3. Unknown provider returns 404
+        let req3 = Request::builder()
+            .uri("/auth/oauth/unknown_provider")
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap();
+        let resp3 = router.call(req3).await.unwrap();
+        assert_eq!(resp3.status(), StatusCode::NOT_FOUND);
     }
 }

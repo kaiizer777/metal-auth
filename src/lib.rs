@@ -48,7 +48,7 @@ pub use email::{
     SharedEmailSender, VerificationEmailPayload,
 };
 pub use error::{AppError, AppResult, ConfigError, ErrorCode, ErrorResponse};
-pub use handler::{auth_routes, session_routes};
+pub use handler::{auth_routes, oauth_routes, session_routes};
 pub use middleware::{AuthUser, csrf_middleware, require_auth, security_headers_middleware};
 pub use oauth::{
     AppleProvider, GitHubProvider, GoogleProvider, OAUTH_BODY_LIMIT, OAuthCallbackResult,

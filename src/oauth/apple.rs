@@ -137,12 +137,7 @@ impl AppleProvider {
             return Err(AppError::OAuthProviderError);
         }
 
-        Self::generate_client_secret(
-            team_id,
-            key_id,
-            &self.cfg.client_id,
-            private_key,
-        )
+        Self::generate_client_secret(team_id, key_id, &self.cfg.client_id, private_key)
     }
 
     /// Fetches and updates the in-memory JWKS cache.
@@ -187,10 +182,8 @@ impl AppleProvider {
                 .map(|exp| Instant::now() < exp)
                 .unwrap_or(false);
 
-            if fresh {
-                if let Some(components) = read_guard.keys.get(kid) {
-                    return Ok(components.clone());
-                }
+            if fresh && let Some(components) = read_guard.keys.get(kid) {
+                return Ok(components.clone());
             }
         }
 
@@ -761,4 +754,3 @@ mod tests {
         ));
     }
 }
-

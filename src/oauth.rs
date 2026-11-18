@@ -15,13 +15,13 @@ pub mod state;
 pub use apple::AppleProvider;
 pub use github::GitHubProvider;
 pub use google::GoogleProvider;
-pub use pkce::{compute_challenge, generate_pkce, verify_pkce, PKCEChallenge};
+pub use pkce::{PKCEChallenge, compute_challenge, generate_pkce, verify_pkce};
 pub use provider::{
-    build_oauth_http_client, create_provider, OAuthProvider, OAuthTokenResponse, OAuthUserInfo,
-    TokenResponse, UserInfo, SUPPORTED_PROVIDERS,
+    OAuthProvider, OAuthTokenResponse, OAuthUserInfo, SUPPORTED_PROVIDERS, TokenResponse, UserInfo,
+    build_oauth_http_client, create_provider,
 };
 pub use state::{
-    build_clear_state_cookie, build_clear_state_cookie_header, build_state_cookie,
-    build_state_cookie_header, create_state_cookie_value, extract_state_cookie,
-    generate_state_token, validate_state, OAuthStatePayload,
+    OAuthStatePayload, build_clear_state_cookie, build_clear_state_cookie_header,
+    build_state_cookie, build_state_cookie_header, create_state_cookie_value, extract_state_cookie,
+    generate_state_token, validate_state,
 };

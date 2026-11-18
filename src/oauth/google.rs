@@ -412,4 +412,3 @@ mod tests {
         assert!(!user.email_verified);
     }
 }
-

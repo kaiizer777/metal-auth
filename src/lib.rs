@@ -52,8 +52,8 @@ pub use handler::{auth_routes, session_routes};
 pub use middleware::{AuthUser, csrf_middleware, require_auth, security_headers_middleware};
 pub use oauth::{
     AppleProvider, GitHubProvider, GoogleProvider, OAuthProvider, OAuthStatePayload,
-    OAuthTokenResponse, OAuthUserInfo, PKCEChallenge, SUPPORTED_PROVIDERS, TokenResponse,
-    UserInfo, build_clear_state_cookie, build_clear_state_cookie_header, build_oauth_http_client,
+    OAuthTokenResponse, OAuthUserInfo, PKCEChallenge, SUPPORTED_PROVIDERS, TokenResponse, UserInfo,
+    build_clear_state_cookie, build_clear_state_cookie_header, build_oauth_http_client,
     build_state_cookie, build_state_cookie_header, compute_challenge, create_provider,
     create_state_cookie_value, extract_state_cookie, generate_pkce, generate_state_token,
     validate_state, verify_pkce,

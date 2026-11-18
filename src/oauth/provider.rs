@@ -111,10 +111,10 @@ pub async fn post_token_form(
         .await
         .map_err(|_| AppError::OAuthProviderError)?;
 
-    if let Some(err) = raw.get("error") {
-        if !err.is_null() {
-            return Err(AppError::OAuthProviderError);
-        }
+    if let Some(err) = raw.get("error")
+        && !err.is_null()
+    {
+        return Err(AppError::OAuthProviderError);
     }
 
     Ok(token_from_raw(raw))
@@ -276,4 +276,3 @@ mod tests {
         assert_eq!(scopes_or_default(&custom, defaults), "custom_a custom_b");
     }
 }
-

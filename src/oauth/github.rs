@@ -79,10 +79,7 @@ impl GitHubProvider {
 }
 
 /// Resolves the user's primary verified email address from the GitHub email list.
-pub fn resolve_github_email(
-    public_email: Option<&str>,
-    emails: &[GitHubEmail],
-) -> (String, bool) {
+pub fn resolve_github_email(public_email: Option<&str>, emails: &[GitHubEmail]) -> (String, bool) {
     let mut verified_by_address = HashMap::new();
     for entry in emails {
         if entry.email.is_empty() {
@@ -96,13 +93,13 @@ pub fn resolve_github_email(
         }
     }
 
-    if let Some(pub_email) = public_email {
-        if !pub_email.is_empty() {
-            if verified_by_address.get(pub_email).copied().unwrap_or(false) {
-                return (pub_email.to_string(), true);
-            }
-            return (pub_email.to_string(), false);
+    if let Some(pub_email) = public_email
+        && !pub_email.is_empty()
+    {
+        if verified_by_address.get(pub_email).copied().unwrap_or(false) {
+            return (pub_email.to_string(), true);
         }
+        return (pub_email.to_string(), false);
     }
 
     (String::new(), false)
@@ -554,4 +551,3 @@ mod tests {
         assert!(matches!(err, AppError::OAuthProviderError));
     }
 }
-

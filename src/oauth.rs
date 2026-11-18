@@ -17,8 +17,8 @@ pub use github::GitHubProvider;
 pub use google::GoogleProvider;
 pub use pkce::{PKCEChallenge, compute_challenge, generate_pkce, verify_pkce};
 pub use provider::{
-    OAuthProvider, OAuthTokenResponse, OAuthUserInfo, SUPPORTED_PROVIDERS, TokenResponse, UserInfo,
-    build_oauth_http_client, create_provider,
+    OAUTH_BODY_LIMIT, OAuthProvider, OAuthTokenResponse, OAuthUserInfo, SUPPORTED_PROVIDERS,
+    TokenResponse, UserInfo, build_oauth_http_client, create_provider,
 };
 pub use state::{
     OAuthStatePayload, build_clear_state_cookie, build_clear_state_cookie_header,

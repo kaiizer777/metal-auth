@@ -27,7 +27,7 @@ pub struct UserInfo {
 pub type OAuthUserInfo = UserInfo;
 
 /// Token credentials received from the provider's token exchange endpoint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,
     pub token_type: String,
@@ -39,6 +39,22 @@ pub struct TokenResponse {
 }
 
 pub type OAuthTokenResponse = TokenResponse;
+
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("access_token", &"[REDACTED]")
+            .field("token_type", &self.token_type)
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("expires_in", &self.expires_in)
+            .field("id_token", &self.id_token.as_ref().map(|_| "[REDACTED]"))
+            .field("raw", &"[REDACTED]")
+            .finish()
+    }
+}
 
 /// Trait defining the contract required for any OAuth2 / OIDC identity provider.
 #[async_trait]
@@ -88,6 +104,32 @@ pub fn scopes_or_default(configured: &[String], defaults: &[&str]) -> String {
     }
 }
 
+/// Reads an HTTP response body up to `OAUTH_BODY_LIMIT` (1 MiB) and parses it as JSON.
+/// Returns AppError::OAuthProviderError if the Content-Length or streamed body exceeds the limit.
+pub async fn read_json_limited<T: serde::de::DeserializeOwned>(
+    mut resp: reqwest::Response,
+) -> Result<T, AppError> {
+    if let Some(len) = resp.content_length()
+        && len > OAUTH_BODY_LIMIT as u64
+    {
+        return Err(AppError::OAuthProviderError);
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|_| AppError::OAuthProviderError)?
+    {
+        if body.len() + chunk.len() > OAUTH_BODY_LIMIT {
+            return Err(AppError::OAuthProviderError);
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    serde_json::from_slice(&body).map_err(|_| AppError::OAuthProviderError)
+}
+
 /// Sends an HTTP POST form request for token exchange, parsing the JSON token response.
 pub async fn post_token_form(
     client: &reqwest::Client,
@@ -106,10 +148,7 @@ pub async fn post_token_form(
         return Err(AppError::OAuthProviderError);
     }
 
-    let raw: HashMap<String, serde_json::Value> = resp
-        .json()
-        .await
-        .map_err(|_| AppError::OAuthProviderError)?;
+    let raw: HashMap<String, serde_json::Value> = read_json_limited(resp).await?;
 
     if let Some(err) = raw.get("error")
         && !err.is_null()
@@ -274,5 +313,44 @@ mod tests {
 
         let custom = vec!["custom_a".to_string(), "custom_b".to_string()];
         assert_eq!(scopes_or_default(&custom, defaults), "custom_a custom_b");
+    }
+
+    #[test]
+    fn test_token_response_debug_redacts_secrets() {
+        let tok = TokenResponse {
+            access_token: "secret-access-token".to_string(),
+            token_type: "Bearer".to_string(),
+            refresh_token: Some("secret-refresh-token".to_string()),
+            expires_in: Some(3600),
+            id_token: Some("secret-id-jwt".to_string()),
+            raw: HashMap::new(),
+        };
+
+        let debug_str = format!("{tok:?}");
+        assert!(!debug_str.contains("secret-access-token"));
+        assert!(!debug_str.contains("secret-refresh-token"));
+        assert!(!debug_str.contains("secret-id-jwt"));
+        assert!(debug_str.contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
+    async fn test_read_json_limited_enforces_body_limit() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // Oversized body (> 1 MiB)
+        let oversized = vec![b'a'; OAUTH_BODY_LIMIT + 10];
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(oversized))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let resp = client.get(server.uri()).send().await.unwrap();
+
+        let res: Result<serde_json::Value, AppError> = read_json_limited(resp).await;
+        assert!(matches!(res, Err(AppError::OAuthProviderError)));
     }
 }

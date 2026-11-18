@@ -1153,7 +1153,11 @@ async fn test_rate_limit_reset_on_success() {
 
     let (email, password) = create_and_verify_user(&app).await;
     let max = app.state.config.rate_limit.max_attempts;
-    let client_ip = "198.51.100.99";
+    let client_ip = dynamic_ip();
+
+    // Reset rate limiter counters consumed during signup/verification
+    app.state.rate_limiter.reset_account(&email);
+    app.state.rate_limiter.reset(&format!("ip:{client_ip}"));
 
     // Fail max - 1 times
     for _ in 0..(max - 1) {
@@ -1161,7 +1165,7 @@ async fn test_rate_limit_reset_on_success() {
             .post_json_with_ip(
                 "/auth/login",
                 json!({ "email": email, "password": "WrongPassword123!" }),
-                client_ip,
+                &client_ip,
             )
             .await;
     }
@@ -1171,7 +1175,7 @@ async fn test_rate_limit_reset_on_success() {
         .post_json_with_ip(
             "/auth/login",
             json!({ "email": email, "password": password }),
-            client_ip,
+            &client_ip,
         )
         .await;
     assert_eq!(ok_resp.status(), StatusCode::OK);
@@ -1184,7 +1188,7 @@ async fn test_rate_limit_reset_on_success() {
         .post_json_with_ip(
             "/auth/login",
             json!({ "email": email, "password": "WrongPassword123!" }),
-            client_ip,
+            &client_ip,
         )
         .await;
     assert_eq!(fail_resp.status(), StatusCode::UNAUTHORIZED);

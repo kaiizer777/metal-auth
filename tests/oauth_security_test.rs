@@ -8,8 +8,7 @@ use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use chrono::Utc;
 use common::*;
 use metal_auth::{
-    ErrorCode, GoogleProvider, OAuthProvider, OAuthService, ProviderConfig,
-    SessionService, User,
+    ErrorCode, GoogleProvider, OAuthProvider, OAuthService, ProviderConfig, SessionService, User,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -58,14 +57,14 @@ impl TestLogScope {
 
 fn extract_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     for val in headers.get_all(header::SET_COOKIE) {
-        if let Ok(s) = val.to_str() {
-            if let Some(cookie_part) = s.split(';').next() {
-                let mut parts = cookie_part.splitn(2, '=');
-                if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
-                    if k.trim() == name {
-                        return Some(v.trim().to_string());
-                    }
-                }
+        if let Ok(s) = val.to_str()
+            && let Some(cookie_part) = s.split(';').next()
+        {
+            let mut parts = cookie_part.splitn(2, '=');
+            if let (Some(k), Some(v)) = (parts.next(), parts.next())
+                && k.trim() == name
+            {
+                return Some(v.trim().to_string());
             }
         }
     }
@@ -216,11 +215,12 @@ async fn test_security_pre_hijacking_unverified_provider_email() {
         .unwrap();
     assert_eq!(count, 0);
 
-    let link_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_accounts WHERE provider_user_id = $1")
-        .bind("attacker-sub-999")
-        .fetch_one(&app.pool)
-        .await
-        .unwrap();
+    let link_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM oauth_accounts WHERE provider_user_id = $1")
+            .bind("attacker-sub-999")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
     assert_eq!(link_count, 0);
 }
 
@@ -334,11 +334,12 @@ async fn test_security_pre_hijacking_collision_unverified_local_account() {
     assert!(!victim_row.email_verified);
 
     // Assert zero links in oauth_accounts
-    let link_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_accounts WHERE user_id = $1")
-        .bind(victim_id)
-        .fetch_one(&app.pool)
-        .await
-        .unwrap();
+    let link_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM oauth_accounts WHERE user_id = $1")
+            .bind(victim_id)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
     assert_eq!(link_count, 0);
 
     // Assert state cookie cleared
@@ -434,7 +435,10 @@ async fn test_security_external_callback_csrf_exemption() {
         .header(header::ACCEPT, "application/json")
         .header(
             header::COOKIE,
-            format!("{}=some_active_session_cookie", app.state.config.session.cookie_name),
+            format!(
+                "{}=some_active_session_cookie",
+                app.state.config.session.cookie_name
+            ),
         )
         .body(Body::from(form_body))
         .unwrap();
@@ -525,7 +529,9 @@ async fn test_security_oauth_state_tampering_and_fixation() {
     let tampered_cookie = format!("{state_cookie}tampered");
     let req = Request::builder()
         .method(Method::GET)
-        .uri(format!("/auth/oauth/google/callback?code=some_code&state={state_token}"))
+        .uri(format!(
+            "/auth/oauth/google/callback?code=some_code&state={state_token}"
+        ))
         .header(header::ACCEPT, "application/json")
         .header(header::COOKIE, format!("oauth_state={tampered_cookie}"))
         .body(Body::empty())
@@ -541,7 +547,7 @@ async fn test_security_oauth_state_tampering_and_fixation() {
     // 4. Mismatched state token (cookie valid for token A, query passes token B)
     let req = Request::builder()
         .method(Method::GET)
-        .uri(format!("/auth/oauth/google/callback?code=some_code&state=mismatched_token_b"))
+        .uri("/auth/oauth/google/callback?code=some_code&state=mismatched_token_b")
         .header(header::ACCEPT, "application/json")
         .header(header::COOKIE, format!("oauth_state={state_cookie}"))
         .body(Body::empty())
@@ -604,7 +610,9 @@ async fn test_security_pkce_exchange_failure() {
 
     let req = Request::builder()
         .method(Method::GET)
-        .uri(format!("/auth/oauth/google/callback?code=bad_grant_code&state={state_token}"))
+        .uri(format!(
+            "/auth/oauth/google/callback?code=bad_grant_code&state={state_token}"
+        ))
         .header(header::ACCEPT, "application/json")
         .header(header::COOKIE, format!("oauth_state={state_cookie}"))
         .body(Body::empty())
@@ -698,7 +706,8 @@ async fn test_security_open_redirect_attempts_rejected() {
         let state_cookie = extract_cookie_value(&resp.headers, "oauth_state").unwrap();
 
         // Browser callback -> Location header must be sanitized to "/"
-        let callback_uri = format!("/auth/oauth/google/callback?code=good_code&state={state_token}");
+        let callback_uri =
+            format!("/auth/oauth/google/callback?code=good_code&state={state_token}");
         let req = Request::builder()
             .method(Method::GET)
             .uri(&callback_uri)
@@ -906,7 +915,8 @@ async fn test_security_zero_secret_leakage_in_tracing_logs() {
     let state_cookie = extract_cookie_value(&resp.headers, "oauth_state").unwrap();
 
     // 2. Callback flow
-    let callback_uri = format!("/auth/oauth/google/callback?code={canary_auth_code}&state={state_token}");
+    let callback_uri =
+        format!("/auth/oauth/google/callback?code={canary_auth_code}&state={state_token}");
     let req = Request::builder()
         .method(Method::GET)
         .uri(&callback_uri)

@@ -74,7 +74,10 @@ pub fn safe_oauth_redirect(target: &str) -> &str {
     if target.len() > 1 && (target.as_bytes()[1] == b'/' || target.as_bytes()[1] == b'\\') {
         return "/";
     }
-    if target.chars().any(|c| matches!(c, '\\' | ' ' | '\t' | '\r' | '\n')) {
+    if target
+        .chars()
+        .any(|c| matches!(c, '\\' | ' ' | '\t' | '\r' | '\n'))
+    {
         return "/";
     }
     target
@@ -219,7 +222,9 @@ async fn handle_callback_internal(
     }
 
     let client_ip = untrusted_client_ip(headers);
-    let user_agent = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok());
 
     if let Some(err) = error_param {
         tracing::info!(
@@ -317,11 +322,7 @@ async fn handle_callback_internal(
         )
             .into_response()
     } else {
-        (
-            StatusCode::FOUND,
-            [(header::LOCATION, sanitized_redirect)],
-        )
-            .into_response()
+        (StatusCode::FOUND, [(header::LOCATION, sanitized_redirect)]).into_response()
     };
 
     match set_session_cookie(&state.config, &result.raw_token) {
@@ -390,7 +391,10 @@ pub async fn unlink_account(
     if !SUPPORTED_PROVIDERS.contains(&provider.as_str()) {
         return Err(AppError::OAuthProviderNotFound);
     }
-    state.oauth_service.unlink_account(user_id, &provider).await?;
+    state
+        .oauth_service
+        .unlink_account(user_id, &provider)
+        .await?;
     Ok(Json(MessageResponse {
         message: "account unlinked",
     }))
@@ -400,7 +404,10 @@ pub async fn unlink_account(
 pub fn routes(state: AppState) -> Router {
     let authenticated_csrf_routes = Router::new()
         .route("/oauth/{provider}/link", axum::routing::post(link_account))
-        .route("/oauth/{provider}/unlink", axum::routing::post(unlink_account))
+        .route(
+            "/oauth/{provider}/unlink",
+            axum::routing::post(unlink_account),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             csrf_middleware,

@@ -39,21 +39,20 @@ struct MockAppleClaims {
 fn mint_test_apple_id_token(kid: &str, claims: MockAppleClaims) -> String {
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(kid.to_string());
-    let encoding_key =
-        jsonwebtoken::EncodingKey::from_rsa_pem(TEST_RSA_PEM.as_bytes()).unwrap();
+    let encoding_key = jsonwebtoken::EncodingKey::from_rsa_pem(TEST_RSA_PEM.as_bytes()).unwrap();
     encode(&header, &claims, &encoding_key).unwrap()
 }
 
 fn extract_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     for val in headers.get_all(header::SET_COOKIE) {
-        if let Ok(s) = val.to_str() {
-            if let Some(cookie_part) = s.split(';').next() {
-                let mut parts = cookie_part.splitn(2, '=');
-                if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
-                    if k.trim() == name {
-                        return Some(v.trim().to_string());
-                    }
-                }
+        if let Ok(s) = val.to_str()
+            && let Some(cookie_part) = s.split(';').next()
+        {
+            let mut parts = cookie_part.splitn(2, '=');
+            if let (Some(k), Some(v)) = (parts.next(), parts.next())
+                && k.trim() == name
+            {
+                return Some(v.trim().to_string());
             }
         }
     }
@@ -175,10 +174,7 @@ async fn test_oauth_google_end_to_end_flow() {
         .unwrap();
     let resp = app.dispatch(req).await;
     assert_eq!(resp.status(), StatusCode::FOUND);
-    assert_eq!(
-        resp.header(header::LOCATION.as_str()),
-        Some("/dashboard")
-    );
+    assert_eq!(resp.header(header::LOCATION.as_str()), Some("/dashboard"));
 
     // Verify session cookie set and oauth_state cookie cleared
     let session_cookie_name = &app.state.config.session.cookie_name;
@@ -197,7 +193,9 @@ async fn test_oauth_google_end_to_end_flow() {
     .await
     .expect("user provisioned in users table");
     assert!(user_row.email_verified);
-    assert!(user_row.password_hash.starts_with("$unusable$oauth$") || user_row.password_hash.is_empty());
+    assert!(
+        user_row.password_hash.starts_with("$unusable$oauth$") || user_row.password_hash.is_empty()
+    );
 
     let oauth_row: OAuthAccount = sqlx::query_as::<_, OAuthAccount>(
         "SELECT id, user_id, provider_id, provider_user_id, email, created_at, updated_at FROM oauth_accounts WHERE user_id = $1",
@@ -774,10 +772,7 @@ async fn test_oauth_apple_form_post_callback() {
     let req = Request::builder()
         .method(Method::POST)
         .uri("/auth/oauth/apple/callback")
-        .header(
-            header::CONTENT_TYPE,
-            "application/x-www-form-urlencoded",
-        )
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header(header::ACCEPT, "application/json")
         .header(header::COOKIE, format!("oauth_state={state_cookie}"))
         .body(Body::from(form_body))
@@ -785,11 +780,8 @@ async fn test_oauth_apple_form_post_callback() {
     let resp = app.dispatch(req).await;
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let session_cookie = extract_cookie_value(
-        &resp.headers,
-        &app.state.config.session.cookie_name,
-    )
-    .expect("session cookie set on Apple form_post callback");
+    let session_cookie = extract_cookie_value(&resp.headers, &app.state.config.session.cookie_name)
+        .expect("session cookie set on Apple form_post callback");
 
     // Verify session
     let req = Request::builder()
@@ -875,7 +867,8 @@ async fn test_oauth_api_alias_routes() {
     let state_cookie = extract_cookie_value(&resp.headers, "oauth_state").unwrap();
 
     // 2. Alias Callback: GET /api/auth/oauth/google/callback
-    let callback_uri = format!("/api/auth/oauth/google/callback?code=alias_code&state={state_token}");
+    let callback_uri =
+        format!("/api/auth/oauth/google/callback?code=alias_code&state={state_token}");
     let req = Request::builder()
         .method(Method::GET)
         .uri(&callback_uri)

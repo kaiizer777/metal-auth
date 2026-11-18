@@ -15,12 +15,14 @@ autotests = true
 # async runtime
 tokio = { version = "1", features = ["macros", "rt", "time", "sync"] }
 
-# crypto (Phase 3)
+# crypto (Phase 3 & 6)
 argon2 = { version = "0.5", features = ["std"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 sha2 = "0.10"
 hex = "0.4"
 subtle = "2.6"
+base64 = "0.22"
+hmac = "0.12"
 
 # rate limiting (Phase 4)
 dashmap = "6"

@@ -556,12 +556,20 @@ pub(crate) fn default_allowed_headers() -> Vec<String> {
 }
 
 pub(crate) fn parse_allowed_headers_str(raw: &str) -> Vec<String> {
+    if raw.trim().is_empty() {
+        return default_allowed_headers();
+    }
+
     let mut headers: Vec<String> = raw
         .split(',')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect();
+
+    if headers.is_empty() {
+        return default_allowed_headers();
+    }
 
     if !headers
         .iter()
@@ -778,6 +786,11 @@ fn parse_env_bool(
 pub struct SessionConfig {
     #[serde(default = "default_cookie_name")]
     pub cookie_name: String,
+    /// Cookie domain for session and CSRF cookies.
+    ///
+    /// In split-host or cross-subdomain architectures (e.g. frontend on `app.example.com` calling
+    /// an API on `api.example.com`), configure `SESSION_COOKIE_DOMAIN` (e.g. `.example.com`) so that
+    /// client-side JavaScript can read the `csrf_token` cookie for Double Submit Cookie verification.
     #[serde(default)]
     pub cookie_domain: Option<String>,
     #[serde(default = "default_cookie_path")]
@@ -2453,6 +2466,30 @@ mod tests {
             headers,
             vec!["Authorization", "X-CSRF-Token", "Content-Type"]
         );
+    }
+
+    #[test]
+    fn parse_allowed_headers_empty_or_whitespace_falls_back_to_defaults() {
+        for empty_val in ["", "   ", " \t\n ", ", ,  ,"] {
+            let headers = parse_allowed_headers_str(empty_val);
+            assert_eq!(
+                headers,
+                default_allowed_headers(),
+                "expected default allowed headers for input '{empty_val}'"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_headers_empty_env_lookup_falls_back_to_defaults() {
+        let cfg = Config::from_lookup(|key| match key {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "ALLOWED_HEADERS" => Ok("   ".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        })
+        .expect("load config with whitespace allowed headers");
+        assert_eq!(cfg.allowed_headers, default_allowed_headers());
     }
 
     #[test]

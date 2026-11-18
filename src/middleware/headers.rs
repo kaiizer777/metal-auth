@@ -10,7 +10,10 @@ use axum::{
 pub async fn security_headers_middleware(req: Request<Body>, next: Next) -> Response<Body> {
     let is_options = req.method() == Method::OPTIONS;
     let path = req.uri().path();
-    let is_auth_route = path.starts_with("/auth") || path.starts_with("/session");
+    let is_auth_route = path == "/auth"
+        || path.starts_with("/auth/")
+        || path == "/session"
+        || path.starts_with("/session/");
 
     let mut res = next.run(req).await;
     let headers = res.headers_mut();
@@ -165,5 +168,34 @@ mod tests {
             res.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
             "nosniff"
         );
+    }
+
+    #[tokio::test]
+    async fn test_exact_path_segment_matching_avoids_spurious_cache_control() {
+        let app = Router::new()
+            .route("/authors", get(|| async { StatusCode::OK }))
+            .route("/session-recording", get(|| async { StatusCode::OK }))
+            .route("/auth", get(|| async { StatusCode::OK }))
+            .route("/session", get(|| async { StatusCode::OK }))
+            .layer(from_fn(security_headers_middleware));
+
+        for path in ["/authors", "/session-recording"] {
+            let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert!(
+                res.headers().get(header::CACHE_CONTROL).is_none(),
+                "path {path} must not receive Cache-Control"
+            );
+        }
+
+        for path in ["/auth", "/session"] {
+            let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                res.headers().get(header::CACHE_CONTROL).unwrap(),
+                "no-store",
+                "path {path} must receive Cache-Control: no-store"
+            );
+        }
     }
 }

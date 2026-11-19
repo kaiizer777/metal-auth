@@ -97,12 +97,13 @@ fn check_oauth_rate_limit(
     state: &AppState,
     headers: &HeaderMap,
     provider: &str,
+    op: &str,
 ) -> Result<(), AppError> {
     if !state.config.rate_limit.enabled {
         return Ok(());
     }
     let ip = untrusted_client_ip(headers).unwrap_or("127.0.0.1");
-    let key = rate_limit_key(&format!("oauth:{provider}"), ip);
+    let key = rate_limit_key(&format!("oauth:{op}:{provider}"), ip);
     state.rate_limiter.check_rate_limit(&key)
 }
 
@@ -145,7 +146,7 @@ pub async fn oauth_initiate(
         return oauth_error_response(&state, AppError::OAuthProviderNotFound);
     }
 
-    if let Err(e) = check_oauth_rate_limit(&state, &headers, &provider) {
+    if let Err(e) = check_oauth_rate_limit(&state, &headers, &provider, "initiate") {
         return oauth_error_response(&state, e);
     }
 
@@ -178,7 +179,7 @@ pub async fn oauth_link_initiate(
         return oauth_error_response(&state, AppError::OAuthProviderNotFound);
     }
 
-    if let Err(e) = check_oauth_rate_limit(&state, &headers, &provider) {
+    if let Err(e) = check_oauth_rate_limit(&state, &headers, &provider, "initiate") {
         return oauth_error_response(&state, e);
     }
 
@@ -251,7 +252,7 @@ async fn handle_callback_internal(
         return oauth_error_response(state, AppError::OAuthProviderNotFound);
     }
 
-    if let Err(e) = check_oauth_rate_limit(state, headers, provider) {
+    if let Err(e) = check_oauth_rate_limit(state, headers, provider, "callback") {
         return oauth_error_response(state, e);
     }
 
@@ -431,7 +432,7 @@ pub async fn link_account(
     if !SUPPORTED_PROVIDERS.contains(&provider.as_str()) {
         return Err(AppError::OAuthProviderNotFound);
     }
-    check_oauth_rate_limit(&state, &headers, &provider)?;
+    check_oauth_rate_limit(&state, &headers, &provider, "callback")?;
     let cookie_header = headers.get(header::COOKIE).and_then(|v| v.to_str().ok());
     let account = match state
         .oauth_service
@@ -536,6 +537,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_oauth_initiate_then_callback_pass_single_attempt_budget() {
+        use crate::config::{AppConfig, Config};
+        use sqlx::PgPool;
+        use std::sync::Arc;
+
+        let mut cfg = Config::default();
+        cfg.rate_limit.enabled = true;
+        cfg.rate_limit.max_attempts = 1;
+        let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
+        let state =
+            AppState::with_configs_and_dispatcher(pool, cfg, Arc::new(AppConfig::default()), None)
+                .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            header::HeaderValue::from_static("203.0.113.9"),
+        );
+        check_oauth_rate_limit(&state, &headers, "google", "initiate").unwrap();
+        check_oauth_rate_limit(&state, &headers, "google", "callback").unwrap();
+        assert!(matches!(
+            check_oauth_rate_limit(&state, &headers, "google", "initiate"),
+            Err(AppError::RateLimitExceeded)
+        ));
+    }
+
+    #[tokio::test]
     async fn test_link_account_enforces_oauth_rate_limit() {
         use crate::config::{AppConfig, Config};
         use sqlx::PgPool;
@@ -552,7 +580,7 @@ mod tests {
         let ip = "203.0.113.7";
         state
             .rate_limiter
-            .check_rate_limit(&rate_limit_key("oauth:google", ip))
+            .check_rate_limit(&rate_limit_key("oauth:callback:google", ip))
             .unwrap();
 
         let mut headers = HeaderMap::new();

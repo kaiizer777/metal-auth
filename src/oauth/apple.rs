@@ -260,11 +260,7 @@ impl OAuthProvider for AppleProvider {
     }
 
     fn auth_url(&self, state: &str, code_challenge: &str) -> String {
-        let redirect_uri = if !self.cfg.redirect_uri.is_empty() {
-            &self.cfg.redirect_uri
-        } else {
-            &self.cfg.redirect_url
-        };
+        let redirect_uri = &self.cfg.redirect_uri;
         let scope = scopes_or_default(&self.cfg.scopes, DEFAULT_SCOPES);
 
         let params = [
@@ -290,11 +286,7 @@ impl OAuthProvider for AppleProvider {
         code_verifier: &str,
     ) -> Result<TokenResponse, AppError> {
         let client_secret = self.get_client_secret()?;
-        let redirect_uri = if !self.cfg.redirect_uri.is_empty() {
-            &self.cfg.redirect_uri
-        } else {
-            &self.cfg.redirect_url
-        };
+        let redirect_uri = &self.cfg.redirect_uri;
 
         let params = [
             ("client_id", self.cfg.client_id.as_str()),

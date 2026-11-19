@@ -1337,12 +1337,7 @@ impl OAuthConfig {
                         reason: "must not be empty for enabled provider",
                     });
                 }
-                let uri = if !provider.redirect_uri.trim().is_empty() {
-                    &provider.redirect_uri
-                } else {
-                    &provider.redirect_url
-                };
-                if uri.trim().is_empty() {
+                if provider.redirect_uri.trim().is_empty() {
                     return Err(ConfigError::InvalidValue {
                         field: "oauth.provider.redirect_uri",
                         reason: "must not be empty for enabled provider",

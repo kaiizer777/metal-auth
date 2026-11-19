@@ -179,6 +179,10 @@ impl AppleProvider {
             }
         }
 
+        if keys.is_empty() {
+            return Err(AppError::OAuthProviderError);
+        }
+
         let mut write_guard = self.cache.write().await;
         write_guard.keys = keys;
         write_guard.expires_at = Some(Instant::now() + APPLE_JWKS_TTL);

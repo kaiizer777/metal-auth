@@ -329,20 +329,11 @@ impl OAuthStateManager {
         state_param: &str,
         provider_id: &str,
     ) -> Result<OAuthStatePayload, AppError> {
-        let cookie_val = if cookie_header.contains('=') {
-            cookie_header
-                .split(';')
-                .find_map(|pair| {
-                    let (name, val) = pair.trim().split_once('=')?;
-                    if name == self.cookie_name {
-                        Some(val)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(cookie_header)
-        } else {
-            cookie_header
+        let Some(cookie_val) = cookie_header.split(';').find_map(|pair| {
+            let (name, val) = pair.trim().split_once('=')?;
+            (name == self.cookie_name).then_some(val)
+        }) else {
+            return Err(AppError::OAuthStateInvalid);
         };
 
         let payload = validate_state(

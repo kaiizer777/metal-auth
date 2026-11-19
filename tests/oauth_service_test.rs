@@ -689,6 +689,65 @@ async fn test_oauth_link_intent_in_callback_attaches_identity_without_session() 
 }
 
 #[tokio::test]
+async fn link_callback_succeeds_without_500_after_commit() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    truncate_tables(&app.pool).await.expect("truncate");
+
+    let email = dynamic_email();
+    let user_id = Uuid::new_v4();
+
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(user_id)
+    .bind(&email)
+    .bind("argon2id$somehash")
+    .bind(true)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+
+    let google_mock = Arc::new(MockOAuthProvider::new(
+        "google",
+        UserInfo {
+            provider_id: "google".to_string(),
+            provider_user_id: "goog_link_sub_500".to_string(),
+            email: email.clone(),
+            email_verified: true,
+            name: None,
+            avatar_url: None,
+        },
+    ));
+
+    let svc = create_test_oauth_service(&app, google_mock, None);
+
+    let (auth_url, set_cookie) = svc
+        .initiate_link_flow("google", user_id, Some("/settings".to_string()))
+        .expect("initiate link flow");
+    let state_token = extract_state_from_url(&auth_url);
+
+    // link intent commits oauth_accounts: callback must succeed, not 500
+    let (_session, linked_user, clear_cookie_header) = svc
+        .handle_callback("google", "valid_code", state_token, Some(&set_cookie))
+        .await
+        .expect("link callback succeeds");
+    assert_eq!(linked_user.id, user_id);
+    assert!(clear_cookie_header.contains("Max-Age=0"));
+
+    let link_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM oauth_accounts WHERE user_id = $1 AND provider_id = 'google'",
+    )
+    .bind(user_id)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(link_count.0, 1);
+}
+
+#[tokio::test]
 async fn test_unlink_disabled_provider_lockout_prevention() {
     let _guard = DB_LOCK.lock().await;
     let Some(app) = setup_test_app().await else {

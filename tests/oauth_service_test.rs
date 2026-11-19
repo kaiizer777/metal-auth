@@ -8,7 +8,8 @@ use async_trait::async_trait;
 use axum::http::StatusCode;
 use common::*;
 use metal_auth::{
-    AppError, ErrorCode, OAuthProvider, OAuthService, SessionService, TokenResponse, UserInfo,
+    AppError, ErrorCode, OAuthCallbackOutcome, OAuthProvider, OAuthService, SessionService,
+    TokenResponse, UserInfo,
 };
 use uuid::Uuid;
 
@@ -322,7 +323,7 @@ async fn test_oauth_auto_provisions_new_verified_user() {
         .expect("get auth url");
     let state_token = extract_state_from_url(&auth_url);
 
-    let res = svc
+    let outcome = svc
         .handle_callback_extended(
             "google",
             "valid_code",
@@ -334,6 +335,10 @@ async fn test_oauth_auto_provisions_new_verified_user() {
         )
         .await
         .expect("handle callback");
+    let res = match outcome {
+        OAuthCallbackOutcome::Login(r) => r,
+        OAuthCallbackOutcome::Linked { .. } => panic!("expected login"),
+    };
 
     assert!(res.is_created);
     assert!(res.is_linked);
@@ -556,7 +561,7 @@ async fn test_oauth_email_normalization_on_provisioning() {
         .expect("get auth url");
     let state_token = extract_state_from_url(&auth_url);
 
-    let res = svc
+    let outcome = svc
         .handle_callback_extended(
             "google",
             "valid_code",
@@ -568,6 +573,10 @@ async fn test_oauth_email_normalization_on_provisioning() {
         )
         .await
         .expect("handle callback");
+    let res = match outcome {
+        OAuthCallbackOutcome::Login(r) => r,
+        OAuthCallbackOutcome::Linked { .. } => panic!("expected login"),
+    };
 
     assert_eq!(res.user.email, normalized_expected);
 
@@ -591,4 +600,211 @@ async fn test_oauth_email_normalization_on_provisioning() {
     let clear_header = svc.clear_state_cookie();
     assert!(clear_header.contains("Max-Age=0"));
     assert!(clear_header.contains("oauth_state="));
+}
+
+#[tokio::test]
+async fn test_oauth_link_intent_in_callback_attaches_identity_without_session() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    truncate_tables(&app.pool).await.expect("truncate");
+
+    let email = dynamic_email();
+    let user_id = Uuid::new_v4();
+
+    // Verified local user
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(user_id)
+    .bind(&email)
+    .bind("argon2id$somehash")
+    .bind(true)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+
+    let google_mock = Arc::new(MockOAuthProvider::new(
+        "google",
+        UserInfo {
+            provider_id: "google".to_string(),
+            provider_user_id: "goog_link_sub_99".to_string(),
+            email: email.clone(),
+            email_verified: true,
+            name: Some("Linked User".to_string()),
+            avatar_url: None,
+        },
+    ));
+
+    let svc = create_test_oauth_service(&app, google_mock, None);
+
+    // 1. Initiate link flow with authenticated user_id
+    let (auth_url, set_cookie) = svc
+        .initiate_link_flow("google", user_id, Some("/settings".to_string()))
+        .expect("initiate link flow");
+    let state_token = extract_state_from_url(&auth_url);
+
+    // 2. Process callback with link intent
+    let outcome = svc
+        .handle_callback_extended(
+            "google",
+            "valid_code",
+            state_token,
+            Some(&set_cookie),
+            "cookie",
+            None,
+            None,
+        )
+        .await
+        .expect("handle callback with link intent");
+
+    match outcome {
+        OAuthCallbackOutcome::Linked {
+            user,
+            account,
+            redirect_url,
+            clear_cookie_header,
+        } => {
+            assert_eq!(user.id, user_id);
+            assert_eq!(account.user_id, user_id);
+            assert_eq!(account.provider_id, "google");
+            assert_eq!(account.provider_user_id, "goog_link_sub_99");
+            assert_eq!(redirect_url, "/settings");
+            assert!(clear_cookie_header.contains("Max-Age=0"));
+        }
+        OAuthCallbackOutcome::Login(_) => panic!("expected Linked outcome, got Login"),
+    }
+
+    // 3. Invariant: no login session was created
+    let session_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sessions WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        session_count.0, 0,
+        "link callback must not issue a login session"
+    );
+}
+
+#[tokio::test]
+async fn test_unlink_disabled_provider_lockout_prevention() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    truncate_tables(&app.pool).await.expect("truncate");
+
+    let email = dynamic_email();
+    let user_id = Uuid::new_v4();
+
+    // Passwordless user
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(user_id)
+    .bind(&email)
+    .bind("$unusable$oauth$")
+    .bind(true)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+
+    // Link Google and GitHub
+    sqlx::query(
+        "INSERT INTO oauth_accounts (id, user_id, provider_id, provider_user_id, email) VALUES ($1, $2, $3, $4, $5), ($6, $7, $8, $9, $10)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(user_id)
+    .bind("google")
+    .bind("goog-sub-1")
+    .bind(&email)
+    .bind(Uuid::new_v4())
+    .bind(user_id)
+    .bind("github")
+    .bind("gh-sub-1")
+    .bind(&email)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+
+    // Service where ONLY google is active (github is disabled)
+    let google_mock = Arc::new(MockOAuthProvider::new(
+        "google",
+        UserInfo {
+            provider_id: "google".to_string(),
+            provider_user_id: "goog-sub-1".to_string(),
+            email: email.clone(),
+            email_verified: true,
+            name: None,
+            avatar_url: None,
+        },
+    ));
+
+    let svc = create_test_oauth_service(&app, google_mock, None);
+
+    // Unlinking Google must be rejected because GitHub is disabled and user has no usable password
+    let res = svc.unlink_account(user_id, "google").await;
+    assert!(matches!(res, Err(AppError::ValidationError(_))));
+}
+
+#[tokio::test]
+async fn test_unlink_multi_identities_same_provider_lockout_prevention() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    truncate_tables(&app.pool).await.expect("truncate");
+
+    let email = dynamic_email();
+    let user_id = Uuid::new_v4();
+
+    // Passwordless user
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(user_id)
+    .bind(&email)
+    .bind("$unusable$oauth$")
+    .bind(true)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+
+    // User linked two different Google accounts, no password, no other provider
+    sqlx::query(
+        "INSERT INTO oauth_accounts (id, user_id, provider_id, provider_user_id, email) VALUES ($1, $2, $3, $4, $5), ($6, $7, $8, $9, $10)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(user_id)
+    .bind("google")
+    .bind("goog-sub-1")
+    .bind(&email)
+    .bind(Uuid::new_v4())
+    .bind(user_id)
+    .bind("google")
+    .bind("goog-sub-2")
+    .bind(&email)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+
+    let google_mock = Arc::new(MockOAuthProvider::new(
+        "google",
+        UserInfo {
+            provider_id: "google".to_string(),
+            provider_user_id: "goog-sub-1".to_string(),
+            email: email.clone(),
+            email_verified: true,
+            name: None,
+            avatar_url: None,
+        },
+    ));
+
+    let svc = create_test_oauth_service(&app, google_mock, None);
+
+    // Unlinking Google would remove both Google rows, leaving user with 0 auth methods. Must be rejected!
+    let res = svc.unlink_account(user_id, "google").await;
+    assert!(matches!(res, Err(AppError::ValidationError(_))));
 }

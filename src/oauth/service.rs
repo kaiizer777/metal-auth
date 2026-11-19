@@ -27,6 +27,18 @@ pub struct OAuthCallbackResult {
     pub is_created: bool,
 }
 
+/// Outcome of processing an OAuth callback, distinguishing between standard login and account linking.
+#[derive(Debug, Clone)]
+pub enum OAuthCallbackOutcome {
+    Login(OAuthCallbackResult),
+    Linked {
+        user: User,
+        account: OAuthAccount,
+        redirect_url: String,
+        clear_cookie_header: String,
+    },
+}
+
 /// Service managing OAuth identity delegation, account linking, and pre-hijacking defense.
 #[derive(Clone)]
 pub struct OAuthService {
@@ -158,6 +170,32 @@ impl OAuthService {
         self.get_authorization_url(provider_id, redirect_url)
     }
 
+    /// Initiates an authenticated account linking flow, embedding user_id in the signed state.
+    pub fn initiate_link_flow(
+        &self,
+        provider_id: &str,
+        user_id: Uuid,
+        redirect_url: Option<String>,
+    ) -> Result<(String, String), AppError> {
+        let provider = self.provider(provider_id)?;
+        let pkce = generate_pkce()?;
+        let (state_token, set_cookie_str) = self.state_mgr.create_state_with_user(
+            provider_id,
+            &pkce.verifier,
+            redirect_url,
+            Some(user_id),
+        )?;
+        let auth_url = provider.auth_url(&state_token, &pkce.challenge);
+
+        tracing::info!(
+            event = "oauth_initiate_link",
+            provider = provider_id,
+            user_id = %user_id,
+        );
+
+        Ok((auth_url, set_cookie_str))
+    }
+
     /// Returns a `Set-Cookie` header value to clear the OAuth state cookie (`Max-Age=0`).
     #[must_use]
     pub fn clear_state_cookie(&self) -> String {
@@ -184,7 +222,7 @@ impl OAuthService {
         state_param: &str,
         cookie_header: Option<&str>,
     ) -> Result<(Session, User, String), AppError> {
-        let result = self
+        let outcome = self
             .handle_callback_extended(
                 provider_id,
                 code,
@@ -195,10 +233,15 @@ impl OAuthService {
                 None,
             )
             .await?;
-        Ok((result.session, result.user, result.clear_cookie_header))
+        match outcome {
+            OAuthCallbackOutcome::Login(result) => {
+                Ok((result.session, result.user, result.clear_cookie_header))
+            }
+            OAuthCallbackOutcome::Linked { .. } => Err(AppError::Internal),
+        }
     }
 
-    /// Handles an incoming OAuth callback returning the full [`OAuthCallbackResult`].
+    /// Handles an incoming OAuth callback returning the full [`OAuthCallbackOutcome`].
     #[allow(clippy::too_many_arguments)]
     pub async fn handle_callback_extended(
         &self,
@@ -209,7 +252,7 @@ impl OAuthService {
         session_type: &str,
         ip: Option<&str>,
         user_agent: Option<&str>,
-    ) -> Result<OAuthCallbackResult, AppError> {
+    ) -> Result<OAuthCallbackOutcome, AppError> {
         let clear_cookie_str = self.state_mgr.build_clear_cookie_for_provider(provider_id);
 
         // 1. Validate state parameter against signed cookie
@@ -311,6 +354,30 @@ impl OAuthService {
             return Err(AppError::OAuthProviderError);
         }
 
+        // If state payload contains user_id (link intent), link this identity to that user
+        if let Some(link_user_id) = payload.user_id {
+            let account = self
+                .link_identity_to_user(link_user_id, provider_id, &user_info)
+                .await?;
+
+            let user = sqlx::query_as::<_, User>(
+                "SELECT id, email, password_hash, email_verified, created_at, updated_at FROM users WHERE id = $1",
+            )
+            .bind(link_user_id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(AppError::Database)?;
+
+            let redirect_url = payload.redirect_url.unwrap_or_else(|| "/".to_string());
+
+            return Ok(OAuthCallbackOutcome::Linked {
+                user,
+                account,
+                redirect_url,
+                clear_cookie_header: clear_cookie_str,
+            });
+        }
+
         // 6. Database linking / user provisioning
         let (user, is_linked, is_created) = self.link_or_create(provider_id, &user_info).await?;
 
@@ -344,7 +411,7 @@ impl OAuthService {
 
         let redirect_url = payload.redirect_url.unwrap_or_else(|| "/".to_string());
 
-        Ok(OAuthCallbackResult {
+        Ok(OAuthCallbackOutcome::Login(OAuthCallbackResult {
             session,
             raw_token,
             user,
@@ -352,7 +419,7 @@ impl OAuthService {
             clear_cookie_header: clear_cookie_str,
             is_linked,
             is_created,
-        })
+        }))
     }
 
     /// Links an identity or creates a new user, returning `(User, is_linked, is_created)`.
@@ -585,41 +652,26 @@ impl OAuthService {
         Ok(())
     }
 
-    /// Links an additional OAuth identity and returns the created or existing [`OAuthAccount`].
-    pub async fn link_account_identity(
+    /// Attaches an external identity to an existing local user.
+    pub async fn link_identity_to_user(
         &self,
         user_id: Uuid,
         provider_id: &str,
-        code: &str,
-        state_param: &str,
-        cookie_header: Option<&str>,
+        user_info: &UserInfo,
     ) -> Result<OAuthAccount, AppError> {
-        let cookie_header = cookie_header.ok_or(AppError::OAuthStateInvalid)?;
-        let payload = self
-            .state_mgr
-            .validate(cookie_header, state_param, provider_id)?;
-
-        if code.trim().is_empty() {
-            return Err(AppError::OAuthCodeInvalid);
-        }
-
-        let provider = self.provider(provider_id)?;
-        let tokens = provider.exchange_code(code, &payload.code_verifier).await?;
-        let mut user_info = provider.get_user_info(&tokens).await?;
-
         // 1. Provider email must be verified
         if !user_info.email_verified {
             return Err(AppError::OAuthEmailUnverified);
         }
 
-        user_info.email = user_info.email.trim().to_lowercase();
-        if user_info.email.is_empty() {
+        let email = user_info.email.trim().to_lowercase();
+        if email.is_empty() {
             return Err(AppError::OAuthProviderError);
         }
 
         // 2. User must exist and have verified status
         let user: Option<User> = sqlx::query_as::<_, User>(
-            "SELECT id, email, password_hash, email_verified, created_at, updated_at FROM users WHERE id = $1"
+            "SELECT id, email, password_hash, email_verified, created_at, updated_at FROM users WHERE id = $1",
         )
         .bind(user_id)
         .fetch_optional(&self.db)
@@ -633,7 +685,7 @@ impl OAuthService {
 
         // 3. Ensure identity is not linked to another user
         let existing_link: Option<OAuthAccount> = sqlx::query_as::<_, OAuthAccount>(
-            "SELECT id, user_id, provider_id, provider_user_id, email, created_at, updated_at FROM oauth_accounts WHERE provider_id = $1 AND provider_user_id = $2"
+            "SELECT id, user_id, provider_id, provider_user_id, email, created_at, updated_at FROM oauth_accounts WHERE provider_id = $1 AND provider_user_id = $2",
         )
         .bind(provider_id)
         .bind(&user_info.provider_user_id)
@@ -654,14 +706,14 @@ impl OAuthService {
             id: link_id,
             user_id,
             provider_id: provider_id.to_string(),
-            provider_user_id: user_info.provider_user_id,
-            email: user_info.email,
+            provider_user_id: user_info.provider_user_id.clone(),
+            email: email.clone(),
             created_at: now,
             updated_at: now,
         };
 
         let insert_res = sqlx::query(
-            "INSERT INTO oauth_accounts (id, user_id, provider_id, provider_user_id, email, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7)"
+            "INSERT INTO oauth_accounts (id, user_id, provider_id, provider_user_id, email, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(row.id)
         .bind(row.user_id)
@@ -677,7 +729,7 @@ impl OAuthService {
             if is_unique_violation(&e) {
                 // If another request linked this identity concurrently, check if it belongs to this user
                 let link: Option<OAuthAccount> = sqlx::query_as::<_, OAuthAccount>(
-                    "SELECT id, user_id, provider_id, provider_user_id, email, created_at, updated_at FROM oauth_accounts WHERE provider_id = $1 AND provider_user_id = $2"
+                    "SELECT id, user_id, provider_id, provider_user_id, email, created_at, updated_at FROM oauth_accounts WHERE provider_id = $1 AND provider_user_id = $2",
                 )
                 .bind(provider_id)
                 .bind(&row.provider_user_id)
@@ -702,6 +754,38 @@ impl OAuthService {
         );
 
         Ok(row)
+    }
+
+    /// Links an additional OAuth identity and returns the created or existing [`OAuthAccount`].
+    pub async fn link_account_identity(
+        &self,
+        user_id: Uuid,
+        provider_id: &str,
+        code: &str,
+        state_param: &str,
+        cookie_header: Option<&str>,
+    ) -> Result<OAuthAccount, AppError> {
+        let cookie_header = cookie_header.ok_or(AppError::OAuthStateInvalid)?;
+        let payload = self
+            .state_mgr
+            .validate(cookie_header, state_param, provider_id)?;
+
+        if let Some(state_uid) = payload.user_id
+            && state_uid != user_id
+        {
+            return Err(AppError::OAuthStateInvalid);
+        }
+
+        if code.trim().is_empty() {
+            return Err(AppError::OAuthCodeInvalid);
+        }
+
+        let provider = self.provider(provider_id)?;
+        let tokens = provider.exchange_code(code, &payload.code_verifier).await?;
+        let user_info = provider.get_user_info(&tokens).await?;
+
+        self.link_identity_to_user(user_id, provider_id, &user_info)
+            .await
     }
 
     /// Unlinks an external provider, preventing account lockout if no usable password remains.
@@ -730,10 +814,10 @@ impl OAuthService {
             return Err(AppError::NotFound);
         }
 
-        let count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM oauth_accounts WHERE user_id = $1")
+        let linked_accounts: Vec<(String,)> =
+            sqlx::query_as("SELECT provider_id FROM oauth_accounts WHERE user_id = $1")
                 .bind(user_id)
-                .fetch_one(&mut *tx)
+                .fetch_all(&mut *tx)
                 .await
                 .map_err(AppError::Database)?;
 
@@ -741,8 +825,14 @@ impl OAuthService {
         let has_usable_password =
             !password_hash.is_empty() && !password_hash.starts_with("$unusable$");
 
-        // Lockout prevention: user must retain a usable password or at least 1 other linked provider
-        if !has_usable_password && count.0 <= 1 {
+        // Count linked OAuth accounts excluding the provider being unlinked AND excluding disabled providers
+        let remaining_enabled_oauth_accounts = linked_accounts
+            .into_iter()
+            .filter(|(p,)| p != provider_id && self.providers.contains_key(p))
+            .count();
+
+        // Lockout prevention: user must retain a usable password or at least 1 other enabled linked provider
+        if (has_usable_password as usize + remaining_enabled_oauth_accounts) == 0 {
             return Err(AppError::ValidationError(
                 "Cannot unlink the only authentication method".to_string(),
             ));

@@ -51,9 +51,9 @@ pub use error::{AppError, AppResult, ConfigError, ErrorCode, ErrorResponse};
 pub use handler::{auth_routes, oauth_routes, session_routes};
 pub use middleware::{AuthUser, csrf_middleware, require_auth, security_headers_middleware};
 pub use oauth::{
-    AppleProvider, GitHubProvider, GoogleProvider, OAUTH_BODY_LIMIT, OAuthCallbackResult,
-    OAuthProvider, OAuthService, OAuthStateManager, OAuthStatePayload, OAuthTokenResponse,
-    OAuthUserInfo, PKCEChallenge, SUPPORTED_PROVIDERS, TokenResponse, UserInfo,
+    AppleProvider, GitHubProvider, GoogleProvider, OAUTH_BODY_LIMIT, OAuthCallbackOutcome,
+    OAuthCallbackResult, OAuthProvider, OAuthService, OAuthStateManager, OAuthStatePayload,
+    OAuthTokenResponse, OAuthUserInfo, PKCEChallenge, SUPPORTED_PROVIDERS, TokenResponse, UserInfo,
     build_clear_state_cookie, build_clear_state_cookie_for_provider,
     build_clear_state_cookie_header, build_clear_state_cookie_header_for_provider,
     build_oauth_http_client, build_state_cookie, build_state_cookie_for_provider,

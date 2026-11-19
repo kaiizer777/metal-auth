@@ -12,7 +12,7 @@ use crate::{
     error::AppError,
     handler::untrusted_client_ip,
     middleware::{AuthUser, csrf_middleware, require_auth},
-    oauth::{OAUTH_BODY_LIMIT, SUPPORTED_PROVIDERS},
+    oauth::{OAUTH_BODY_LIMIT, OAuthCallbackOutcome, SUPPORTED_PROVIDERS},
     ratelimit::rate_limit_key,
     session::cookie::{set_csrf_cookie, set_session_cookie},
     state::AppState,
@@ -164,6 +164,40 @@ pub async fn oauth_initiate(
     resp
 }
 
+/// GET /auth/oauth/{provider}/link (and /api/auth/oauth/{provider}/link)
+///
+/// Initiates an authenticated account linking flow, embedding user_id in the signed state.
+pub async fn oauth_link_initiate(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+    Path(provider): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<InitiateQuery>,
+) -> Response {
+    if !SUPPORTED_PROVIDERS.contains(&provider.as_str()) {
+        return oauth_error_response(&state, AppError::OAuthProviderNotFound);
+    }
+
+    if let Err(e) = check_oauth_rate_limit(&state, &headers, &provider) {
+        return oauth_error_response(&state, e);
+    }
+
+    let (auth_url, set_cookie_str) =
+        match state
+            .oauth_service
+            .initiate_link_flow(&provider, user_id, query.redirect_url)
+        {
+            Ok(v) => v,
+            Err(e) => return oauth_error_response(&state, e),
+        };
+
+    let mut resp = (StatusCode::FOUND, [(header::LOCATION, auth_url)]).into_response();
+    if let Ok(hv) = header::HeaderValue::from_str(&set_cookie_str) {
+        resp.headers_mut().insert(header::SET_COOKIE, hv);
+    }
+    resp
+}
+
 /// GET /auth/oauth/{provider}/callback (and /api/auth/oauth/{provider}/callback)
 pub async fn oauth_callback(
     State(state): State<AppState>,
@@ -288,64 +322,89 @@ async fn handle_callback_internal(
         Err(e) => return oauth_error_response(state, e),
     };
 
-    if wants_bearer {
-        let mut resp = (
-            StatusCode::OK,
-            Json(OAuthSuccessResponse {
-                user_id: result.user.id,
-                token: Some(result.raw_token),
-                csrf_token: None,
-                expires_at: result.session.absolute_expires_at,
-                redirect_url: None,
-            }),
-        )
-            .into_response();
-        if let Ok(hv) = header::HeaderValue::from_str(&result.clear_cookie_header) {
-            resp.headers_mut().append(header::SET_COOKIE, hv);
-        }
-        return resp;
-    }
+    match result {
+        OAuthCallbackOutcome::Login(result) => {
+            if wants_bearer {
+                let mut resp = (
+                    StatusCode::OK,
+                    Json(OAuthSuccessResponse {
+                        user_id: result.user.id,
+                        token: Some(result.raw_token),
+                        csrf_token: None,
+                        expires_at: result.session.absolute_expires_at,
+                        redirect_url: None,
+                    }),
+                )
+                    .into_response();
+                if let Ok(hv) = header::HeaderValue::from_str(&result.clear_cookie_header) {
+                    resp.headers_mut().append(header::SET_COOKIE, hv);
+                }
+                return resp;
+            }
 
-    let wants_json = wants_oauth_json(headers, query_session_type);
-    let sanitized_redirect = safe_oauth_redirect(&result.redirect_url);
+            let wants_json = wants_oauth_json(headers, query_session_type);
+            let sanitized_redirect = safe_oauth_redirect(&result.redirect_url);
 
-    let mut resp = if wants_json {
-        (
-            StatusCode::OK,
-            Json(OAuthSuccessResponse {
-                user_id: result.user.id,
-                token: None,
-                csrf_token: result.session.csrf_token.clone(),
-                expires_at: result.session.absolute_expires_at,
-                redirect_url: Some(sanitized_redirect.to_string()),
-            }),
-        )
-            .into_response()
-    } else {
-        (StatusCode::FOUND, [(header::LOCATION, sanitized_redirect)]).into_response()
-    };
+            let mut resp = if wants_json {
+                (
+                    StatusCode::OK,
+                    Json(OAuthSuccessResponse {
+                        user_id: result.user.id,
+                        token: None,
+                        csrf_token: result.session.csrf_token.clone(),
+                        expires_at: result.session.absolute_expires_at,
+                        redirect_url: Some(sanitized_redirect.to_string()),
+                    }),
+                )
+                    .into_response()
+            } else {
+                (StatusCode::FOUND, [(header::LOCATION, sanitized_redirect)]).into_response()
+            };
 
-    match set_session_cookie(&state.config, &result.raw_token) {
-        Ok(hv) => {
-            resp.headers_mut().append(header::SET_COOKIE, hv);
-        }
-        Err(e) => return oauth_error_response(state, e),
-    }
+            match set_session_cookie(&state.config, &result.raw_token) {
+                Ok(hv) => {
+                    resp.headers_mut().append(header::SET_COOKIE, hv);
+                }
+                Err(e) => return oauth_error_response(state, e),
+            }
 
-    if let Some(ref csrf) = result.session.csrf_token {
-        match set_csrf_cookie(&state.config, csrf) {
-            Ok(hv) => {
+            if let Some(ref csrf) = result.session.csrf_token {
+                match set_csrf_cookie(&state.config, csrf) {
+                    Ok(hv) => {
+                        resp.headers_mut().append(header::SET_COOKIE, hv);
+                    }
+                    Err(e) => return oauth_error_response(state, e),
+                }
+            }
+
+            if let Ok(hv) = header::HeaderValue::from_str(&result.clear_cookie_header) {
                 resp.headers_mut().append(header::SET_COOKIE, hv);
             }
-            Err(e) => return oauth_error_response(state, e),
+
+            resp
+        }
+        OAuthCallbackOutcome::Linked {
+            user: _,
+            account,
+            redirect_url,
+            clear_cookie_header,
+        } => {
+            let wants_json = wants_oauth_json(headers, query_session_type);
+            let sanitized_redirect = safe_oauth_redirect(&redirect_url);
+
+            let mut resp = if wants_json {
+                (StatusCode::OK, Json(account)).into_response()
+            } else {
+                (StatusCode::FOUND, [(header::LOCATION, sanitized_redirect)]).into_response()
+            };
+
+            if let Ok(hv) = header::HeaderValue::from_str(&clear_cookie_header) {
+                resp.headers_mut().append(header::SET_COOKIE, hv);
+            }
+
+            resp
         }
     }
-
-    if let Ok(hv) = header::HeaderValue::from_str(&result.clear_cookie_header) {
-        resp.headers_mut().append(header::SET_COOKIE, hv);
-    }
-
-    resp
 }
 
 /// GET /auth/oauth/accounts (and /api/auth/oauth/accounts)
@@ -428,6 +487,10 @@ pub fn routes(state: AppState) -> Router {
 
     let authenticated_read_routes = Router::new()
         .route("/oauth/accounts", axum::routing::get(list_accounts))
+        .route(
+            "/oauth/{provider}/link",
+            axum::routing::get(oauth_link_initiate),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_auth,

@@ -13,6 +13,7 @@ use metal_auth::{
     ProviderConfig, SessionService, User,
 };
 use serde::Serialize;
+use uuid::Uuid;
 use wiremock::matchers::{header as wm_header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -893,4 +894,146 @@ async fn test_oauth_api_alias_routes() {
     let resp = app.dispatch(req).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(resp.json()["user_id"].is_string());
+}
+
+#[tokio::test]
+async fn test_oauth_link_initiate_and_callback_flow() {
+    let _guard = DB_LOCK.lock().await;
+    let server = MockServer::start().await;
+
+    let test_sub = "google_link_flow_sub_42";
+    let test_email = "link_flow_user@example.com";
+
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "goog-flow-link-at",
+            "token_type": "Bearer",
+            "expires_in": 3600
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/userinfo"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "sub": test_sub,
+            "email": test_email,
+            "email_verified": true,
+            "name": "Link Flow User"
+        })))
+        .mount(&server)
+        .await;
+
+    let cfg = ProviderConfig {
+        client_id: "google-flow-id".to_string(),
+        client_secret: "google-flow-secret".to_string(),
+        redirect_uri: "http://localhost:3000/auth/oauth/google/callback".to_string(),
+        redirect_url: "http://localhost:3000/auth/oauth/google/callback".to_string(),
+        scopes: vec!["openid".to_string(), "email".to_string()],
+        enabled: true,
+        team_id: None,
+        key_id: None,
+        private_key: None,
+    };
+
+    let google = GoogleProvider::with_endpoints(
+        &cfg,
+        reqwest::Client::new(),
+        format!("{}/auth", server.uri()),
+        format!("{}/token", server.uri()),
+        format!("{}/userinfo", server.uri()),
+    )
+    .unwrap();
+
+    let mut providers: HashMap<String, Arc<dyn OAuthProvider>> = HashMap::new();
+    providers.insert("google".to_string(), Arc::new(google));
+
+    let Some(app) = setup_oauth_test_app(providers).await else {
+        return;
+    };
+
+    let user_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(user_id)
+    .bind(test_email)
+    .bind("argon2id$somehash")
+    .bind(true)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+
+    let session_service = SessionService::new(app.pool.clone(), Arc::new(app.state.config.clone()));
+    let (_session, session_token) = session_service
+        .create_session(user_id, "cookie", None, None)
+        .await
+        .unwrap();
+
+    let session_cookie_name = &app.state.config.session.cookie_name;
+
+    // 1. Authenticated initiate: GET /auth/oauth/google/link?redirect_url=/settings
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/auth/oauth/google/link?redirect_url=/settings")
+        .header(
+            header::COOKIE,
+            format!("{session_cookie_name}={session_token}"),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.dispatch(req).await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let state_token = extract_state_from_location(&resp.headers);
+    let state_cookie = extract_cookie_value(&resp.headers, "oauth_state").unwrap();
+
+    // 2. Provider returns to callback: GET /auth/oauth/google/callback
+    let callback_uri = format!("/auth/oauth/google/callback?code=flow_code&state={state_token}");
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(&callback_uri)
+        .header(
+            header::COOKIE,
+            format!("{session_cookie_name}={session_token}; oauth_state={state_cookie}"),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.dispatch(req).await;
+
+    // Must redirect to /settings without re-issuing session cookies
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    assert_eq!(
+        resp.headers
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("/settings")
+    );
+
+    let state_cleared = resp.headers.get_all(header::SET_COOKIE).iter().any(|v| {
+        let s = v.to_str().unwrap_or("");
+        s.contains("oauth_state=") && s.contains("Max-Age=0")
+    });
+    assert!(state_cleared, "state cookie must be cleared");
+
+    let session_reissued = resp.headers.get_all(header::SET_COOKIE).iter().any(|v| {
+        let s = v.to_str().unwrap_or("");
+        s.contains(&format!("{session_cookie_name}=")) && !s.contains("Max-Age=0")
+    });
+    assert!(
+        !session_reissued,
+        "must not issue new session cookie on link"
+    );
+
+    // 3. Verify identity is linked to user_id in database
+    let link: OAuthAccount = sqlx::query_as::<_, OAuthAccount>(
+        "SELECT id, user_id, provider_id, provider_user_id, email, created_at, updated_at FROM oauth_accounts WHERE provider_id = 'google' AND provider_user_id = $1",
+    )
+    .bind(test_sub)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(link.user_id, user_id);
+    assert_eq!(link.provider_id, "google");
 }

@@ -21,7 +21,7 @@ pub use provider::{
     OAUTH_BODY_LIMIT, OAuthProvider, OAuthTokenResponse, OAuthUserInfo, SUPPORTED_PROVIDERS,
     TokenResponse, UserInfo, build_oauth_http_client, create_provider,
 };
-pub use service::{OAuthCallbackResult, OAuthService};
+pub use service::{OAuthCallbackOutcome, OAuthCallbackResult, OAuthService};
 pub use state::{
     OAuthStateManager, OAuthStatePayload, build_clear_state_cookie,
     build_clear_state_cookie_for_provider, build_clear_state_cookie_header,

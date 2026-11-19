@@ -9,6 +9,7 @@ use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
+use uuid::Uuid;
 
 use crate::error::AppError;
 
@@ -32,6 +33,9 @@ pub struct OAuthStatePayload {
     /// State expiration timestamp serialized as Unix epoch seconds.
     #[serde(rename = "e", with = "chrono::serde::ts_seconds")]
     pub expires_at: DateTime<Utc>,
+    /// Optional authenticated user ID if this state represents an account linking intent.
+    #[serde(rename = "u", default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<Uuid>,
 }
 
 /// Generates a 32-byte CSPRNG state token encoded as unpadded base64url.
@@ -285,6 +289,16 @@ impl OAuthStateManager {
         code_verifier: &str,
         redirect_url: Option<String>,
     ) -> Result<(String, String), AppError> {
+        self.create_state_with_user(provider_id, code_verifier, redirect_url, None)
+    }
+
+    pub fn create_state_with_user(
+        &self,
+        provider_id: &str,
+        code_verifier: &str,
+        redirect_url: Option<String>,
+        user_id: Option<Uuid>,
+    ) -> Result<(String, String), AppError> {
         let token = generate_state_token();
         let expires_at = Utc::now()
             + chrono::Duration::from_std(self.state_ttl)
@@ -295,6 +309,7 @@ impl OAuthStateManager {
             code_verifier: code_verifier.to_string(),
             redirect_url,
             expires_at,
+            user_id,
         };
         let cookie_val = create_state_cookie_value(&payload, self.state_secret.as_bytes())?;
         let set_cookie_str = build_state_cookie_for_provider(
@@ -425,6 +440,7 @@ mod tests {
             code_verifier: "test_code_verifier_1234567890_43chars_len_pkce".to_string(),
             redirect_url: Some("/dashboard".to_string()),
             expires_at,
+            user_id: None,
         };
 
         let cookie_val =
@@ -453,6 +469,7 @@ mod tests {
             code_verifier: "verifier".to_string(),
             redirect_url: None,
             expires_at: Utc::now() + ChronoDuration::minutes(10),
+            user_id: None,
         };
 
         let cookie_val =
@@ -481,6 +498,7 @@ mod tests {
             code_verifier: "verifier".to_string(),
             redirect_url: None,
             expires_at: Utc::now() - ChronoDuration::seconds(5),
+            user_id: None,
         };
 
         let cookie_val =
@@ -497,6 +515,7 @@ mod tests {
             code_verifier: "verifier".to_string(),
             redirect_url: None,
             expires_at: Utc::now() + ChronoDuration::minutes(10),
+            user_id: None,
         };
 
         let cookie_val =
@@ -513,6 +532,7 @@ mod tests {
             code_verifier: "verifier".to_string(),
             redirect_url: None,
             expires_at: Utc::now() + ChronoDuration::minutes(10),
+            user_id: None,
         };
 
         let cookie_val =
@@ -622,5 +642,31 @@ mod tests {
             .expect("create google state");
         assert!(google_cookie_secure.contains("SameSite=Lax"));
         assert!(google_cookie_secure.contains("Secure"));
+    }
+
+    #[test]
+    fn test_state_with_user_link_intent() {
+        let cfg = crate::config::OAuthConfig {
+            state_secret: "01234567890123456789012345678901".to_string(),
+            ..Default::default()
+        };
+        let mgr = OAuthStateManager::new(&cfg, false);
+        let link_user_id = Uuid::new_v4();
+
+        let (token, cookie_str) = mgr
+            .create_state_with_user(
+                "google",
+                "pkce_val",
+                Some("/settings".to_string()),
+                Some(link_user_id),
+            )
+            .expect("create state with user");
+
+        let payload = mgr
+            .validate(&cookie_str, &token, "google")
+            .expect("validate state with user");
+
+        assert_eq!(payload.user_id, Some(link_user_id));
+        assert_eq!(payload.redirect_url.as_deref(), Some("/settings"));
     }
 }

@@ -894,8 +894,8 @@ async fn test_oauth_link_initiate_and_callback_flow() {
     let _guard = DB_LOCK.lock().await;
     let server = MockServer::start().await;
 
-    let test_sub = "google_link_flow_sub_42";
-    let test_email = "link_flow_user@example.com";
+    let test_sub = format!("google-link-flow-{}", Uuid::new_v4());
+    let test_email = dynamic_email();
 
     Mock::given(method("POST"))
         .and(path("/token"))

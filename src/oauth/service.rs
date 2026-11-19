@@ -214,33 +214,6 @@ impl OAuthService {
         &self.state_mgr
     }
 
-    /// Handles an incoming OAuth callback, returning `(Session, User, clear_cookie_header)`.
-    pub async fn handle_callback(
-        &self,
-        provider_id: &str,
-        code: &str,
-        state_param: &str,
-        cookie_header: Option<&str>,
-    ) -> Result<(Session, User, String), AppError> {
-        let outcome = self
-            .handle_callback_extended(
-                provider_id,
-                code,
-                state_param,
-                cookie_header,
-                "cookie",
-                None,
-                None,
-            )
-            .await?;
-        match outcome {
-            OAuthCallbackOutcome::Login(result) => {
-                Ok((result.session, result.user, result.clear_cookie_header))
-            }
-            OAuthCallbackOutcome::Linked { .. } => Err(AppError::Internal),
-        }
-    }
-
     /// Handles an incoming OAuth callback returning the full [`OAuthCallbackOutcome`].
     #[allow(clippy::too_many_arguments)]
     pub async fn handle_callback_extended(
@@ -1013,17 +986,20 @@ mod tests {
 
         // Missing cookie
         let res = svc
-            .handle_callback("google", "code123", "state123", None)
+            .handle_callback_extended("google", "code123", "state123", None, "cookie", None, None)
             .await;
         assert!(matches!(res, Err(AppError::OAuthStateInvalid)));
 
         // Tampered cookie
         let res = svc
-            .handle_callback(
+            .handle_callback_extended(
                 "google",
                 "code123",
                 "state123",
                 Some("oauth_state=invalid.signature"),
+                "cookie",
+                None,
+                None,
             )
             .await;
         assert!(matches!(res, Err(AppError::OAuthStateInvalid)));
@@ -1053,7 +1029,15 @@ mod tests {
             .unwrap();
 
         let res = svc
-            .handle_callback("google", "", state_token, Some(&set_cookie))
+            .handle_callback_extended(
+                "google",
+                "",
+                state_token,
+                Some(&set_cookie),
+                "cookie",
+                None,
+                None,
+            )
             .await;
         assert!(matches!(res, Err(AppError::OAuthCodeInvalid)));
     }
@@ -1083,7 +1067,15 @@ mod tests {
 
         // Must reject with 400 OAuthEmailUnverified BEFORE any database queries
         let res = svc
-            .handle_callback("google", "valid_code", state_token, Some(&set_cookie))
+            .handle_callback_extended(
+                "google",
+                "valid_code",
+                state_token,
+                Some(&set_cookie),
+                "cookie",
+                None,
+                None,
+            )
             .await;
         assert!(matches!(res, Err(AppError::OAuthEmailUnverified)));
     }

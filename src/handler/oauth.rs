@@ -170,7 +170,11 @@ pub async fn oauth_initiate(
 /// Initiates an authenticated account linking flow, embedding user_id in the signed state.
 pub async fn oauth_link_initiate(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    AuthUser {
+        user_id,
+        session_hash,
+        ..
+    }: AuthUser,
     Path(provider): Path<String>,
     headers: HeaderMap,
     Query(query): Query<InitiateQuery>,
@@ -183,14 +187,15 @@ pub async fn oauth_link_initiate(
         return oauth_error_response(&state, e);
     }
 
-    let (auth_url, set_cookie_str) =
-        match state
-            .oauth_service
-            .initiate_link_flow(&provider, user_id, query.redirect_url)
-        {
-            Ok(v) => v,
-            Err(e) => return oauth_error_response(&state, e),
-        };
+    let (auth_url, set_cookie_str) = match state.oauth_service.initiate_link_flow(
+        &provider,
+        user_id,
+        query.redirect_url,
+        Some(session_hash),
+    ) {
+        Ok(v) => v,
+        Err(e) => return oauth_error_response(&state, e),
+    };
 
     let mut resp = (StatusCode::FOUND, [(header::LOCATION, auth_url)]).into_response();
     if let Ok(hv) = header::HeaderValue::from_str(&set_cookie_str) {

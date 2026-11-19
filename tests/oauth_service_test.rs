@@ -680,8 +680,18 @@ async fn test_oauth_link_intent_in_callback_attaches_identity_without_session() 
     let svc = create_test_oauth_service(&app, google_mock, None);
 
     // 1. Initiate link flow with authenticated user_id
+    let session_svc = SessionService::new(app.pool.clone(), Arc::new(app.state.config.clone()));
+    let (session, _raw) = session_svc
+        .create_session(user_id, "cookie", None, None)
+        .await
+        .unwrap();
     let (auth_url, set_cookie) = svc
-        .initiate_link_flow("google", user_id, Some("/settings".to_string()))
+        .initiate_link_flow(
+            "google",
+            user_id,
+            Some("/settings".to_string()),
+            Some(session.token_hash.clone()),
+        )
         .expect("initiate link flow");
     let state_token = extract_state_from_url(&auth_url);
 
@@ -716,12 +726,14 @@ async fn test_oauth_link_intent_in_callback_attaches_identity_without_session() 
         OAuthCallbackOutcome::Login(_) => panic!("expected Linked outcome, got Login"),
     }
 
-    // 3. Invariant: no login session was created
-    let session_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sessions WHERE user_id = $1")
-        .bind(user_id)
-        .fetch_one(&app.pool)
-        .await
-        .unwrap();
+    // 3. Invariant: the callback issued no session beyond the initiating one
+    let session_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM sessions WHERE user_id = $1 AND token_hash != $2")
+            .bind(user_id)
+            .bind(&session.token_hash)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
     assert_eq!(
         session_count.0, 0,
         "link callback must not issue a login session"
@@ -764,8 +776,18 @@ async fn link_callback_succeeds_without_500_after_commit() {
 
     let svc = create_test_oauth_service(&app, google_mock, None);
 
+    let session_svc = SessionService::new(app.pool.clone(), Arc::new(app.state.config.clone()));
+    let (session, _raw) = session_svc
+        .create_session(user_id, "cookie", None, None)
+        .await
+        .unwrap();
     let (auth_url, set_cookie) = svc
-        .initiate_link_flow("google", user_id, Some("/settings".to_string()))
+        .initiate_link_flow(
+            "google",
+            user_id,
+            Some("/settings".to_string()),
+            Some(session.token_hash.clone()),
+        )
         .expect("initiate link flow");
     let state_token = extract_state_from_url(&auth_url);
 
@@ -829,7 +851,8 @@ async fn link_callback_missing_user_fails_before_commit() {
     let svc = create_test_oauth_service(&app, google_mock, None);
 
     let (auth_url, set_cookie) = svc
-        .initiate_link_flow("google", missing_user_id, Some("/settings".to_string()))
+        // missing user owns no session; the pre-commit user read fails first
+        .initiate_link_flow("google", missing_user_id, Some("/settings".to_string()), None)
         .expect("initiate link flow");
     let state_token = extract_state_from_url(&auth_url);
 
@@ -849,6 +872,88 @@ async fn link_callback_missing_user_fails_before_commit() {
     assert!(
         matches!(err, AppError::Database(_)),
         "expected pre-commit Database read error, got {err:?}"
+    );
+
+    let link_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM oauth_accounts")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(link_count.0, 0, "no link row may be committed");
+}
+
+#[tokio::test]
+async fn link_callback_revoked_session_rejected_before_commit() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    truncate_tables(&app.pool).await.expect("truncate");
+
+    let email = dynamic_email();
+    let user_id = Uuid::new_v4();
+
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(user_id)
+    .bind(&email)
+    .bind("argon2id$somehash")
+    .bind(true)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+
+    let google_mock = Arc::new(MockOAuthProvider::new(
+        "google",
+        UserInfo {
+            provider_id: "google".to_string(),
+            provider_user_id: format!("goog-revoked-session-{}", Uuid::new_v4()),
+            email: email.clone(),
+            email_verified: true,
+            name: None,
+            avatar_url: None,
+        },
+    ));
+
+    let svc = create_test_oauth_service(&app, google_mock, None);
+
+    let session_svc = SessionService::new(app.pool.clone(), Arc::new(app.state.config.clone()));
+    let (session, _raw) = session_svc
+        .create_session(user_id, "cookie", None, None)
+        .await
+        .unwrap();
+    let (auth_url, set_cookie) = svc
+        .initiate_link_flow(
+            "google",
+            user_id,
+            Some("/settings".to_string()),
+            Some(session.token_hash.clone()),
+        )
+        .expect("initiate link flow");
+    let state_token = extract_state_from_url(&auth_url);
+
+    // initiating session revoked in-flight (logout / revoke-all)
+    session_svc
+        .invalidate_by_hash(&session.token_hash)
+        .await
+        .unwrap();
+
+    // revoked session must block the link pre-commit, never Err-after-write
+    let err = svc
+        .handle_callback_extended(
+            "google",
+            "valid_code",
+            state_token,
+            Some(&set_cookie),
+            "cookie",
+            None,
+            None,
+        )
+        .await
+        .expect_err("revoked session must fail");
+    assert!(
+        matches!(err, AppError::OAuthStateInvalid),
+        "expected OAuthStateInvalid for revoked initiating session, got {err:?}"
     );
 
     let link_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM oauth_accounts")

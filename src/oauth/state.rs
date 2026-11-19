@@ -36,6 +36,9 @@ pub struct OAuthStatePayload {
     /// Optional authenticated user ID if this state represents an account linking intent.
     #[serde(rename = "u", default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<Uuid>,
+    /// SHA-256 hash of the initiating session token; binds link intent to a live session.
+    #[serde(rename = "s", default, skip_serializing_if = "Option::is_none")]
+    pub session_hash: Option<String>,
 }
 
 /// Generates a 32-byte CSPRNG state token encoded as unpadded base64url.
@@ -289,7 +292,7 @@ impl OAuthStateManager {
         code_verifier: &str,
         redirect_url: Option<String>,
     ) -> Result<(String, String), AppError> {
-        self.create_state_with_user(provider_id, code_verifier, redirect_url, None)
+        self.create_state_with_user(provider_id, code_verifier, redirect_url, None, None)
     }
 
     pub fn create_state_with_user(
@@ -298,6 +301,7 @@ impl OAuthStateManager {
         code_verifier: &str,
         redirect_url: Option<String>,
         user_id: Option<Uuid>,
+        session_hash: Option<String>,
     ) -> Result<(String, String), AppError> {
         let token = generate_state_token();
         let expires_at = Utc::now()
@@ -310,6 +314,7 @@ impl OAuthStateManager {
             redirect_url,
             expires_at,
             user_id,
+            session_hash,
         };
         let cookie_val = create_state_cookie_value(&payload, self.state_secret.as_bytes())?;
         let set_cookie_str = build_state_cookie_for_provider(
@@ -432,6 +437,7 @@ mod tests {
             redirect_url: Some("/dashboard".to_string()),
             expires_at,
             user_id: None,
+            session_hash: None,
         };
 
         let cookie_val =
@@ -461,6 +467,7 @@ mod tests {
             redirect_url: None,
             expires_at: Utc::now() + ChronoDuration::minutes(10),
             user_id: None,
+            session_hash: None,
         };
 
         let cookie_val =
@@ -490,6 +497,7 @@ mod tests {
             redirect_url: None,
             expires_at: Utc::now() - ChronoDuration::seconds(5),
             user_id: None,
+            session_hash: None,
         };
 
         let cookie_val =
@@ -507,6 +515,7 @@ mod tests {
             redirect_url: None,
             expires_at: Utc::now() + ChronoDuration::minutes(10),
             user_id: None,
+            session_hash: None,
         };
 
         let cookie_val =
@@ -524,6 +533,7 @@ mod tests {
             redirect_url: None,
             expires_at: Utc::now() + ChronoDuration::minutes(10),
             user_id: None,
+            session_hash: None,
         };
 
         let cookie_val =
@@ -684,6 +694,7 @@ mod tests {
                 "pkce_val",
                 Some("/settings".to_string()),
                 Some(link_user_id),
+                Some("session-hash-abc".to_string()),
             )
             .expect("create state with user");
 
@@ -692,6 +703,7 @@ mod tests {
             .expect("validate state with user");
 
         assert_eq!(payload.user_id, Some(link_user_id));
+        assert_eq!(payload.session_hash.as_deref(), Some("session-hash-abc"));
         assert_eq!(payload.redirect_url.as_deref(), Some("/settings"));
     }
 }

@@ -176,6 +176,7 @@ impl OAuthService {
         provider_id: &str,
         user_id: Uuid,
         redirect_url: Option<String>,
+        session_hash: Option<String>,
     ) -> Result<(String, String), AppError> {
         let provider = self.provider(provider_id)?;
         let pkce = generate_pkce()?;
@@ -184,6 +185,7 @@ impl OAuthService {
             &pkce.verifier,
             redirect_url,
             Some(user_id),
+            session_hash,
         )?;
         let auth_url = provider.auth_url(&state_token, &pkce.challenge);
 
@@ -337,6 +339,40 @@ impl OAuthService {
             .fetch_one(&self.db)
             .await
             .map_err(AppError::Database)?;
+
+            // Session binding: the initiating session must still be live. A logout or
+            // revoke-all in flight blocks the link. Fail closed pre-commit.
+            let session_live = match payload.session_hash.as_deref() {
+                Some(hash) if !hash.is_empty() => {
+                    let row: Option<Session> = sqlx::query_as::<_, Session>(
+                        "SELECT id, user_id, token_hash, created_at, last_active_at, absolute_expires_at, session_type, csrf_token FROM sessions WHERE token_hash = $1 AND user_id = $2",
+                    )
+                    .bind(hash)
+                    .bind(link_user_id)
+                    .fetch_optional(&self.db)
+                    .await
+                    .map_err(AppError::Database)?;
+                    match row {
+                        Some(s) => {
+                            let idle =
+                                chrono::Duration::from_std(self.config.session.idle_timeout())
+                                    .map_err(|_| AppError::Internal)?;
+                            let now = Utc::now();
+                            now <= s.absolute_expires_at && now <= s.last_active_at + idle
+                        }
+                        None => false,
+                    }
+                }
+                _ => false,
+            };
+            if !session_live {
+                tracing::info!(
+                    event = "oauth_callback_failure",
+                    provider = provider_id,
+                    reason = "link_session_revoked",
+                );
+                return Err(AppError::OAuthStateInvalid);
+            }
 
             let account = self
                 .link_identity_to_user(link_user_id, provider_id, &user_info)

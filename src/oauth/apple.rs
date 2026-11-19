@@ -144,6 +144,12 @@ impl AppleProvider {
 
     /// Fetches and updates the in-memory JWKS cache.
     async fn refresh_jwks(&self) -> Result<(), AppError> {
+        // Record refresh attempt upfront so the 5-minute cooldown applies even on network/HTTP failures
+        {
+            let mut write_guard = self.cache.write().await;
+            write_guard.last_refreshed_at = Some(Instant::now());
+        }
+
         let resp = self
             .client
             .get(&self.jwks_url)
@@ -803,5 +809,33 @@ mod tests {
             p.fetch_user_info(&tok_tampered).await.unwrap_err(),
             AppError::OAuthProviderError
         ));
+    }
+
+    #[tokio::test]
+    async fn test_jwks_refresh_cooldown_applied_on_fetch_failure() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/keys"))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cfg = test_apple_config();
+        let provider = AppleProvider::with_endpoints(
+            &cfg,
+            reqwest::Client::new(),
+            "https://mock/auth",
+            "https://mock/token",
+            format!("{}/keys", server.uri()),
+        )
+        .unwrap();
+
+        let err1 = provider.get_jwks_key("some-kid").await;
+        assert!(matches!(err1, Err(AppError::OAuthProviderError)));
+
+        // Cooldown prevents second HTTP call within 5-minute window
+        let err2 = provider.get_jwks_key("some-kid").await;
+        assert!(matches!(err2, Err(AppError::OAuthProviderError)));
     }
 }

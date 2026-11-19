@@ -3,9 +3,7 @@ use serde::Deserialize;
 
 use crate::config::ProviderConfig;
 use crate::error::AppError;
-use crate::oauth::provider::{
-    OAuthProvider, TokenResponse, UserInfo, post_token_form, scopes_or_default,
-};
+use crate::oauth::provider::{OAuthProvider, TokenResponse, UserInfo, post_token_form};
 
 pub const GITHUB_AUTH_ENDPOINT: &str = "https://github.com/login/oauth/authorize";
 pub const GITHUB_TOKEN_ENDPOINT: &str = "https://github.com/login/oauth/access_token";
@@ -104,7 +102,15 @@ impl OAuthProvider for GitHubProvider {
         } else {
             &self.cfg.redirect_url
         };
-        let scope = scopes_or_default(&self.cfg.scopes, DEFAULT_SCOPES);
+        let scope = if self.cfg.scopes.is_empty() {
+            DEFAULT_SCOPES.join(" ")
+        } else {
+            let mut scopes = self.cfg.scopes.clone();
+            if !scopes.iter().any(|s| s == "user:email") {
+                scopes.push("user:email".to_string());
+            }
+            scopes.join(" ")
+        };
 
         let params = [
             ("response_type", "code"),
@@ -265,13 +271,26 @@ mod tests {
             Some("S256")
         );
 
-        // Custom scopes override defaults
+        // Custom scopes ensure user:email is always present
         let mut custom_cfg = test_github_config();
         custom_cfg.scopes = vec!["read:user".to_string()];
         let p_custom = GitHubProvider::new(&custom_cfg, reqwest::Client::new()).unwrap();
         let custom_url = reqwest::Url::parse(&p_custom.auth_url("s", "c")).unwrap();
         let custom_q: HashMap<_, _> = custom_url.query_pairs().into_owned().collect();
-        assert_eq!(custom_q.get("scope").map(|s| s.as_str()), Some("read:user"));
+        assert_eq!(
+            custom_q.get("scope").map(|s| s.as_str()),
+            Some("read:user user:email")
+        );
+
+        // When user:email already present, no duplicate is added
+        custom_cfg.scopes = vec!["read:user".to_string(), "user:email".to_string()];
+        let p_custom2 = GitHubProvider::new(&custom_cfg, reqwest::Client::new()).unwrap();
+        let custom_url2 = reqwest::Url::parse(&p_custom2.auth_url("s", "c")).unwrap();
+        let custom_q2: HashMap<_, _> = custom_url2.query_pairs().into_owned().collect();
+        assert_eq!(
+            custom_q2.get("scope").map(|s| s.as_str()),
+            Some("read:user user:email")
+        );
     }
 
     #[test]

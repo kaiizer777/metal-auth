@@ -215,7 +215,7 @@ jobs:
       - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
         with:
           fail-on-severity: high
-          comment-summary-in-pr: always
+          comment-summary-in-pr: never
 
   release-build:
     name: Release Build

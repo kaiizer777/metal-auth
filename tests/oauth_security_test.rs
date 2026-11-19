@@ -8,7 +8,8 @@ use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use chrono::Utc;
 use common::*;
 use metal_auth::{
-    ErrorCode, GoogleProvider, OAuthProvider, OAuthService, ProviderConfig, SessionService, User,
+    AppleProvider, ErrorCode, GoogleProvider, OAuthProvider, OAuthService, ProviderConfig,
+    SessionService, User,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -396,27 +397,27 @@ async fn test_security_external_callback_csrf_exemption() {
     let _guard = DB_LOCK.lock().await;
     let server = MockServer::start().await;
 
-    let google_cfg = ProviderConfig {
-        client_id: "google-id".to_string(),
-        client_secret: "google-secret".to_string(),
-        redirect_uri: "https://example.com/auth/oauth/google/callback".to_string(),
+    let apple_cfg = ProviderConfig {
+        client_id: "apple-id".to_string(),
+        client_secret: "apple-secret".to_string(),
+        redirect_uri: "https://example.com/auth/oauth/apple/callback".to_string(),
         scopes: vec![],
         enabled: true,
         team_id: None,
         key_id: None,
         private_key: None,
     };
-    let google = GoogleProvider::with_endpoints(
-        &google_cfg,
+    let apple = AppleProvider::with_endpoints(
+        &apple_cfg,
         reqwest::Client::new(),
         format!("{}/auth", server.uri()),
         format!("{}/token", server.uri()),
-        format!("{}/userinfo", server.uri()),
+        format!("{}/jwks", server.uri()),
     )
     .unwrap();
 
     let mut providers: HashMap<String, Arc<dyn OAuthProvider>> = HashMap::new();
-    providers.insert("google".to_string(), Arc::new(google));
+    providers.insert("apple".to_string(), Arc::new(apple));
 
     let Some(app) = setup_oauth_test_app(providers).await else {
         return;
@@ -427,7 +428,7 @@ async fn test_security_external_callback_csrf_exemption() {
     let form_body = "code=test_code&state=bad_state";
     let req = Request::builder()
         .method(Method::POST)
-        .uri("/auth/oauth/google/callback")
+        .uri("/auth/oauth/apple/callback")
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header(header::ACCEPT, "application/json")
         .header(

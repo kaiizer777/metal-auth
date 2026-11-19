@@ -7,7 +7,8 @@ use axum::{
 use chrono::Utc;
 use metal_auth::{
     AppConfig, AppError, AppState, Auth, Config, ConfigError, EmailDispatcher, ErrorCode,
-    ErrorResponse, PasswordResetToken, Session, User, UserResponse, VerificationToken,
+    ErrorResponse, PasswordResetToken, ProviderConfig, Session, User, UserResponse,
+    VerificationToken,
 };
 use sqlx::PgPool;
 use tower::Service;
@@ -33,6 +34,7 @@ fn test_config() -> Config {
         outbox_sent_retention: std::time::Duration::from_secs(7 * 24 * 3600),
         session: metal_auth::SessionConfig::default(),
         rate_limit: metal_auth::RateLimitConfig::default(),
+        oauth: metal_auth::OAuthConfig::default(),
     }
 }
 
@@ -247,6 +249,92 @@ async fn test_auth_boot_fails_fast_on_invalid_cors() {
     assert!(matches!(
         result,
         Err(AppError::Config(ConfigError::InvalidOrigin { ref value, .. })) if value == "invalid\norigin"
+    ));
+}
+
+fn oauth_enabled_test_config() -> Config {
+    let mut cfg = test_config();
+    cfg.oauth.state_secret = "01234567890123456789012345678901".to_string();
+    cfg.oauth.providers.insert(
+        "google".to_string(),
+        ProviderConfig {
+            client_id: "google-id".to_string(),
+            client_secret: "google-secret".to_string(),
+            redirect_uri: "https://app.example.com/auth/oauth/google/callback".to_string(),
+            scopes: vec![],
+            enabled: true,
+            team_id: None,
+            key_id: None,
+            private_key: None,
+        },
+    );
+    cfg
+}
+
+#[tokio::test]
+async fn test_auth_boot_with_oauth_enabled_serves_initiate() {
+    let cfg = oauth_enabled_test_config();
+
+    let pool = PgPool::connect_lazy(&cfg.database_url).expect("lazy pool creation");
+    let state = AppState::new(pool, cfg).unwrap();
+    let mut auth = Auth::from_state(state).unwrap();
+
+    let req = Request::builder()
+        .uri("/auth/oauth/google")
+        .method(Method::GET)
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = auth.router.call(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FOUND);
+}
+
+#[tokio::test]
+async fn test_auth_boot_with_oauth_disabled_fails_oauth_route_per_request() {
+    let cfg = test_config();
+
+    let pool = PgPool::connect_lazy(&cfg.database_url).expect("lazy pool creation");
+    let state = AppState::new(pool, cfg).unwrap();
+    let mut auth = Auth::from_state(state).unwrap();
+
+    let req = Request::builder()
+        .uri("/auth/oauth/google")
+        .method(Method::GET)
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = auth.router.call(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    let err_envelope: ErrorResponse = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(err_envelope.code, ErrorCode::OAuthProviderNotFound);
+}
+
+#[tokio::test]
+async fn test_auth_boot_fails_fast_on_invalid_oauth_secret() {
+    let mut cfg = test_config();
+    cfg.oauth.state_secret = "short".to_string();
+    cfg.oauth.providers.insert(
+        "google".to_string(),
+        ProviderConfig {
+            client_id: "google-id".to_string(),
+            client_secret: "google-secret".to_string(),
+            redirect_uri: "https://app.example.com/auth/oauth/google/callback".to_string(),
+            scopes: vec![],
+            enabled: true,
+            team_id: None,
+            key_id: None,
+            private_key: None,
+        },
+    );
+
+    let pool = PgPool::connect_lazy(&cfg.database_url).expect("lazy pool creation");
+    // Bootstrap rejects the config before a router or pool can be used.
+    let result = AppState::new(pool, cfg);
+    assert!(matches!(
+        result,
+        Err(AppError::Config(ConfigError::InvalidValue { field, .. })) if field == "oauth.state_secret"
     ));
 }
 

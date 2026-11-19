@@ -61,6 +61,7 @@ async fn setup_live_db() -> Option<(axum::Router, sqlx::PgPool, AppState)> {
         outbox_sent_retention: std::time::Duration::from_secs(7 * 24 * 3600),
         session: metal_auth::SessionConfig::default(),
         rate_limit: metal_auth::RateLimitConfig::default(),
+        oauth: metal_auth::OAuthConfig::default(),
     };
     let state = AppState::new(pool.clone(), cfg).expect("failed to create app state");
     let router = create_router(state.clone()).expect("failed to create router");

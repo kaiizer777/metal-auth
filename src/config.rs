@@ -51,6 +51,9 @@ pub struct Config {
     // Phase 4: Session & Rate Limit
     pub session: SessionConfig,
     pub rate_limit: RateLimitConfig,
+
+    // Phase 6: OAuth
+    pub oauth: OAuthConfig,
 }
 
 impl std::fmt::Debug for Config {
@@ -74,6 +77,7 @@ impl std::fmt::Debug for Config {
             .field("outbox_sent_retention", &self.outbox_sent_retention)
             .field("session", &self.session)
             .field("rate_limit", &self.rate_limit)
+            .field("oauth", &self.oauth)
             .finish()
     }
 }
@@ -195,6 +199,15 @@ impl Config {
         }
         self.session.validate()?;
         self.rate_limit.validate()?;
+        self.oauth.validate()?;
+        // The callback clears the state cookie after setting the session cookie;
+        // a shared name deletes the fresh session.
+        if self.oauth.state_cookie_name == self.session.cookie_name {
+            return Err(ConfigError::InvalidValue {
+                field: "oauth.state_cookie_name",
+                reason: "must not match the session cookie name",
+            });
+        }
         Ok(())
     }
 
@@ -507,6 +520,94 @@ impl Config {
             login_cooldown_secs,
         };
 
+        let oauth_state_secret = lookup_env_or_default(&lookup, "OAUTH_STATE_SECRET", "")?;
+        let oauth_state_cookie_name = lookup_env_or_default(
+            &lookup,
+            "OAUTH_STATE_COOKIE_NAME",
+            DEFAULT_OAUTH_STATE_COOKIE_NAME,
+        )?;
+        let oauth_state_cookie_path = lookup_env_or_default(
+            &lookup,
+            "OAUTH_STATE_COOKIE_PATH",
+            DEFAULT_OAUTH_STATE_COOKIE_PATH,
+        )?;
+        let oauth_state_ttl_secs = lookup_env_or_default(&lookup, "OAUTH_STATE_TTL_SECS", "600")?
+            .parse::<u64>()
+            .map_err(|_| ConfigError::InvalidEnvVar("OAUTH_STATE_TTL_SECS"))?;
+        let oauth_callback_base_url =
+            lookup_env_or_default(&lookup, "OAUTH_CALLBACK_BASE_URL", "")?;
+
+        let mut providers: std::collections::HashMap<String, ProviderConfig> =
+            std::collections::HashMap::new();
+        for name in SUPPORTED_PROVIDERS {
+            let (enabled_key, client_id_key, client_secret_key, redirect_uri_key): (
+                &'static str,
+                &'static str,
+                &'static str,
+                &'static str,
+            ) = match *name {
+                "google" => (
+                    "OAUTH_GOOGLE_ENABLED",
+                    "OAUTH_GOOGLE_CLIENT_ID",
+                    "OAUTH_GOOGLE_CLIENT_SECRET",
+                    "OAUTH_GOOGLE_REDIRECT_URI",
+                ),
+                "github" => (
+                    "OAUTH_GITHUB_ENABLED",
+                    "OAUTH_GITHUB_CLIENT_ID",
+                    "OAUTH_GITHUB_CLIENT_SECRET",
+                    "OAUTH_GITHUB_REDIRECT_URI",
+                ),
+                "apple" => (
+                    "OAUTH_APPLE_ENABLED",
+                    "OAUTH_APPLE_CLIENT_ID",
+                    "OAUTH_APPLE_CLIENT_SECRET",
+                    "OAUTH_APPLE_REDIRECT_URI",
+                ),
+                _ => continue,
+            };
+            let enabled = lookup_env_or_default(&lookup, enabled_key, "false")?
+                .parse::<bool>()
+                .map_err(|_| ConfigError::InvalidEnvVar(enabled_key))?;
+            let client_id = lookup_env_or_default(&lookup, client_id_key, "")?;
+            let client_secret = lookup_env_or_default(&lookup, client_secret_key, "")?;
+            let redirect_uri = lookup_env_or_default(&lookup, redirect_uri_key, "")?;
+            let (team_id, key_id, private_key) = if *name == "apple" {
+                let team_id = lookup_env_or_default(&lookup, "OAUTH_APPLE_TEAM_ID", "")?;
+                let key_id = lookup_env_or_default(&lookup, "OAUTH_APPLE_KEY_ID", "")?;
+                let private_key = lookup_env_or_default(&lookup, "OAUTH_APPLE_PRIVATE_KEY", "")?;
+                (
+                    (!team_id.is_empty()).then_some(team_id),
+                    (!key_id.is_empty()).then_some(key_id),
+                    (!private_key.is_empty()).then_some(private_key),
+                )
+            } else {
+                (None, None, None)
+            };
+            providers.insert(
+                (*name).to_string(),
+                ProviderConfig {
+                    redirect_uri,
+                    client_id,
+                    client_secret,
+                    scopes: Vec::new(),
+                    enabled,
+                    team_id,
+                    key_id,
+                    private_key,
+                },
+            );
+        }
+
+        let oauth = OAuthConfig {
+            providers,
+            state_cookie_name: oauth_state_cookie_name,
+            state_cookie_path: oauth_state_cookie_path,
+            state_ttl: Duration::from_secs(oauth_state_ttl_secs),
+            state_secret: oauth_state_secret,
+            callback_base_url: oauth_callback_base_url,
+        };
+
         let cfg = Self {
             database_url,
             port,
@@ -529,6 +630,7 @@ impl Config {
             outbox_sent_retention,
             session,
             rate_limit,
+            oauth,
         };
 
         cfg.validate()?;
@@ -553,6 +655,21 @@ pub(crate) fn default_allowed_headers() -> Vec<String> {
         "Content-Type".to_string(),
         "X-CSRF-Token".to_string(),
     ]
+}
+
+fn lookup_env_or_default<F>(
+    lookup: &F,
+    key: &'static str,
+    default: &str,
+) -> Result<String, ConfigError>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    match lookup(key) {
+        Ok(val) => Ok(val),
+        Err(std::env::VarError::NotPresent) => Ok(default.to_string()),
+        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::NonUnicodeEnvVar(key)),
+    }
 }
 
 pub(crate) fn parse_allowed_headers_str(raw: &str) -> Vec<String> {
@@ -1071,6 +1188,233 @@ impl RateLimitConfig {
     }
 }
 
+// ─── Phase 6 — OAuth Config ──────────────────────────────────────────────────
+
+pub const SUPPORTED_PROVIDERS: &[&str] = &["google", "github", "apple"];
+pub const DEFAULT_OAUTH_STATE_COOKIE_NAME: &str = "oauth_state";
+pub const DEFAULT_OAUTH_STATE_COOKIE_PATH: &str = "/";
+pub const DEFAULT_OAUTH_STATE_TTL_SECS: u64 = 600; // 10 minutes
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderConfig {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub scopes: Vec<String>,
+    pub enabled: bool,
+
+    // Apple-specific credentials for dynamic ES256 client_secret JWT signing
+    pub team_id: Option<String>,
+    pub key_id: Option<String>,
+    pub private_key: Option<String>,
+}
+
+impl ProviderConfig {
+    pub fn new(
+        client_id: impl Into<String>,
+        client_secret: impl Into<String>,
+        redirect_uri: impl Into<String>,
+        scopes: Vec<String>,
+        enabled: bool,
+    ) -> Self {
+        Self {
+            client_id: client_id.into(),
+            client_secret: client_secret.into(),
+            redirect_uri: redirect_uri.into(),
+            scopes,
+            enabled,
+            team_id: None,
+            key_id: None,
+            private_key: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[REDACTED]")
+            .field("redirect_uri", &self.redirect_uri)
+            .field("scopes", &self.scopes)
+            .field("enabled", &self.enabled)
+            .field("team_id", &self.team_id)
+            .field("key_id", &self.key_id)
+            .field(
+                "private_key",
+                &self.private_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct OAuthConfig {
+    pub providers: std::collections::HashMap<String, ProviderConfig>,
+    pub state_cookie_name: String,
+    pub state_cookie_path: String,
+    pub state_ttl: Duration,
+    pub state_secret: String,
+    pub callback_base_url: String,
+}
+
+impl std::fmt::Debug for OAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthConfig")
+            .field("providers", &self.providers)
+            .field("state_cookie_name", &self.state_cookie_name)
+            .field("state_cookie_path", &self.state_cookie_path)
+            .field("state_ttl", &self.state_ttl)
+            .field("state_secret", &"[REDACTED]")
+            .field("callback_base_url", &self.callback_base_url)
+            .finish()
+    }
+}
+
+impl Default for OAuthConfig {
+    fn default() -> Self {
+        Self {
+            providers: std::collections::HashMap::new(),
+            state_cookie_name: DEFAULT_OAUTH_STATE_COOKIE_NAME.to_string(),
+            state_cookie_path: DEFAULT_OAUTH_STATE_COOKIE_PATH.to_string(),
+            state_ttl: Duration::from_secs(DEFAULT_OAUTH_STATE_TTL_SECS),
+            state_secret: String::new(),
+            callback_base_url: String::new(),
+        }
+    }
+}
+
+// RFC 6265 cookie-name token characters; spaces/separators break Set-Cookie.
+fn is_valid_cookie_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            matches!(
+                b,
+                b'0'..=b'9'
+                    | b'A'..=b'Z'
+                    | b'a'..=b'z'
+                    | b'!'
+                    | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
+        })
+}
+
+// RFC 6265 path-value minus whitespace: browsers trim it, breaking lookup.
+fn is_valid_cookie_path(path: &str) -> bool {
+    !path.is_empty() && path.bytes().all(|b| b >= 0x21 && b != 0x7f && b != b';')
+}
+
+impl OAuthConfig {
+    #[must_use]
+    pub fn state_ttl_secs(&self) -> u64 {
+        self.state_ttl.as_secs()
+    }
+
+    #[must_use]
+    pub fn ttl(&self) -> Duration {
+        self.state_ttl
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !is_valid_cookie_name(&self.state_cookie_name) {
+            return Err(ConfigError::InvalidValue {
+                field: "oauth.state_cookie_name",
+                reason: "must be a valid cookie name (RFC 6265 token characters)",
+            });
+        }
+        if !is_valid_cookie_path(&self.state_cookie_path) {
+            return Err(ConfigError::InvalidValue {
+                field: "oauth.state_cookie_path",
+                reason: "must be a valid cookie path (no whitespace, controls, or ';')",
+            });
+        }
+        let ttl_secs = self.ttl().as_secs();
+        if !(60..=3600).contains(&ttl_secs) {
+            return Err(ConfigError::InvalidValue {
+                field: "oauth.state_ttl",
+                reason: "must be between 60 and 3600 seconds",
+            });
+        }
+
+        let any_enabled = self.providers.values().any(|p| p.enabled);
+        if any_enabled && self.state_secret.len() < 32 {
+            return Err(ConfigError::InvalidValue {
+                field: "oauth.state_secret",
+                reason: "must be at least 32 bytes when oauth providers are enabled",
+            });
+        }
+
+        for (name, provider) in &self.providers {
+            if !SUPPORTED_PROVIDERS.contains(&name.as_str()) {
+                return Err(ConfigError::InvalidValue {
+                    field: "oauth.providers",
+                    reason: "unsupported provider key; supported providers are google, github, apple",
+                });
+            }
+
+            if provider.enabled {
+                if provider.client_id.trim().is_empty() {
+                    return Err(ConfigError::InvalidValue {
+                        field: "oauth.provider.client_id",
+                        reason: "must not be empty for enabled provider",
+                    });
+                }
+                if provider.redirect_uri.trim().is_empty() {
+                    return Err(ConfigError::InvalidValue {
+                        field: "oauth.provider.redirect_uri",
+                        reason: "must not be empty for enabled provider",
+                    });
+                }
+
+                if name == "google" || name == "github" {
+                    if provider.client_secret.trim().is_empty() {
+                        return Err(ConfigError::InvalidValue {
+                            field: "oauth.provider.client_secret",
+                            reason: "must not be empty for google/github provider",
+                        });
+                    }
+                } else if name == "apple" {
+                    let has_secret = !provider.client_secret.trim().is_empty();
+                    let has_p8 = provider
+                        .team_id
+                        .as_deref()
+                        .is_some_and(|s| !s.trim().is_empty())
+                        && provider
+                            .key_id
+                            .as_deref()
+                            .is_some_and(|s| !s.trim().is_empty())
+                        && provider
+                            .private_key
+                            .as_deref()
+                            .is_some_and(|s| !s.trim().is_empty());
+
+                    if !has_secret && !has_p8 {
+                        return Err(ConfigError::InvalidValue {
+                            field: "oauth.provider.apple",
+                            reason: "must configure either client_secret or team_id, key_id, and private_key",
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         let cfg = Self {
@@ -1098,6 +1442,7 @@ impl Default for Config {
             outbox_sent_retention: Duration::from_secs(DEFAULT_OUTBOX_SENT_RETENTION_SECS),
             session: SessionConfig::default(),
             rate_limit: RateLimitConfig::default(),
+            oauth: OAuthConfig::default(),
         };
         // Compiled-in defaults must stay deployable: fail fast in debug/test
         // if a future default edit stops validating.
@@ -1166,6 +1511,7 @@ mod tests {
             outbox_sent_retention: Duration::from_secs(DEFAULT_OUTBOX_SENT_RETENTION_SECS),
             session: SessionConfig::default(),
             rate_limit: RateLimitConfig::default(),
+            oauth: OAuthConfig::default(),
         }
     }
 
@@ -2511,5 +2857,261 @@ mod tests {
             cfg.allowed_headers,
             vec!["Authorization", "X-Custom-Header", "X-CSRF-Token"]
         );
+    }
+
+    #[test]
+    fn test_oauth_config_defaults() {
+        let oauth = OAuthConfig::default();
+        assert_eq!(oauth.state_cookie_name, "oauth_state");
+        assert_eq!(oauth.state_cookie_path, "/");
+        assert_eq!(oauth.ttl(), Duration::from_secs(600));
+        assert!(oauth.providers.is_empty());
+        assert!(oauth.validate().is_ok());
+    }
+
+    #[test]
+    fn test_oauth_config_validation_ttl_bounds() {
+        let mut oauth = OAuthConfig {
+            state_ttl: Duration::from_secs(59),
+            ..Default::default()
+        };
+        assert!(oauth.validate().is_err());
+
+        oauth.state_ttl = Duration::from_secs(3601);
+        assert!(oauth.validate().is_err());
+
+        oauth.state_ttl = Duration::from_secs(600);
+        assert!(oauth.validate().is_ok());
+        assert_eq!(oauth.state_ttl_secs(), 600);
+    }
+
+    #[test]
+    fn test_oauth_config_validation_secret_length() {
+        let mut oauth = OAuthConfig::default();
+        oauth.providers.insert(
+            "google".into(),
+            ProviderConfig::new("cid", "sec", "https://app.com/callback", vec![], true),
+        );
+        // Empty secret with enabled provider fails
+        assert!(oauth.validate().is_err());
+
+        // Short secret (< 32 bytes) fails
+        oauth.state_secret = "short_secret_under_32_bytes!!".into();
+        assert!(oauth.validate().is_err());
+
+        // Valid secret >= 32 bytes succeeds
+        oauth.state_secret = "01234567890123456789012345678901".into();
+        assert!(oauth.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_state_cookie_name() {
+        let mut oauth = OAuthConfig {
+            state_secret: "01234567890123456789012345678901".into(),
+            ..Default::default()
+        };
+
+        oauth.state_cookie_name = " oauth_state".into();
+        assert!(oauth.validate().is_err());
+
+        oauth.state_cookie_name = "bad;name".into();
+        assert!(oauth.validate().is_err());
+
+        oauth.state_cookie_name = "bad=name".into();
+        assert!(oauth.validate().is_err());
+
+        oauth.state_cookie_name = "my_oauth_state".into();
+        assert!(oauth.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_state_cookie_path() {
+        let mut oauth = OAuthConfig {
+            state_secret: "01234567890123456789012345678901".into(),
+            ..Default::default()
+        };
+
+        oauth.state_cookie_path = "/bad path".into();
+        assert!(oauth.validate().is_err());
+
+        oauth.state_cookie_path = "/bad;path".into();
+        assert!(oauth.validate().is_err());
+
+        oauth.state_cookie_path = "/".into();
+        assert!(oauth.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_state_cookie_name_matching_session_cookie() {
+        let mut cfg = test_infra_config();
+        cfg.oauth.state_cookie_name = cfg.session.cookie_name.clone();
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "oauth.state_cookie_name",
+                ..
+            })
+        ));
+
+        cfg.oauth.state_cookie_name = "oauth_state".into();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_oauth_config_validation_provider_keys() {
+        let mut oauth = OAuthConfig {
+            state_secret: "01234567890123456789012345678901".into(),
+            ..Default::default()
+        };
+        oauth.providers.insert(
+            "discord".into(),
+            ProviderConfig::new("cid", "sec", "https://app.com/callback", vec![], false),
+        );
+        assert!(oauth.validate().is_err());
+    }
+
+    #[test]
+    fn test_oauth_config_validation_provider_required_fields() {
+        let mut oauth = OAuthConfig {
+            state_secret: "01234567890123456789012345678901".into(),
+            ..Default::default()
+        };
+
+        // Missing client_secret on enabled Google provider
+        oauth.providers.insert(
+            "google".into(),
+            ProviderConfig::new("cid", "", "https://app.com/callback", vec![], true),
+        );
+        assert!(oauth.validate().is_err());
+
+        // Missing client_id
+        oauth.providers.insert(
+            "google".into(),
+            ProviderConfig::new("", "sec", "https://app.com/callback", vec![], true),
+        );
+        assert!(oauth.validate().is_err());
+
+        // Missing redirect_uri
+        oauth.providers.insert(
+            "google".into(),
+            ProviderConfig::new("cid", "sec", "", vec![], true),
+        );
+        assert!(oauth.validate().is_err());
+    }
+
+    #[test]
+    fn test_oauth_config_debug_redacts_secrets() {
+        let provider = ProviderConfig {
+            client_id: "client-id-123".into(),
+            client_secret: "super-secret-key".into(),
+            redirect_uri: "https://example.com/callback".into(),
+            scopes: vec!["email".into()],
+            enabled: true,
+            team_id: Some("team1".into()),
+            key_id: Some("key1".into()),
+            private_key: Some("private-key-secret".into()),
+        };
+
+        let rendered = format!("{provider:?}");
+        assert!(!rendered.contains("super-secret-key"));
+        assert!(!rendered.contains("private-key-secret"));
+        assert!(rendered.contains("[REDACTED]"));
+
+        let oauth = OAuthConfig {
+            state_secret: "super-secret-oauth-state-key-32b".into(),
+            ..Default::default()
+        };
+        let rendered_oauth = format!("{oauth:?}");
+        assert!(!rendered_oauth.contains("super-secret-oauth-state-key-32b"));
+        assert!(rendered_oauth.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn oauth_env_populates_providers_and_state() {
+        let cfg = Config::from_lookup(|key| match key {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "OAUTH_STATE_SECRET" => Ok("01234567890123456789012345678901".into()),
+            "OAUTH_STATE_COOKIE_NAME" => Ok("my_oauth_state".into()),
+            "OAUTH_STATE_TTL_SECS" => Ok("900".into()),
+            "OAUTH_CALLBACK_BASE_URL" => Ok("https://app.example.com".into()),
+            "OAUTH_GOOGLE_ENABLED" => Ok("true".into()),
+            "OAUTH_GOOGLE_CLIENT_ID" => Ok("google-id".into()),
+            "OAUTH_GOOGLE_CLIENT_SECRET" => Ok("google-secret".into()),
+            "OAUTH_GOOGLE_REDIRECT_URI" => Ok("https://app.example.com/cb".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        })
+        .expect("load oauth env vars");
+
+        assert_eq!(cfg.oauth.state_secret, "01234567890123456789012345678901");
+        assert_eq!(cfg.oauth.state_cookie_name, "my_oauth_state");
+        assert_eq!(cfg.oauth.state_cookie_path, DEFAULT_OAUTH_STATE_COOKIE_PATH);
+        assert_eq!(cfg.oauth.state_ttl, Duration::from_secs(900));
+        assert_eq!(cfg.oauth.callback_base_url, "https://app.example.com");
+        let google = &cfg.oauth.providers["google"];
+        assert!(google.enabled);
+        assert_eq!(google.client_id, "google-id");
+        assert_eq!(google.client_secret, "google-secret");
+        assert_eq!(google.redirect_uri, "https://app.example.com/cb");
+        assert!(!cfg.oauth.providers["github"].enabled);
+    }
+
+    #[test]
+    fn oauth_env_rejects_invalid_values() {
+        let bad_ttl = |key: &str| match key {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "OAUTH_STATE_TTL_SECS" => Ok("not-a-number".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        assert!(matches!(
+            Config::from_lookup(bad_ttl),
+            Err(ConfigError::InvalidEnvVar("OAUTH_STATE_TTL_SECS"))
+        ));
+
+        let bad_bool = |key: &str| match key {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "OAUTH_GOOGLE_ENABLED" => Ok("yes".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        assert!(matches!(
+            Config::from_lookup(bad_bool),
+            Err(ConfigError::InvalidEnvVar("OAUTH_GOOGLE_ENABLED"))
+        ));
+    }
+
+    #[test]
+    fn oauth_env_enabled_without_secret_fails_validation() {
+        let cfg = Config {
+            oauth: OAuthConfig {
+                state_secret: "01234567890123456789012345678901".into(),
+                providers: [(
+                    "google".to_string(),
+                    ProviderConfig::new(
+                        "google-id",
+                        "",
+                        "https://app.example.com/cb",
+                        vec![],
+                        true,
+                    ),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            ..test_infra_config()
+        };
+        assert!(cfg.validate().is_err());
+
+        let lookup = |key: &str| match key {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "OAUTH_GOOGLE_ENABLED" => Ok("true".into()),
+            "OAUTH_GOOGLE_CLIENT_ID" => Ok("google-id".into()),
+            "OAUTH_GOOGLE_REDIRECT_URI" => Ok("https://app.example.com/cb".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        assert!(Config::from_lookup(lookup).is_err());
     }
 }

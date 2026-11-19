@@ -343,6 +343,7 @@ mod tests {
             ),
             session: SessionConfig::default(),
             rate_limit: crate::config::RateLimitConfig::default(),
+            oauth: crate::config::OAuthConfig::default(),
         }
     }
 

@@ -13,7 +13,9 @@ pub async fn security_headers_middleware(req: Request<Body>, next: Next) -> Resp
     let is_auth_route = path == "/auth"
         || path.starts_with("/auth/")
         || path == "/session"
-        || path.starts_with("/session/");
+        || path.starts_with("/session/")
+        || path == "/api/auth"
+        || path.starts_with("/api/auth/");
 
     let mut res = next.run(req).await;
     let headers = res.headers_mut();
@@ -134,6 +136,32 @@ mod tests {
         );
         assert!(h.get(header::CACHE_CONTROL).is_none());
         assert!(h.get(header::PRAGMA).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cache_control_on_api_auth_alias_with_segment_guard() {
+        let app = Router::new()
+            .route("/api/auth/oauth/accounts", get(|| async { StatusCode::OK }))
+            .route("/api/authorize", get(|| async { StatusCode::OK }))
+            .layer(from_fn(security_headers_middleware));
+
+        let req = Request::builder()
+            .uri("/api/auth/oauth/accounts")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            res.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert_eq!(res.headers().get(header::PRAGMA).unwrap(), "no-cache");
+
+        let req = Request::builder()
+            .uri("/api/authorize")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert!(res.headers().get(header::CACHE_CONTROL).is_none());
     }
 
     #[tokio::test]

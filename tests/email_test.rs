@@ -359,6 +359,7 @@ fn test_config() -> Config {
         outbox_sent_retention: Duration::from_secs(7 * 24 * 3600),
         session: metal_auth::SessionConfig::default(),
         rate_limit: metal_auth::RateLimitConfig::default(),
+        oauth: metal_auth::OAuthConfig::default(),
     }
 }
 

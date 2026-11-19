@@ -76,7 +76,7 @@ pub fn safe_oauth_redirect(target: &str) -> &str {
     }
     if target
         .chars()
-        .any(|c| matches!(c, '\\' | ' ' | '\t' | '\r' | '\n'))
+        .any(|c| c == '\\' || c == ' ' || c.is_control())
     {
         return "/";
     }
@@ -431,6 +431,7 @@ pub async fn link_account(
     if !SUPPORTED_PROVIDERS.contains(&provider.as_str()) {
         return Err(AppError::OAuthProviderNotFound);
     }
+    check_oauth_rate_limit(&state, &headers, &provider)?;
     let cookie_header = headers.get(header::COOKIE).and_then(|v| v.to_str().ok());
     let account = match state
         .oauth_service
@@ -529,5 +530,55 @@ mod tests {
         assert_eq!(safe_oauth_redirect("/with\rnewline"), "/");
         assert_eq!(safe_oauth_redirect("/with\nnewline"), "/");
         assert_eq!(safe_oauth_redirect("/back\\slash"), "/");
+        assert_eq!(safe_oauth_redirect("/\0evil"), "/");
+        assert_eq!(safe_oauth_redirect("/\u{7}bell"), "/");
+        assert_eq!(safe_oauth_redirect("/\u{7f}del"), "/");
+    }
+
+    #[tokio::test]
+    async fn test_link_account_enforces_oauth_rate_limit() {
+        use crate::config::{AppConfig, Config};
+        use sqlx::PgPool;
+        use std::sync::Arc;
+
+        let mut cfg = Config::default();
+        cfg.rate_limit.enabled = true;
+        cfg.rate_limit.max_attempts = 1;
+        let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
+        let state = AppState::with_configs_and_dispatcher(
+            pool,
+            cfg,
+            Arc::new(AppConfig::default()),
+            None,
+        )
+        .unwrap();
+
+        let ip = "203.0.113.7";
+        state
+            .rate_limiter
+            .check_rate_limit(&rate_limit_key("oauth:google", ip))
+            .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            header::HeaderValue::from_static("203.0.113.7"),
+        );
+        let result = link_account(
+            State(state),
+            AuthUser {
+                user_id: Uuid::new_v4(),
+                session_hash: "hash".to_string(),
+                session_type: "cookie".to_string(),
+            },
+            Path("google".to_string()),
+            headers,
+            Json(LinkRequest {
+                code: "code".to_string(),
+                state: "state".to_string(),
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::RateLimitExceeded)));
     }
 }

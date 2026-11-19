@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::Utc;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -37,6 +37,15 @@ pub enum OAuthCallbackOutcome {
         redirect_url: String,
         clear_cookie_header: String,
     },
+}
+
+/// Outcome of the transactional link write: a fresh row, a pre-existing row
+/// owned by the same user, or a unique race requiring a post-rollback read.
+#[derive(Debug)]
+enum LinkWrite {
+    Created(OAuthAccount),
+    Existing(OAuthAccount),
+    UniqueRace,
 }
 
 /// Service managing OAuth identity delegation, account linking, and pre-hijacking defense.
@@ -329,27 +338,34 @@ impl OAuthService {
             return Err(AppError::OAuthProviderError);
         }
 
-        // If state payload contains user_id (link intent), link this identity to that user
+        // If state payload contains user_id (link intent), link this identity to that user.
+        // The session check and the identity insert share one transaction holding
+        // the session row lock, so a revocation commits either before the check
+        // (link rejected) or after the insert (link stands). All reads stay
+        // pre-commit: no Err-after-write.
         if let Some(link_user_id) = payload.user_id {
+            let mut tx = self.db.begin().await.map_err(AppError::Database)?;
+
             // Read before write: a post-commit read failure is an unretryable Err-after-commit.
             let user = sqlx::query_as::<_, User>(
                 "SELECT id, email, password_hash, email_verified, created_at, updated_at FROM users WHERE id = $1",
             )
             .bind(link_user_id)
-            .fetch_one(&self.db)
+            .fetch_one(&mut *tx)
             .await
             .map_err(AppError::Database)?;
 
             // Session binding: the initiating session must still be live. A logout or
-            // revoke-all in flight blocks the link. Fail closed pre-commit.
+            // revoke-all in flight blocks the link. The row lock serializes this
+            // check with revocation. Fail closed pre-commit.
             let session_live = match payload.session_hash.as_deref() {
                 Some(hash) if !hash.is_empty() => {
                     let row: Option<Session> = sqlx::query_as::<_, Session>(
-                        "SELECT id, user_id, token_hash, created_at, last_active_at, absolute_expires_at, session_type, csrf_token FROM sessions WHERE token_hash = $1 AND user_id = $2",
+                        "SELECT id, user_id, token_hash, created_at, last_active_at, absolute_expires_at, session_type, csrf_token FROM sessions WHERE token_hash = $1 AND user_id = $2 FOR UPDATE",
                     )
                     .bind(hash)
                     .bind(link_user_id)
-                    .fetch_optional(&self.db)
+                    .fetch_optional(&mut *tx)
                     .await
                     .map_err(AppError::Database)?;
                     match row {
@@ -366,6 +382,7 @@ impl OAuthService {
                 _ => false,
             };
             if !session_live {
+                let _ = tx.rollback().await;
                 tracing::info!(
                     event = "oauth_callback_failure",
                     provider = provider_id,
@@ -374,11 +391,41 @@ impl OAuthService {
                 return Err(AppError::OAuthStateInvalid);
             }
 
-            let account = self
-                .link_identity_to_user(link_user_id, provider_id, &user_info)
-                .await?;
-
             let redirect_url = payload.redirect_url.unwrap_or_else(|| "/".to_string());
+
+            let account = match Self::link_identity_in_tx(
+                &mut tx,
+                link_user_id,
+                provider_id,
+                &user_info.email,
+                &user_info.provider_user_id,
+            )
+            .await
+            {
+                Ok(LinkWrite::Created(account)) | Ok(LinkWrite::Existing(account)) => account,
+                Ok(LinkWrite::UniqueRace) => {
+                    let _ = tx.rollback().await;
+                    let account = self
+                        .resolve_link_race(
+                            link_user_id,
+                            provider_id,
+                            &user_info.provider_user_id,
+                        )
+                        .await?;
+                    return Ok(OAuthCallbackOutcome::Linked {
+                        user,
+                        account,
+                        redirect_url,
+                        clear_cookie_header: clear_cookie_str,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.rollback().await;
+                    return Err(e);
+                }
+            };
+
+            tx.commit().await.map_err(AppError::Database)?;
 
             return Ok(OAuthCallbackOutcome::Linked {
                 user,
@@ -679,12 +726,60 @@ impl OAuthService {
             return Err(AppError::OAuthProviderError);
         }
 
+        let mut tx = self.db.begin().await.map_err(AppError::Database)?;
+        match Self::link_identity_in_tx(
+            &mut tx,
+            user_id,
+            provider_id,
+            &email,
+            &user_info.provider_user_id,
+        )
+        .await
+        {
+            Ok(LinkWrite::Created(account)) => {
+                tx.commit().await.map_err(AppError::Database)?;
+
+                tracing::info!(
+                    event = "oauth_account_linked",
+                    provider = provider_id,
+                    user_id = %user_id,
+                );
+
+                Ok(account)
+            }
+            Ok(LinkWrite::Existing(account)) => {
+                // Read-only fast path: nothing was written.
+                let _ = tx.rollback().await;
+                Ok(account)
+            }
+            Ok(LinkWrite::UniqueRace) => {
+                let _ = tx.rollback().await;
+                self.resolve_link_race(user_id, provider_id, &user_info.provider_user_id)
+                    .await
+            }
+            Err(e) => {
+                let _ = tx.rollback().await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Runs the link read-check-insert sequence inside the caller's transaction.
+    /// On `UniqueRace` the caller's transaction is aborted: roll it back and
+    /// resolve via [`Self::resolve_link_race`].
+    async fn link_identity_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        user_id: Uuid,
+        provider_id: &str,
+        email: &str,
+        provider_user_id: &str,
+    ) -> Result<LinkWrite, AppError> {
         // 2. User must exist and have verified status
         let user: Option<User> = sqlx::query_as::<_, User>(
             "SELECT id, email, password_hash, email_verified, created_at, updated_at FROM users WHERE id = $1",
         )
         .bind(user_id)
-        .fetch_optional(&self.db)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(AppError::Database)?;
 
@@ -698,8 +793,8 @@ impl OAuthService {
             "SELECT id, user_id, provider_id, provider_user_id, email, created_at, updated_at FROM oauth_accounts WHERE provider_id = $1 AND provider_user_id = $2",
         )
         .bind(provider_id)
-        .bind(&user_info.provider_user_id)
-        .fetch_optional(&self.db)
+        .bind(provider_user_id)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(AppError::Database)?;
 
@@ -707,7 +802,7 @@ impl OAuthService {
             if link.user_id != user_id {
                 return Err(AppError::OAuthAccountLinkConflict);
             }
-            return Ok(link);
+            return Ok(LinkWrite::Existing(link));
         }
 
         let link_id = Uuid::new_v4();
@@ -716,8 +811,8 @@ impl OAuthService {
             id: link_id,
             user_id,
             provider_id: provider_id.to_string(),
-            provider_user_id: user_info.provider_user_id.clone(),
-            email: email.clone(),
+            provider_user_id: provider_user_id.to_string(),
+            email: email.to_string(),
             created_at: now,
             updated_at: now,
         };
@@ -732,38 +827,43 @@ impl OAuthService {
         .bind(&row.email)
         .bind(row.created_at)
         .bind(row.updated_at)
-        .execute(&self.db)
+        .execute(&mut **tx)
         .await;
 
         if let Err(e) = insert_res {
             if is_unique_violation(&e) {
-                // If another request linked this identity concurrently, check if it belongs to this user
-                let link: Option<OAuthAccount> = sqlx::query_as::<_, OAuthAccount>(
-                    "SELECT id, user_id, provider_id, provider_user_id, email, created_at, updated_at FROM oauth_accounts WHERE provider_id = $1 AND provider_user_id = $2",
-                )
-                .bind(provider_id)
-                .bind(&row.provider_user_id)
-                .fetch_optional(&self.db)
-                .await
-                .map_err(AppError::Database)?;
-
-                if let Some(link) = link
-                    && link.user_id == user_id
-                {
-                    return Ok(link);
-                }
-                return Err(AppError::OAuthAccountLinkConflict);
+                return Ok(LinkWrite::UniqueRace);
             }
             return Err(AppError::Database(e));
         }
 
-        tracing::info!(
-            event = "oauth_account_linked",
-            provider = provider_id,
-            user_id = %user_id,
-        );
+        Ok(LinkWrite::Created(row))
+    }
 
-        Ok(row)
+    /// Post-rollback read for a link lost to a concurrent unique insert: the
+    /// winner's row decides, same-user wins, cross-user conflicts.
+    async fn resolve_link_race(
+        &self,
+        user_id: Uuid,
+        provider_id: &str,
+        provider_user_id: &str,
+    ) -> Result<OAuthAccount, AppError> {
+        // If another request linked this identity concurrently, check if it belongs to this user
+        let link: Option<OAuthAccount> = sqlx::query_as::<_, OAuthAccount>(
+            "SELECT id, user_id, provider_id, provider_user_id, email, created_at, updated_at FROM oauth_accounts WHERE provider_id = $1 AND provider_user_id = $2",
+        )
+        .bind(provider_id)
+        .bind(provider_user_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(AppError::Database)?;
+
+        if let Some(link) = link
+            && link.user_id == user_id
+        {
+            return Ok(link);
+        }
+        Err(AppError::OAuthAccountLinkConflict)
     }
 
     /// Links an additional OAuth identity and returns the created or existing [`OAuthAccount`].

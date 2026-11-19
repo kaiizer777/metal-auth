@@ -129,7 +129,15 @@ async fn test_oauth_pre_hijacking_rejected_on_unverified_provider_email() {
 
     // Act: callback must reject before database mutations
     let res = svc
-        .handle_callback("google", "valid_code", state_token, Some(&set_cookie))
+        .handle_callback_extended(
+            "google",
+            "valid_code",
+            state_token,
+            Some(&set_cookie),
+            "cookie",
+            None,
+            None,
+        )
         .await;
 
     assert!(matches!(res, Err(AppError::OAuthEmailUnverified)));
@@ -193,7 +201,15 @@ async fn test_oauth_pre_hijacking_collision_rejected_on_unverified_local_account
 
     // Act: must reject with 409 Conflict to prevent account hijacking
     let res = svc
-        .handle_callback("google", "valid_code", state_token, Some(&set_cookie))
+        .handle_callback_extended(
+            "google",
+            "valid_code",
+            state_token,
+            Some(&set_cookie),
+            "cookie",
+            None,
+            None,
+        )
         .await;
 
     assert!(matches!(res, Err(AppError::OAuthAccountLinkConflict)));
@@ -249,10 +265,22 @@ async fn test_oauth_auto_links_verified_existing_local_user() {
     let state_token = extract_state_from_url(&auth_url);
 
     // Act: link verified user
-    let (session, user, clear_cookie) = svc
-        .handle_callback("google", "valid_code", state_token, Some(&set_cookie))
+    let OAuthCallbackOutcome::Login(res) = svc
+        .handle_callback_extended(
+            "google",
+            "valid_code",
+            state_token,
+            Some(&set_cookie),
+            "cookie",
+            None,
+            None,
+        )
         .await
-        .expect("handle callback");
+        .expect("handle callback")
+    else {
+        panic!("expected login outcome");
+    };
+    let (session, user, clear_cookie) = (res.session, res.user, res.clear_cookie_header);
 
     assert_eq!(user.id, local_user_id);
     assert_eq!(session.user_id, local_user_id);
@@ -280,10 +308,22 @@ async fn test_oauth_auto_links_verified_existing_local_user() {
         .expect("get auth url");
     let state_token2 = extract_state_from_url(&auth_url2);
 
-    let (session2, user2, _) = svc
-        .handle_callback("google", "valid_code", state_token2, Some(&set_cookie2))
+    let OAuthCallbackOutcome::Login(res2) = svc
+        .handle_callback_extended(
+            "google",
+            "valid_code",
+            state_token2,
+            Some(&set_cookie2),
+            "cookie",
+            None,
+            None,
+        )
         .await
-        .expect("second callback");
+        .expect("second callback")
+    else {
+        panic!("expected login outcome");
+    };
+    let (session2, user2) = (res2.session, res2.user);
 
     assert_eq!(user2.id, local_user_id);
     assert_ne!(session.id, session2.id); // New session minted
@@ -730,11 +770,29 @@ async fn link_callback_succeeds_without_500_after_commit() {
     let state_token = extract_state_from_url(&auth_url);
 
     // link intent commits oauth_accounts: callback must succeed, not 500
-    let (_session, linked_user, clear_cookie_header) = svc
-        .handle_callback("google", "valid_code", state_token, Some(&set_cookie))
+    let outcome = svc
+        .handle_callback_extended(
+            "google",
+            "valid_code",
+            state_token,
+            Some(&set_cookie),
+            "cookie",
+            None,
+            None,
+        )
         .await
         .expect("link callback succeeds");
+    let (linked_user, redirect_url, clear_cookie_header) = match outcome {
+        OAuthCallbackOutcome::Linked {
+            user,
+            redirect_url,
+            clear_cookie_header,
+            ..
+        } => (user, redirect_url, clear_cookie_header),
+        OAuthCallbackOutcome::Login(_) => panic!("expected Linked outcome, got Login"),
+    };
     assert_eq!(linked_user.id, user_id);
+    assert_eq!(redirect_url, "/settings");
     assert!(clear_cookie_header.contains("Max-Age=0"));
 
     let link_count: (i64,) = sqlx::query_as(

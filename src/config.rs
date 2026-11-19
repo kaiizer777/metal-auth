@@ -1276,6 +1276,39 @@ impl Default for OAuthConfig {
     }
 }
 
+// RFC 6265 cookie-name token characters; spaces/separators break Set-Cookie.
+fn is_valid_cookie_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            matches!(
+                b,
+                b'0'..=b'9'
+                    | b'A'..=b'Z'
+                    | b'a'..=b'z'
+                    | b'!'
+                    | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
+        })
+}
+
+// RFC 6265 path-value minus whitespace: browsers trim it, breaking lookup.
+fn is_valid_cookie_path(path: &str) -> bool {
+    !path.is_empty() && path.bytes().all(|b| b >= 0x21 && b != 0x7f && b != b';')
+}
+
 impl OAuthConfig {
     #[must_use]
     pub fn state_ttl_secs(&self) -> u64 {
@@ -1288,16 +1321,16 @@ impl OAuthConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.state_cookie_name.trim().is_empty() {
+        if !is_valid_cookie_name(&self.state_cookie_name) {
             return Err(ConfigError::InvalidValue {
                 field: "oauth.state_cookie_name",
-                reason: "must not be empty",
+                reason: "must be a valid cookie name (RFC 6265 token characters)",
             });
         }
-        if self.state_cookie_path.trim().is_empty() {
+        if !is_valid_cookie_path(&self.state_cookie_path) {
             return Err(ConfigError::InvalidValue {
                 field: "oauth.state_cookie_path",
-                reason: "must not be empty",
+                reason: "must be a valid cookie path (no whitespace, controls, or ';')",
             });
         }
         let ttl_secs = self.ttl().as_secs();
@@ -2860,6 +2893,43 @@ mod tests {
 
         // Valid secret >= 32 bytes succeeds
         oauth.state_secret = "01234567890123456789012345678901".into();
+        assert!(oauth.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_state_cookie_name() {
+        let mut oauth = OAuthConfig {
+            state_secret: "01234567890123456789012345678901".into(),
+            ..Default::default()
+        };
+
+        oauth.state_cookie_name = " oauth_state".into();
+        assert!(oauth.validate().is_err());
+
+        oauth.state_cookie_name = "bad;name".into();
+        assert!(oauth.validate().is_err());
+
+        oauth.state_cookie_name = "bad=name".into();
+        assert!(oauth.validate().is_err());
+
+        oauth.state_cookie_name = "my_oauth_state".into();
+        assert!(oauth.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_state_cookie_path() {
+        let mut oauth = OAuthConfig {
+            state_secret: "01234567890123456789012345678901".into(),
+            ..Default::default()
+        };
+
+        oauth.state_cookie_path = "/bad path".into();
+        assert!(oauth.validate().is_err());
+
+        oauth.state_cookie_path = "/bad;path".into();
+        assert!(oauth.validate().is_err());
+
+        oauth.state_cookie_path = "/".into();
         assert!(oauth.validate().is_ok());
     }
 

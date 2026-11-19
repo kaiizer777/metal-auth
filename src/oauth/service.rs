@@ -329,10 +329,7 @@ impl OAuthService {
 
         // If state payload contains user_id (link intent), link this identity to that user
         if let Some(link_user_id) = payload.user_id {
-            let account = self
-                .link_identity_to_user(link_user_id, provider_id, &user_info)
-                .await?;
-
+            // Read before write: a post-commit read failure is an unretryable Err-after-commit.
             let user = sqlx::query_as::<_, User>(
                 "SELECT id, email, password_hash, email_verified, created_at, updated_at FROM users WHERE id = $1",
             )
@@ -340,6 +337,10 @@ impl OAuthService {
             .fetch_one(&self.db)
             .await
             .map_err(AppError::Database)?;
+
+            let account = self
+                .link_identity_to_user(link_user_id, provider_id, &user_info)
+                .await?;
 
             let redirect_url = payload.redirect_url.unwrap_or_else(|| "/".to_string());
 

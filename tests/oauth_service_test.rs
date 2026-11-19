@@ -806,6 +806,59 @@ async fn link_callback_succeeds_without_500_after_commit() {
 }
 
 #[tokio::test]
+async fn link_callback_missing_user_fails_before_commit() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    truncate_tables(&app.pool).await.expect("truncate");
+
+    let missing_user_id = Uuid::new_v4();
+    let google_mock = Arc::new(MockOAuthProvider::new(
+        "google",
+        UserInfo {
+            provider_id: "google".to_string(),
+            provider_user_id: format!("goog-missing-user-{}", Uuid::new_v4()),
+            email: dynamic_email(),
+            email_verified: true,
+            name: None,
+            avatar_url: None,
+        },
+    ));
+
+    let svc = create_test_oauth_service(&app, google_mock, None);
+
+    let (auth_url, set_cookie) = svc
+        .initiate_link_flow("google", missing_user_id, Some("/settings".to_string()))
+        .expect("initiate link flow");
+    let state_token = extract_state_from_url(&auth_url);
+
+    // user read must fail fast pre-commit, never Err-after-write
+    let err = svc
+        .handle_callback_extended(
+            "google",
+            "valid_code",
+            state_token,
+            Some(&set_cookie),
+            "cookie",
+            None,
+            None,
+        )
+        .await
+        .expect_err("missing user must fail");
+    assert!(
+        matches!(err, AppError::Database(_)),
+        "expected pre-commit Database read error, got {err:?}"
+    );
+
+    let link_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM oauth_accounts")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(link_count.0, 0, "no link row may be committed");
+}
+
+#[tokio::test]
 async fn test_unlink_disabled_provider_lockout_prevention() {
     let _guard = DB_LOCK.lock().await;
     let Some(app) = setup_test_app().await else {

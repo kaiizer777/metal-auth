@@ -545,13 +545,9 @@ mod tests {
         cfg.rate_limit.enabled = true;
         cfg.rate_limit.max_attempts = 1;
         let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
-        let state = AppState::with_configs_and_dispatcher(
-            pool,
-            cfg,
-            Arc::new(AppConfig::default()),
-            None,
-        )
-        .unwrap();
+        let state =
+            AppState::with_configs_and_dispatcher(pool, cfg, Arc::new(AppConfig::default()), None)
+                .unwrap();
 
         let ip = "203.0.113.7";
         state

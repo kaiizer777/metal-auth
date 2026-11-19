@@ -369,7 +369,6 @@ mod tests {
             client_id: "com.example.app".to_string(),
             client_secret: "static-secret".to_string(),
             redirect_uri: "https://app.example.com/auth/apple/callback".to_string(),
-            redirect_url: "https://app.example.com/auth/apple/callback".to_string(),
             scopes: vec![],
             enabled: true,
             team_id: Some("TEAM123456".to_string()),

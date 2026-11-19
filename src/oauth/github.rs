@@ -223,7 +223,6 @@ mod tests {
             client_id: "github-id".to_string(),
             client_secret: "github-secret".to_string(),
             redirect_uri: "https://app.example.com/auth/github/callback".to_string(),
-            redirect_url: "https://app.example.com/auth/github/callback".to_string(),
             scopes: vec![],
             enabled: true,
             team_id: None,

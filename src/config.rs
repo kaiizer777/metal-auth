@@ -579,7 +579,6 @@ impl Config {
             providers.insert(
                 (*name).to_string(),
                 ProviderConfig {
-                    redirect_url: redirect_uri.clone(),
                     redirect_uri,
                     client_id,
                     client_secret,
@@ -1193,7 +1192,6 @@ pub struct ProviderConfig {
     pub client_id: String,
     pub client_secret: String,
     pub redirect_uri: String,
-    pub redirect_url: String,
     pub scopes: Vec<String>,
     pub enabled: bool,
 
@@ -1211,12 +1209,10 @@ impl ProviderConfig {
         scopes: Vec<String>,
         enabled: bool,
     ) -> Self {
-        let uri = redirect_uri.into();
         Self {
             client_id: client_id.into(),
             client_secret: client_secret.into(),
-            redirect_url: uri.clone(),
-            redirect_uri: uri,
+            redirect_uri: redirect_uri.into(),
             scopes,
             enabled,
             team_id: None,
@@ -1232,7 +1228,6 @@ impl std::fmt::Debug for ProviderConfig {
             .field("client_id", &self.client_id)
             .field("client_secret", &"[REDACTED]")
             .field("redirect_uri", &self.redirect_uri)
-            .field("redirect_url", &self.redirect_url)
             .field("scopes", &self.scopes)
             .field("enabled", &self.enabled)
             .field("team_id", &self.team_id)
@@ -2916,7 +2911,6 @@ mod tests {
             client_id: "client-id-123".into(),
             client_secret: "super-secret-key".into(),
             redirect_uri: "https://example.com/callback".into(),
-            redirect_url: "https://example.com/callback".into(),
             scopes: vec!["email".into()],
             enabled: true,
             team_id: Some("team1".into()),

@@ -141,10 +141,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_control_on_api_auth_alias_with_segment_guard() {
         let app = Router::new()
-            .route(
-                "/api/auth/oauth/accounts",
-                get(|| async { StatusCode::OK }),
-            )
+            .route("/api/auth/oauth/accounts", get(|| async { StatusCode::OK }))
             .route("/api/authorize", get(|| async { StatusCode::OK }))
             .layer(from_fn(security_headers_middleware));
 

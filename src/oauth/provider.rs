@@ -233,7 +233,6 @@ mod tests {
             client_id: "test-client".to_string(),
             client_secret: "test-secret".to_string(),
             redirect_uri: "https://app.example.com/callback".to_string(),
-            redirect_url: "https://app.example.com/callback".to_string(),
             scopes: vec![],
             enabled,
             team_id: None,

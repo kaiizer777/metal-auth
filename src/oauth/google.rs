@@ -160,7 +160,6 @@ mod tests {
             client_id: "google-id".to_string(),
             client_secret: "google-secret".to_string(),
             redirect_uri: "https://app.example.com/auth/google/callback".to_string(),
-            redirect_url: "https://app.example.com/auth/google/callback".to_string(),
             scopes: vec![],
             enabled: true,
             team_id: None,

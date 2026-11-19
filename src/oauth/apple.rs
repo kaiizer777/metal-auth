@@ -840,6 +840,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_jwks_response_preserves_cached_keys() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/auth/keys"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "keys": [{ "kty": "RSA", "kid": "kid-1", "n": TEST_RSA_N, "e": TEST_RSA_E }]
+            })))
+            .mount(&server)
+            .await;
+
+        let p = AppleProvider::with_endpoints(
+            &test_apple_config(),
+            reqwest::Client::new(),
+            APPLE_AUTH_ENDPOINT,
+            format!("{}/auth/token", server.uri()),
+            format!("{}/auth/keys", server.uri()),
+        )
+        .unwrap();
+        p.get_jwks_key("kid-1").await.expect("prime cache");
+
+        // simulate cooldown expiry without losing cached keys
+        p.cache.write().await.last_refreshed_at = None;
+
+        // upstream now serves an empty key set
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/auth/keys"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "keys": []
+            })))
+            .mount(&server)
+            .await;
+
+        assert!(matches!(
+            p.refresh_jwks().await.unwrap_err(),
+            AppError::OAuthProviderError
+        ));
+        assert!(p.get_jwks_key("kid-1").await.is_ok());
+    }
+
+    #[tokio::test]
     async fn test_jwks_refresh_cooldown_applied_on_fetch_failure() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))

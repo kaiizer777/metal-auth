@@ -12,6 +12,10 @@ use metal_auth::{
 };
 use uuid::Uuid;
 
+fn generate_test_password() -> String {
+    format!("T3st!{}", Uuid::new_v4().simple())
+}
+
 #[derive(Debug)]
 struct MockOAuthProvider {
     id: &'static str,
@@ -434,7 +438,11 @@ async fn test_oauth_link_and_unlink_account_lifecycle() {
     assert!(matches!(unlink_err2, Err(AppError::ValidationError(_))));
 
     // 6. User sets a password
-    sqlx::query("UPDATE users SET password_hash = 'argon2id$hashedpassword' WHERE id = $1")
+    let valid_password = generate_test_password();
+    let password_hash = metal_auth::crypto::hash_password(&valid_password, &app.state.auth_config)
+        .expect("hash password");
+    sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+        .bind(&password_hash)
         .bind(user_id)
         .execute(&app.pool)
         .await
@@ -446,6 +454,9 @@ async fn test_oauth_link_and_unlink_account_lifecycle() {
         .expect("unlink github with password");
     let accounts_empty = svc.list_linked_accounts(user_id).await.unwrap();
     assert_eq!(accounts_empty.len(), 0);
+
+    let login_res = app.state.auth_service.login(&email, &valid_password).await;
+    assert!(login_res.is_ok());
 }
 
 #[tokio::test]
@@ -458,6 +469,7 @@ async fn test_oauth_unusable_password_login_returns_invalid_credentials() {
 
     let email = dynamic_email();
     let user_id = Uuid::new_v4();
+    let attempted_password = generate_test_password();
 
     // 1. User created via OAuth with sentinel $unusable$oauth$ password hash
     sqlx::query(
@@ -475,7 +487,7 @@ async fn test_oauth_unusable_password_login_returns_invalid_credentials() {
     let res = app
         .state
         .auth_service
-        .login(&email, "any_attempted_password")
+        .login(&email, &attempted_password)
         .await;
     assert!(matches!(res, Err(AppError::InvalidCredentials)));
 
@@ -485,7 +497,7 @@ async fn test_oauth_unusable_password_login_returns_invalid_credentials() {
             "/auth/login",
             serde_json::json!({
                 "email": email,
-                "password": "any_attempted_password"
+                "password": &attempted_password
             }),
         )
         .await;
@@ -509,7 +521,7 @@ async fn test_oauth_unusable_password_login_returns_invalid_credentials() {
     let res_empty = app
         .state
         .auth_service
-        .login(&email_empty_hash, "any_attempted_password")
+        .login(&email_empty_hash, &attempted_password)
         .await;
     assert!(matches!(res_empty, Err(AppError::InvalidCredentials)));
 }

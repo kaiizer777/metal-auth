@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use jsonwebtoken::{Algorithm, Header, Validation, decode, decode_header, encode};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::config::ProviderConfig;
 use crate::error::AppError;
@@ -69,6 +69,7 @@ pub struct AppleProvider {
     token_url: String,
     jwks_url: String,
     cache: Arc<RwLock<JwksCache>>,
+    refresh_lock: Arc<Mutex<()>>,
 }
 
 impl AppleProvider {
@@ -80,6 +81,7 @@ impl AppleProvider {
             token_url: APPLE_TOKEN_ENDPOINT.to_string(),
             jwks_url: APPLE_JWKS_ENDPOINT.to_string(),
             cache: Arc::new(RwLock::new(JwksCache::default())),
+            refresh_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -97,6 +99,7 @@ impl AppleProvider {
             token_url: token_url.into(),
             jwks_url: jwks_url.into(),
             cache: Arc::new(RwLock::new(JwksCache::default())),
+            refresh_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -147,6 +150,11 @@ impl AppleProvider {
         // Record refresh attempt upfront so the 5-minute cooldown applies even on network/HTTP failures
         {
             let mut write_guard = self.cache.write().await;
+            if let Some(last_refreshed) = write_guard.last_refreshed_at
+                && Instant::now().duration_since(last_refreshed) < APPLE_JWKS_REFRESH_COOLDOWN
+            {
+                return Err(AppError::OAuthProviderError);
+            }
             write_guard.last_refreshed_at = Some(Instant::now());
         }
 
@@ -180,8 +188,26 @@ impl AppleProvider {
     }
 
     /// Resolves RSA public key components for `kid`, auto-refreshing cache if missing.
-    /// Enforces a cooldown between refresh attempts on unknown keys to mitigate DoS amplification.
+    /// Enforces single-flight coordination and a cooldown between refresh attempts to mitigate stampedes and DoS.
     async fn get_jwks_key(&self, kid: &str) -> Result<(String, String), AppError> {
+        // Fast path: if cache is fresh and contains requested key, return immediately without locking
+        {
+            let read_guard = self.cache.read().await;
+            let fresh = read_guard
+                .expires_at
+                .map(|exp| Instant::now() < exp)
+                .unwrap_or(false);
+
+            if fresh && let Some(components) = read_guard.keys.get(kid) {
+                return Ok(components.clone());
+            }
+        }
+
+        // Slow path: single-flight lock ensures concurrent requests share one in-flight refresh
+        let _flight_guard = self.refresh_lock.lock().await;
+
+        // Double check cache after acquiring refresh ownership:
+        // another concurrent task might have just refreshed the keys
         {
             let read_guard = self.cache.read().await;
             let fresh = read_guard
@@ -193,6 +219,8 @@ impl AppleProvider {
                 return Ok(components.clone());
             }
 
+            // Cooldown check: if an attempt was recently made (success or failure) and kid is still missing,
+            // enforce cooldown to prevent DoS amplification on unknown keys
             if let Some(last_refreshed) = read_guard.last_refreshed_at
                 && Instant::now().duration_since(last_refreshed) < APPLE_JWKS_REFRESH_COOLDOWN
             {
@@ -200,7 +228,7 @@ impl AppleProvider {
             }
         }
 
-        // Cache expired or kid unknown (and cooldown window elapsed): refresh once
+        // Cache expired or kid unknown (and cooldown window elapsed): execute refresh
         self.refresh_jwks().await?;
 
         let read_guard = self.cache.read().await;
@@ -837,5 +865,51 @@ mod tests {
         // Cooldown prevents second HTTP call within 5-minute window
         let err2 = provider.get_jwks_key("some-kid").await;
         assert!(matches!(err2, Err(AppError::OAuthProviderError)));
+    }
+
+    #[tokio::test]
+    async fn test_jwks_refresh_single_flight_concurrent_requests() {
+        let server = wiremock::MockServer::start().await;
+        let jwks_body = serde_json::json!({
+            "keys": [{
+                "kty": "RSA",
+                "kid": "shared-kid",
+                "use": "sig",
+                "alg": "RS256",
+                "n": "AQAB",
+                "e": "AQAB"
+            }]
+        });
+
+        // Exactly one HTTP request must occur despite concurrent requests
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/keys"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(jwks_body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cfg = test_apple_config();
+        let provider = Arc::new(
+            AppleProvider::with_endpoints(
+                &cfg,
+                reqwest::Client::new(),
+                "https://mock/auth",
+                "https://mock/token",
+                format!("{}/keys", server.uri()),
+            )
+            .unwrap(),
+        );
+
+        let p1 = provider.clone();
+        let p2 = provider.clone();
+
+        let (res1, res2) = tokio::join!(
+            tokio::spawn(async move { p1.get_jwks_key("shared-kid").await }),
+            tokio::spawn(async move { p2.get_jwks_key("shared-kid").await }),
+        );
+
+        assert!(res1.unwrap().is_ok());
+        assert!(res2.unwrap().is_ok());
     }
 }

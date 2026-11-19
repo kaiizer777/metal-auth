@@ -512,6 +512,100 @@ impl Config {
             login_cooldown_secs,
         };
 
+        let oauth_state_secret = lookup_env_or_default(&lookup, "OAUTH_STATE_SECRET", "")?;
+        let oauth_state_cookie_name = lookup_env_or_default(
+            &lookup,
+            "OAUTH_STATE_COOKIE_NAME",
+            DEFAULT_OAUTH_STATE_COOKIE_NAME,
+        )?;
+        let oauth_state_cookie_path = lookup_env_or_default(
+            &lookup,
+            "OAUTH_STATE_COOKIE_PATH",
+            DEFAULT_OAUTH_STATE_COOKIE_PATH,
+        )?;
+        let oauth_state_ttl_secs = lookup_env_or_default(
+            &lookup,
+            "OAUTH_STATE_TTL_SECS",
+            "600",
+        )?
+        .parse::<u64>()
+        .map_err(|_| ConfigError::InvalidEnvVar("OAUTH_STATE_TTL_SECS"))?;
+        let oauth_callback_base_url =
+            lookup_env_or_default(&lookup, "OAUTH_CALLBACK_BASE_URL", "")?;
+
+        let mut providers: std::collections::HashMap<String, ProviderConfig> =
+            std::collections::HashMap::new();
+        for name in SUPPORTED_PROVIDERS {
+            let (enabled_key, client_id_key, client_secret_key, redirect_uri_key): (
+                &'static str,
+                &'static str,
+                &'static str,
+                &'static str,
+            ) = match *name {
+                "google" => (
+                    "OAUTH_GOOGLE_ENABLED",
+                    "OAUTH_GOOGLE_CLIENT_ID",
+                    "OAUTH_GOOGLE_CLIENT_SECRET",
+                    "OAUTH_GOOGLE_REDIRECT_URI",
+                ),
+                "github" => (
+                    "OAUTH_GITHUB_ENABLED",
+                    "OAUTH_GITHUB_CLIENT_ID",
+                    "OAUTH_GITHUB_CLIENT_SECRET",
+                    "OAUTH_GITHUB_REDIRECT_URI",
+                ),
+                "apple" => (
+                    "OAUTH_APPLE_ENABLED",
+                    "OAUTH_APPLE_CLIENT_ID",
+                    "OAUTH_APPLE_CLIENT_SECRET",
+                    "OAUTH_APPLE_REDIRECT_URI",
+                ),
+                _ => continue,
+            };
+            let enabled = lookup_env_or_default(&lookup, enabled_key, "false")?
+                .parse::<bool>()
+                .map_err(|_| ConfigError::InvalidEnvVar(enabled_key))?;
+            let client_id = lookup_env_or_default(&lookup, client_id_key, "")?;
+            let client_secret = lookup_env_or_default(&lookup, client_secret_key, "")?;
+            let redirect_uri = lookup_env_or_default(&lookup, redirect_uri_key, "")?;
+            let (team_id, key_id, private_key) = if *name == "apple" {
+                let team_id = lookup_env_or_default(&lookup, "OAUTH_APPLE_TEAM_ID", "")?;
+                let key_id = lookup_env_or_default(&lookup, "OAUTH_APPLE_KEY_ID", "")?;
+                let private_key =
+                    lookup_env_or_default(&lookup, "OAUTH_APPLE_PRIVATE_KEY", "")?;
+                (
+                    (!team_id.is_empty()).then_some(team_id),
+                    (!key_id.is_empty()).then_some(key_id),
+                    (!private_key.is_empty()).then_some(private_key),
+                )
+            } else {
+                (None, None, None)
+            };
+            providers.insert(
+                (*name).to_string(),
+                ProviderConfig {
+                    redirect_url: redirect_uri.clone(),
+                    redirect_uri,
+                    client_id,
+                    client_secret,
+                    scopes: Vec::new(),
+                    enabled,
+                    team_id,
+                    key_id,
+                    private_key,
+                },
+            );
+        }
+
+        let oauth = OAuthConfig {
+            providers,
+            state_cookie_name: oauth_state_cookie_name,
+            state_cookie_path: oauth_state_cookie_path,
+            state_ttl: Duration::from_secs(oauth_state_ttl_secs),
+            state_secret: oauth_state_secret,
+            callback_base_url: oauth_callback_base_url,
+        };
+
         let cfg = Self {
             database_url,
             port,
@@ -534,7 +628,7 @@ impl Config {
             outbox_sent_retention,
             session,
             rate_limit,
-            oauth: OAuthConfig::default(),
+            oauth,
         };
 
         cfg.validate()?;
@@ -559,6 +653,17 @@ pub(crate) fn default_allowed_headers() -> Vec<String> {
         "Content-Type".to_string(),
         "X-CSRF-Token".to_string(),
     ]
+}
+
+fn lookup_env_or_default<F>(lookup: &F, key: &'static str, default: &str) -> Result<String, ConfigError>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    match lookup(key) {
+        Ok(val) => Ok(val),
+        Err(std::env::VarError::NotPresent) => Ok(default.to_string()),
+        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::NonUnicodeEnvVar(key)),
+    }
 }
 
 pub(crate) fn parse_allowed_headers_str(raw: &str) -> Vec<String> {

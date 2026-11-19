@@ -10,7 +10,7 @@ use common::*;
 use jsonwebtoken::{Algorithm, Header, encode};
 use metal_auth::{
     AppleProvider, GitHubProvider, GoogleProvider, OAuthAccount, OAuthProvider, OAuthService,
-    ProviderConfig, SessionService, User,
+    ProviderConfig, RateLimiter, SessionService, User,
 };
 use serde::Serialize;
 use uuid::Uuid;
@@ -1018,6 +1018,136 @@ async fn test_oauth_link_initiate_and_callback_flow() {
     );
 
     // 3. Verify identity is linked to user_id in database
+    let link: OAuthAccount = sqlx::query_as::<_, OAuthAccount>(
+        "SELECT id, user_id, provider_id, provider_user_id, email, created_at, updated_at FROM oauth_accounts WHERE provider_id = 'google' AND provider_user_id = $1",
+    )
+    .bind(test_sub)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(link.user_id, user_id);
+    assert_eq!(link.provider_id, "google");
+}
+
+#[tokio::test]
+async fn test_oauth_link_flow_passes_with_single_attempt_budget() {
+    let _guard = DB_LOCK.lock().await;
+    let server = MockServer::start().await;
+
+    let test_sub = format!("google-link-budget-{}", Uuid::new_v4());
+    let test_email = dynamic_email();
+
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "goog-flow-budget-at",
+            "token_type": "Bearer",
+            "expires_in": 3600
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/userinfo"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "sub": test_sub,
+            "email": test_email,
+            "email_verified": true,
+            "name": "Budget Flow User"
+        })))
+        .mount(&server)
+        .await;
+
+    let cfg = ProviderConfig {
+        client_id: "google-budget-id".to_string(),
+        client_secret: "google-budget-secret".to_string(),
+        redirect_uri: "http://localhost:3000/auth/oauth/google/callback".to_string(),
+        scopes: vec!["openid".to_string(), "email".to_string()],
+        enabled: true,
+        team_id: None,
+        key_id: None,
+        private_key: None,
+    };
+
+    let google = GoogleProvider::with_endpoints(
+        &cfg,
+        reqwest::Client::new(),
+        format!("{}/auth", server.uri()),
+        format!("{}/token", server.uri()),
+        format!("{}/userinfo", server.uri()),
+    )
+    .unwrap();
+
+    let mut providers: HashMap<String, Arc<dyn OAuthProvider>> = HashMap::new();
+    providers.insert("google".to_string(), Arc::new(google));
+
+    let Some(mut app) = setup_oauth_test_app(providers).await else {
+        return;
+    };
+
+    // Tightest valid budget: initiate and callback must each pass exactly once.
+    app.state.config.rate_limit.enabled = true;
+    app.state.config.rate_limit.max_attempts = 1;
+    app.state.rate_limiter = Arc::new(RateLimiter::with_config(
+        app.state.config.rate_limit.clone(),
+    ));
+    app.router = metal_auth::handler::create_router(app.state.clone()).unwrap();
+
+    let user_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(user_id)
+    .bind(test_email)
+    .bind("argon2id$somehash")
+    .bind(true)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+
+    let session_service = SessionService::new(app.pool.clone(), Arc::new(app.state.config.clone()));
+    let (_session, session_token) = session_service
+        .create_session(user_id, "cookie", None, None)
+        .await
+        .unwrap();
+
+    let session_cookie_name = &app.state.config.session.cookie_name;
+
+    // 1. Authenticated initiate: GET /auth/oauth/google/link?redirect_url=/settings
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/auth/oauth/google/link?redirect_url=/settings")
+        .header(
+            header::COOKIE,
+            format!("{session_cookie_name}={session_token}"),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.dispatch(req).await;
+    assert_ne!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let state_token = extract_state_from_location(&resp.headers);
+    let state_cookie = extract_cookie_value(&resp.headers, "oauth_state").unwrap();
+
+    // 2. Provider returns to callback: GET /auth/oauth/google/callback
+    let callback_uri = format!("/auth/oauth/google/callback?code=flow_code&state={state_token}");
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(&callback_uri)
+        .header(
+            header::COOKIE,
+            format!("{session_cookie_name}={session_token}; oauth_state={state_cookie}"),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.dispatch(req).await;
+
+    // Single-attempt budget must admit the callback, not 429 it.
+    assert_ne!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(resp.status(), StatusCode::FOUND);
+
+    // 3. Identity is linked to user_id in database
     let link: OAuthAccount = sqlx::query_as::<_, OAuthAccount>(
         "SELECT id, user_id, provider_id, provider_user_id, email, created_at, updated_at FROM oauth_accounts WHERE provider_id = 'google' AND provider_user_id = $1",
     )

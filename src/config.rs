@@ -2838,4 +2838,87 @@ mod tests {
         assert!(!rendered_oauth.contains("super-secret-oauth-state-key-32b"));
         assert!(rendered_oauth.contains("[REDACTED]"));
     }
+
+    #[test]
+    fn oauth_env_populates_providers_and_state() {
+        let cfg = Config::from_lookup(|key| match key {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "OAUTH_STATE_SECRET" => Ok("01234567890123456789012345678901".into()),
+            "OAUTH_STATE_COOKIE_NAME" => Ok("my_oauth_state".into()),
+            "OAUTH_STATE_TTL_SECS" => Ok("900".into()),
+            "OAUTH_CALLBACK_BASE_URL" => Ok("https://app.example.com".into()),
+            "OAUTH_GOOGLE_ENABLED" => Ok("true".into()),
+            "OAUTH_GOOGLE_CLIENT_ID" => Ok("google-id".into()),
+            "OAUTH_GOOGLE_CLIENT_SECRET" => Ok("google-secret".into()),
+            "OAUTH_GOOGLE_REDIRECT_URI" => Ok("https://app.example.com/cb".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        })
+        .expect("load oauth env vars");
+
+        assert_eq!(cfg.oauth.state_secret, "01234567890123456789012345678901");
+        assert_eq!(cfg.oauth.state_cookie_name, "my_oauth_state");
+        assert_eq!(cfg.oauth.state_cookie_path, DEFAULT_OAUTH_STATE_COOKIE_PATH);
+        assert_eq!(cfg.oauth.state_ttl, Duration::from_secs(900));
+        assert_eq!(cfg.oauth.callback_base_url, "https://app.example.com");
+        let google = &cfg.oauth.providers["google"];
+        assert!(google.enabled);
+        assert_eq!(google.client_id, "google-id");
+        assert_eq!(google.client_secret, "google-secret");
+        assert_eq!(google.redirect_uri, "https://app.example.com/cb");
+        assert!(!cfg.oauth.providers["github"].enabled);
+    }
+
+    #[test]
+    fn oauth_env_rejects_invalid_values() {
+        let bad_ttl = |key: &str| match key {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "OAUTH_STATE_TTL_SECS" => Ok("not-a-number".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        assert!(matches!(
+            Config::from_lookup(bad_ttl),
+            Err(ConfigError::InvalidEnvVar("OAUTH_STATE_TTL_SECS"))
+        ));
+
+        let bad_bool = |key: &str| match key {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "OAUTH_GOOGLE_ENABLED" => Ok("yes".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        assert!(matches!(
+            Config::from_lookup(bad_bool),
+            Err(ConfigError::InvalidEnvVar("OAUTH_GOOGLE_ENABLED"))
+        ));
+    }
+
+    #[test]
+    fn oauth_env_enabled_without_secret_fails_validation() {
+        let cfg = Config {
+            oauth: OAuthConfig {
+                state_secret: "01234567890123456789012345678901".into(),
+                providers: [(
+                    "google".to_string(),
+                    ProviderConfig::new("google-id", "", "https://app.example.com/cb", vec![], true),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            ..test_infra_config()
+        };
+        assert!(cfg.validate().is_err());
+
+        let lookup = |key: &str| match key {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "OAUTH_GOOGLE_ENABLED" => Ok("true".into()),
+            "OAUTH_GOOGLE_CLIENT_ID" => Ok("google-id".into()),
+            "OAUTH_GOOGLE_REDIRECT_URI" => Ok("https://app.example.com/cb".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        assert!(Config::from_lookup(lookup).is_err());
+    }
 }

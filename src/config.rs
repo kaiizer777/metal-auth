@@ -200,6 +200,14 @@ impl Config {
         self.session.validate()?;
         self.rate_limit.validate()?;
         self.oauth.validate()?;
+        // The callback clears the state cookie after setting the session cookie;
+        // a shared name deletes the fresh session.
+        if self.oauth.state_cookie_name == self.session.cookie_name {
+            return Err(ConfigError::InvalidValue {
+                field: "oauth.state_cookie_name",
+                reason: "must not match the session cookie name",
+            });
+        }
         Ok(())
     }
 
@@ -2931,6 +2939,22 @@ mod tests {
 
         oauth.state_cookie_path = "/".into();
         assert!(oauth.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_state_cookie_name_matching_session_cookie() {
+        let mut cfg = test_infra_config();
+        cfg.oauth.state_cookie_name = cfg.session.cookie_name.clone();
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "oauth.state_cookie_name",
+                ..
+            })
+        ));
+
+        cfg.oauth.state_cookie_name = "oauth_state".into();
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

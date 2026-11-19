@@ -55,14 +55,22 @@ impl OAuthService {
         config: Arc<Config>,
         session_service: Arc<SessionService>,
     ) -> Result<Self, AppError> {
-        let http_client = build_oauth_http_client()?;
+        let mut http_client: Option<reqwest::Client> = None;
         let mut providers: HashMap<String, Arc<dyn OAuthProvider>> = HashMap::new();
 
         for id in SUPPORTED_PROVIDERS {
             if let Some(cfg) = config.oauth.providers.get(*id)
                 && cfg.enabled
             {
-                let provider = create_provider(id, cfg, http_client.clone())?;
+                let client = match &http_client {
+                    Some(c) => c.clone(),
+                    None => {
+                        let c = build_oauth_http_client()?;
+                        http_client = Some(c.clone());
+                        c
+                    }
+                };
+                let provider = create_provider(id, cfg, client)?;
                 providers.insert((*id).to_string(), provider);
             }
         }
@@ -156,6 +164,12 @@ impl OAuthService {
         self.state_mgr.build_clear_cookie()
     }
 
+    /// Returns a `Set-Cookie` header value to clear the OAuth state cookie for a specific provider.
+    #[must_use]
+    pub fn clear_state_cookie_for_provider(&self, provider_id: &str) -> String {
+        self.state_mgr.build_clear_cookie_for_provider(provider_id)
+    }
+
     /// Exposes a reference to the internal [`OAuthStateManager`].
     #[must_use]
     pub fn state_mgr(&self) -> &OAuthStateManager {
@@ -196,7 +210,7 @@ impl OAuthService {
         ip: Option<&str>,
         user_agent: Option<&str>,
     ) -> Result<OAuthCallbackResult, AppError> {
-        let clear_cookie_str = self.state_mgr.build_clear_cookie();
+        let clear_cookie_str = self.state_mgr.build_clear_cookie_for_provider(provider_id);
 
         // 1. Validate state parameter against signed cookie
         let cookie_header = match cookie_header {

@@ -24,6 +24,9 @@ pub use provider::{
 pub use service::{OAuthCallbackResult, OAuthService};
 pub use state::{
     OAuthStateManager, OAuthStatePayload, build_clear_state_cookie,
-    build_clear_state_cookie_header, build_state_cookie, build_state_cookie_header,
-    create_state_cookie_value, extract_state_cookie, generate_state_token, validate_state,
+    build_clear_state_cookie_for_provider, build_clear_state_cookie_header,
+    build_clear_state_cookie_header_for_provider, build_state_cookie,
+    build_state_cookie_for_provider, build_state_cookie_header,
+    build_state_cookie_header_for_provider, create_state_cookie_value, extract_state_cookie,
+    generate_state_token, validate_state,
 };

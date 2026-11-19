@@ -113,6 +113,33 @@ pub fn validate_state(
     Ok(payload)
 }
 
+/// Builds a `Set-Cookie` header string for setting the signed OAuth state cookie for a specific provider.
+/// For Apple (`response_mode=form_post`), if HTTPS is enabled (`secure == true`), `SameSite=None; Secure`
+/// is set so the cross-site POST can carry the cookie. For GET-based providers, `SameSite=Lax` is maintained.
+#[must_use]
+pub fn build_state_cookie_for_provider(
+    name: &str,
+    value: &str,
+    path: &str,
+    max_age_secs: u64,
+    secure: bool,
+    provider_id: &str,
+) -> String {
+    let same_site = if provider_id == "apple" && secure {
+        "None"
+    } else {
+        "Lax"
+    };
+
+    let mut cookie = format!(
+        "{name}={value}; Path={path}; Max-Age={max_age_secs}; HttpOnly; SameSite={same_site}"
+    );
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
 /// Builds a `Set-Cookie` header string for setting the signed OAuth state cookie.
 #[must_use]
 pub fn build_state_cookie(
@@ -122,8 +149,25 @@ pub fn build_state_cookie(
     max_age_secs: u64,
     secure: bool,
 ) -> String {
-    let mut cookie =
-        format!("{name}={value}; Path={path}; Max-Age={max_age_secs}; HttpOnly; SameSite=Lax");
+    build_state_cookie_for_provider(name, value, path, max_age_secs, secure, "")
+}
+
+/// Builds a `Set-Cookie` header string for immediately invalidating the OAuth state cookie for a specific provider.
+#[must_use]
+pub fn build_clear_state_cookie_for_provider(
+    name: &str,
+    path: &str,
+    secure: bool,
+    provider_id: &str,
+) -> String {
+    let same_site = if provider_id == "apple" && secure {
+        "None"
+    } else {
+        "Lax"
+    };
+    let mut cookie = format!(
+        "{name}=; Path={path}; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite={same_site}"
+    );
     if secure {
         cookie.push_str("; Secure");
     }
@@ -133,13 +177,7 @@ pub fn build_state_cookie(
 /// Builds a `Set-Cookie` header string for immediately invalidating the OAuth state cookie.
 #[must_use]
 pub fn build_clear_state_cookie(name: &str, path: &str, secure: bool) -> String {
-    let mut cookie = format!(
-        "{name}=; Path={path}; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Lax"
-    );
-    if secure {
-        cookie.push_str("; Secure");
-    }
-    cookie
+    build_clear_state_cookie_for_provider(name, path, secure, "")
 }
 
 /// Builds a `HeaderValue` for setting the signed OAuth state cookie.
@@ -154,6 +192,19 @@ pub fn build_state_cookie_header(
     HeaderValue::from_str(&raw).map_err(|_| AppError::Internal)
 }
 
+/// Builds a `HeaderValue` for setting the signed OAuth state cookie for a specific provider.
+pub fn build_state_cookie_header_for_provider(
+    name: &str,
+    value: &str,
+    path: &str,
+    max_age_secs: u64,
+    secure: bool,
+    provider_id: &str,
+) -> Result<HeaderValue, AppError> {
+    let raw = build_state_cookie_for_provider(name, value, path, max_age_secs, secure, provider_id);
+    HeaderValue::from_str(&raw).map_err(|_| AppError::Internal)
+}
+
 /// Builds a `HeaderValue` for invalidating the OAuth state cookie.
 pub fn build_clear_state_cookie_header(
     name: &str,
@@ -161,6 +212,17 @@ pub fn build_clear_state_cookie_header(
     secure: bool,
 ) -> Result<HeaderValue, AppError> {
     let raw = build_clear_state_cookie(name, path, secure);
+    HeaderValue::from_str(&raw).map_err(|_| AppError::Internal)
+}
+
+/// Builds a `HeaderValue` for invalidating the OAuth state cookie for a specific provider.
+pub fn build_clear_state_cookie_header_for_provider(
+    name: &str,
+    path: &str,
+    secure: bool,
+    provider_id: &str,
+) -> Result<HeaderValue, AppError> {
+    let raw = build_clear_state_cookie_for_provider(name, path, secure, provider_id);
     HeaderValue::from_str(&raw).map_err(|_| AppError::Internal)
 }
 
@@ -235,12 +297,13 @@ impl OAuthStateManager {
             expires_at,
         };
         let cookie_val = create_state_cookie_value(&payload, self.state_secret.as_bytes())?;
-        let set_cookie_str = build_state_cookie(
+        let set_cookie_str = build_state_cookie_for_provider(
             &self.cookie_name,
             &cookie_val,
             &self.cookie_path,
             self.state_ttl.as_secs(),
             self.cookie_secure,
+            provider_id,
         );
         Ok((token, set_cookie_str))
     }
@@ -316,8 +379,30 @@ impl OAuthStateManager {
         build_clear_state_cookie(&self.cookie_name, &self.cookie_path, self.cookie_secure)
     }
 
+    #[must_use]
+    pub fn build_clear_cookie_for_provider(&self, provider_id: &str) -> String {
+        build_clear_state_cookie_for_provider(
+            &self.cookie_name,
+            &self.cookie_path,
+            self.cookie_secure,
+            provider_id,
+        )
+    }
+
     pub fn build_clear_cookie_header(&self) -> Result<HeaderValue, AppError> {
         build_clear_state_cookie_header(&self.cookie_name, &self.cookie_path, self.cookie_secure)
+    }
+
+    pub fn build_clear_cookie_header_for_provider(
+        &self,
+        provider_id: &str,
+    ) -> Result<HeaderValue, AppError> {
+        build_clear_state_cookie_header_for_provider(
+            &self.cookie_name,
+            &self.cookie_path,
+            self.cookie_secure,
+            provider_id,
+        )
     }
 }
 
@@ -502,5 +587,40 @@ mod tests {
         let debug_str = format!("{mgr:?}");
         assert!(debug_str.contains("[REDACTED]"));
         assert!(!debug_str.contains("01234567890123456789012345678901"));
+    }
+
+    #[test]
+    fn test_apple_samesite_none_secure_handling() {
+        let cfg = crate::config::OAuthConfig {
+            state_secret: "01234567890123456789012345678901".to_string(),
+            ..Default::default()
+        };
+
+        // 1. Apple with HTTPS (secure = true): SameSite=None; Secure
+        let mgr_secure = OAuthStateManager::new(&cfg, true);
+        let (_, apple_cookie_secure) = mgr_secure
+            .create_state("apple", "verifier_apple", None)
+            .expect("create apple state");
+        assert!(apple_cookie_secure.contains("SameSite=None"));
+        assert!(apple_cookie_secure.contains("Secure"));
+
+        let apple_clear_secure = mgr_secure.build_clear_cookie_for_provider("apple");
+        assert!(apple_clear_secure.contains("SameSite=None"));
+        assert!(apple_clear_secure.contains("Secure"));
+
+        // 2. Apple with HTTP (secure = false): SameSite=Lax (browsers reject SameSite=None without Secure)
+        let mgr_insecure = OAuthStateManager::new(&cfg, false);
+        let (_, apple_cookie_insecure) = mgr_insecure
+            .create_state("apple", "verifier_apple", None)
+            .expect("create apple state");
+        assert!(apple_cookie_insecure.contains("SameSite=Lax"));
+        assert!(!apple_cookie_insecure.contains("Secure"));
+
+        // 3. GET providers (e.g. google, github) with secure = true: SameSite=Lax; Secure
+        let (_, google_cookie_secure) = mgr_secure
+            .create_state("google", "verifier_google", None)
+            .expect("create google state");
+        assert!(google_cookie_secure.contains("SameSite=Lax"));
+        assert!(google_cookie_secure.contains("Secure"));
     }
 }

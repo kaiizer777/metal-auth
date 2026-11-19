@@ -1142,12 +1142,12 @@ async fn link_callback_race_with_revoke_stays_legal() {
             .expect("revoke executes")
     });
 
-    let (callback_res, revoker_res) = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        async { (callback.await, revoker.await) },
-    )
-    .await
-    .expect("callback and revocation must complete, not deadlock");
+    let (callback_res, revoker_res) =
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            (callback.await, revoker.await)
+        })
+        .await
+        .expect("callback and revocation must complete, not deadlock");
     let outcome = callback_res.expect("callback task");
     revoker_res.expect("revoker task");
 

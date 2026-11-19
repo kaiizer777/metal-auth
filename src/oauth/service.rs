@@ -406,11 +406,7 @@ impl OAuthService {
                 Ok(LinkWrite::UniqueRace) => {
                     let _ = tx.rollback().await;
                     let account = self
-                        .resolve_link_race(
-                            link_user_id,
-                            provider_id,
-                            &user_info.provider_user_id,
-                        )
+                        .resolve_link_race(link_user_id, provider_id, &user_info.provider_user_id)
                         .await?;
                     return Ok(OAuthCallbackOutcome::Linked {
                         user,

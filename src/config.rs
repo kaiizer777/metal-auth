@@ -523,13 +523,9 @@ impl Config {
             "OAUTH_STATE_COOKIE_PATH",
             DEFAULT_OAUTH_STATE_COOKIE_PATH,
         )?;
-        let oauth_state_ttl_secs = lookup_env_or_default(
-            &lookup,
-            "OAUTH_STATE_TTL_SECS",
-            "600",
-        )?
-        .parse::<u64>()
-        .map_err(|_| ConfigError::InvalidEnvVar("OAUTH_STATE_TTL_SECS"))?;
+        let oauth_state_ttl_secs = lookup_env_or_default(&lookup, "OAUTH_STATE_TTL_SECS", "600")?
+            .parse::<u64>()
+            .map_err(|_| ConfigError::InvalidEnvVar("OAUTH_STATE_TTL_SECS"))?;
         let oauth_callback_base_url =
             lookup_env_or_default(&lookup, "OAUTH_CALLBACK_BASE_URL", "")?;
 
@@ -571,8 +567,7 @@ impl Config {
             let (team_id, key_id, private_key) = if *name == "apple" {
                 let team_id = lookup_env_or_default(&lookup, "OAUTH_APPLE_TEAM_ID", "")?;
                 let key_id = lookup_env_or_default(&lookup, "OAUTH_APPLE_KEY_ID", "")?;
-                let private_key =
-                    lookup_env_or_default(&lookup, "OAUTH_APPLE_PRIVATE_KEY", "")?;
+                let private_key = lookup_env_or_default(&lookup, "OAUTH_APPLE_PRIVATE_KEY", "")?;
                 (
                     (!team_id.is_empty()).then_some(team_id),
                     (!key_id.is_empty()).then_some(key_id),
@@ -655,7 +650,11 @@ pub(crate) fn default_allowed_headers() -> Vec<String> {
     ]
 }
 
-fn lookup_env_or_default<F>(lookup: &F, key: &'static str, default: &str) -> Result<String, ConfigError>
+fn lookup_env_or_default<F>(
+    lookup: &F,
+    key: &'static str,
+    default: &str,
+) -> Result<String, ConfigError>
 where
     F: Fn(&str) -> Result<String, std::env::VarError>,
 {
@@ -3001,7 +3000,13 @@ mod tests {
                 state_secret: "01234567890123456789012345678901".into(),
                 providers: [(
                     "google".to_string(),
-                    ProviderConfig::new("google-id", "", "https://app.example.com/cb", vec![], true),
+                    ProviderConfig::new(
+                        "google-id",
+                        "",
+                        "https://app.example.com/cb",
+                        vec![],
+                        true,
+                    ),
                 )]
                 .into_iter()
                 .collect(),

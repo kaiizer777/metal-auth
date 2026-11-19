@@ -645,7 +645,13 @@ mod tests {
         let (token, set_cookie) = mgr
             .create_state("google", "verifier", None)
             .expect("create");
-        let cookie_val = set_cookie.split(';').next().unwrap().split_once('=').unwrap().1;
+        let cookie_val = set_cookie
+            .split(';')
+            .next()
+            .unwrap()
+            .split_once('=')
+            .unwrap()
+            .1;
 
         // bare cookie value with no `=` is not a Cookie header → reject
         assert!(matches!(
@@ -654,7 +660,9 @@ mod tests {
         ));
 
         // jar carrying other cookies but not ours → reject
-        let (token2, _) = mgr.create_state("google", "verifier", None).expect("create");
+        let (token2, _) = mgr
+            .create_state("google", "verifier", None)
+            .expect("create");
         assert!(matches!(
             mgr.validate("unrelated=1; other=2", &token2, "google"),
             Err(AppError::OAuthStateInvalid)

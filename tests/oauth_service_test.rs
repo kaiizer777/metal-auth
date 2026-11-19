@@ -963,6 +963,220 @@ async fn link_callback_revoked_session_rejected_before_commit() {
     assert_eq!(link_count.0, 0, "no link row may be committed");
 }
 
+// Revoke-before-link ordering: the revocation commits while the callback is
+// in flight, before its session check executes. The link must be rejected.
+#[tokio::test]
+async fn link_callback_rejects_when_revoke_commits_before_link_check() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    truncate_tables(&app.pool).await.expect("truncate");
+
+    let email = dynamic_email();
+    let user_id = Uuid::new_v4();
+
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(user_id)
+    .bind(&email)
+    .bind("argon2id$somehash")
+    .bind(true)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+
+    let google_mock = Arc::new(MockOAuthProvider::new(
+        "google",
+        UserInfo {
+            provider_id: "google".to_string(),
+            provider_user_id: format!("goog-revoke-race-{}", Uuid::new_v4()),
+            email: email.clone(),
+            email_verified: true,
+            name: None,
+            avatar_url: None,
+        },
+    ));
+
+    let svc = create_test_oauth_service(&app, google_mock, None);
+
+    let session_svc = SessionService::new(app.pool.clone(), Arc::new(app.state.config.clone()));
+    let (session, _raw) = session_svc
+        .create_session(user_id, "cookie", None, None)
+        .await
+        .unwrap();
+    let (auth_url, set_cookie) = svc
+        .initiate_link_flow(
+            "google",
+            user_id,
+            Some("/settings".to_string()),
+            Some(session.token_hash.clone()),
+        )
+        .expect("initiate link flow");
+    let state_token = extract_state_from_url(&auth_url).to_string();
+
+    // Stage the revocation in an open transaction: deleted but uncommitted.
+    let mut holder = app.pool.begin().await.expect("revoke txn");
+    sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
+        .bind(&session.token_hash)
+        .execute(&mut *holder)
+        .await
+        .expect("stage session delete");
+
+    // Callback runs concurrently with the in-flight revocation.
+    let callback = tokio::spawn(async move {
+        svc.handle_callback_extended(
+            "google",
+            "valid_code",
+            &state_token,
+            Some(&set_cookie),
+            "cookie",
+            None,
+            None,
+        )
+        .await
+    });
+
+    // Let the callback reach its session check, then commit the revocation
+    // before that check executes.
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    holder.commit().await.expect("commit revocation");
+
+    let err = callback
+        .await
+        .expect("callback task")
+        .expect_err("in-flight revoke must fail");
+    assert!(
+        matches!(err, AppError::OAuthStateInvalid),
+        "expected OAuthStateInvalid for revoked initiating session, got {err:?}"
+    );
+
+    let link_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM oauth_accounts")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(link_count.0, 0, "no link row may be committed");
+}
+
+// Link-before-revoke ordering: the callback and the revocation race from a
+// barrier. Exactly one serialization is legal, and the callback outcome must
+// match the committed link row (no Err after a committed write).
+#[tokio::test]
+async fn link_callback_race_with_revoke_stays_legal() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    truncate_tables(&app.pool).await.expect("truncate");
+
+    let email = dynamic_email();
+    let user_id = Uuid::new_v4();
+
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(user_id)
+    .bind(&email)
+    .bind("argon2id$somehash")
+    .bind(true)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+
+    let provider_sub = format!("goog-link-revoke-race-{}", Uuid::new_v4());
+    let google_mock = Arc::new(MockOAuthProvider::new(
+        "google",
+        UserInfo {
+            provider_id: "google".to_string(),
+            provider_user_id: provider_sub.clone(),
+            email: email.clone(),
+            email_verified: true,
+            name: None,
+            avatar_url: None,
+        },
+    ));
+
+    let svc = create_test_oauth_service(&app, google_mock, None);
+
+    let session_svc = SessionService::new(app.pool.clone(), Arc::new(app.state.config.clone()));
+    let (session, _raw) = session_svc
+        .create_session(user_id, "cookie", None, None)
+        .await
+        .unwrap();
+    let (auth_url, set_cookie) = svc
+        .initiate_link_flow(
+            "google",
+            user_id,
+            Some("/settings".to_string()),
+            Some(session.token_hash.clone()),
+        )
+        .expect("initiate link flow");
+    let state_token = extract_state_from_url(&auth_url).to_string();
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let callback_barrier = Arc::clone(&barrier);
+    let callback = tokio::spawn(async move {
+        callback_barrier.wait().await;
+        svc.handle_callback_extended(
+            "google",
+            "valid_code",
+            &state_token,
+            Some(&set_cookie),
+            "cookie",
+            None,
+            None,
+        )
+        .await
+    });
+
+    let pool = app.pool.clone();
+    let token_hash = session.token_hash.clone();
+    let revoker_barrier = Arc::clone(&barrier);
+    let revoker = tokio::spawn(async move {
+        revoker_barrier.wait().await;
+        sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
+            .bind(&token_hash)
+            .execute(&pool)
+            .await
+            .expect("revoke executes")
+    });
+
+    let (callback_res, revoker_res) = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        async { (callback.await, revoker.await) },
+    )
+    .await
+    .expect("callback and revocation must complete, not deadlock");
+    let outcome = callback_res.expect("callback task");
+    revoker_res.expect("revoker task");
+
+    let link_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM oauth_accounts WHERE provider_user_id = $1")
+            .bind(&provider_sub)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    let session_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM sessions WHERE token_hash = $1")
+            .bind(&session.token_hash)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    // The revocation always commits, so the session row is always gone.
+    assert_eq!(session_count.0, 0);
+    match outcome {
+        Ok(OAuthCallbackOutcome::Linked { .. }) => {
+            assert_eq!(link_count.0, 1, "committed link must have its row");
+        }
+        Ok(OAuthCallbackOutcome::Login(_)) => panic!("link intent must not log in"),
+        Err(AppError::OAuthStateInvalid) => {
+            assert_eq!(link_count.0, 0, "rejected link must leave no row");
+        }
+        Err(e) => panic!("unexpected callback error under revoke race: {e:?}"),
+    }
+}
+
 #[tokio::test]
 async fn test_unlink_disabled_provider_lockout_prevention() {
     let _guard = DB_LOCK.lock().await;

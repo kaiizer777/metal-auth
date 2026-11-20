@@ -730,7 +730,18 @@ impl OAuthService {
                 is_created: false,
             }),
             Err(e) if is_unique_violation(&e) => {
-                self.relink_winner(provider_id, provider_user_id).await
+                let winner = self.relink_winner(provider_id, provider_user_id).await?;
+                if winner.user.id != user.id {
+                    tracing::warn!(
+                        event = "oauth_login_identity_adopted",
+                        provider = provider_id,
+                        provider_user_id = provider_user_id,
+                        resolved_user_id = %user.id,
+                        winner_user_id = %winner.user.id,
+                        "login adopted an identity already owned by another account"
+                    );
+                }
+                Ok(winner)
             }
             Err(e) => Err(AppError::Database(e)),
         }

@@ -75,8 +75,8 @@ pub use totp::backup::{
 };
 pub use totp::crypto::{
     TOTP_DIGITS, TOTP_STEP_SECS, build_otpauth_uri, compute_code_replay_hash, current_totp_counter,
-    decrypt_secret, encrypt_secret, generate_totp, generate_totp_secret, parse_encryption_key,
-    verify_totp_code, verify_totp_code_at,
+    decrypt_secret, encrypt_secret, generate_totp, generate_totp_secret, verify_totp_code,
+    verify_totp_code_at,
 };
 
 #[cfg(any(test, feature = "test-utils"))]

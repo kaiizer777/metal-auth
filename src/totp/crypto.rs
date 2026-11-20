@@ -13,7 +13,10 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{config::TOTP_ENCRYPTION_KEY_BYTES, error::AppError};
+use crate::error::AppError;
+
+/// AES-256-GCM key length in bytes.
+pub const AES_KEY_BYTES: usize = 32;
 
 /// AES-GCM nonce length in bytes (96-bit nonce, per NIST SP 800-38D §8.2).
 const NONCE_LEN: usize = 12;
@@ -35,25 +38,10 @@ const TOTP_ALPHABET: base32::Alphabet = base32::Alphabet::RFC4648 { padding: fal
 
 type HmacSha1 = Hmac<Sha1>;
 
-/// Parse a 64-character hex string into a raw AES-256-GCM key.
-pub fn parse_encryption_key(hex_key: &str) -> Result<[u8; TOTP_ENCRYPTION_KEY_BYTES], AppError> {
-    if hex_key.len() != TOTP_ENCRYPTION_KEY_BYTES * 2
-        || !hex_key.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(AppError::Internal);
-    }
-    let mut key = [0u8; TOTP_ENCRYPTION_KEY_BYTES];
-    hex::decode_to_slice(hex_key, &mut key).map_err(|_| AppError::Internal)?;
-    Ok(key)
-}
-
 /// Encrypt `plaintext` with AES-256-GCM under a fresh CSPRNG nonce.
 ///
 /// Output layout: `nonce (12 bytes) || ciphertext || tag (16 bytes)`.
-pub fn encrypt_secret(
-    key: &[u8; TOTP_ENCRYPTION_KEY_BYTES],
-    plaintext: &[u8],
-) -> Result<Vec<u8>, AppError> {
+pub fn encrypt_secret(key: &[u8; AES_KEY_BYTES], plaintext: &[u8]) -> Result<Vec<u8>, AppError> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let mut nonce_bytes = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce_bytes);
@@ -74,10 +62,7 @@ pub fn encrypt_secret(
 ///
 /// Fails on truncation, tampering, and wrong keys alike: distinguishing them would
 /// tell an attacker whether a guessed key was close, so all map to an internal error.
-pub fn decrypt_secret(
-    key: &[u8; TOTP_ENCRYPTION_KEY_BYTES],
-    blob: &[u8],
-) -> Result<Vec<u8>, AppError> {
+pub fn decrypt_secret(key: &[u8; AES_KEY_BYTES], blob: &[u8]) -> Result<Vec<u8>, AppError> {
     if blob.len() < MIN_BLOB_LEN {
         return Err(AppError::Internal);
     }
@@ -206,7 +191,7 @@ fn percent_encode(value: &str) -> String {
 mod tests {
     use super::*;
 
-    fn test_key() -> [u8; TOTP_ENCRYPTION_KEY_BYTES] {
+    fn test_key() -> [u8; AES_KEY_BYTES] {
         *b"0123456789abcdef0123456789abcdef"
     }
 
@@ -272,31 +257,6 @@ mod tests {
                 decrypt_secret(&test_key(), &vec![0u8; len]),
                 Err(AppError::Internal)
             ));
-        }
-    }
-
-    #[test]
-    fn parse_encryption_key_accepts_64_hex_chars() {
-        let key = parse_encryption_key(
-            "00112233445566778899AABBCCDDEEFF00112233445566778899aabbccddeeff",
-        )
-        .expect("valid key");
-        assert_eq!(key.len(), TOTP_ENCRYPTION_KEY_BYTES);
-        assert_eq!(key[0], 0x00);
-        assert_eq!(key[1], 0x11);
-        assert_eq!(key[31], 0xff);
-    }
-
-    #[test]
-    fn parse_encryption_key_rejects_bad_shape() {
-        for raw in [
-            "",
-            &"00".repeat(31),
-            &"00".repeat(33),
-            &"zz".repeat(32),
-            &" 0".repeat(32),
-        ] {
-            assert!(parse_encryption_key(raw).is_err(), "accepted {raw:?}");
         }
     }
 

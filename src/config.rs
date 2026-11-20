@@ -1530,7 +1530,10 @@ impl TotpConfig {
     /// Decode the configured key into raw AES-256-GCM key bytes.
     ///
     /// Fails fast: callers build their crypto layer with this and must not proceed without it.
+    /// This is the only place the 64-hex rule lives; [`Self::validate`] reuses it.
     pub fn encryption_key_bytes(&self) -> Result<[u8; TOTP_ENCRYPTION_KEY_BYTES], ConfigError> {
+        const HEX_LEN: usize = TOTP_ENCRYPTION_KEY_BYTES * 2;
+
         let raw = self
             .encryption_key
             .as_deref()
@@ -1538,10 +1541,18 @@ impl TotpConfig {
                 field: "totp.encryption_key",
                 reason: "must be set to enable totp",
             })?;
-        crate::totp::crypto::parse_encryption_key(raw).map_err(|_| ConfigError::InvalidValue {
+        if raw.len() != HEX_LEN || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ConfigError::InvalidValue {
+                field: "totp.encryption_key",
+                reason: "must be exactly 64 hexadecimal characters",
+            });
+        }
+        let mut key = [0u8; TOTP_ENCRYPTION_KEY_BYTES];
+        hex::decode_to_slice(raw, &mut key).map_err(|_| ConfigError::InvalidValue {
             field: "totp.encryption_key",
             reason: "must be exactly 64 hexadecimal characters",
-        })
+        })?;
+        Ok(key)
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -3472,22 +3483,40 @@ mod tests {
         assert_eq!(key[0], 0x00);
         assert_eq!(key[1], 0x11);
         assert_eq!(key[31], 0xff);
+
+        let uppercase = TotpConfig {
+            encryption_key: Some(totp_key_hex().to_uppercase()),
+            ..TotpConfig::default()
+        };
+        assert_eq!(
+            uppercase.encryption_key_bytes().expect("uppercase hex"),
+            key
+        );
     }
 
     #[test]
     fn totp_encryption_key_bytes_rejects_bad_length_and_non_hex() {
-        for raw in ["00".repeat(31), "00".repeat(33), "zz".repeat(32)] {
+        for raw in [
+            String::new(),
+            "00".repeat(31),
+            "00".repeat(33),
+            "zz".repeat(32),
+            format!(" {}0", "0".repeat(62)),
+        ] {
             let cfg = TotpConfig {
-                encryption_key: Some(raw),
+                encryption_key: Some(raw.clone()),
                 ..TotpConfig::default()
             };
-            assert!(matches!(
-                cfg.encryption_key_bytes(),
-                Err(ConfigError::InvalidValue {
-                    field: "totp.encryption_key",
-                    ..
-                })
-            ));
+            assert!(
+                matches!(
+                    cfg.encryption_key_bytes(),
+                    Err(ConfigError::InvalidValue {
+                        field: "totp.encryption_key",
+                        ..
+                    })
+                ),
+                "accepted {raw:?}"
+            );
         }
     }
 

@@ -831,7 +831,7 @@ async fn link_callback_succeeds_without_500_after_commit() {
 }
 
 #[tokio::test]
-async fn link_callback_missing_user_fails_before_commit() {
+async fn link_callback_for_unknown_initiator_rejects_before_commit() {
     let _guard = DB_LOCK.lock().await;
     let Some(app) = setup_test_app().await else {
         return;
@@ -854,12 +854,13 @@ async fn link_callback_missing_user_fails_before_commit() {
     let svc = create_test_oauth_service(&app, google_mock, None);
 
     let (auth_url, set_cookie) = svc
-        // missing user owns no session; the pre-commit session gate rejects first
+        // The intent carries no session hash, so the pre-commit session gate
+        // rejects before the missing-initiator lookup would run.
         .initiate_link_flow("google", missing_user_id, Some("/settings".to_string()), None)
         .expect("initiate link flow");
     let state_token = extract_state_from_url(&auth_url);
 
-    // A vanished initiator is an invalid state, never a server fault.
+    // An absent initiator is an invalid state, never a server fault.
     let err = svc
         .handle_callback_extended(
             "google",
@@ -1413,6 +1414,9 @@ async fn link_count_for_identity(app: &TestApp, provider_user_id: &str) -> i64 {
 /// by design: the gate must fail on a missed race, never on a slow executor.
 const BLOCK_EVIDENCE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// `pg_stat_activity` row: pid, state, wait event type, wait event, query head.
+type BackendRow = (i32, Option<String>, Option<String>, Option<String>, String);
+
 /// Backend pid of a holding transaction, usable as a stable blocker id: the
 /// worker runs on a pooled connection whose pid the test cannot know up front.
 async fn holder_backend_pid(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> i32 {
@@ -1453,9 +1457,12 @@ async fn wait_until_blocked_by(
             return;
         }
         if Instant::now() > deadline {
-            let active: Vec<(i32, Option<String>, Option<String>, String)> = sqlx::query_as(
-                "SELECT pid, wait_event_type, wait_event, left(query, 120) FROM pg_stat_activity \
-                 WHERE datname = current_database() AND state <> 'idle'",
+            let backends: Vec<BackendRow> = sqlx::query_as(
+                // No `state` filter: the holder is idle with an open transaction and
+                // a finished worker is idle too, so filtering hides exactly the
+                // backends that explain the miss.
+                "SELECT pid, state, wait_event_type, wait_event, left(query, 120) \
+                 FROM pg_stat_activity WHERE datname = current_database() ORDER BY pid",
             )
             .fetch_all(pool)
             .await
@@ -1463,7 +1470,7 @@ async fn wait_until_blocked_by(
             panic!(
                 "{branch}: no backend was blocked by pg_backend_pid {blocker_pid} while running \
                  `{statement_prefix}...`, so the race branch was never entered; \
-                 active backends: {active:?}"
+                 holder pid {blocker_pid}; backends: {backends:?}"
             );
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1773,7 +1780,9 @@ async fn link_callback_rival_identity_race_conflicts() {
     });
 
     // The pre-insert read cannot see the uncommitted rival, so the conflict has
-    // to come from the unique violation and its post-rollback resolution.
+    // to come from the unique violation and its post-rollback resolution. The
+    // lock gate below is the sole discriminator: a worker arriving after the
+    // commit takes the pre-insert conflict path and proves nothing about the race.
     wait_until_blocked_by(
         &app.pool,
         blocker_pid,

@@ -10,6 +10,7 @@ use crate::{
     oauth::OAuthService,
     ratelimit::RateLimiter,
     session::SessionService,
+    totp::service::TotpService,
 };
 
 /// Constructs an [`EmailDispatcher`] from application config and optional email sender.
@@ -39,6 +40,7 @@ pub struct AppState {
     pub session_service: Arc<SessionService>,
     pub rate_limiter: Arc<RateLimiter>,
     pub oauth_service: Arc<OAuthService>,
+    pub totp_service: Arc<TotpService>,
 }
 
 impl AppState {
@@ -102,6 +104,11 @@ impl AppState {
         )?);
 
         let shared_config = Arc::new(config.clone());
+        let totp_service = Arc::new(TotpService::new(
+            pool.clone(),
+            Arc::clone(&shared_config),
+            Arc::clone(&auth_config),
+        ));
         let session_service = Arc::new(SessionService::new(
             pool.clone(),
             Arc::clone(&shared_config),
@@ -135,6 +142,7 @@ impl AppState {
             session_service,
             rate_limiter,
             oauth_service,
+            totp_service,
         })
     }
 

@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::{
     config::{AppConfig, Config},
+    crypto::verify_password,
     error::AppError,
     totp::{
         backup,
@@ -255,6 +256,69 @@ impl TotpService {
             event = "totp_backup_code_verified",
             user_id = %user_id,
             outcome = "accepted",
+        );
+        Ok(())
+    }
+
+    /// Disable 2FA after a fresh password or live TOTP proof.
+    ///
+    /// Deletes the secret (and its backup codes) plus the user's replay log. Any live
+    /// challenge token therefore has no secret left to satisfy.
+    pub async fn disable_totp(
+        &self,
+        user_id: Uuid,
+        fresh_auth: FreshAuthProof,
+        ip: &str,
+    ) -> Result<(), AppError> {
+        match fresh_auth {
+            FreshAuthProof::Password(password) => {
+                let password_hash: String = sqlx::query_scalar::<_, String>(
+                    "SELECT password_hash FROM users WHERE id = $1",
+                )
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(AppError::Database)?
+                .ok_or(AppError::InvalidCredentials)?;
+
+                // Argon2id is CPU-bound; never run it on the executor thread.
+                let verified =
+                    tokio::task::spawn_blocking(move || verify_password(&password, &password_hash))
+                        .await
+                        .map_err(|err| {
+                            tracing::error!(error = %err, "password verification task failed");
+                            AppError::Internal
+                        })??;
+                if !verified {
+                    return Err(AppError::InvalidCredentials);
+                }
+            }
+            FreshAuthProof::TotpCode(code) => self.verify_totp(user_id, &code, ip).await?,
+        }
+
+        let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
+        let secret_delete = sqlx::query("DELETE FROM totp_secrets WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await;
+        if let Err(error) = secret_delete {
+            let _ = transaction.rollback().await;
+            return Err(AppError::Database(error));
+        }
+        let replay_delete = sqlx::query("DELETE FROM totp_used_codes WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await;
+        if let Err(error) = replay_delete {
+            let _ = transaction.rollback().await;
+            return Err(AppError::Database(error));
+        }
+        transaction.commit().await.map_err(AppError::Database)?;
+
+        tracing::debug!(
+            event = "totp_secret_deleted",
+            user_id = %user_id,
+            outcome = "disabled",
         );
         Ok(())
     }

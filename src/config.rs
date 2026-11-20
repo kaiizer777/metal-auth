@@ -1479,9 +1479,8 @@ pub const DEFAULT_TOTP_RATE_LIMIT_WINDOW_SECS: u64 = 600;
 pub const DEFAULT_TOTP_CHALLENGE_TOKEN_TTL_SECS: u64 = 900;
 pub const DEFAULT_TOTP_USED_CODE_PRUNE_AGE_SECS: u64 = 120;
 
-/// AES-256-GCM key size in bytes (and hex characters × 2).
+/// AES-256-GCM key size in bytes.
 pub const TOTP_ENCRYPTION_KEY_BYTES: usize = 32;
-const TOTP_ENCRYPTION_KEY_HEX_LEN: usize = TOTP_ENCRYPTION_KEY_BYTES * 2;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct TotpConfig {
@@ -1546,14 +1545,8 @@ impl TotpConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if let Some(raw) = &self.encryption_key
-            && (raw.len() != TOTP_ENCRYPTION_KEY_HEX_LEN
-                || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        {
-            return Err(ConfigError::InvalidValue {
-                field: "totp.encryption_key",
-                reason: "must be exactly 64 hexadecimal characters",
-            });
+        if self.encryption_key.is_some() {
+            self.encryption_key_bytes()?;
         }
         if self.issuer.trim().is_empty() {
             return Err(ConfigError::InvalidValue {

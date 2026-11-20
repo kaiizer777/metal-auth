@@ -392,6 +392,7 @@ pub async fn setup_test_app_with_auth_config(auth_config: Arc<AppConfig>) -> Opt
         session: metal_auth::SessionConfig::default(),
         rate_limit: metal_auth::RateLimitConfig::default(),
         oauth: metal_auth::OAuthConfig::default(),
+        totp: metal_auth::TotpConfig::default(),
     };
 
     let state = AppState::with_dispatcher(pool.clone(), cfg, auth_config, dispatcher)

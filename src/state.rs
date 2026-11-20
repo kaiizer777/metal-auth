@@ -184,6 +184,7 @@ mod tests {
             session: crate::config::SessionConfig::default(),
             rate_limit: crate::config::RateLimitConfig::default(),
             oauth: crate::config::OAuthConfig::default(),
+            totp: crate::config::TotpConfig::default(),
         }
     }
 

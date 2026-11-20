@@ -54,6 +54,9 @@ pub struct Config {
 
     // Phase 6: OAuth
     pub oauth: OAuthConfig,
+
+    // Phase 7: TOTP two-factor authentication
+    pub totp: TotpConfig,
 }
 
 impl std::fmt::Debug for Config {
@@ -78,6 +81,7 @@ impl std::fmt::Debug for Config {
             .field("session", &self.session)
             .field("rate_limit", &self.rate_limit)
             .field("oauth", &self.oauth)
+            .field("totp", &self.totp)
             .finish()
     }
 }
@@ -200,6 +204,7 @@ impl Config {
         self.session.validate()?;
         self.rate_limit.validate()?;
         self.oauth.validate()?;
+        self.totp.validate()?;
         // The callback clears the state cookie after setting the session cookie;
         // a shared name deletes the fresh session.
         if self.oauth.state_cookie_name == self.session.cookie_name {
@@ -610,6 +615,46 @@ impl Config {
             callback_base_url: oauth_callback_base_url,
         };
 
+        let totp_encryption_key = match lookup("TOTP_ENCRYPTION_KEY") {
+            Ok(val) => {
+                let trimmed = val.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            }
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar("TOTP_ENCRYPTION_KEY"));
+            }
+        };
+        let totp = TotpConfig {
+            encryption_key: totp_encryption_key,
+            issuer: lookup_env_or_default(&lookup, "TOTP_ISSUER", DEFAULT_TOTP_ISSUER)?,
+            rate_limit_ip_max_attempts: parse_env_from_str(
+                &lookup,
+                "TOTP_RATE_LIMIT_IP_MAX_ATTEMPTS",
+                DEFAULT_TOTP_RATE_LIMIT_IP_MAX_ATTEMPTS,
+            )?,
+            rate_limit_user_max_attempts: parse_env_from_str(
+                &lookup,
+                "TOTP_RATE_LIMIT_USER_MAX_ATTEMPTS",
+                DEFAULT_TOTP_RATE_LIMIT_USER_MAX_ATTEMPTS,
+            )?,
+            rate_limit_window_secs: parse_env_from_str(
+                &lookup,
+                "TOTP_RATE_LIMIT_WINDOW_SECS",
+                DEFAULT_TOTP_RATE_LIMIT_WINDOW_SECS,
+            )?,
+            challenge_token_ttl_secs: parse_env_from_str(
+                &lookup,
+                "TOTP_CHALLENGE_TOKEN_TTL_SECS",
+                DEFAULT_TOTP_CHALLENGE_TOKEN_TTL_SECS,
+            )?,
+            used_code_prune_age_secs: parse_env_from_str(
+                &lookup,
+                "TOTP_USED_CODE_PRUNE_AGE_SECS",
+                DEFAULT_TOTP_USED_CODE_PRUNE_AGE_SECS,
+            )?,
+        };
+
         let cfg = Self {
             database_url,
             port,
@@ -633,6 +678,7 @@ impl Config {
             session,
             rate_limit,
             oauth,
+            totp,
         };
 
         cfg.validate()?;
@@ -1424,6 +1470,157 @@ fn validate_provider_credentials(name: &str, provider: &ProviderConfig) -> Resul
     Ok(())
 }
 
+// ─── Phase 7 — TOTP Config ───────────────────────────────────────────────────
+
+pub const DEFAULT_TOTP_ISSUER: &str = "metal-auth";
+pub const DEFAULT_TOTP_RATE_LIMIT_IP_MAX_ATTEMPTS: u32 = 10;
+pub const DEFAULT_TOTP_RATE_LIMIT_USER_MAX_ATTEMPTS: u32 = 5;
+pub const DEFAULT_TOTP_RATE_LIMIT_WINDOW_SECS: u64 = 600;
+pub const DEFAULT_TOTP_CHALLENGE_TOKEN_TTL_SECS: u64 = 900;
+pub const DEFAULT_TOTP_USED_CODE_PRUNE_AGE_SECS: u64 = 120;
+
+/// AES-256-GCM key size in bytes (and hex characters × 2).
+pub const TOTP_ENCRYPTION_KEY_BYTES: usize = 32;
+const TOTP_ENCRYPTION_KEY_HEX_LEN: usize = TOTP_ENCRYPTION_KEY_BYTES * 2;
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct TotpConfig {
+    /// 64-character hex AES-256 key for encrypting TOTP secrets at rest.
+    ///
+    /// `None` means no key was configured; TOTP operations fail fast when they ask for the
+    /// key bytes. Kept optional so a deployment without 2FA still boots.
+    pub encryption_key: Option<String>,
+    /// Issuer label shown in authenticator apps.
+    pub issuer: String,
+    /// Max attempts per window on the `totp:ip:<ip>` dimension.
+    pub rate_limit_ip_max_attempts: u32,
+    /// Max attempts per window on the `totp:user:<user_id>` dimension.
+    pub rate_limit_user_max_attempts: u32,
+    /// Rate limit window in seconds.
+    pub rate_limit_window_secs: u64,
+    /// TTL for intermediate two-factor challenge tokens.
+    pub challenge_token_ttl_secs: u64,
+    /// Minimum age before `totp_used_codes` rows may be pruned.
+    pub used_code_prune_age_secs: u64,
+}
+
+impl std::fmt::Debug for TotpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TotpConfig")
+            .field(
+                "encryption_key",
+                &self.encryption_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("issuer", &self.issuer)
+            .field(
+                "rate_limit_ip_max_attempts",
+                &self.rate_limit_ip_max_attempts,
+            )
+            .field(
+                "rate_limit_user_max_attempts",
+                &self.rate_limit_user_max_attempts,
+            )
+            .field("rate_limit_window_secs", &self.rate_limit_window_secs)
+            .field("challenge_token_ttl_secs", &self.challenge_token_ttl_secs)
+            .field("used_code_prune_age_secs", &self.used_code_prune_age_secs)
+            .finish()
+    }
+}
+
+impl TotpConfig {
+    /// Decode the configured key into raw AES-256-GCM key bytes.
+    ///
+    /// Fails fast: callers build their crypto layer with this and must not proceed without it.
+    pub fn encryption_key_bytes(&self) -> Result<[u8; TOTP_ENCRYPTION_KEY_BYTES], ConfigError> {
+        let raw = self
+            .encryption_key
+            .as_deref()
+            .ok_or(ConfigError::InvalidValue {
+                field: "totp.encryption_key",
+                reason: "must be set to enable totp",
+            })?;
+        if raw.len() != TOTP_ENCRYPTION_KEY_HEX_LEN
+            || !raw.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "totp.encryption_key",
+                reason: "must be exactly 64 hexadecimal characters",
+            });
+        }
+        let mut key = [0u8; TOTP_ENCRYPTION_KEY_BYTES];
+        hex::decode_to_slice(raw, &mut key).map_err(|_| ConfigError::InvalidValue {
+            field: "totp.encryption_key",
+            reason: "must be exactly 64 hexadecimal characters",
+        })?;
+        Ok(key)
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(raw) = &self.encryption_key {
+            if raw.len() != TOTP_ENCRYPTION_KEY_HEX_LEN
+                || !raw.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(ConfigError::InvalidValue {
+                    field: "totp.encryption_key",
+                    reason: "must be exactly 64 hexadecimal characters",
+                });
+            }
+        }
+        if self.issuer.trim().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "totp.issuer",
+                reason: "must not be empty",
+            });
+        }
+        if self.rate_limit_ip_max_attempts < 3 {
+            return Err(ConfigError::InvalidValue {
+                field: "totp.rate_limit_ip_max_attempts",
+                reason: "must be at least 3",
+            });
+        }
+        if self.rate_limit_user_max_attempts < 3 {
+            return Err(ConfigError::InvalidValue {
+                field: "totp.rate_limit_user_max_attempts",
+                reason: "must be at least 3",
+            });
+        }
+        if self.rate_limit_window_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "totp.rate_limit_window_secs",
+                reason: "must be greater than 0",
+            });
+        }
+        if !(300..=1800).contains(&self.challenge_token_ttl_secs) {
+            return Err(ConfigError::InvalidValue {
+                field: "totp.challenge_token_ttl_secs",
+                reason: "must be between 300 and 1800 seconds",
+            });
+        }
+        // Pruning sooner than two TOTP steps would erase live replay records.
+        if self.used_code_prune_age_secs < 60 {
+            return Err(ConfigError::InvalidValue {
+                field: "totp.used_code_prune_age_secs",
+                reason: "must be at least 60 seconds",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Default for TotpConfig {
+    fn default() -> Self {
+        Self {
+            encryption_key: None,
+            issuer: DEFAULT_TOTP_ISSUER.to_string(),
+            rate_limit_ip_max_attempts: DEFAULT_TOTP_RATE_LIMIT_IP_MAX_ATTEMPTS,
+            rate_limit_user_max_attempts: DEFAULT_TOTP_RATE_LIMIT_USER_MAX_ATTEMPTS,
+            rate_limit_window_secs: DEFAULT_TOTP_RATE_LIMIT_WINDOW_SECS,
+            challenge_token_ttl_secs: DEFAULT_TOTP_CHALLENGE_TOKEN_TTL_SECS,
+            used_code_prune_age_secs: DEFAULT_TOTP_USED_CODE_PRUNE_AGE_SECS,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         let cfg = Self {
@@ -1452,6 +1649,7 @@ impl Default for Config {
             session: SessionConfig::default(),
             rate_limit: RateLimitConfig::default(),
             oauth: OAuthConfig::default(),
+            totp: TotpConfig::default(),
         };
         // Compiled-in defaults must stay deployable: fail fast in debug/test
         // if a future default edit stops validating.
@@ -1521,6 +1719,7 @@ mod tests {
             session: SessionConfig::default(),
             rate_limit: RateLimitConfig::default(),
             oauth: OAuthConfig::default(),
+            totp: TotpConfig::default(),
         }
     }
 
@@ -3215,5 +3414,214 @@ mod tests {
         apple_p8.key_id = Some("KEY1234567".into());
         apple_p8.private_key = Some("-----BEGIN PRIVATE KEY-----".into());
         assert!(check("apple", apple_p8).is_ok());
+    }
+
+    // ── Phase 7 — TOTP config tests ──────────────────────────────────────────
+
+    fn totp_key_hex() -> String {
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_string()
+    }
+
+    #[test]
+    fn totp_default_validates_and_redacts_key() {
+        let cfg = TotpConfig::default();
+        assert!(cfg.validate().is_ok());
+        assert!(Config::default().validate().is_ok());
+
+        let cfg = TotpConfig {
+            encryption_key: Some(totp_key_hex()),
+            ..TotpConfig::default()
+        };
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains(&totp_key_hex()));
+        assert!(rendered.contains("issuer: \"metal-auth\""));
+    }
+
+    #[test]
+    fn totp_validate_rejects_short_key() {
+        let cfg = TotpConfig {
+            encryption_key: Some("00".repeat(31)),
+            ..TotpConfig::default()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "totp.encryption_key",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn totp_validate_rejects_non_hex_key() {
+        let mut key = totp_key_hex();
+        key.replace_range(..2, "zz");
+        let cfg = TotpConfig {
+            encryption_key: Some(key),
+            ..TotpConfig::default()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "totp.encryption_key",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn totp_encryption_key_bytes_requires_key() {
+        assert!(matches!(
+            TotpConfig::default().encryption_key_bytes(),
+            Err(ConfigError::InvalidValue {
+                field: "totp.encryption_key",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn totp_encryption_key_bytes_decodes_hex() {
+        let cfg = TotpConfig {
+            encryption_key: Some(totp_key_hex()),
+            ..TotpConfig::default()
+        };
+        let key = cfg.encryption_key_bytes().expect("valid key");
+        assert_eq!(key[0], 0x00);
+        assert_eq!(key[1], 0x11);
+        assert_eq!(key[31], 0xff);
+    }
+
+    #[test]
+    fn totp_encryption_key_bytes_rejects_bad_length_and_non_hex() {
+        for raw in ["00".repeat(31), "00".repeat(33), "zz".repeat(32)] {
+            let cfg = TotpConfig {
+                encryption_key: Some(raw),
+                ..TotpConfig::default()
+            };
+            assert!(matches!(
+                cfg.encryption_key_bytes(),
+                Err(ConfigError::InvalidValue {
+                    field: "totp.encryption_key",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn totp_validate_rejects_empty_issuer() {
+        let cfg = TotpConfig {
+            issuer: "   ".into(),
+            ..TotpConfig::default()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "totp.issuer",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn totp_validate_bounds_challenge_ttl() {
+        let too_short = TotpConfig {
+            challenge_token_ttl_secs: 60,
+            ..TotpConfig::default()
+        };
+        assert!(too_short.validate().is_err());
+
+        let ok = TotpConfig {
+            challenge_token_ttl_secs: 900,
+            ..TotpConfig::default()
+        };
+        assert!(ok.validate().is_ok());
+
+        let too_long = TotpConfig {
+            challenge_token_ttl_secs: 1801,
+            ..TotpConfig::default()
+        };
+        assert!(too_long.validate().is_err());
+    }
+
+    #[test]
+    fn totp_validate_rejects_weak_rate_limits_and_prune_age() {
+        let low_ip = TotpConfig {
+            rate_limit_ip_max_attempts: 2,
+            ..TotpConfig::default()
+        };
+        assert!(low_ip.validate().is_err());
+
+        let low_user = TotpConfig {
+            rate_limit_user_max_attempts: 2,
+            ..TotpConfig::default()
+        };
+        assert!(low_user.validate().is_err());
+
+        let zero_window = TotpConfig {
+            rate_limit_window_secs: 0,
+            ..TotpConfig::default()
+        };
+        assert!(zero_window.validate().is_err());
+
+        let short_prune = TotpConfig {
+            used_code_prune_age_secs: 59,
+            ..TotpConfig::default()
+        };
+        assert!(short_prune.validate().is_err());
+    }
+
+    #[test]
+    fn totp_env_parsing_reads_key_and_defaults_the_rest() {
+        let key = totp_key_hex();
+        let lookup = move |name: &str| match name {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "TOTP_ENCRYPTION_KEY" => Ok(key.clone()),
+            "TOTP_ISSUER" => Ok("Acme".into()),
+            "TOTP_CHALLENGE_TOKEN_TTL_SECS" => Ok("600".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        let cfg = Config::from_lookup(lookup).expect("valid config");
+        assert_eq!(
+            cfg.totp.encryption_key.as_deref(),
+            Some(totp_key_hex().as_str())
+        );
+        assert_eq!(cfg.totp.issuer, "Acme");
+        assert_eq!(cfg.totp.challenge_token_ttl_secs, 600);
+        assert_eq!(
+            cfg.totp.rate_limit_ip_max_attempts,
+            DEFAULT_TOTP_RATE_LIMIT_IP_MAX_ATTEMPTS
+        );
+    }
+
+    #[test]
+    fn totp_env_empty_key_is_treated_as_absent() {
+        let lookup = |name: &str| match name {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "TOTP_ENCRYPTION_KEY" => Ok("   ".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        let cfg = Config::from_lookup(lookup).expect("valid config");
+        assert!(cfg.totp.encryption_key.is_none());
+    }
+
+    #[test]
+    fn totp_env_rejects_invalid_key_shape() {
+        let lookup = |name: &str| match name {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "TOTP_ENCRYPTION_KEY" => Ok("not-hex".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        assert!(matches!(
+            Config::from_lookup(lookup),
+            Err(ConfigError::InvalidValue {
+                field: "totp.encryption_key",
+                ..
+            })
+        ));
     }
 }

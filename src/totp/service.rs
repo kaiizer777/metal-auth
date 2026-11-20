@@ -192,6 +192,73 @@ impl TotpService {
         Ok(())
     }
 
+    /// Verify a single-use backup code and remove exactly that hash.
+    ///
+    /// The removal is one atomic statement keyed on the matched hash, so two concurrent
+    /// submissions cannot both consume a code or delete a neighbouring one.
+    pub async fn verify_backup_code(
+        &self,
+        user_id: Uuid,
+        code: &str,
+        _ip: &str,
+    ) -> Result<(), AppError> {
+        let record =
+            sqlx::query("SELECT backup_codes, enabled FROM totp_secrets WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(AppError::Database)?
+                .ok_or(AppError::TotpNotEnrolled)?;
+        if !record
+            .try_get::<bool, _>("enabled")
+            .map_err(AppError::Database)?
+        {
+            return Err(AppError::TotpNotEnrolled);
+        }
+
+        let stored_codes: serde_json::Value =
+            record.try_get("backup_codes").map_err(AppError::Database)?;
+        let hashes: Vec<String> = serde_json::from_value(stored_codes).map_err(|err| {
+            tracing::error!(error = %err, user_id = %user_id, "backup code store is corrupt");
+            AppError::Internal
+        })?;
+
+        // Both inputs must cross into the blocking closure; every Argon2id verify is CPU-bound.
+        let candidate = code.to_string();
+        let hashes_for_verification = hashes.clone();
+        let index = tokio::task::spawn_blocking(move || {
+            backup::verify_backup_code(&candidate, &hashes_for_verification)
+        })
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "backup code verification task failed");
+            AppError::Internal
+        })??;
+
+        let matched_hash = hashes.get(index).ok_or(AppError::Internal)?;
+        let removed = sqlx::query(
+            "UPDATE totp_secrets SET backup_codes = backup_codes - $2, \
+             updated_at = CURRENT_TIMESTAMP \
+             WHERE user_id = $1 AND backup_codes ? $2",
+        )
+        .bind(user_id)
+        .bind(matched_hash.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(AppError::Database)?;
+        if removed.rows_affected() == 0 {
+            // Another request consumed this exact hash after our read.
+            return Err(AppError::TotpBackupCodeInvalid);
+        }
+
+        tracing::debug!(
+            event = "totp_backup_code_verified",
+            user_id = %user_id,
+            outcome = "accepted",
+        );
+        Ok(())
+    }
+
     /// Return true when `totp_secrets.enabled` is set for `user_id`.
     pub async fn is_totp_enabled(&self, user_id: Uuid) -> Result<bool, AppError> {
         sqlx::query_scalar::<_, bool>("SELECT enabled FROM totp_secrets WHERE user_id = $1")

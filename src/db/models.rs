@@ -190,6 +190,85 @@ pub struct OAuthAccount {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A user's TOTP enrollment record.
+///
+/// `encrypted_secret` is AES-256-GCM ciphertext (`nonce || ciphertext || tag`);
+/// `backup_codes` holds Argon2id PHC strings only. Intentionally does NOT derive
+/// `Serialize` so neither the ciphertext nor the hashes can reach an API response.
+#[derive(Clone, FromRow, PartialEq, Eq)]
+pub struct TotpSecret {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub encrypted_secret: Vec<u8>,
+    pub backup_codes: serde_json::Value,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+// Manual `Debug`: the ciphertext decrypts to the TOTP seed, the JSON array holds
+// backup-code hashes. Neither belongs in logs or traces.
+impl std::fmt::Debug for TotpSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TotpSecret")
+            .field("id", &self.id)
+            .field("user_id", &self.user_id)
+            .field("encrypted_secret", &"[redacted]")
+            .field("backup_codes", &"[redacted]")
+            .field("enabled", &self.enabled)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
+/// Replay-tracking row for a consumed TOTP code.
+///
+/// `code_hash` is SHA-256 of `code_string || "::" || step`; the raw code is never stored.
+#[derive(Clone, FromRow, PartialEq, Eq)]
+pub struct TotpUsedCode {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub code_hash: Vec<u8>,
+    pub used_at: DateTime<Utc>,
+}
+
+// Manual `Debug`: the hash identifies a live one-time code.
+impl std::fmt::Debug for TotpUsedCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TotpUsedCode")
+            .field("id", &self.id)
+            .field("user_id", &self.user_id)
+            .field("code_hash", &"[redacted]")
+            .field("used_at", &self.used_at)
+            .finish()
+    }
+}
+
+/// Intermediate two-factor challenge token issued between password and second factor.
+///
+/// `token_hash` is SHA-256 of the raw token. Intentionally does NOT derive `Serialize`
+/// so the hash cannot reach an API response.
+#[derive(Clone, FromRow, PartialEq, Eq)]
+pub struct TwoFactorToken {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub token_hash: Vec<u8>,
+    pub expires_at: DateTime<Utc>,
+}
+
+// Manual `Debug`: the hash preimage is a live half-authentication credential.
+impl std::fmt::Debug for TwoFactorToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TwoFactorToken")
+            .field("id", &self.id)
+            .field("user_id", &self.user_id)
+            .field("token_hash", &"[redacted]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,6 +384,40 @@ mod tests {
             error_log: None,
         };
         assert!(!format!("{outbox:?}").contains("raw-single-use-token"));
+
+        let totp_secret = TotpSecret {
+            id: Uuid::new_v4(),
+            user_id: user.id,
+            encrypted_secret: vec![0x11, 0x22, 0x33],
+            backup_codes: serde_json::json!(["$argon2id$v=19$m=19456,t=2,p=1$salt$hash"]),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        };
+        let rendered_totp = format!("{totp_secret:?}");
+        assert!(!rendered_totp.contains("[17, 34, 51]"));
+        assert!(!rendered_totp.contains("$argon2id$"));
+        assert!(rendered_totp.contains("enabled: true"));
+
+        let used_code = TotpUsedCode {
+            id: Uuid::new_v4(),
+            user_id: user.id,
+            code_hash: vec![0x44, 0x55],
+            used_at: now,
+        };
+        let rendered_used = format!("{used_code:?}");
+        assert!(!rendered_used.contains("[68, 85]"));
+        assert!(rendered_used.contains("code_hash: \"[redacted]\""));
+
+        let two_factor = TwoFactorToken {
+            id: Uuid::new_v4(),
+            user_id: user.id,
+            token_hash: vec![0x66, 0x77],
+            expires_at: now,
+        };
+        let rendered_two_factor = format!("{two_factor:?}");
+        assert!(!rendered_two_factor.contains("[102, 119]"));
+        assert!(rendered_two_factor.contains("token_hash: \"[redacted]\""));
     }
 
     #[test]

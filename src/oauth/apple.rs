@@ -42,8 +42,13 @@ struct JwksResponse {
 
 #[derive(Debug, Deserialize)]
 struct JwksKey {
+    // Non-RSA entries (EC/OKP) omit `n`/`e`; tolerating them keeps one unusable
+    // key from rejecting the whole document. The refresh filter drops empties.
+    #[serde(default)]
     kid: String,
+    #[serde(default)]
     n: String,
+    #[serde(default)]
     e: String,
 }
 
@@ -941,6 +946,39 @@ mod tests {
             AppError::OAuthProviderError
         ));
         assert!(p.get_jwks_key("kid-1").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn mixed_jwks_entries_still_refresh_usable_rsa_key() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/auth/keys"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "keys": [
+                    { "kty": "EC", "kid": "kid-ec", "crv": "P-256", "x": "abc", "y": "def" },
+                    { "kty": "RSA", "kid": "kid-1", "n": TEST_RSA_N, "e": TEST_RSA_E }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let p = AppleProvider::with_endpoints(
+            &test_apple_config(),
+            reqwest::Client::new(),
+            APPLE_AUTH_ENDPOINT,
+            format!("{}/auth/token", server.uri()),
+            format!("{}/auth/keys", server.uri()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            p.get_jwks_key("kid-1").await.expect("rsa key"),
+            (TEST_RSA_N.to_string(), TEST_RSA_E.to_string())
+        );
+        assert!(matches!(
+            p.get_jwks_key("kid-ec").await,
+            Err(AppError::OAuthProviderError)
+        ));
     }
 
     #[tokio::test]

@@ -1956,3 +1956,203 @@ async fn concurrent_link_same_identity_exactly_one_wins() {
         .unwrap();
     assert_eq!(user_count.0, 2);
 }
+
+// Login-path identity race: the provider email resolves to one local account
+// while a concurrent insert links the same federated identity to another. The
+// login trusts the unique-constraint winner instead of turning into a conflict,
+// which is the deliberate asymmetry against the link path. This is the branch
+// that reports the cross-owner adoption; the event itself is not assertable
+// without a process-wide subscriber, so the adoption is pinned through its
+// observable result.
+#[tokio::test]
+async fn login_adopts_identity_won_by_concurrent_insert() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    truncate_tables(&app.pool).await.expect("truncate");
+
+    let resolved_email = dynamic_email();
+    let rival_email = dynamic_email();
+    let resolved_id = insert_verified_user(&app, &resolved_email, "argon2id$somehash").await;
+    let rival_id = insert_verified_user(&app, &rival_email, "argon2id$somehash").await;
+    let provider_sub = format!("goog-login-adopt-{}", Uuid::new_v4());
+
+    let google_mock = Arc::new(MockOAuthProvider::new(
+        "google",
+        UserInfo {
+            provider_id: "google".to_string(),
+            provider_user_id: provider_sub.clone(),
+            email: resolved_email.clone(),
+            email_verified: true,
+            name: None,
+            avatar_url: None,
+        },
+    ));
+    let svc = create_test_oauth_service(&app, google_mock, None);
+
+    let (auth_url, set_cookie) = svc.get_authorization_url("google", None).unwrap();
+    let state_token = extract_state_from_url(&auth_url).to_string();
+
+    // The rival owns the identity but reports a different email, so the login
+    // resolves to `resolved_id` and only the unique violation decides.
+    let mut holder = app.pool.begin().await.expect("holder txn");
+    sqlx::query(
+        "INSERT INTO oauth_accounts (id, user_id, provider_id, provider_user_id, email) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(rival_id)
+    .bind("google")
+    .bind(&provider_sub)
+    .bind(&rival_email)
+    .execute(&mut *holder)
+    .await
+    .expect("stage rival link");
+    let blocker_pid = holder_backend_pid(&mut holder).await;
+
+    let callback = tokio::spawn(async move {
+        svc.handle_callback_extended(
+            "google",
+            "valid_code",
+            &state_token,
+            Some(&set_cookie),
+            "cookie",
+            None,
+            None,
+        )
+        .await
+    });
+
+    wait_until_blocked_by(
+        &app.pool,
+        blocker_pid,
+        "INSERT INTO oauth_accounts",
+        "login_adopts_identity_won_by_concurrent_insert",
+    )
+    .await;
+    holder.commit().await.expect("commit rival link");
+
+    let OAuthCallbackOutcome::Login(res) = callback
+        .await
+        .expect("callback task")
+        .expect("a concurrent identity insert must not fail the login")
+    else {
+        panic!("expected login outcome");
+    };
+
+    // `relink_winner` is the only adoption path that reports `is_linked: false`.
+    assert_eq!(res.user.id, rival_id, "the login must adopt the winner");
+    assert!(
+        !res.is_linked,
+        "adoption by unique-race is not a fresh link"
+    );
+    assert!(!res.is_created);
+    assert_eq!(link_count_for_identity(&app, &provider_sub).await, 1);
+
+    let resolved_links: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM oauth_accounts WHERE user_id = $1")
+            .bind(resolved_id)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        resolved_links.0, 0,
+        "the losing insert must leave no row behind"
+    );
+
+    let user_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(user_count.0, 2, "no third user may be provisioned");
+}
+
+// Login-path user race: two logins provision the same normalized email at once.
+// The loser must converge on the committed user and attach its identity there,
+// not fail and not create a duplicate account.
+#[tokio::test]
+async fn login_adopts_user_won_by_concurrent_insert() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    truncate_tables(&app.pool).await.expect("truncate");
+
+    let email = dynamic_email();
+    let provider_sub = format!("goog-login-user-race-{}", Uuid::new_v4());
+    let raced_id = Uuid::new_v4();
+
+    let google_mock = Arc::new(MockOAuthProvider::new(
+        "google",
+        UserInfo {
+            provider_id: "google".to_string(),
+            provider_user_id: provider_sub.clone(),
+            email: email.clone(),
+            email_verified: true,
+            name: None,
+            avatar_url: None,
+        },
+    ));
+    let svc = create_test_oauth_service(&app, google_mock, None);
+
+    let (auth_url, set_cookie) = svc.get_authorization_url("google", None).unwrap();
+    let state_token = extract_state_from_url(&auth_url).to_string();
+
+    // A concurrent flow has already staged the user for this email but not the
+    // identity: the callback's user insert blocks, then loses to the index.
+    let mut holder = app.pool.begin().await.expect("holder txn");
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(raced_id)
+    .bind(&email)
+    .bind("argon2id$somehash")
+    .bind(true)
+    .execute(&mut *holder)
+    .await
+    .expect("stage raced user");
+    let blocker_pid = holder_backend_pid(&mut holder).await;
+
+    let callback = tokio::spawn(async move {
+        svc.handle_callback_extended(
+            "google",
+            "valid_code",
+            &state_token,
+            Some(&set_cookie),
+            "cookie",
+            None,
+            None,
+        )
+        .await
+    });
+
+    wait_until_blocked_by(
+        &app.pool,
+        blocker_pid,
+        "INSERT INTO users",
+        "login_adopts_user_won_by_concurrent_insert",
+    )
+    .await;
+    holder.commit().await.expect("commit raced user");
+
+    let OAuthCallbackOutcome::Login(res) = callback
+        .await
+        .expect("callback task")
+        .expect("a concurrent user insert must not fail the login")
+    else {
+        panic!("expected login outcome");
+    };
+
+    assert_eq!(res.user.id, raced_id, "the login must adopt the raced user");
+    assert!(res.is_linked, "the adopted user gains the identity");
+    assert!(!res.is_created, "the stale attempt created no user");
+    assert_eq!(link_count_for_identity(&app, &provider_sub).await, 1);
+
+    let users_for_email: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM users WHERE LOWER(email) = LOWER($1)")
+            .bind(&email)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(users_for_email.0, 1, "email must stay unique");
+}

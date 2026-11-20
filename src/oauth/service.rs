@@ -135,9 +135,15 @@ impl std::fmt::Debug for OAuthService {
     }
 }
 
-/// Transaction boundary invariant: every write commits before any fallible
-/// read or session issuance, so a later error is never reported for a
-/// committed change (no `Err` after `commit`).
+/// Transaction boundary: each write helper commits only after all of its
+/// fallible reads, so it never reports an `Err` for a change it already
+/// committed.
+///
+/// Login is deliberately not atomic across session issuance: `handle_login`
+/// commits the user and identity rows via `converge_link` before issuing
+/// a session, so a failed session creation leaves a verified user and its link
+/// behind without a session. The state token is already consumed, so recovery is
+/// a fresh authorize round-trip, which converges on the existing identity.
 impl OAuthService {
     /// Constructs a new OAuth service instance with active providers instantiated
     /// from application configuration.

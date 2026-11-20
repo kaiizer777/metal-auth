@@ -257,9 +257,11 @@ pub enum AppError {
     #[error("backup code is invalid")]
     TotpBackupCodeInvalid,
 
-    /// Login sentinel for a completed password step that still needs a second factor.
+    /// Wire-code mapping for [`ErrorCode::TwoFactorRequired`] only — never returned from a handler.
     ///
-    /// Not a failure — [`Self::status_code`] maps it to `200 OK`.
+    /// [`Self::status_code`] maps it to `200 OK`, and the error envelope cannot carry the
+    /// `challenge_token`. The 2FA login contract is a success body
+    /// (`{"two_factor_required": true, "challenge_token": …}`), not an `Err`.
     #[error("two factor authentication required")]
     TwoFactorRequired,
 
@@ -511,6 +513,7 @@ impl AppError {
             ErrorCode::TotpCodeExpired => Self::TotpCodeExpired,
             ErrorCode::TotpCodeReplayed => Self::TotpCodeReplayed,
             ErrorCode::TotpBackupCodeInvalid => Self::TotpBackupCodeInvalid,
+            // Mapping-only: no handler ever produces this, see `Self::TwoFactorRequired`.
             ErrorCode::TwoFactorRequired => Self::TwoFactorRequired,
             ErrorCode::TwoFactorTokenInvalid => Self::TwoFactorTokenInvalid,
             ErrorCode::TwoFactorTokenExpired => Self::TwoFactorTokenExpired,

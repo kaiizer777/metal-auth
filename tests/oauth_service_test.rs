@@ -1699,6 +1699,135 @@ async fn link_race_other_user_conflicts() {
     assert_eq!(owner.0, user_b);
 }
 
+// Link-intent unique race: the callback's identity insert loses to a rival row
+// committed by another user. The post-rollback resolution is read-only, so the
+// link must fail with a conflict rather than report a success that would echo
+// the rival's account (including its email) back to the linking user.
+#[tokio::test]
+async fn link_callback_rival_identity_race_conflicts() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    truncate_tables(&app.pool).await.expect("truncate");
+
+    let email_a = dynamic_email();
+    let email_b = dynamic_email();
+    let user_a = insert_verified_user(&app, &email_a, "argon2id$somehash").await;
+    let user_b = insert_verified_user(&app, &email_b, "argon2id$somehash").await;
+    let provider_sub = format!("goog-link-callback-race-{}", Uuid::new_v4());
+
+    let google_mock = Arc::new(MockOAuthProvider::new(
+        "google",
+        UserInfo {
+            provider_id: "google".to_string(),
+            provider_user_id: provider_sub.clone(),
+            email: email_a.clone(),
+            email_verified: true,
+            name: None,
+            avatar_url: None,
+        },
+    ));
+    let svc = create_test_oauth_service(&app, google_mock, None);
+
+    let session_svc = SessionService::new(app.pool.clone(), Arc::new(app.state.config.clone()));
+    let (session, _raw) = session_svc
+        .create_session(user_a, "cookie", None, None)
+        .await
+        .unwrap();
+    let (auth_url, set_cookie) = svc
+        .initiate_link_flow(
+            "google",
+            user_a,
+            Some("/settings".to_string()),
+            Some(session.token_hash.clone()),
+        )
+        .expect("initiate link flow");
+    let state_token = extract_state_from_url(&auth_url).to_string();
+
+    let mut holder = app.pool.begin().await.expect("holder txn");
+    sqlx::query(
+        "INSERT INTO oauth_accounts (id, user_id, provider_id, provider_user_id, email) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(user_b)
+    .bind("google")
+    .bind(&provider_sub)
+    .bind(&email_b)
+    .execute(&mut *holder)
+    .await
+    .expect("stage rival link");
+    let blocker_pid = holder_backend_pid(&mut holder).await;
+
+    let callback = tokio::spawn(async move {
+        svc.handle_callback_extended(
+            "google",
+            "valid_code",
+            &state_token,
+            Some(&set_cookie),
+            "cookie",
+            None,
+            None,
+        )
+        .await
+    });
+
+    // The pre-insert read cannot see the uncommitted rival, so the conflict has
+    // to come from the unique violation and its post-rollback resolution.
+    wait_until_blocked_by(
+        &app.pool,
+        blocker_pid,
+        "INSERT INTO oauth_accounts",
+        "link_callback_rival_identity_race_conflicts",
+    )
+    .await;
+    holder.commit().await.expect("commit rival link");
+
+    let err = callback
+        .await
+        .expect("callback task")
+        .expect_err("a rival identity must never be reported as linked");
+    assert!(
+        matches!(err, AppError::OAuthAccountLinkConflict),
+        "expected OAuthAccountLinkConflict from the race resolution, got {err:?}"
+    );
+
+    let rival_email: (String,) =
+        sqlx::query_as("SELECT email FROM oauth_accounts WHERE provider_user_id = $1")
+            .bind(&provider_sub)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        rival_email.0, email_b,
+        "the rival row must be left untouched"
+    );
+    assert_eq!(link_count_for_identity(&app, &provider_sub).await, 1);
+
+    let linking_user_links: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM oauth_accounts WHERE user_id = $1")
+            .bind(user_a)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        linking_user_links.0, 0,
+        "the rejected link must write nothing"
+    );
+
+    let session_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM sessions WHERE user_id = $1 AND token_hash != $2")
+            .bind(user_a)
+            .bind(&session.token_hash)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        session_count.0, 0,
+        "link callback must not issue a login session"
+    );
+}
+
 #[tokio::test]
 async fn login_with_linked_identity_returns_owner_not_conflict() {
     let _guard = DB_LOCK.lock().await;

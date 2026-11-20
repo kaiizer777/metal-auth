@@ -25,3 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged.
 - Signup and password-reset responses no longer wait for the mailer, and delivery survives a client
   disconnect.
+
+### Fixed
+
+- A link callback whose initiating user no longer exists now returns 403 instead of a 500.
+- OAuth state that would render a cookie above the browser size budget is rejected with 400 instead
+  of emitting an over-limit `Set-Cookie`.

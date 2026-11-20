@@ -15,9 +15,10 @@ use crate::error::AppError;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Browser cap (attributes included) for a single `Set-Cookie` value. Anything
-/// larger is dropped silently, which would fail the callback after a full
-/// provider round-trip.
+/// Conservative cap for a rendered `Set-Cookie` string, attributes included.
+/// Browsers cap name+value at 4096 bytes and ignore attributes, so this budget
+/// is strictly tighter; anything larger risks a silently dropped cookie that
+/// would fail the callback after a full provider round-trip.
 const MAX_STATE_COOKIE_LEN: usize = 4096;
 
 /// High-entropy OAuth state payload bound to user's browser session.
@@ -169,6 +170,7 @@ fn format_state_cookie(
 /// Builds a `Set-Cookie` header string for setting the signed OAuth state cookie for a specific provider.
 /// For Apple (`response_mode=form_post`), if HTTPS is enabled (`secure == true`), `SameSite=None; Secure`
 /// is set so the cross-site POST can carry the cookie. For GET-based providers, `SameSite=Lax` is maintained.
+/// Does not apply the `MAX_STATE_COOKIE_LEN` budget enforced by `OAuthStateManager::create_state`.
 #[must_use]
 pub fn build_state_cookie_for_provider(
     name: &str,
@@ -235,6 +237,7 @@ pub fn build_state_cookie_header(
 }
 
 /// Builds a `HeaderValue` for setting the signed OAuth state cookie for a specific provider.
+/// Does not apply the `MAX_STATE_COOKIE_LEN` budget enforced by `OAuthStateManager::create_state`.
 pub fn build_state_cookie_header_for_provider(
     name: &str,
     value: &str,

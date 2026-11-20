@@ -124,6 +124,44 @@ pub fn generate_totp_secret() -> String {
     encoded
 }
 
+/// Decode an unpadded RFC 4648 base32 TOTP secret into its raw HMAC key bytes.
+///
+/// Accepts upper- and lower-case input, rejects padding, whitespace, non-alphabet
+/// characters, and non-canonical trailing bits. HMAC must run over these bytes, never
+/// over the base32 ASCII that authenticator apps display.
+pub fn decode_totp_secret(secret_base32: &str) -> Result<Vec<u8>, AppError> {
+    if secret_base32.is_empty() {
+        return Err(AppError::Internal);
+    }
+
+    let mut accumulator: u32 = 0;
+    let mut bit_count: u32 = 0;
+    let mut decoded = Vec::with_capacity(secret_base32.len() * 5 / 8);
+
+    for character in secret_base32.chars() {
+        let value = match character {
+            'A'..='Z' => character as u32 - 'A' as u32,
+            'a'..='z' => character as u32 - 'a' as u32,
+            '2'..='7' => character as u32 - '2' as u32 + 26,
+            _ => return Err(AppError::Internal),
+        };
+        accumulator = (accumulator << 5) | value;
+        bit_count += 5;
+        if bit_count >= 8 {
+            bit_count -= 8;
+            decoded.push((accumulator >> bit_count) as u8);
+            accumulator &= (1 << bit_count) - 1;
+        }
+    }
+
+    // Fewer than five trailing bits is the only valid remainder; any set bit or a
+    // five-plus-bit leftover encodes a partial symbol and is non-canonical.
+    if bit_count >= 5 || accumulator != 0 {
+        return Err(AppError::Internal);
+    }
+    Ok(decoded)
+}
+
 /// Current TOTP step counter: Unix time divided by the step, `T0 = 0`.
 #[must_use]
 pub fn current_totp_counter() -> u64 {
@@ -418,6 +456,69 @@ mod tests {
                     .all(|byte| matches!(byte, b'A'..=b'Z' | b'2'..=b'7'))
             );
             assert!(secrets.insert(secret), "secret reused");
+        }
+    }
+
+    /// RFC 6238 Appendix B eight-digit SHA-1 vector, for the decoder proof.
+    fn rfc6238_eight_digit(secret: &[u8], counter: u64) -> u32 {
+        let mut mac = <HmacSha1 as Mac>::new_from_slice(secret).expect("hmac key");
+        mac.update(&counter.to_be_bytes());
+        let digest = mac.finalize().into_bytes();
+        let offset = usize::from(digest[19] & 0x0f);
+        u32::from_be_bytes([
+            digest[offset] & 0x7f,
+            digest[offset + 1],
+            digest[offset + 2],
+            digest[offset + 3],
+        ]) % 100_000_000
+    }
+
+    #[test]
+    fn base32_decoder_recovers_rfc6238_seed() {
+        let raw = decode_totp_secret("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ").expect("decode");
+        assert_eq!(raw, RFC_SECRET);
+        assert_eq!(rfc6238_eight_digit(&raw, 59 / TOTP_STEP_SECS), 94_287_082);
+        assert_eq!(
+            format!(
+                "{:06}",
+                generate_totp(&raw, 59 / TOTP_STEP_SECS).expect("generate")
+            ),
+            "287082"
+        );
+    }
+
+    #[test]
+    fn base32_decoder_is_case_insensitive() {
+        let uppercase = decode_totp_secret("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ").expect("decode");
+        let lowercase = decode_totp_secret("gezdgnbvgy3tqojqgezdgnbvgy3tqojq").expect("decode");
+        assert_eq!(uppercase, lowercase);
+    }
+
+    #[test]
+    fn base32_decoder_round_trips_generated_secrets() {
+        for _ in 0..16 {
+            let secret = generate_totp_secret();
+            let raw = decode_totp_secret(&secret).expect("decode");
+            assert_eq!(raw.len(), TOTP_SECRET_BYTES);
+            assert_eq!(base32::encode(TOTP_ALPHABET, &raw), secret);
+        }
+    }
+
+    #[test]
+    fn base32_decoder_rejects_non_canonical_input() {
+        for input in [
+            "",
+            "A",                                 // five-bit partial symbol
+            "AB",                                // non-zero trailing bits
+            "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ=", // padding
+            "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ0", // '0' is outside RFC 4648
+            "GEZD GNBV",                         // whitespace
+            "GEZD-GNBV",                         // separator
+        ] {
+            assert!(
+                matches!(decode_totp_secret(input), Err(AppError::Internal)),
+                "accepted {input:?}"
+            );
         }
     }
 

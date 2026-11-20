@@ -15,6 +15,11 @@ use crate::error::AppError;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Browser cap (attributes included) for a single `Set-Cookie` value. Anything
+/// larger is dropped silently, which would fail the callback after a full
+/// provider round-trip.
+const MAX_STATE_COOKIE_LEN: usize = 4096;
+
 /// High-entropy OAuth state payload bound to user's browser session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OAuthStatePayload {
@@ -365,6 +370,11 @@ impl OAuthStateManager {
             self.cookie_secure,
             provider_id,
         );
+        if set_cookie_str.len() > MAX_STATE_COOKIE_LEN {
+            return Err(AppError::ValidationError(format!(
+                "oauth state cookie exceeds {MAX_STATE_COOKIE_LEN} bytes"
+            )));
+        }
         Ok((token, set_cookie_str))
     }
 
@@ -630,6 +640,31 @@ mod tests {
             build_clear_state_cookie_for_provider("oauth_state", "/", true, "apple"),
             "oauth_state=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=None; Secure"
         );
+    }
+
+    #[test]
+    fn create_state_rejects_cookie_above_browser_limit_for_escaped_redirect() {
+        // Largest redirect the HTTP handler accepts (handler::oauth::MAX_REDIRECT_URL_LEN).
+        const MAX_REDIRECT_URL_LEN: usize = 2048;
+        let cfg = crate::config::OAuthConfig {
+            state_secret: "01234567890123456789012345678901".to_string(),
+            ..Default::default()
+        };
+        let mgr = OAuthStateManager::new(&cfg, true);
+
+        let plain = format!("/{}", "a".repeat(MAX_REDIRECT_URL_LEN - 1));
+        let (_, cookie) = mgr
+            .create_state("google", "verifier", Some(plain))
+            .expect("a plain redirect at the limit fits");
+        assert!(cookie.len() <= MAX_STATE_COOKIE_LEN);
+
+        // JSON escaping doubles every quote, so the raw limit no longer bounds the cookie.
+        let escaped = format!("/{}", "\"".repeat(MAX_REDIRECT_URL_LEN - 1));
+        assert_eq!(escaped.len(), MAX_REDIRECT_URL_LEN);
+        assert!(matches!(
+            mgr.create_state("google", "verifier", Some(escaped)),
+            Err(AppError::ValidationError(_))
+        ));
     }
 
     #[test]

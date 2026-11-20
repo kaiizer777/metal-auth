@@ -248,7 +248,10 @@ mod tests {
     fn aes_gcm_rejects_tampered_nonce() {
         let mut blob = encrypt_secret(&test_key(), b"secret").expect("encrypt");
         blob[0] ^= 0x01;
-        assert!(decrypt_secret(&test_key(), &blob).is_err());
+        assert!(matches!(
+            decrypt_secret(&test_key(), &blob),
+            Err(AppError::Internal)
+        ));
     }
 
     #[test]
@@ -256,13 +259,19 @@ mod tests {
         let blob = encrypt_secret(&test_key(), b"secret").expect("encrypt");
         let mut wrong_key = test_key();
         wrong_key[0] ^= 0xff;
-        assert!(decrypt_secret(&wrong_key, &blob).is_err());
+        assert!(matches!(
+            decrypt_secret(&wrong_key, &blob),
+            Err(AppError::Internal)
+        ));
     }
 
     #[test]
     fn aes_gcm_rejects_truncated_blob() {
         for len in 0..MIN_BLOB_LEN {
-            assert!(decrypt_secret(&test_key(), &vec![0u8; len]).is_err());
+            assert!(matches!(
+                decrypt_secret(&test_key(), &vec![0u8; len]),
+                Err(AppError::Internal)
+            ));
         }
     }
 

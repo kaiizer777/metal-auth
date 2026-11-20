@@ -3,6 +3,7 @@ mod common;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axum::http::StatusCode;
@@ -1408,6 +1409,67 @@ async fn link_count_for_identity(app: &TestApp, provider_user_id: &str) -> i64 {
     count.0
 }
 
+/// Deadline for observing a backend blocked by a staged transaction. Generous
+/// by design: the gate must fail on a missed race, never on a slow executor.
+const BLOCK_EVIDENCE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Backend pid of a holding transaction, usable as a stable blocker id: the
+/// worker runs on a pooled connection whose pid the test cannot know up front.
+async fn holder_backend_pid(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> i32 {
+    sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut **tx)
+        .await
+        .expect("holder backend pid readable")
+}
+
+/// Waits until a backend running `statement_prefix` is blocked by `blocker_pid`.
+///
+/// Without this gate a staged-race test converges through the read-only paths
+/// whenever the worker arrives after the commit, leaving the unique-violation
+/// branch unexercised while the test still passes. Expiry is a hard failure
+/// naming the missing evidence, never a skip.
+async fn wait_until_blocked_by(
+    pool: &sqlx::PgPool,
+    blocker_pid: i32,
+    statement_prefix: &str,
+    branch: &str,
+) {
+    let pattern = format!("{statement_prefix}%");
+    let deadline = Instant::now() + BLOCK_EVIDENCE_TIMEOUT;
+    loop {
+        let blocked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity \
+             WHERE datname = current_database() \
+               AND query LIKE $2 \
+               AND $1 = ANY (pg_blocking_pids(pid))",
+        )
+        .bind(blocker_pid)
+        .bind(&pattern)
+        .fetch_one(pool)
+        .await
+        .expect("pg_stat_activity must be readable");
+
+        if blocked > 0 {
+            return;
+        }
+        if Instant::now() > deadline {
+            let active: Vec<(i32, Option<String>, Option<String>, String)> = sqlx::query_as(
+                "SELECT pid, wait_event_type, wait_event, left(query, 120) FROM pg_stat_activity \
+                 WHERE datname = current_database() AND state <> 'idle'",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+            panic!(
+                "{branch}: no backend was blocked by pg_backend_pid {blocker_pid} while running \
+                 `{statement_prefix}...`, so the race branch was never entered; \
+                 active backends: {active:?}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[tokio::test]
 async fn unlink_unknown_provider_returns_not_found() {
     let _guard = DB_LOCK.lock().await;
@@ -1521,6 +1583,7 @@ async fn link_race_same_user_converges() {
     .execute(&mut *holder)
     .await
     .expect("stage winning link");
+    let blocker_pid = holder_backend_pid(&mut holder).await;
 
     let svc_task = svc.clone();
     let info = UserInfo {
@@ -1537,7 +1600,15 @@ async fn link_race_same_user_converges() {
             .await
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Hold the transaction open until the worker's insert is provably waiting
+    // on it: only then does the unique violation decide the outcome.
+    wait_until_blocked_by(
+        &app.pool,
+        blocker_pid,
+        "INSERT INTO oauth_accounts",
+        "link_race_same_user_converges",
+    )
+    .await;
     holder.commit().await.expect("commit winning link");
 
     let account = task
@@ -1587,6 +1658,7 @@ async fn link_race_other_user_conflicts() {
     .execute(&mut *holder)
     .await
     .expect("stage rival link");
+    let blocker_pid = holder_backend_pid(&mut holder).await;
 
     let svc_task = svc.clone();
     let info = UserInfo {
@@ -1603,7 +1675,15 @@ async fn link_race_other_user_conflicts() {
             .await
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // The conflict must come from the post-rollback race resolution, not from
+    // the pre-insert read, so wait until the insert is blocked on the rival.
+    wait_until_blocked_by(
+        &app.pool,
+        blocker_pid,
+        "INSERT INTO oauth_accounts",
+        "link_race_other_user_conflicts",
+    )
+    .await;
     holder.commit().await.expect("commit rival link");
 
     let res = task.await.expect("link task");

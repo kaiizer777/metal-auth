@@ -4,13 +4,15 @@ use serde::Deserialize;
 use crate::config::ProviderConfig;
 use crate::error::AppError;
 use crate::oauth::provider::{
-    OAuthProvider, TokenResponse, UserInfo, post_token_form, scopes_or_default,
+    OAuthProvider, TokenResponse, UserInfo, authorize_url, get_json_limited, parse_endpoint,
+    post_token_form, scopes_or_default, token_exchange_params,
 };
 
 pub const GOOGLE_AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub const GOOGLE_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 pub const GOOGLE_USERINFO_ENDPOINT: &str = "https://openidconnect.googleapis.com/v1/userinfo";
 
+const ID: &str = "google";
 const DEFAULT_SCOPES: &[&str] = &["openid", "email", "profile"];
 
 #[derive(Debug, Deserialize)]
@@ -30,20 +32,36 @@ struct GoogleProfile {
 pub struct GoogleProvider {
     cfg: ProviderConfig,
     client: reqwest::Client,
-    auth_url: String,
+    auth_url: reqwest::Url,
     token_url: String,
     userinfo_url: String,
 }
 
 impl GoogleProvider {
-    pub fn new(cfg: &ProviderConfig, client: reqwest::Client) -> Result<Self, AppError> {
+    fn build(
+        cfg: &ProviderConfig,
+        client: reqwest::Client,
+        auth_url: String,
+        token_url: String,
+        userinfo_url: String,
+    ) -> Result<Self, AppError> {
         Ok(Self {
             cfg: cfg.clone(),
             client,
-            auth_url: GOOGLE_AUTH_ENDPOINT.to_string(),
-            token_url: GOOGLE_TOKEN_ENDPOINT.to_string(),
-            userinfo_url: GOOGLE_USERINFO_ENDPOINT.to_string(),
+            auth_url: parse_endpoint(&auth_url)?,
+            token_url,
+            userinfo_url,
         })
+    }
+
+    pub fn new(cfg: &ProviderConfig, client: reqwest::Client) -> Result<Self, AppError> {
+        Self::build(
+            cfg,
+            client,
+            GOOGLE_AUTH_ENDPOINT.to_string(),
+            GOOGLE_TOKEN_ENDPOINT.to_string(),
+            GOOGLE_USERINFO_ENDPOINT.to_string(),
+        )
     }
 
     pub fn with_endpoints(
@@ -53,30 +71,29 @@ impl GoogleProvider {
         token_url: impl Into<String>,
         userinfo_url: impl Into<String>,
     ) -> Result<Self, AppError> {
-        Ok(Self {
-            cfg: cfg.clone(),
+        Self::build(
+            cfg,
             client,
-            auth_url: auth_url.into(),
-            token_url: token_url.into(),
-            userinfo_url: userinfo_url.into(),
-        })
+            auth_url.into(),
+            token_url.into(),
+            userinfo_url.into(),
+        )
     }
 }
 
 #[async_trait]
 impl OAuthProvider for GoogleProvider {
     fn id(&self) -> &'static str {
-        "google"
+        ID
     }
 
     fn auth_url(&self, state: &str, code_challenge: &str) -> String {
-        let redirect_uri = &self.cfg.redirect_uri;
         let scope = scopes_or_default(&self.cfg.scopes, DEFAULT_SCOPES);
 
         let params = [
             ("response_type", "code"),
             ("client_id", self.cfg.client_id.as_str()),
-            ("redirect_uri", redirect_uri.as_str()),
+            ("redirect_uri", self.cfg.redirect_uri.as_str()),
             ("scope", scope.as_str()),
             ("state", state),
             ("code_challenge", code_challenge),
@@ -85,10 +102,7 @@ impl OAuthProvider for GoogleProvider {
             ("prompt", "select_account"),
         ];
 
-        let mut url = reqwest::Url::parse(&self.auth_url)
-            .unwrap_or_else(|_| reqwest::Url::parse(GOOGLE_AUTH_ENDPOINT).expect("valid auth url"));
-        url.query_pairs_mut().extend_pairs(&params);
-        url.to_string()
+        authorize_url(&self.auth_url, &params)
     }
 
     async fn exchange_code(
@@ -96,16 +110,13 @@ impl OAuthProvider for GoogleProvider {
         code: &str,
         code_verifier: &str,
     ) -> Result<TokenResponse, AppError> {
-        let redirect_uri = &self.cfg.redirect_uri;
-
-        let params = [
-            ("code", code),
-            ("client_id", self.cfg.client_id.as_str()),
-            ("client_secret", self.cfg.client_secret.as_str()),
-            ("redirect_uri", redirect_uri.as_str()),
-            ("grant_type", "authorization_code"),
-            ("code_verifier", code_verifier),
-        ];
+        let params = token_exchange_params(
+            &self.cfg.client_id,
+            &self.cfg.client_secret,
+            code,
+            &self.cfg.redirect_uri,
+            code_verifier,
+        );
 
         post_token_form(&self.client, &self.token_url, &params).await
     }
@@ -115,20 +126,13 @@ impl OAuthProvider for GoogleProvider {
             return Err(AppError::OAuthProviderError);
         }
 
-        let resp = self
-            .client
-            .get(&self.userinfo_url)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .bearer_auth(&tokens.access_token)
-            .send()
-            .await
-            .map_err(|_| AppError::OAuthProviderError)?;
-
-        if !resp.status().is_success() {
-            return Err(AppError::OAuthProviderError);
-        }
-
-        let profile: GoogleProfile = crate::oauth::provider::read_json_limited(resp).await?;
+        let profile: GoogleProfile = get_json_limited(
+            &self.client,
+            &self.userinfo_url,
+            "application/json",
+            Some(&tokens.access_token),
+        )
+        .await?;
 
         if profile.sub.trim().is_empty() {
             return Err(AppError::OAuthProviderError);
@@ -138,7 +142,7 @@ impl OAuthProvider for GoogleProvider {
         let verified = profile.email_verified.unwrap_or(false) && !email.trim().is_empty();
 
         Ok(UserInfo {
-            provider_id: "google".to_string(),
+            provider_id: ID.to_string(),
             provider_user_id: profile.sub,
             email,
             email_verified: verified,
@@ -269,6 +273,59 @@ mod tests {
             user.avatar_url.as_deref(),
             Some("https://lh3.googleusercontent.com/pic")
         );
+    }
+
+    #[tokio::test]
+    async fn test_google_rejects_empty_access_token() {
+        let server = MockServer::start().await;
+        let p = GoogleProvider::with_endpoints(
+            &test_google_config(),
+            reqwest::Client::new(),
+            GOOGLE_AUTH_ENDPOINT,
+            format!("{}/token", server.uri()),
+            format!("{}/userinfo", server.uri()),
+        )
+        .unwrap();
+
+        let empty_tok = TokenResponse {
+            access_token: String::new(),
+            token_type: "Bearer".to_string(),
+            refresh_token: None,
+            expires_in: None,
+            id_token: None,
+            raw: HashMap::new(),
+        };
+
+        let err = p.fetch_user_info(&empty_tok).await.unwrap_err();
+        assert!(matches!(err, AppError::OAuthProviderError));
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "an empty access token must not issue a userinfo request"
+        );
+    }
+
+    #[test]
+    fn test_google_rejects_malformed_auth_endpoint() {
+        let err = GoogleProvider::with_endpoints(
+            &test_google_config(),
+            reqwest::Client::new(),
+            "accounts.google.com/o/oauth2/v2/auth",
+            GOOGLE_TOKEN_ENDPOINT,
+            GOOGLE_USERINFO_ENDPOINT,
+        )
+        .expect_err("malformed endpoint must fail construction");
+        assert!(matches!(err, AppError::OAuthProviderError));
+
+        // Same for an unparseable string: no canonical fallback, no panic.
+        let err = GoogleProvider::with_endpoints(
+            &test_google_config(),
+            reqwest::Client::new(),
+            "not a url",
+            GOOGLE_TOKEN_ENDPOINT,
+            GOOGLE_USERINFO_ENDPOINT,
+        )
+        .expect_err("garbage endpoint must fail construction");
+        assert!(matches!(err, AppError::OAuthProviderError));
     }
 
     #[tokio::test]

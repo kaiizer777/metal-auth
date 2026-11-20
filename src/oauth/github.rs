@@ -3,14 +3,20 @@ use serde::Deserialize;
 
 use crate::config::ProviderConfig;
 use crate::error::AppError;
-use crate::oauth::provider::{OAuthProvider, TokenResponse, UserInfo, post_token_form};
+use crate::oauth::provider::{
+    OAuthProvider, TokenResponse, UserInfo, authorize_url, get_json_limited, parse_endpoint,
+    post_token_form, token_exchange_params,
+};
 
 pub const GITHUB_AUTH_ENDPOINT: &str = "https://github.com/login/oauth/authorize";
 pub const GITHUB_TOKEN_ENDPOINT: &str = "https://github.com/login/oauth/access_token";
 pub const GITHUB_USER_ENDPOINT: &str = "https://api.github.com/user";
 pub const GITHUB_EMAILS_ENDPOINT: &str = "https://api.github.com/user/emails";
 
+const ID: &str = "github";
 const DEFAULT_SCOPES: &[&str] = &["read:user", "user:email"];
+const USER_EMAIL_SCOPE: &str = "user:email";
+const ACCEPT_GITHUB_JSON: &str = "application/vnd.github+json";
 
 #[derive(Debug, Deserialize)]
 struct GitHubUser {
@@ -37,22 +43,40 @@ pub struct GitHubEmail {
 pub struct GitHubProvider {
     cfg: ProviderConfig,
     client: reqwest::Client,
-    auth_url: String,
+    auth_url: reqwest::Url,
     token_url: String,
     user_url: String,
     emails_url: String,
 }
 
 impl GitHubProvider {
-    pub fn new(cfg: &ProviderConfig, client: reqwest::Client) -> Result<Self, AppError> {
+    fn build(
+        cfg: &ProviderConfig,
+        client: reqwest::Client,
+        auth_url: String,
+        token_url: String,
+        user_url: String,
+        emails_url: String,
+    ) -> Result<Self, AppError> {
         Ok(Self {
             cfg: cfg.clone(),
             client,
-            auth_url: GITHUB_AUTH_ENDPOINT.to_string(),
-            token_url: GITHUB_TOKEN_ENDPOINT.to_string(),
-            user_url: GITHUB_USER_ENDPOINT.to_string(),
-            emails_url: GITHUB_EMAILS_ENDPOINT.to_string(),
+            auth_url: parse_endpoint(&auth_url)?,
+            token_url,
+            user_url,
+            emails_url,
         })
+    }
+
+    pub fn new(cfg: &ProviderConfig, client: reqwest::Client) -> Result<Self, AppError> {
+        Self::build(
+            cfg,
+            client,
+            GITHUB_AUTH_ENDPOINT.to_string(),
+            GITHUB_TOKEN_ENDPOINT.to_string(),
+            GITHUB_USER_ENDPOINT.to_string(),
+            GITHUB_EMAILS_ENDPOINT.to_string(),
+        )
     }
 
     pub fn with_endpoints(
@@ -63,15 +87,29 @@ impl GitHubProvider {
         user_url: impl Into<String>,
         emails_url: impl Into<String>,
     ) -> Result<Self, AppError> {
-        Ok(Self {
-            cfg: cfg.clone(),
+        Self::build(
+            cfg,
             client,
-            auth_url: auth_url.into(),
-            token_url: token_url.into(),
-            user_url: user_url.into(),
-            emails_url: emails_url.into(),
-        })
+            auth_url.into(),
+            token_url.into(),
+            user_url.into(),
+            emails_url.into(),
+        )
     }
+}
+
+/// GitHub only exposes the primary address through the emails API, which requires the `user:email`
+/// scope; it is force-appended when a custom scope list omits it.
+fn github_scopes(configured: &[String]) -> String {
+    if configured.is_empty() {
+        return DEFAULT_SCOPES.join(" ");
+    }
+
+    let mut scopes = configured.to_vec();
+    if !scopes.iter().any(|scope| scope == USER_EMAIL_SCOPE) {
+        scopes.push(USER_EMAIL_SCOPE.to_string());
+    }
+    scopes.join(" ")
 }
 
 /// Resolves the user's primary verified email address from the GitHub email list.
@@ -93,35 +131,23 @@ pub fn resolve_github_email(_public_email: Option<&str>, emails: &[GitHubEmail])
 #[async_trait]
 impl OAuthProvider for GitHubProvider {
     fn id(&self) -> &'static str {
-        "github"
+        ID
     }
 
     fn auth_url(&self, state: &str, code_challenge: &str) -> String {
-        let redirect_uri = &self.cfg.redirect_uri;
-        let scope = if self.cfg.scopes.is_empty() {
-            DEFAULT_SCOPES.join(" ")
-        } else {
-            let mut scopes = self.cfg.scopes.clone();
-            if !scopes.iter().any(|s| s == "user:email") {
-                scopes.push("user:email".to_string());
-            }
-            scopes.join(" ")
-        };
+        let scope = github_scopes(&self.cfg.scopes);
 
         let params = [
             ("response_type", "code"),
             ("client_id", self.cfg.client_id.as_str()),
-            ("redirect_uri", redirect_uri.as_str()),
+            ("redirect_uri", self.cfg.redirect_uri.as_str()),
             ("scope", scope.as_str()),
             ("state", state),
             ("code_challenge", code_challenge),
             ("code_challenge_method", "S256"),
         ];
 
-        let mut url = reqwest::Url::parse(&self.auth_url)
-            .unwrap_or_else(|_| reqwest::Url::parse(GITHUB_AUTH_ENDPOINT).expect("valid auth url"));
-        url.query_pairs_mut().extend_pairs(&params);
-        url.to_string()
+        authorize_url(&self.auth_url, &params)
     }
 
     async fn exchange_code(
@@ -129,16 +155,13 @@ impl OAuthProvider for GitHubProvider {
         code: &str,
         code_verifier: &str,
     ) -> Result<TokenResponse, AppError> {
-        let redirect_uri = &self.cfg.redirect_uri;
-
-        let params = [
-            ("client_id", self.cfg.client_id.as_str()),
-            ("client_secret", self.cfg.client_secret.as_str()),
-            ("code", code),
-            ("redirect_uri", redirect_uri.as_str()),
-            ("grant_type", "authorization_code"),
-            ("code_verifier", code_verifier),
-        ];
+        let params = token_exchange_params(
+            &self.cfg.client_id,
+            &self.cfg.client_secret,
+            code,
+            &self.cfg.redirect_uri,
+            code_verifier,
+        );
 
         post_token_form(&self.client, &self.token_url, &params).await
     }
@@ -148,50 +171,25 @@ impl OAuthProvider for GitHubProvider {
             return Err(AppError::OAuthProviderError);
         }
 
-        // 1. Fetch user profile
-        let user_resp = self
-            .client
-            .get(&self.user_url)
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-            .header(
-                reqwest::header::USER_AGENT,
-                crate::oauth::provider::USER_AGENT,
-            )
-            .bearer_auth(&tokens.access_token)
-            .send()
-            .await
-            .map_err(|_| AppError::OAuthProviderError)?;
-
-        if !user_resp.status().is_success() {
-            return Err(AppError::OAuthProviderError);
-        }
-
-        let user: GitHubUser = crate::oauth::provider::read_json_limited(user_resp).await?;
+        let user: GitHubUser = get_json_limited(
+            &self.client,
+            &self.user_url,
+            ACCEPT_GITHUB_JSON,
+            Some(&tokens.access_token),
+        )
+        .await?;
 
         if user.id <= 0 {
             return Err(AppError::OAuthProviderError);
         }
 
-        // 2. Fetch user emails
-        let emails_resp = self
-            .client
-            .get(&self.emails_url)
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-            .header(
-                reqwest::header::USER_AGENT,
-                crate::oauth::provider::USER_AGENT,
-            )
-            .bearer_auth(&tokens.access_token)
-            .send()
-            .await
-            .map_err(|_| AppError::OAuthProviderError)?;
-
-        if !emails_resp.status().is_success() {
-            return Err(AppError::OAuthProviderError);
-        }
-
-        let emails: Vec<GitHubEmail> =
-            crate::oauth::provider::read_json_limited(emails_resp).await?;
+        let emails: Vec<GitHubEmail> = get_json_limited(
+            &self.client,
+            &self.emails_url,
+            ACCEPT_GITHUB_JSON,
+            Some(&tokens.access_token),
+        )
+        .await?;
 
         let (email, verified) = resolve_github_email(user.email.as_deref(), &emails);
 
@@ -201,7 +199,7 @@ impl OAuthProvider for GitHubProvider {
             .unwrap_or(user.login);
 
         Ok(UserInfo {
-            provider_id: "github".to_string(),
+            provider_id: ID.to_string(),
             provider_user_id: user.id.to_string(),
             email,
             email_verified: verified,
@@ -285,6 +283,17 @@ mod tests {
     }
 
     #[test]
+    fn test_github_scopes_policy() {
+        assert_eq!(github_scopes(&[]), "read:user user:email");
+
+        let custom = vec!["read:user".to_string()];
+        assert_eq!(github_scopes(&custom), "read:user user:email");
+
+        let already_present = vec!["read:user".to_string(), "user:email".to_string()];
+        assert_eq!(github_scopes(&already_present), "read:user user:email");
+    }
+
+    #[test]
     fn test_resolve_github_email_combinations() {
         // 1. Primary and verified present
         let emails1 = vec![
@@ -327,6 +336,50 @@ mod tests {
         let (email, verified) = resolve_github_email(None, &[]);
         assert_eq!(email, "");
         assert!(!verified);
+    }
+
+    #[tokio::test]
+    async fn test_github_rejects_empty_access_token() {
+        let server = MockServer::start().await;
+        let p = GitHubProvider::with_endpoints(
+            &test_github_config(),
+            reqwest::Client::new(),
+            GITHUB_AUTH_ENDPOINT,
+            format!("{}/token", server.uri()),
+            format!("{}/user", server.uri()),
+            format!("{}/user/emails", server.uri()),
+        )
+        .unwrap();
+
+        let tok = TokenResponse {
+            access_token: String::new(),
+            token_type: "bearer".to_string(),
+            refresh_token: None,
+            expires_in: None,
+            id_token: None,
+            raw: HashMap::new(),
+        };
+
+        let err = p.fetch_user_info(&tok).await.unwrap_err();
+        assert!(matches!(err, AppError::OAuthProviderError));
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "an empty access token must not issue userinfo or emails requests"
+        );
+    }
+
+    #[test]
+    fn test_github_rejects_malformed_auth_endpoint() {
+        let err = GitHubProvider::with_endpoints(
+            &test_github_config(),
+            reqwest::Client::new(),
+            "github.com/login/oauth/authorize",
+            GITHUB_TOKEN_ENDPOINT,
+            GITHUB_USER_ENDPOINT,
+            GITHUB_EMAILS_ENDPOINT,
+        )
+        .expect_err("malformed endpoint must fail construction");
+        assert!(matches!(err, AppError::OAuthProviderError));
     }
 
     #[tokio::test]

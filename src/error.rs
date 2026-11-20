@@ -418,7 +418,7 @@ impl AppError {
 const MAX_LOG_FIELD_CHARS: usize = 256;
 
 /// Truncate user-controlled input for log fields, always at a char boundary.
-fn truncate_for_log(input: &str) -> &str {
+pub(crate) fn truncate_for_log(input: &str) -> &str {
     match input.char_indices().nth(MAX_LOG_FIELD_CHARS) {
         Some((idx, _)) => &input[..idx],
         None => input,

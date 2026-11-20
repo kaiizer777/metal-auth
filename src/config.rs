@@ -531,9 +531,11 @@ impl Config {
             "OAUTH_STATE_COOKIE_PATH",
             DEFAULT_OAUTH_STATE_COOKIE_PATH,
         )?;
-        let oauth_state_ttl_secs = lookup_env_or_default(&lookup, "OAUTH_STATE_TTL_SECS", "600")?
-            .parse::<u64>()
-            .map_err(|_| ConfigError::InvalidEnvVar("OAUTH_STATE_TTL_SECS"))?;
+        let oauth_state_ttl_default = DEFAULT_OAUTH_STATE_TTL_SECS.to_string();
+        let oauth_state_ttl_secs =
+            lookup_env_or_default(&lookup, "OAUTH_STATE_TTL_SECS", &oauth_state_ttl_default)?
+                .parse::<u64>()
+                .map_err(|_| ConfigError::InvalidEnvVar("OAUTH_STATE_TTL_SECS"))?;
         let oauth_callback_base_url =
             lookup_env_or_default(&lookup, "OAUTH_CALLBACK_BASE_URL", "")?;
 
@@ -1320,7 +1322,7 @@ fn is_valid_cookie_path(path: &str) -> bool {
 impl OAuthConfig {
     #[must_use]
     pub fn state_ttl_secs(&self) -> u64 {
-        self.state_ttl.as_secs()
+        self.ttl().as_secs()
     }
 
     #[must_use]
@@ -1366,53 +1368,60 @@ impl OAuthConfig {
             }
 
             if provider.enabled {
-                if provider.client_id.trim().is_empty() {
-                    return Err(ConfigError::InvalidValue {
-                        field: "oauth.provider.client_id",
-                        reason: "must not be empty for enabled provider",
-                    });
-                }
-                if provider.redirect_uri.trim().is_empty() {
-                    return Err(ConfigError::InvalidValue {
-                        field: "oauth.provider.redirect_uri",
-                        reason: "must not be empty for enabled provider",
-                    });
-                }
-
-                if name == "google" || name == "github" {
-                    if provider.client_secret.trim().is_empty() {
-                        return Err(ConfigError::InvalidValue {
-                            field: "oauth.provider.client_secret",
-                            reason: "must not be empty for google/github provider",
-                        });
-                    }
-                } else if name == "apple" {
-                    let has_secret = !provider.client_secret.trim().is_empty();
-                    let has_p8 = provider
-                        .team_id
-                        .as_deref()
-                        .is_some_and(|s| !s.trim().is_empty())
-                        && provider
-                            .key_id
-                            .as_deref()
-                            .is_some_and(|s| !s.trim().is_empty())
-                        && provider
-                            .private_key
-                            .as_deref()
-                            .is_some_and(|s| !s.trim().is_empty());
-
-                    if !has_secret && !has_p8 {
-                        return Err(ConfigError::InvalidValue {
-                            field: "oauth.provider.apple",
-                            reason: "must configure either client_secret or team_id, key_id, and private_key",
-                        });
-                    }
-                }
+                validate_provider_credentials(name, provider)?;
             }
         }
 
         Ok(())
     }
+}
+
+/// Field/reason strings here are part of the boot error contract — keep byte-identical.
+fn validate_provider_credentials(name: &str, provider: &ProviderConfig) -> Result<(), ConfigError> {
+    if provider.client_id.trim().is_empty() {
+        return Err(ConfigError::InvalidValue {
+            field: "oauth.provider.client_id",
+            reason: "must not be empty for enabled provider",
+        });
+    }
+    if provider.redirect_uri.trim().is_empty() {
+        return Err(ConfigError::InvalidValue {
+            field: "oauth.provider.redirect_uri",
+            reason: "must not be empty for enabled provider",
+        });
+    }
+
+    if name == "google" || name == "github" {
+        if provider.client_secret.trim().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "oauth.provider.client_secret",
+                reason: "must not be empty for google/github provider",
+            });
+        }
+    } else if name == "apple" {
+        let has_secret = !provider.client_secret.trim().is_empty();
+        let has_p8 = provider
+            .team_id
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+            && provider
+                .key_id
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+            && provider
+                .private_key
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
+
+        if !has_secret && !has_p8 {
+            return Err(ConfigError::InvalidValue {
+                field: "oauth.provider.apple",
+                reason: "must configure either client_secret or team_id, key_id, and private_key",
+            });
+        }
+    }
+
+    Ok(())
 }
 
 impl Default for Config {
@@ -3113,5 +3122,98 @@ mod tests {
             _ => Err(std::env::VarError::NotPresent),
         };
         assert!(Config::from_lookup(lookup).is_err());
+    }
+
+    #[test]
+    fn oauth_state_ttl_env_accepts_exact_bounds() {
+        let with_ttl = |ttl: &'static str| {
+            Config::from_lookup(move |key| match key {
+                "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+                "BASE_URL" => Ok("https://app.example.com".into()),
+                "OAUTH_STATE_TTL_SECS" => Ok(ttl.into()),
+                _ => Err(std::env::VarError::NotPresent),
+            })
+        };
+
+        for ttl in ["60", "3600"] {
+            let cfg = with_ttl(ttl).expect("boundary ttl must be accepted");
+            assert_eq!(cfg.oauth.state_ttl_secs(), ttl.parse::<u64>().unwrap());
+        }
+
+        for ttl in ["59", "3601"] {
+            assert!(
+                matches!(
+                    with_ttl(ttl),
+                    Err(ConfigError::InvalidValue {
+                        field: "oauth.state_ttl",
+                        ..
+                    })
+                ),
+                "ttl {ttl} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_provider_credential_branches() {
+        let base = OAuthConfig {
+            state_secret: "01234567890123456789012345678901".into(),
+            ..Default::default()
+        };
+
+        let check = |name: &str, provider: ProviderConfig| {
+            OAuthConfig {
+                providers: [(name.to_string(), provider)].into_iter().collect(),
+                ..base.clone()
+            }
+            .validate()
+        };
+
+        // google/github: client_secret is mandatory.
+        for name in ["google", "github"] {
+            assert!(
+                check(
+                    name,
+                    ProviderConfig::new("cid", "", "https://app/cb", vec![], true)
+                )
+                .is_err()
+            );
+            assert!(
+                check(
+                    name,
+                    ProviderConfig::new("cid", "sec", "https://app/cb", vec![], true)
+                )
+                .is_ok()
+            );
+        }
+
+        // apple: client_secret OR the p8 triple; neither is rejected by name.
+        let apple_no_credentials = || {
+            let mut p = ProviderConfig::new("cid", "", "https://app/cb", vec![], true);
+            p.team_id = Some("".into());
+            p.key_id = Some("KEY123".into());
+            p.private_key = Some("".into());
+            p
+        };
+        assert!(matches!(
+            check("apple", apple_no_credentials()),
+            Err(ConfigError::InvalidValue {
+                field: "oauth.provider.apple",
+                ..
+            })
+        ));
+        assert!(
+            check(
+                "apple",
+                ProviderConfig::new("cid", "sec", "https://app/cb", vec![], true)
+            )
+            .is_ok()
+        );
+
+        let mut apple_p8 = ProviderConfig::new("cid", "", "https://app/cb", vec![], true);
+        apple_p8.team_id = Some("TEAM123456".into());
+        apple_p8.key_id = Some("KEY1234567".into());
+        apple_p8.private_key = Some("-----BEGIN PRIVATE KEY-----".into());
+        assert!(check("apple", apple_p8).is_ok());
     }
 }

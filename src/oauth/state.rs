@@ -15,6 +15,12 @@ use crate::error::AppError;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Conservative cap for a rendered `Set-Cookie` string, attributes included.
+/// Browsers cap name+value at 4096 bytes and ignore attributes, so this budget
+/// is strictly tighter; anything larger risks a silently dropped cookie that
+/// would fail the callback after a full provider round-trip.
+const MAX_STATE_COOKIE_LEN: usize = 4096;
+
 /// High-entropy OAuth state payload bound to user's browser session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OAuthStatePayload {
@@ -120,15 +126,20 @@ pub fn validate_state(
     Ok(payload)
 }
 
-/// Builds a `Set-Cookie` header string for setting the signed OAuth state cookie for a specific provider.
-/// For Apple (`response_mode=form_post`), if HTTPS is enabled (`secure == true`), `SameSite=None; Secure`
-/// is set so the cross-site POST can carry the cookie. For GET-based providers, `SameSite=Lax` is maintained.
-#[must_use]
-pub fn build_state_cookie_for_provider(
+/// Cookie variants emitted for the state cookie: set with a value, or cleared.
+enum CookieShape<'a> {
+    Set { value: &'a str, max_age_secs: u64 },
+    Clear,
+}
+
+/// Renders the one OAuth state cookie format shared by every set/clear, plain/provider variant.
+///
+/// `SameSite=None; Secure` is required for Apple's `form_post` cross-site POST and only emitted when
+/// the cookie is actually secure; every other combination stays `SameSite=Lax`.
+fn format_state_cookie(
     name: &str,
-    value: &str,
     path: &str,
-    max_age_secs: u64,
+    shape: CookieShape<'_>,
     secure: bool,
     provider_id: &str,
 ) -> String {
@@ -138,13 +149,47 @@ pub fn build_state_cookie_for_provider(
         "Lax"
     };
 
-    let mut cookie = format!(
-        "{name}={value}; Path={path}; Max-Age={max_age_secs}; HttpOnly; SameSite={same_site}"
-    );
+    let mut cookie = match shape {
+        CookieShape::Set {
+            value,
+            max_age_secs,
+        } => format!("{name}={value}; Path={path}; Max-Age={max_age_secs}"),
+        CookieShape::Clear => {
+            format!("{name}=; Path={path}; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT")
+        }
+    };
+
+    cookie.push_str("; HttpOnly; SameSite=");
+    cookie.push_str(same_site);
     if secure {
         cookie.push_str("; Secure");
     }
     cookie
+}
+
+/// Builds a `Set-Cookie` header string for setting the signed OAuth state cookie for a specific provider.
+/// For Apple (`response_mode=form_post`), if HTTPS is enabled (`secure == true`), `SameSite=None; Secure`
+/// is set so the cross-site POST can carry the cookie. For GET-based providers, `SameSite=Lax` is maintained.
+/// Does not apply the `MAX_STATE_COOKIE_LEN` budget enforced by `OAuthStateManager::create_state`.
+#[must_use]
+pub fn build_state_cookie_for_provider(
+    name: &str,
+    value: &str,
+    path: &str,
+    max_age_secs: u64,
+    secure: bool,
+    provider_id: &str,
+) -> String {
+    format_state_cookie(
+        name,
+        path,
+        CookieShape::Set {
+            value,
+            max_age_secs,
+        },
+        secure,
+        provider_id,
+    )
 }
 
 /// Builds a `Set-Cookie` header string for setting the signed OAuth state cookie.
@@ -167,24 +212,17 @@ pub fn build_clear_state_cookie_for_provider(
     secure: bool,
     provider_id: &str,
 ) -> String {
-    let same_site = if provider_id == "apple" && secure {
-        "None"
-    } else {
-        "Lax"
-    };
-    let mut cookie = format!(
-        "{name}=; Path={path}; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite={same_site}"
-    );
-    if secure {
-        cookie.push_str("; Secure");
-    }
-    cookie
+    format_state_cookie(name, path, CookieShape::Clear, secure, provider_id)
 }
 
 /// Builds a `Set-Cookie` header string for immediately invalidating the OAuth state cookie.
 #[must_use]
 pub fn build_clear_state_cookie(name: &str, path: &str, secure: bool) -> String {
     build_clear_state_cookie_for_provider(name, path, secure, "")
+}
+
+fn cookie_header_value(raw: String) -> Result<HeaderValue, AppError> {
+    HeaderValue::from_str(&raw).map_err(|_| AppError::Internal)
 }
 
 /// Builds a `HeaderValue` for setting the signed OAuth state cookie.
@@ -195,11 +233,11 @@ pub fn build_state_cookie_header(
     max_age_secs: u64,
     secure: bool,
 ) -> Result<HeaderValue, AppError> {
-    let raw = build_state_cookie(name, value, path, max_age_secs, secure);
-    HeaderValue::from_str(&raw).map_err(|_| AppError::Internal)
+    cookie_header_value(build_state_cookie(name, value, path, max_age_secs, secure))
 }
 
 /// Builds a `HeaderValue` for setting the signed OAuth state cookie for a specific provider.
+/// Does not apply the `MAX_STATE_COOKIE_LEN` budget enforced by `OAuthStateManager::create_state`.
 pub fn build_state_cookie_header_for_provider(
     name: &str,
     value: &str,
@@ -208,8 +246,14 @@ pub fn build_state_cookie_header_for_provider(
     secure: bool,
     provider_id: &str,
 ) -> Result<HeaderValue, AppError> {
-    let raw = build_state_cookie_for_provider(name, value, path, max_age_secs, secure, provider_id);
-    HeaderValue::from_str(&raw).map_err(|_| AppError::Internal)
+    cookie_header_value(build_state_cookie_for_provider(
+        name,
+        value,
+        path,
+        max_age_secs,
+        secure,
+        provider_id,
+    ))
 }
 
 /// Builds a `HeaderValue` for invalidating the OAuth state cookie.
@@ -218,8 +262,7 @@ pub fn build_clear_state_cookie_header(
     path: &str,
     secure: bool,
 ) -> Result<HeaderValue, AppError> {
-    let raw = build_clear_state_cookie(name, path, secure);
-    HeaderValue::from_str(&raw).map_err(|_| AppError::Internal)
+    cookie_header_value(build_clear_state_cookie(name, path, secure))
 }
 
 /// Builds a `HeaderValue` for invalidating the OAuth state cookie for a specific provider.
@@ -229,25 +272,30 @@ pub fn build_clear_state_cookie_header_for_provider(
     secure: bool,
     provider_id: &str,
 ) -> Result<HeaderValue, AppError> {
-    let raw = build_clear_state_cookie_for_provider(name, path, secure, provider_id);
-    HeaderValue::from_str(&raw).map_err(|_| AppError::Internal)
+    cookie_header_value(build_clear_state_cookie_for_provider(
+        name,
+        path,
+        secure,
+        provider_id,
+    ))
+}
+
+/// Finds `name` in a raw `Cookie:` header value.
+fn cookie_value<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {
+    cookie_header.split(';').find_map(|pair| {
+        let (key, val) = pair.trim().split_once('=')?;
+        (key == name).then_some(val)
+    })
 }
 
 /// Extracts an OAuth state cookie value from HTTP request headers.
 #[must_use]
 pub fn extract_state_cookie<'a>(headers: &'a HeaderMap, cookie_name: &str) -> Option<&'a str> {
-    for cookie_header in headers.get_all(axum::http::header::COOKIE) {
-        if let Ok(cookie_str) = cookie_header.to_str() {
-            for pair in cookie_str.split(';') {
-                if let Some((name, val)) = pair.trim().split_once('=')
-                    && name == cookie_name
-                {
-                    return Some(val);
-                }
-            }
-        }
-    }
-    None
+    headers
+        .get_all(axum::http::header::COOKIE)
+        .iter()
+        .filter_map(|cookie_header| cookie_header.to_str().ok())
+        .find_map(|cookie_str| cookie_value(cookie_str, cookie_name))
 }
 
 /// State manager bundling OAuth state configuration and helper methods.
@@ -325,6 +373,11 @@ impl OAuthStateManager {
             self.cookie_secure,
             provider_id,
         );
+        if set_cookie_str.len() > MAX_STATE_COOKIE_LEN {
+            return Err(AppError::ValidationError(format!(
+                "oauth state cookie exceeds {MAX_STATE_COOKIE_LEN} bytes"
+            )));
+        }
         Ok((token, set_cookie_str))
     }
 
@@ -334,10 +387,7 @@ impl OAuthStateManager {
         state_param: &str,
         provider_id: &str,
     ) -> Result<OAuthStatePayload, AppError> {
-        let Some(cookie_val) = cookie_header.split(';').find_map(|pair| {
-            let (name, val) = pair.trim().split_once('=')?;
-            (name == self.cookie_name).then_some(val)
-        }) else {
+        let Some(cookie_val) = cookie_value(cookie_header, &self.cookie_name) else {
             return Err(AppError::OAuthStateInvalid);
         };
 
@@ -576,6 +626,69 @@ mod tests {
     }
 
     #[test]
+    fn test_cookie_strings_are_byte_exact() {
+        assert_eq!(
+            build_state_cookie("oauth_state", "val123", "/", 600, false),
+            "oauth_state=val123; Path=/; Max-Age=600; HttpOnly; SameSite=Lax"
+        );
+        assert_eq!(
+            build_state_cookie_for_provider("oauth_state", "val123", "/", 600, true, "apple"),
+            "oauth_state=val123; Path=/; Max-Age=600; HttpOnly; SameSite=None; Secure"
+        );
+        assert_eq!(
+            build_clear_state_cookie("oauth_state", "/", false),
+            "oauth_state=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Lax"
+        );
+        assert_eq!(
+            build_clear_state_cookie_for_provider("oauth_state", "/", true, "apple"),
+            "oauth_state=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=None; Secure"
+        );
+    }
+
+    #[test]
+    fn create_state_rejects_cookie_above_browser_limit_for_escaped_redirect() {
+        // Largest redirect the HTTP handler accepts (handler::oauth::MAX_REDIRECT_URL_LEN).
+        const MAX_REDIRECT_URL_LEN: usize = 2048;
+        let cfg = crate::config::OAuthConfig {
+            state_secret: "01234567890123456789012345678901".to_string(),
+            ..Default::default()
+        };
+        let mgr = OAuthStateManager::new(&cfg, true);
+
+        let plain = format!("/{}", "a".repeat(MAX_REDIRECT_URL_LEN - 1));
+        let (_, cookie) = mgr
+            .create_state("google", "verifier", Some(plain))
+            .expect("a plain redirect at the limit fits");
+        assert!(cookie.len() <= MAX_STATE_COOKIE_LEN);
+
+        // JSON escaping doubles every quote, so the raw limit no longer bounds the cookie.
+        let escaped = format!("/{}", "\"".repeat(MAX_REDIRECT_URL_LEN - 1));
+        assert_eq!(escaped.len(), MAX_REDIRECT_URL_LEN);
+        assert!(matches!(
+            mgr.create_state("google", "verifier", Some(escaped)),
+            Err(AppError::ValidationError(_))
+        ));
+    }
+
+    #[test]
+    fn extract_state_cookie_scans_every_cookie_header() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            axum::http::header::COOKIE,
+            HeaderValue::from_static("session=abc"),
+        );
+        headers.append(
+            axum::http::header::COOKIE,
+            HeaderValue::from_static("other=1; oauth_state=from_second"),
+        );
+
+        assert_eq!(
+            extract_state_cookie(&headers, "oauth_state"),
+            Some("from_second")
+        );
+    }
+
+    #[test]
     fn test_oauth_state_manager_lifecycle() {
         let cfg = crate::config::OAuthConfig {
             state_secret: "01234567890123456789012345678901".to_string(),
@@ -675,6 +788,32 @@ mod tests {
             .expect("create");
         assert!(matches!(
             mgr.validate("unrelated=1; other=2", &token2, "google"),
+            Err(AppError::OAuthStateInvalid)
+        ));
+    }
+
+    #[test]
+    fn rejects_own_cookie_under_a_different_name() {
+        let cfg = crate::config::OAuthConfig {
+            state_secret: "01234567890123456789012345678901".to_string(),
+            ..Default::default()
+        };
+        let mgr = OAuthStateManager::new(&cfg, false);
+        let (token, set_cookie) = mgr
+            .create_state("google", "verifier", None)
+            .expect("create");
+        let cookie_val = set_cookie
+            .split(';')
+            .next()
+            .unwrap()
+            .split_once('=')
+            .unwrap()
+            .1;
+
+        // A validly signed value planted under another cookie name is still not our state cookie.
+        let jar = format!("x_oauth_state={cookie_val}; session=abc");
+        assert!(matches!(
+            mgr.validate(&jar, &token, "google"),
             Err(AppError::OAuthStateInvalid)
         ));
     }

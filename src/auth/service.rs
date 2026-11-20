@@ -25,6 +25,7 @@ use crate::{
         argon2::{generate_dummy_hash, hash_password, verify_password},
         token::{generate_token, hash_token},
     },
+    db::models::is_unusable_password_hash,
     email::{EmailDispatcher, PasswordResetEmailPayload, VerificationEmailPayload},
     error::{AppError, AppResult},
 };
@@ -195,6 +196,20 @@ impl AuthServiceImpl {
 
     // ─── Login ───────────────────────────────────────────────────────────────
 
+    /// Consumes Argon2-equivalent CPU time so a missing or unusable credential
+    /// is indistinguishable from a wrong password.
+    async fn verify_dummy_password(&self, password: &str) {
+        let dummy_hash = self.dummy_hash.clone();
+        let pw = password.to_string();
+        if let Err(join_err) = tokio::task::spawn_blocking(move || {
+            let _ = verify_password(&pw, &dummy_hash);
+        })
+        .await
+        {
+            tracing::debug!(err = %join_err, "dummy password verify task failed");
+        }
+    }
+
     /// Authenticate and return the user's `Uuid` on success.
     ///
     /// Anti-enumeration: always runs Argon2 verify even when email not found.
@@ -228,15 +243,7 @@ impl AuthServiceImpl {
                 // Anti-enumeration: run dummy verify to consume equivalent CPU time.
                 // A JoinError here (panic/cancel) still maps to InvalidCredentials:
                 // the timing signal is best-effort, the error signal is exact.
-                let dummy_hash = self.dummy_hash.clone();
-                let pw = password.to_string();
-                if let Err(join_err) = tokio::task::spawn_blocking(move || {
-                    let _ = verify_password(&pw, &dummy_hash);
-                })
-                .await
-                {
-                    tracing::debug!(err = %join_err, "dummy password verify task failed");
-                }
+                self.verify_dummy_password(password).await;
                 Err(AppError::InvalidCredentials)
             }
             Some(row) => {
@@ -246,16 +253,8 @@ impl AuthServiceImpl {
 
                 // Accounts created via OAuth have an empty or unusable password sentinel.
                 // Execute dummy Argon2id verification to eliminate timing differences.
-                if hash.is_empty() || hash.starts_with("$unusable$") {
-                    let dummy_hash = self.dummy_hash.clone();
-                    let pw = password.to_string();
-                    if let Err(join_err) = tokio::task::spawn_blocking(move || {
-                        let _ = verify_password(&pw, &dummy_hash);
-                    })
-                    .await
-                    {
-                        tracing::debug!(err = %join_err, "dummy password verify task failed");
-                    }
+                if is_unusable_password_hash(&hash) {
+                    self.verify_dummy_password(password).await;
                     return Err(AppError::InvalidCredentials);
                 }
 

@@ -38,6 +38,42 @@ const TOTP_ALPHABET: base32::Alphabet = base32::Alphabet::RFC4648 { padding: fal
 
 type HmacSha1 = Hmac<Sha1>;
 
+/// Decrypted TOTP secret that zeroes its bytes on drop.
+///
+/// [`decrypt_secret`] returns this guard so no caller can leave the seed resident in the
+/// heap after use. Deref to borrow it as `&[u8]`.
+pub struct DecryptedSecret(Vec<u8>);
+
+impl std::ops::Deref for DecryptedSecret {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AsRef<[u8]> for DecryptedSecret {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for DecryptedSecret {
+    fn drop(&mut self) {
+        crate::crypto::zeroize_bytes(&mut self.0);
+    }
+}
+
+// Manual `Debug`: the contained bytes are the live TOTP seed.
+impl std::fmt::Debug for DecryptedSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecryptedSecret")
+            .field("bytes", &"[redacted]")
+            .field("len", &self.0.len())
+            .finish()
+    }
+}
+
 /// Encrypt `plaintext` with AES-256-GCM under a fresh CSPRNG nonce.
 ///
 /// Output layout: `nonce (12 bytes) || ciphertext || tag (16 bytes)`.
@@ -62,18 +98,20 @@ pub fn encrypt_secret(key: &[u8; AES_KEY_BYTES], plaintext: &[u8]) -> Result<Vec
 ///
 /// Fails on truncation, tampering, and wrong keys alike: distinguishing them would
 /// tell an attacker whether a guessed key was close, so all map to an internal error.
-pub fn decrypt_secret(key: &[u8; AES_KEY_BYTES], blob: &[u8]) -> Result<Vec<u8>, AppError> {
+/// The returned guard zeroes the plaintext when dropped.
+pub fn decrypt_secret(key: &[u8; AES_KEY_BYTES], blob: &[u8]) -> Result<DecryptedSecret, AppError> {
     if blob.len() < MIN_BLOB_LEN {
         return Err(AppError::Internal);
     }
     let (nonce_bytes, payload) = blob.split_at(NONCE_LEN);
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    cipher
+    let plaintext = cipher
         .decrypt(Nonce::from_slice(nonce_bytes), payload)
         .map_err(|err| {
             tracing::warn!(error = %err, "totp secret decryption failed");
             AppError::Internal
-        })
+        })?;
+    Ok(DecryptedSecret(plaintext))
 }
 
 /// Generate a fresh 160-bit TOTP secret as unpadded base32 (32 characters).
@@ -207,10 +245,20 @@ mod tests {
         let plaintext = b"JBSWY3DPEHPK3PXP";
         let blob = encrypt_secret(&test_key(), plaintext).expect("encrypt");
         assert_eq!(blob.len(), plaintext.len() + MIN_BLOB_LEN);
-        assert_eq!(
-            decrypt_secret(&test_key(), &blob).expect("decrypt"),
-            plaintext
-        );
+
+        let decrypted = decrypt_secret(&test_key(), &blob).expect("decrypt");
+        assert_eq!(&*decrypted, &plaintext[..]);
+    }
+
+    #[test]
+    fn decrypted_secret_debug_redacts_bytes() {
+        let plaintext = b"JBSWY3DPEHPK3PXP";
+        let blob = encrypt_secret(&test_key(), plaintext).expect("encrypt");
+        let decrypted = decrypt_secret(&test_key(), &blob).expect("decrypt");
+        let rendered = format!("{decrypted:?}");
+        assert!(!rendered.contains("JBSWY3DPEHPK3PXP"));
+        assert!(rendered.contains("bytes: \"[redacted]\""));
+        assert!(rendered.contains("len: 16"));
     }
 
     #[test]

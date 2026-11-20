@@ -465,3 +465,509 @@ impl std::fmt::Debug for EnrollTotpResponse {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::TotpConfig,
+        crypto::hash_password,
+        db::DbPoolOptions,
+        totp::crypto::{current_totp_counter, generate_totp},
+    };
+
+    static TOTP_DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Test-only AES key. Never a production key.
+    const TEST_KEY_HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    struct DbTestContext {
+        service: TotpService,
+        pool: PgPool,
+        auth_config: Arc<AppConfig>,
+        _guard: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    async fn setup_db_context() -> Option<DbTestContext> {
+        let guard = TOTP_DB_TEST_LOCK.lock().await;
+        dotenvy::dotenv().ok();
+        let url = db_test_url()?;
+        let pool = crate::db::init_pool_with_options(
+            &url,
+            DbPoolOptions {
+                max_connections: 5,
+                min_connections: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("DATABASE_URL is set, so the DB-backed test must connect");
+        let auth_config = Arc::new(AppConfig {
+            argon2_m_cost: 8,
+            argon2_t_cost: 1,
+            argon2_p_cost: 1,
+            ..Default::default()
+        });
+        let config = Arc::new(Config {
+            database_url: url,
+            totp: TotpConfig {
+                encryption_key: Some(TEST_KEY_HEX.into()),
+                ..TotpConfig::default()
+            },
+            ..Config::default()
+        });
+        let service = TotpService::new(pool.clone(), config, Arc::clone(&auth_config));
+        Some(DbTestContext {
+            service,
+            pool,
+            auth_config,
+            _guard: guard,
+        })
+    }
+
+    /// Returns `DATABASE_URL`, or skips loudly. In CI the variable is mandatory, so a
+    /// missing value fails the run instead of silently reporting green.
+    fn db_test_url() -> Option<String> {
+        match std::env::var("DATABASE_URL") {
+            Ok(url) => Some(url),
+            Err(_) => {
+                assert!(
+                    std::env::var_os("CI").is_none(),
+                    "DATABASE_URL must be set in CI: DB-backed tests must never skip silently"
+                );
+                eprintln!("SKIP: DB-backed totp service tests need DATABASE_URL");
+                None
+            }
+        }
+    }
+
+    // Unique generated password per call: no hard-coded credential material in tests.
+    fn fixture_password() -> String {
+        format!("Fixture-{}-Aa1!", Uuid::new_v4().simple())
+    }
+
+    async fn create_user(ctx: &DbTestContext, verified: bool, password: &str) -> Uuid {
+        let email = format!("totp-{}@example.com", Uuid::new_v4().simple());
+        let password_hash = hash_password(password, &ctx.auth_config).expect("hash");
+        sqlx::query_scalar(
+            "INSERT INTO users (email, password_hash, email_verified) \
+             VALUES ($1, $2, $3) RETURNING id",
+        )
+        .bind(email)
+        .bind(password_hash)
+        .bind(verified)
+        .fetch_one(&ctx.pool)
+        .await
+        .expect("insert user")
+    }
+
+    fn current_code(secret_base32: &str) -> String {
+        let raw = decode_totp_secret(secret_base32).expect("decode");
+        format!(
+            "{:06}",
+            generate_totp(&raw, current_totp_counter()).expect("generate")
+        )
+    }
+
+    async fn enroll_and_confirm(ctx: &DbTestContext, user_id: Uuid) -> EnrollTotpResponse {
+        let response = ctx.service.enroll_totp(user_id).await.expect("enroll");
+        let code = current_code(&response.secret_base32);
+        ctx.service
+            .confirm_enrollment(user_id, &code, "127.0.0.1")
+            .await
+            .expect("confirm");
+        response
+    }
+
+    async fn count_rows(pool: &PgPool, table: &str, user_id: Uuid) -> i64 {
+        let sql = match table {
+            "totp_secrets" => "SELECT COUNT(*) FROM totp_secrets WHERE user_id = $1",
+            "totp_used_codes" => "SELECT COUNT(*) FROM totp_used_codes WHERE user_id = $1",
+            "two_factor_tokens" => "SELECT COUNT(*) FROM two_factor_tokens WHERE user_id = $1",
+            other => panic!("unexpected table {other}"),
+        };
+        sqlx::query_scalar(sql)
+            .bind(user_id)
+            .fetch_one(pool)
+            .await
+            .expect("count")
+    }
+
+    #[tokio::test]
+    async fn enroll_requires_verified_email() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, false, &fixture_password()).await;
+
+        assert!(matches!(
+            ctx.service.enroll_totp(user_id).await,
+            Err(AppError::TotpEmailNotVerified)
+        ));
+        assert_eq!(count_rows(&ctx.pool, "totp_secrets", user_id).await, 0);
+    }
+
+    #[tokio::test]
+    async fn enroll_issues_secret_uri_and_ten_backup_codes() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+
+        let response = ctx.service.enroll_totp(user_id).await.expect("enroll");
+        assert_eq!(response.secret_base32.len(), 32);
+        assert!(response.otpauth_uri.starts_with("otpauth://totp/"));
+        assert_eq!(response.backup_codes.len(), 10);
+        let unique: std::collections::HashSet<_> = response.backup_codes.iter().collect();
+        assert_eq!(unique.len(), 10);
+
+        let enabled: bool =
+            sqlx::query_scalar("SELECT enabled FROM totp_secrets WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(&ctx.pool)
+                .await
+                .expect("pending secret");
+        assert!(!enabled);
+    }
+
+    #[tokio::test]
+    async fn enroll_rejects_enabled_user_but_rerolls_pending_secret() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+
+        let first = ctx
+            .service
+            .enroll_totp(user_id)
+            .await
+            .expect("first enroll");
+        let second = ctx.service.enroll_totp(user_id).await.expect("reroll");
+        assert_ne!(first.secret_base32, second.secret_base32);
+
+        enroll_and_confirm(&ctx, user_id).await;
+        assert!(matches!(
+            ctx.service.enroll_totp(user_id).await,
+            Err(AppError::TotpAlreadyEnabled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn confirm_requires_pending_secret_and_valid_code() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+
+        assert!(matches!(
+            ctx.service
+                .confirm_enrollment(user_id, "000000", "127.0.0.1")
+                .await,
+            Err(AppError::TotpNotEnrolled)
+        ));
+
+        let response = ctx.service.enroll_totp(user_id).await.expect("enroll");
+        assert!(matches!(
+            ctx.service
+                .confirm_enrollment(user_id, "000000", "127.0.0.1")
+                .await,
+            Err(AppError::TotpCodeInvalid)
+        ));
+
+        let code = current_code(&response.secret_base32);
+        ctx.service
+            .confirm_enrollment(user_id, &code, "127.0.0.1")
+            .await
+            .expect("confirm");
+        assert!(ctx.service.is_totp_enabled(user_id).await.expect("state"));
+        assert!(matches!(
+            ctx.service
+                .confirm_enrollment(user_id, &code, "127.0.0.1")
+                .await,
+            Err(AppError::TotpAlreadyEnabled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn verify_requires_an_enabled_secret() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        assert!(matches!(
+            ctx.service.verify_totp(user_id, "000000", "ip").await,
+            Err(AppError::TotpNotEnrolled)
+        ));
+
+        let response = ctx.service.enroll_totp(user_id).await.expect("enroll");
+        let code = current_code(&response.secret_base32);
+        assert!(matches!(
+            ctx.service.verify_totp(user_id, &code, "ip").await,
+            Err(AppError::TotpNotEnrolled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn verify_totp_accepts_once_then_reports_replay() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let response = enroll_and_confirm(&ctx, user_id).await;
+        let code = current_code(&response.secret_base32);
+
+        ctx.service
+            .verify_totp(user_id, &code, "ip")
+            .await
+            .expect("first use");
+        assert!(matches!(
+            ctx.service.verify_totp(user_id, &code, "ip").await,
+            Err(AppError::TotpCodeReplayed)
+        ));
+        assert_eq!(count_rows(&ctx.pool, "totp_used_codes", user_id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_out_of_window_and_malformed_codes() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let response = enroll_and_confirm(&ctx, user_id).await;
+        let raw = decode_totp_secret(&response.secret_base32).expect("decode");
+        let distant_code = format!(
+            "{:06}",
+            generate_totp(&raw, current_totp_counter() + 3).expect("generate")
+        );
+
+        assert!(matches!(
+            ctx.service.verify_totp(user_id, &distant_code, "ip").await,
+            Err(AppError::TotpCodeInvalid)
+        ));
+        assert!(matches!(
+            ctx.service.verify_totp(user_id, "12345", "ip").await,
+            Err(AppError::TotpCodeInvalid)
+        ));
+        assert_eq!(count_rows(&ctx.pool, "totp_used_codes", user_id).await, 0);
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_corrupt_ciphertext_without_leaking_the_cause() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let response = enroll_and_confirm(&ctx, user_id).await;
+        let code = current_code(&response.secret_base32);
+
+        sqlx::query("UPDATE totp_secrets SET encrypted_secret = $2 WHERE user_id = $1")
+            .bind(user_id)
+            .bind(vec![0u8; 40])
+            .execute(&ctx.pool)
+            .await
+            .expect("corrupt");
+
+        assert!(matches!(
+            ctx.service.verify_totp(user_id, &code, "ip").await,
+            Err(AppError::TotpCodeInvalid)
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_verification_admits_exactly_one_request() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let response = enroll_and_confirm(&ctx, user_id).await;
+        let code = current_code(&response.secret_base32);
+
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let service = ctx.service.clone();
+            let attempt = code.clone();
+            handles.push(tokio::spawn(async move {
+                service.verify_totp(user_id, &attempt, "ip").await
+            }));
+        }
+        let mut accepted = 0;
+        let mut replayed = 0;
+        for handle in handles {
+            match handle.await.expect("join") {
+                Ok(()) => accepted += 1,
+                Err(AppError::TotpCodeReplayed) => replayed += 1,
+                Err(other) => panic!("unexpected result: {other:?}"),
+            }
+        }
+        assert_eq!(accepted, 1);
+        assert_eq!(replayed, 4);
+        assert_eq!(count_rows(&ctx.pool, "totp_used_codes", user_id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn backup_codes_are_single_use() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let response = enroll_and_confirm(&ctx, user_id).await;
+        let code = response.backup_codes[0].clone();
+
+        ctx.service
+            .verify_backup_code(user_id, &code, "ip")
+            .await
+            .expect("first use");
+        assert!(matches!(
+            ctx.service.verify_backup_code(user_id, &code, "ip").await,
+            Err(AppError::TotpBackupCodeInvalid)
+        ));
+        assert!(matches!(
+            ctx.service
+                .verify_backup_code(user_id, "AAAAAAAAAA", "ip")
+                .await,
+            Err(AppError::TotpBackupCodeInvalid)
+        ));
+
+        let stored: serde_json::Value =
+            sqlx::query_scalar("SELECT backup_codes FROM totp_secrets WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(&ctx.pool)
+                .await
+                .expect("backup codes");
+        assert_eq!(stored.as_array().expect("array").len(), 9);
+    }
+
+    #[tokio::test]
+    async fn disable_requires_a_valid_password_and_wipes_state() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let password = fixture_password();
+        let user_id = create_user(&ctx, true, &password).await;
+        let response = enroll_and_confirm(&ctx, user_id).await;
+        let code = current_code(&response.secret_base32);
+        ctx.service
+            .verify_totp(user_id, &code, "ip")
+            .await
+            .expect("seed replay row");
+
+        assert!(matches!(
+            ctx.service
+                .disable_totp(
+                    user_id,
+                    FreshAuthProof::Password("wrong-password".into()),
+                    "ip",
+                )
+                .await,
+            Err(AppError::InvalidCredentials)
+        ));
+        assert!(ctx.service.is_totp_enabled(user_id).await.expect("state"));
+
+        ctx.service
+            .disable_totp(user_id, FreshAuthProof::Password(password), "ip")
+            .await
+            .expect("disable");
+        assert!(!ctx.service.is_totp_enabled(user_id).await.expect("state"));
+        assert_eq!(count_rows(&ctx.pool, "totp_secrets", user_id).await, 0);
+        assert_eq!(count_rows(&ctx.pool, "totp_used_codes", user_id).await, 0);
+    }
+
+    #[tokio::test]
+    async fn disable_accepts_a_live_totp_code() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let response = enroll_and_confirm(&ctx, user_id).await;
+        let code = current_code(&response.secret_base32);
+
+        ctx.service
+            .disable_totp(user_id, FreshAuthProof::TotpCode(code), "ip")
+            .await
+            .expect("disable");
+        assert!(!ctx.service.is_totp_enabled(user_id).await.expect("state"));
+        assert_eq!(count_rows(&ctx.pool, "totp_used_codes", user_id).await, 0);
+    }
+
+    #[tokio::test]
+    async fn challenge_token_survives_validation_and_is_single_use() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+
+        let token = ctx
+            .service
+            .generate_two_factor_token(user_id)
+            .await
+            .expect("generate");
+        assert_eq!(
+            ctx.service
+                .validate_two_factor_token(&token)
+                .await
+                .expect("validate"),
+            user_id
+        );
+        assert_eq!(
+            ctx.service
+                .validate_two_factor_token(&token)
+                .await
+                .expect("retry"),
+            user_id
+        );
+
+        ctx.service
+            .consume_two_factor_token(&token)
+            .await
+            .expect("consume");
+        assert!(matches!(
+            ctx.service.consume_two_factor_token(&token).await,
+            Err(AppError::TwoFactorTokenInvalid)
+        ));
+        assert!(matches!(
+            ctx.service.validate_two_factor_token(&token).await,
+            Err(AppError::TwoFactorTokenInvalid)
+        ));
+        assert!(matches!(
+            ctx.service.validate_two_factor_token("not-a-token").await,
+            Err(AppError::TwoFactorTokenInvalid)
+        ));
+    }
+
+    #[tokio::test]
+    async fn expired_challenge_token_is_rejected_and_left_for_cleanup() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let token = ctx
+            .service
+            .generate_two_factor_token(user_id)
+            .await
+            .expect("generate");
+
+        sqlx::query(
+            "UPDATE two_factor_tokens SET expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second' \
+             WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .execute(&ctx.pool)
+        .await
+        .expect("expire");
+
+        assert!(matches!(
+            ctx.service.validate_two_factor_token(&token).await,
+            Err(AppError::TwoFactorTokenExpired)
+        ));
+        assert_eq!(count_rows(&ctx.pool, "two_factor_tokens", user_id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn is_totp_enabled_defaults_to_false() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        assert!(!ctx.service.is_totp_enabled(user_id).await.expect("state"));
+    }
+}

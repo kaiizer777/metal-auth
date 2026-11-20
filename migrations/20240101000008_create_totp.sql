@@ -1,7 +1,8 @@
--- Migration: TOTP two-factor authentication state.
+-- Migration: 20240101000008_create_totp.sql
+-- Up Migration
 -- Phase 7: encrypted TOTP secrets, replay log, and intermediate challenge tokens.
 
-CREATE TABLE totp_secrets (
+CREATE TABLE IF NOT EXISTS totp_secrets (
     id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id           UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     -- AES-256-GCM blob: nonce (12 bytes) || ciphertext || tag (16 bytes)
@@ -14,9 +15,9 @@ CREATE TABLE totp_secrets (
     CONSTRAINT uq_totp_secrets_user_id UNIQUE (user_id)
 );
 
-CREATE INDEX idx_totp_secrets_user_id ON totp_secrets (user_id);
+CREATE INDEX IF NOT EXISTS idx_totp_secrets_user_id ON totp_secrets (user_id);
 
-CREATE TABLE totp_used_codes (
+CREATE TABLE IF NOT EXISTS totp_used_codes (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     -- SHA-256 of (code_string || "::" || step_window_number)
@@ -26,9 +27,9 @@ CREATE TABLE totp_used_codes (
 );
 
 -- Replay lookup and TTL pruning both seek on this composite.
-CREATE INDEX idx_totp_used_codes_user_used ON totp_used_codes (user_id, used_at);
+CREATE INDEX IF NOT EXISTS idx_totp_used_codes_user_used ON totp_used_codes (user_id, used_at);
 
-CREATE TABLE two_factor_tokens (
+CREATE TABLE IF NOT EXISTS two_factor_tokens (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     -- SHA-256 of the raw 32-byte challenge token
@@ -37,10 +38,10 @@ CREATE TABLE two_factor_tokens (
     CONSTRAINT uq_two_factor_tokens_hash UNIQUE (token_hash)
 );
 
-CREATE INDEX idx_two_factor_tokens_user_id ON two_factor_tokens (user_id);
-CREATE INDEX idx_two_factor_tokens_expires ON two_factor_tokens (expires_at);
+CREATE INDEX IF NOT EXISTS idx_two_factor_tokens_user_id ON two_factor_tokens (user_id);
+CREATE INDEX IF NOT EXISTS idx_two_factor_tokens_expires ON two_factor_tokens (expires_at);
 
--- Down migration (sqlx applies forward only; kept as the rollback reference):
+-- Down Migration (Documentation / Rollback Reference)
 -- DROP INDEX IF EXISTS idx_two_factor_tokens_expires;
 -- DROP INDEX IF EXISTS idx_two_factor_tokens_user_id;
 -- DROP TABLE IF EXISTS two_factor_tokens;

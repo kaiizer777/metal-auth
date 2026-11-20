@@ -178,6 +178,59 @@ mod tests {
     }
 
     #[test]
+    fn verify_traverses_every_hash_after_a_match() {
+        let (raw, mut store) = generate_backup_codes(&test_config()).expect("generate");
+        // Match first, unparsable last: a loop that exits on match never reaches index 9
+        // and therefore emits no warning for it.
+        store.truncate(1);
+        store.extend(std::iter::repeat_n("not-a-phc-hash".to_string(), 9));
+
+        let logs = capture_logs(|| {
+            assert_eq!(verify_backup_code(&raw[0], &store).expect("verify"), 0);
+        });
+
+        assert!(
+            logs.contains("unparsable backup code hash skipped"),
+            "no traversal past the match; logs: {logs}"
+        );
+        assert!(logs.contains("index=9"), "last hash not visited: {logs}");
+    }
+
+    /// Run `body` with a subscriber that captures formatted log lines.
+    fn capture_logs<F: FnOnce()>(body: F) -> String {
+        use std::io;
+        use std::sync::{Arc, Mutex};
+
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("log buffer poisoned")
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt::Subscriber::builder()
+            .with_ansi(false)
+            .with_writer({
+                let buffer = Arc::clone(&buffer);
+                move || Capture(Arc::clone(&buffer))
+            })
+            .finish();
+
+        tracing::dispatcher::with_default(&tracing::dispatcher::Dispatch::new(subscriber), body);
+
+        String::from_utf8(buffer.lock().expect("log buffer poisoned").clone())
+            .expect("logs are UTF-8")
+    }
+
+    #[test]
     fn unparsable_hash_does_not_break_verification() {
         let (raw, mut hashed) = generate_backup_codes(&test_config()).expect("generate");
         hashed[0] = "not-a-phc-hash".to_string();

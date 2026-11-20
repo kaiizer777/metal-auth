@@ -290,6 +290,140 @@ async fn test_auth_boot_with_oauth_enabled_serves_initiate() {
 }
 
 #[tokio::test]
+async fn test_oauth_initiate_sets_state_cookie_attributes() {
+    let cfg = oauth_enabled_test_config();
+    assert!(cfg.session.cookie_secure, "precondition: secure cookies");
+
+    let pool = PgPool::connect_lazy(&cfg.database_url).expect("lazy pool creation");
+    let state = AppState::new(pool, cfg).unwrap();
+    let mut auth = Auth::from_state(state).unwrap();
+
+    let req = Request::builder()
+        .uri("/auth/oauth/google")
+        .method(Method::GET)
+        .body(Body::empty())
+        .unwrap();
+    let resp = auth.router.call(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FOUND);
+
+    let cookie = resp
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|v| v.starts_with("oauth_state="))
+        .expect("state cookie set on initiate");
+
+    for attribute in [
+        "Path=/",
+        "Max-Age=600",
+        "HttpOnly",
+        "SameSite=Lax",
+        "Secure",
+    ] {
+        assert!(
+            cookie.contains(attribute),
+            "state cookie missing {attribute}: {cookie}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_oauth_routes_emit_no_store_on_both_mounts() {
+    let pool = PgPool::connect_lazy("postgres://user:pass@localhost:5432/metal_auth_test")
+        .expect("lazy pool creation");
+    let state = AppState::new(pool, oauth_enabled_test_config()).unwrap();
+    let mut auth = Auth::from_state(state).unwrap();
+
+    for path in ["/auth/oauth/google", "/api/auth/oauth/google"] {
+        let req = Request::builder()
+            .uri(path)
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap();
+        let resp = auth.router.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FOUND, "path {path}");
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store",
+            "path {path} must not be cached"
+        );
+        assert_eq!(resp.headers().get(header::PRAGMA).unwrap(), "no-cache");
+    }
+}
+
+#[tokio::test]
+async fn test_oauth_preflight_options_on_oauth_route() {
+    let pool = PgPool::connect_lazy("postgres://user:pass@localhost:5432/metal_auth_test")
+        .expect("lazy pool creation");
+    let state = AppState::new(pool, oauth_enabled_test_config()).unwrap();
+    let mut auth = Auth::from_state(state).unwrap();
+
+    let req = Request::builder()
+        .uri("/auth/oauth/google")
+        .method(Method::OPTIONS)
+        .header(header::ORIGIN, "https://app.example.com")
+        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+        .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization")
+        .body(Body::empty())
+        .unwrap();
+    let resp = auth.router.call(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .unwrap(),
+        "https://app.example.com"
+    );
+    // OPTIONS is exempt from the no-store cache controls.
+    assert!(resp.headers().get(header::CACHE_CONTROL).is_none());
+
+    let denied = Request::builder()
+        .uri("/auth/oauth/google")
+        .method(Method::OPTIONS)
+        .header(header::ORIGIN, "https://unauthorized-origin.com")
+        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+        .body(Body::empty())
+        .unwrap();
+    let resp = auth.router.call(denied).await.unwrap();
+    assert!(
+        resp.headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn test_oauth_initiate_rejects_oversized_redirect_url() {
+    let pool = PgPool::connect_lazy("postgres://user:pass@localhost:5432/metal_auth_test")
+        .expect("lazy pool creation");
+    let state = AppState::new(pool, oauth_enabled_test_config()).unwrap();
+    let mut auth = Auth::from_state(state).unwrap();
+
+    let oversized = format!("/{}", "a".repeat(4096));
+    let req = Request::builder()
+        .uri(format!("/auth/oauth/google?redirect_url={oversized}"))
+        .method(Method::GET)
+        .body(Body::empty())
+        .unwrap();
+    let resp = auth.router.call(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    let err_envelope: ErrorResponse = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(err_envelope.code, ErrorCode::ValidationError);
+
+    // A short redirect still flows through to the provider.
+    let req = Request::builder()
+        .uri("/auth/oauth/google?redirect_url=%2Fdashboard")
+        .method(Method::GET)
+        .body(Body::empty())
+        .unwrap();
+    let resp = auth.router.call(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FOUND);
+}
+
+#[tokio::test]
 async fn test_auth_boot_with_oauth_disabled_fails_oauth_route_per_request() {
     let cfg = test_config();
 

@@ -628,7 +628,38 @@ async fn test_oauth_multi_provider_link_and_unlink_lifecycle() {
     let accounts: Vec<serde_json::Value> = serde_json::from_str(&resp.body_str).unwrap();
     assert_eq!(accounts.len(), 2);
 
-    // 5. Unlink GitHub account via POST /auth/oauth/github/unlink
+    // 5. Unlink without the CSRF token is rejected and leaves the link intact
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/auth/oauth/github/unlink")
+        .header(
+            header::COOKIE,
+            format!("{session_cookie_name}={session_cookie}; csrf_token={csrf_cookie}"),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.dispatch(req).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.json()["code"], "CSRF_TOKEN_MISSING");
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/auth/oauth/accounts")
+        .header(
+            header::COOKIE,
+            format!("{session_cookie_name}={session_cookie}"),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.dispatch(req).await;
+    let accounts: Vec<serde_json::Value> = serde_json::from_str(&resp.body_str).unwrap();
+    assert_eq!(
+        accounts.len(),
+        2,
+        "rejected unlink must not remove the link"
+    );
+
+    // 6. Unlink GitHub account via POST /auth/oauth/github/unlink
     let req = Request::builder()
         .method(Method::POST)
         .uri("/auth/oauth/github/unlink")
@@ -643,7 +674,7 @@ async fn test_oauth_multi_provider_link_and_unlink_lifecycle() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.json()["message"], "account unlinked");
 
-    // 6. Verify list accounts now returns 1 account (Google)
+    // 7. Verify list accounts now returns 1 account (Google)
     let req = Request::builder()
         .method(Method::GET)
         .uri("/auth/oauth/accounts")
@@ -658,7 +689,7 @@ async fn test_oauth_multi_provider_link_and_unlink_lifecycle() {
     assert_eq!(accounts.len(), 1);
     assert_eq!(accounts[0]["provider_id"], "google");
 
-    // 7. Lockout prevention: attempt to unlink remaining Google account without a password
+    // 8. Lockout prevention: attempt to unlink remaining Google account without a password
     let req = Request::builder()
         .method(Method::POST)
         .uri("/auth/oauth/google/unlink")
@@ -774,6 +805,21 @@ async fn test_oauth_apple_form_post_callback() {
     let resp = app.dispatch(req).await;
     let state_token = extract_state_from_location(&resp.headers);
     let state_cookie = extract_cookie_value(&resp.headers, "oauth_state").unwrap();
+
+    // Apple form_post must survive a cross-site POST: SameSite=None; Secure.
+    let apple_cookie = resp
+        .headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|v| v.starts_with("oauth_state="))
+        .expect("apple state cookie set on initiate");
+    for attribute in ["SameSite=None", "Secure", "HttpOnly"] {
+        assert!(
+            apple_cookie.contains(attribute),
+            "apple state cookie missing {attribute}: {apple_cookie}"
+        );
+    }
 
     // Apple form_post: POST /auth/oauth/apple/callback (no CSRF token, raw POST)
     let form_body = format!("code=apple_code_001&state={state_token}");

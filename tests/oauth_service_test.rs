@@ -282,6 +282,8 @@ async fn test_oauth_auto_links_verified_existing_local_user() {
     };
     let (session, user, clear_cookie) = (res.session, res.user, res.clear_cookie_header);
 
+    assert!(res.is_linked);
+    assert!(!res.is_created);
     assert_eq!(user.id, local_user_id);
     assert_eq!(session.user_id, local_user_id);
     assert!(clear_cookie.contains("Max-Age=0"));
@@ -449,7 +451,7 @@ async fn test_oauth_link_and_unlink_account_lifecycle() {
     // 1. Link Google
     let (auth_url_g, cookie_g) = svc.get_authorization_url("google", None).unwrap();
     let state_g = extract_state_from_url(&auth_url_g);
-    svc.link_account(user_id, "google", "code_g", state_g, Some(&cookie_g))
+    svc.link_account_identity(user_id, "google", "code_g", state_g, Some(&cookie_g))
         .await
         .expect("link google");
 
@@ -460,7 +462,7 @@ async fn test_oauth_link_and_unlink_account_lifecycle() {
     // 3. Link GitHub (now 2 linked accounts)
     let (auth_url_gh, cookie_gh) = svc.get_authorization_url("github", None).unwrap();
     let state_gh = extract_state_from_url(&auth_url_gh);
-    svc.link_account(user_id, "github", "code_gh", state_gh, Some(&cookie_gh))
+    svc.link_account_identity(user_id, "github", "code_gh", state_gh, Some(&cookie_gh))
         .await
         .expect("link github");
 
@@ -1296,4 +1298,369 @@ async fn test_unlink_multi_identities_same_provider_lockout_prevention() {
     // Unlinking Google would remove both Google rows, leaving user with 0 auth methods. Must be rejected!
     let res = svc.unlink_account(user_id, "google").await;
     assert!(matches!(res, Err(AppError::ValidationError(_))));
+}
+
+async fn insert_verified_user(app: &TestApp, email: &str, password_hash: &str) -> Uuid {
+    let user_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(user_id)
+    .bind(email)
+    .bind(password_hash)
+    .bind(true)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    user_id
+}
+
+async fn link_count_for_identity(app: &TestApp, provider_user_id: &str) -> i64 {
+    let count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM oauth_accounts WHERE provider_user_id = $1")
+            .bind(provider_user_id)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    count.0
+}
+
+#[tokio::test]
+async fn unlink_unknown_provider_returns_not_found() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    truncate_tables(&app.pool).await.expect("truncate");
+
+    let email = dynamic_email();
+    let user_id = insert_verified_user(&app, &email, "argon2id$somehash").await;
+
+    let google_mock = Arc::new(MockOAuthProvider::new(
+        "google",
+        UserInfo {
+            provider_id: "google".to_string(),
+            provider_user_id: "goog-unlinked".to_string(),
+            email: email.clone(),
+            email_verified: true,
+            name: None,
+            avatar_url: None,
+        },
+    ));
+    let svc = create_test_oauth_service(&app, google_mock, None);
+
+    let res = svc.unlink_account(user_id, "google").await;
+    assert!(matches!(res, Err(AppError::NotFound)));
+}
+
+#[tokio::test]
+async fn link_intent_without_session_hash_is_rejected() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    truncate_tables(&app.pool).await.expect("truncate");
+
+    let email = dynamic_email();
+    let user_id = insert_verified_user(&app, &email, "argon2id$somehash").await;
+    let provider_sub = format!("goog-no-session-hash-{}", Uuid::new_v4());
+
+    let google_mock = Arc::new(MockOAuthProvider::new(
+        "google",
+        UserInfo {
+            provider_id: "google".to_string(),
+            provider_user_id: provider_sub.clone(),
+            email: email.clone(),
+            email_verified: true,
+            name: None,
+            avatar_url: None,
+        },
+    ));
+    let svc = create_test_oauth_service(&app, google_mock, None);
+
+    let (auth_url, set_cookie) = svc
+        .initiate_link_flow("google", user_id, Some("/settings".to_string()), None)
+        .expect("initiate link flow");
+    let state_token = extract_state_from_url(&auth_url);
+
+    let err = svc
+        .handle_callback_extended(
+            "google",
+            "valid_code",
+            state_token,
+            Some(&set_cookie),
+            "cookie",
+            None,
+            None,
+        )
+        .await
+        .expect_err("link intent without session binding must fail");
+    assert!(matches!(err, AppError::OAuthStateInvalid));
+    assert_eq!(link_count_for_identity(&app, &provider_sub).await, 0);
+}
+
+#[tokio::test]
+async fn link_race_same_user_converges() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    truncate_tables(&app.pool).await.expect("truncate");
+
+    let email = dynamic_email();
+    let user_id = insert_verified_user(&app, &email, "argon2id$somehash").await;
+    let provider_sub = format!("goog-race-same-{}", Uuid::new_v4());
+
+    let google_mock = Arc::new(MockOAuthProvider::new(
+        "google",
+        UserInfo {
+            provider_id: "google".to_string(),
+            provider_user_id: provider_sub.clone(),
+            email: email.clone(),
+            email_verified: true,
+            name: None,
+            avatar_url: None,
+        },
+    ));
+    let svc = create_test_oauth_service(&app, google_mock, None);
+
+    // Stage the winning row uncommitted so the service's insert must wait and
+    // lose to the unique constraint.
+    let mut holder = app.pool.begin().await.expect("holder txn");
+    sqlx::query(
+        "INSERT INTO oauth_accounts (id, user_id, provider_id, provider_user_id, email) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(user_id)
+    .bind("google")
+    .bind(&provider_sub)
+    .bind(&email)
+    .execute(&mut *holder)
+    .await
+    .expect("stage winning link");
+
+    let svc_task = svc.clone();
+    let info = UserInfo {
+        provider_id: "google".to_string(),
+        provider_user_id: provider_sub.clone(),
+        email: email.clone(),
+        email_verified: true,
+        name: None,
+        avatar_url: None,
+    };
+    let task = tokio::spawn(async move {
+        svc_task
+            .link_identity_to_user(user_id, "google", &info)
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    holder.commit().await.expect("commit winning link");
+
+    let account = task
+        .await
+        .expect("link task")
+        .expect("same-user race converges");
+    assert_eq!(account.user_id, user_id);
+    assert_eq!(link_count_for_identity(&app, &provider_sub).await, 1);
+}
+
+#[tokio::test]
+async fn link_race_other_user_conflicts() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    truncate_tables(&app.pool).await.expect("truncate");
+
+    let email_a = dynamic_email();
+    let email_b = dynamic_email();
+    let user_a = insert_verified_user(&app, &email_a, "argon2id$somehash").await;
+    let user_b = insert_verified_user(&app, &email_b, "argon2id$somehash").await;
+    let provider_sub = format!("goog-race-other-{}", Uuid::new_v4());
+
+    let google_mock = Arc::new(MockOAuthProvider::new(
+        "google",
+        UserInfo {
+            provider_id: "google".to_string(),
+            provider_user_id: provider_sub.clone(),
+            email: email_a.clone(),
+            email_verified: true,
+            name: None,
+            avatar_url: None,
+        },
+    ));
+    let svc = create_test_oauth_service(&app, google_mock, None);
+
+    let mut holder = app.pool.begin().await.expect("holder txn");
+    sqlx::query(
+        "INSERT INTO oauth_accounts (id, user_id, provider_id, provider_user_id, email) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(user_b)
+    .bind("google")
+    .bind(&provider_sub)
+    .bind(&email_b)
+    .execute(&mut *holder)
+    .await
+    .expect("stage rival link");
+
+    let svc_task = svc.clone();
+    let info = UserInfo {
+        provider_id: "google".to_string(),
+        provider_user_id: provider_sub.clone(),
+        email: email_a.clone(),
+        email_verified: true,
+        name: None,
+        avatar_url: None,
+    };
+    let task = tokio::spawn(async move {
+        svc_task
+            .link_identity_to_user(user_a, "google", &info)
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    holder.commit().await.expect("commit rival link");
+
+    let res = task.await.expect("link task");
+    assert!(matches!(res, Err(AppError::OAuthAccountLinkConflict)));
+    assert_eq!(link_count_for_identity(&app, &provider_sub).await, 1);
+
+    let owner: (Uuid,) =
+        sqlx::query_as("SELECT user_id FROM oauth_accounts WHERE provider_user_id = $1")
+            .bind(&provider_sub)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(owner.0, user_b);
+}
+
+#[tokio::test]
+async fn login_with_linked_identity_returns_owner_not_conflict() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    truncate_tables(&app.pool).await.expect("truncate");
+
+    let owner_email = dynamic_email();
+    let owner_id = insert_verified_user(&app, &owner_email, "argon2id$somehash").await;
+    let other_email = dynamic_email();
+    let _other_id = insert_verified_user(&app, &other_email, "argon2id$somehash").await;
+    let provider_sub = format!("goog-login-owner-{}", Uuid::new_v4());
+
+    sqlx::query(
+        "INSERT INTO oauth_accounts (id, user_id, provider_id, provider_user_id, email) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(owner_id)
+    .bind("google")
+    .bind(&provider_sub)
+    .bind(&owner_email)
+    .execute(&app.pool)
+    .await
+    .expect("seed owner link");
+
+    // Provider now reports a different local email for the same federated
+    // principal: the login path resolves the identity owner, never a conflict.
+    let google_mock = Arc::new(MockOAuthProvider::new(
+        "google",
+        UserInfo {
+            provider_id: "google".to_string(),
+            provider_user_id: provider_sub.clone(),
+            email: other_email.clone(),
+            email_verified: true,
+            name: None,
+            avatar_url: None,
+        },
+    ));
+    let svc = create_test_oauth_service(&app, google_mock, None);
+
+    let (auth_url, set_cookie) = svc.get_authorization_url("google", None).unwrap();
+    let state_token = extract_state_from_url(&auth_url);
+
+    let OAuthCallbackOutcome::Login(res) = svc
+        .handle_callback_extended(
+            "google",
+            "valid_code",
+            state_token,
+            Some(&set_cookie),
+            "cookie",
+            None,
+            None,
+        )
+        .await
+        .expect("login converges to the identity owner")
+    else {
+        panic!("expected login outcome");
+    };
+
+    assert_eq!(res.user.id, owner_id);
+    assert!(!res.is_linked);
+    assert!(!res.is_created);
+    assert_eq!(link_count_for_identity(&app, &provider_sub).await, 1);
+}
+
+#[tokio::test]
+async fn concurrent_link_same_identity_exactly_one_wins() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    truncate_tables(&app.pool).await.expect("truncate");
+
+    let email_a = dynamic_email();
+    let email_b = dynamic_email();
+    let user_a = insert_verified_user(&app, &email_a, "argon2id$somehash").await;
+    let user_b = insert_verified_user(&app, &email_b, "argon2id$somehash").await;
+    let provider_sub = format!("goog-concurrent-{}", Uuid::new_v4());
+
+    let google_mock = Arc::new(MockOAuthProvider::new(
+        "google",
+        UserInfo {
+            provider_id: "google".to_string(),
+            provider_user_id: provider_sub.clone(),
+            email: email_a.clone(),
+            email_verified: true,
+            name: None,
+            avatar_url: None,
+        },
+    ));
+    let svc = create_test_oauth_service(&app, google_mock, None);
+
+    let info_a = UserInfo {
+        provider_id: "google".to_string(),
+        provider_user_id: provider_sub.clone(),
+        email: email_a.clone(),
+        email_verified: true,
+        name: None,
+        avatar_url: None,
+    };
+    let info_b = UserInfo {
+        provider_id: "google".to_string(),
+        provider_user_id: provider_sub.clone(),
+        email: email_b.clone(),
+        email_verified: true,
+        name: None,
+        avatar_url: None,
+    };
+
+    let (res_a, res_b) = tokio::join!(
+        svc.link_identity_to_user(user_a, "google", &info_a),
+        svc.link_identity_to_user(user_b, "google", &info_b),
+    );
+
+    let wins = usize::from(res_a.is_ok()) + usize::from(res_b.is_ok());
+    assert_eq!(wins, 1, "exactly one link may win: {res_a:?} / {res_b:?}");
+    let loser = if res_a.is_ok() { res_b } else { res_a };
+    assert!(matches!(loser, Err(AppError::OAuthAccountLinkConflict)));
+    assert_eq!(link_count_for_identity(&app, &provider_sub).await, 1);
+
+    // No provisioning happened on the link path: the two seeded users remain.
+    let user_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(user_count.0, 2);
 }

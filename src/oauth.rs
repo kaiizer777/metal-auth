@@ -19,7 +19,7 @@ pub use google::GoogleProvider;
 pub use pkce::{PKCEChallenge, compute_challenge, generate_pkce, verify_pkce};
 pub use provider::{
     OAUTH_BODY_LIMIT, OAuthProvider, OAuthTokenResponse, OAuthUserInfo, SUPPORTED_PROVIDERS,
-    TokenResponse, UserInfo, build_oauth_http_client, create_provider,
+    TokenResponse, UserInfo, build_oauth_http_client,
 };
 pub use service::{OAuthCallbackOutcome, OAuthCallbackResult, OAuthService};
 pub use state::{

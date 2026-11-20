@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::{
     db::models::OAuthAccount,
-    error::AppError,
+    error::{AppError, truncate_for_log},
     handler::untrusted_client_ip,
     middleware::{AuthUser, csrf_middleware, require_auth},
     oauth::{OAUTH_BODY_LIMIT, OAuthCallbackOutcome, SUPPORTED_PROVIDERS},
@@ -17,6 +17,10 @@ use crate::{
     session::cookie::{set_csrf_cookie, set_session_cookie},
     state::AppState,
 };
+
+/// Upper bound on `redirect_url`; the value is signed into the state cookie and
+/// re-emitted as `Location`, so an unbounded value blows past header limits.
+const MAX_REDIRECT_URL_LEN: usize = 2048;
 
 #[derive(Debug, Deserialize)]
 pub struct InitiateQuery {
@@ -83,14 +87,37 @@ pub fn safe_oauth_redirect(target: &str) -> &str {
     target
 }
 
-/// Attaches a Set-Cookie header clearing the `oauth_state` cookie on error.
-fn oauth_error_response(state: &AppState, err: AppError) -> Response {
+/// Attaches a `Set-Cookie` header clearing the provider-scoped OAuth state cookie.
+fn oauth_error_response(state: &AppState, provider: &str, err: AppError) -> Response {
     let mut resp = err.into_response();
-    let clear_cookie = state.oauth_service.clear_state_cookie();
-    if let Ok(hv) = header::HeaderValue::from_str(&clear_cookie) {
+    clear_state_cookie(&mut resp, state, provider);
+    resp
+}
+
+/// Appends a `Set-Cookie` header. Cookie strings are built from config values that
+/// `OAuthConfig::validate` already vetted for header safety, so failure is unreachable.
+fn append_set_cookie(resp: &mut Response, cookie: &str) {
+    if let Ok(hv) = header::HeaderValue::from_str(cookie) {
         resp.headers_mut().append(header::SET_COOKIE, hv);
     }
-    resp
+}
+
+fn clear_state_cookie(resp: &mut Response, state: &AppState, provider: &str) {
+    append_set_cookie(
+        resp,
+        &state
+            .oauth_service
+            .clear_state_cookie_for_provider(provider),
+    );
+}
+
+fn check_redirect_url(redirect_url: Option<String>) -> Result<Option<String>, AppError> {
+    match redirect_url {
+        Some(url) if url.len() > MAX_REDIRECT_URL_LEN => Err(AppError::ValidationError(format!(
+            "redirect_url exceeds {MAX_REDIRECT_URL_LEN} bytes"
+        ))),
+        other => Ok(other),
+    }
 }
 
 fn check_oauth_rate_limit(
@@ -126,10 +153,15 @@ fn wants_oauth_json(headers: &HeaderMap, query_type: Option<&str>) -> bool {
     if wants_oauth_bearer(headers, query_type) {
         return true;
     }
-    if let Some(accept) = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()) {
-        return accept.to_ascii_lowercase().contains("application/json");
-    }
-    false
+    let Some(accept) = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    accept.split(',').any(|media_range| {
+        media_range
+            .split(';')
+            .next()
+            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
+    })
 }
 
 /// GET /auth/oauth/{provider} (and /api/auth/oauth/{provider})
@@ -143,25 +175,26 @@ pub async fn oauth_initiate(
     Query(query): Query<InitiateQuery>,
 ) -> Response {
     if !SUPPORTED_PROVIDERS.contains(&provider.as_str()) {
-        return oauth_error_response(&state, AppError::OAuthProviderNotFound);
+        return oauth_error_response(&state, &provider, AppError::OAuthProviderNotFound);
     }
 
     if let Err(e) = check_oauth_rate_limit(&state, &headers, &provider, "initiate") {
-        return oauth_error_response(&state, e);
+        return oauth_error_response(&state, &provider, e);
     }
 
-    let (auth_url, set_cookie_str) = match state
-        .oauth_service
-        .initiate_flow(&provider, query.redirect_url)
-    {
-        Ok(v) => v,
-        Err(e) => return oauth_error_response(&state, e),
+    let redirect_url = match check_redirect_url(query.redirect_url) {
+        Ok(url) => url,
+        Err(e) => return oauth_error_response(&state, &provider, e),
     };
 
+    let (auth_url, set_cookie_str) =
+        match state.oauth_service.initiate_flow(&provider, redirect_url) {
+            Ok(v) => v,
+            Err(e) => return oauth_error_response(&state, &provider, e),
+        };
+
     let mut resp = (StatusCode::FOUND, [(header::LOCATION, auth_url)]).into_response();
-    if let Ok(hv) = header::HeaderValue::from_str(&set_cookie_str) {
-        resp.headers_mut().insert(header::SET_COOKIE, hv);
-    }
+    append_set_cookie(&mut resp, &set_cookie_str);
     resp
 }
 
@@ -180,27 +213,30 @@ pub async fn oauth_link_initiate(
     Query(query): Query<InitiateQuery>,
 ) -> Response {
     if !SUPPORTED_PROVIDERS.contains(&provider.as_str()) {
-        return oauth_error_response(&state, AppError::OAuthProviderNotFound);
+        return oauth_error_response(&state, &provider, AppError::OAuthProviderNotFound);
     }
 
     if let Err(e) = check_oauth_rate_limit(&state, &headers, &provider, "initiate") {
-        return oauth_error_response(&state, e);
+        return oauth_error_response(&state, &provider, e);
     }
+
+    let redirect_url = match check_redirect_url(query.redirect_url) {
+        Ok(url) => url,
+        Err(e) => return oauth_error_response(&state, &provider, e),
+    };
 
     let (auth_url, set_cookie_str) = match state.oauth_service.initiate_link_flow(
         &provider,
         user_id,
-        query.redirect_url,
+        redirect_url,
         Some(session_hash),
     ) {
         Ok(v) => v,
-        Err(e) => return oauth_error_response(&state, e),
+        Err(e) => return oauth_error_response(&state, &provider, e),
     };
 
     let mut resp = (StatusCode::FOUND, [(header::LOCATION, auth_url)]).into_response();
-    if let Ok(hv) = header::HeaderValue::from_str(&set_cookie_str) {
-        resp.headers_mut().insert(header::SET_COOKIE, hv);
-    }
+    append_set_cookie(&mut resp, &set_cookie_str);
     resp
 }
 
@@ -211,54 +247,74 @@ pub async fn oauth_callback(
     headers: HeaderMap,
     Query(query): Query<CallbackQuery>,
 ) -> Response {
-    handle_callback_internal(
-        &state,
-        &provider,
-        &headers,
-        query.code.as_deref(),
-        query.state.as_deref(),
-        query.error.as_deref(),
-        query.session_type.as_deref(),
-    )
-    .await
+    let params = CallbackParams {
+        provider: &provider,
+        code: query.code.as_deref(),
+        state: query.state.as_deref(),
+        error: query.error.as_deref(),
+        session_type: query.session_type.as_deref(),
+    };
+    handle_callback_internal(&state, &headers, params).await
 }
 
 /// POST /auth/oauth/{provider}/callback (and /api/auth/oauth/{provider}/callback)
 ///
-/// Handles Apple `form_post` responses. Exempt from local CSRF middleware.
+/// Handles Apple `form_post` responses. The route is CSRF-exempt by construction:
+/// `public_oauth_routes` is never wrapped in `csrf_middleware`, and the signed
+/// `state` parameter supplies the cross-site request binding instead.
 pub async fn oauth_callback_post(
     State(state): State<AppState>,
     Path(provider): Path<String>,
     headers: HeaderMap,
     Form(form): Form<AppleCallbackForm>,
 ) -> Response {
-    handle_callback_internal(
-        &state,
-        &provider,
-        &headers,
-        form.code.as_deref(),
-        form.state.as_deref(),
-        form.error.as_deref(),
-        None,
-    )
-    .await
+    let params = CallbackParams {
+        provider: &provider,
+        code: form.code.as_deref(),
+        state: form.state.as_deref(),
+        error: form.error.as_deref(),
+        session_type: None,
+    };
+    handle_callback_internal(&state, &headers, params).await
+}
+
+struct CallbackParams<'a> {
+    provider: &'a str,
+    code: Option<&'a str>,
+    state: Option<&'a str>,
+    error: Option<&'a str>,
+    session_type: Option<&'a str>,
+}
+
+fn log_callback_failure(
+    provider: &str,
+    reason: &str,
+    ip: Option<&str>,
+    user_agent: Option<&str>,
+    error: Option<&str>,
+) {
+    tracing::info!(
+        event = "oauth_callback_failure",
+        provider = provider,
+        reason = reason,
+        error = error.map(truncate_for_log),
+        ip = ?ip,
+        user_agent = user_agent.map(truncate_for_log),
+    );
 }
 
 async fn handle_callback_internal(
     state: &AppState,
-    provider: &str,
     headers: &HeaderMap,
-    code: Option<&str>,
-    state_param: Option<&str>,
-    error_param: Option<&str>,
-    query_session_type: Option<&str>,
+    params: CallbackParams<'_>,
 ) -> Response {
+    let provider = params.provider;
     if !SUPPORTED_PROVIDERS.contains(&provider) {
-        return oauth_error_response(state, AppError::OAuthProviderNotFound);
+        return oauth_error_response(state, provider, AppError::OAuthProviderNotFound);
     }
 
     if let Err(e) = check_oauth_rate_limit(state, headers, provider, "callback") {
-        return oauth_error_response(state, e);
+        return oauth_error_response(state, provider, e);
     }
 
     let client_ip = untrusted_client_ip(headers);
@@ -266,47 +322,23 @@ async fn handle_callback_internal(
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok());
 
-    if let Some(err) = error_param {
-        tracing::info!(
-            event = "oauth_callback_failure",
-            provider = provider,
-            reason = "provider_error",
-            error = err,
-            ip = ?client_ip,
-            user_agent = ?user_agent,
-        );
-        return oauth_error_response(state, AppError::OAuthProviderError);
+    if let Some(err) = params.error {
+        log_callback_failure(provider, "provider_error", client_ip, user_agent, Some(err));
+        return oauth_error_response(state, provider, AppError::OAuthProviderError);
     }
 
-    let code = match code {
-        Some(c) if !c.trim().is_empty() => c,
-        _ => {
-            tracing::info!(
-                event = "oauth_callback_failure",
-                provider = provider,
-                reason = "code_invalid",
-                ip = ?client_ip,
-                user_agent = ?user_agent,
-            );
-            return oauth_error_response(state, AppError::OAuthCodeInvalid);
-        }
+    let Some(code) = params.code.filter(|c| !c.trim().is_empty()) else {
+        log_callback_failure(provider, "code_invalid", client_ip, user_agent, None);
+        return oauth_error_response(state, provider, AppError::OAuthCodeInvalid);
     };
 
-    let state_param = match state_param {
-        Some(s) if !s.trim().is_empty() => s,
-        _ => {
-            tracing::info!(
-                event = "oauth_callback_failure",
-                provider = provider,
-                reason = "state_invalid",
-                ip = ?client_ip,
-                user_agent = ?user_agent,
-            );
-            return oauth_error_response(state, AppError::OAuthStateInvalid);
-        }
+    let Some(state_param) = params.state.filter(|s| !s.trim().is_empty()) else {
+        log_callback_failure(provider, "state_invalid", client_ip, user_agent, None);
+        return oauth_error_response(state, provider, AppError::OAuthStateInvalid);
     };
 
-    let wants_bearer = wants_oauth_bearer(headers, query_session_type);
+    let wants_bearer = wants_oauth_bearer(headers, params.session_type);
+    let wants_json = wants_oauth_json(headers, params.session_type);
     let session_type = if wants_bearer { "bearer" } else { "cookie" };
 
     let cookie_header = headers.get(header::COOKIE).and_then(|v| v.to_str().ok());
@@ -325,7 +357,7 @@ async fn handle_callback_internal(
         .await
     {
         Ok(r) => r,
-        Err(e) => return oauth_error_response(state, e),
+        Err(e) => return oauth_error_response(state, provider, e),
     };
 
     match result {
@@ -342,13 +374,10 @@ async fn handle_callback_internal(
                     }),
                 )
                     .into_response();
-                if let Ok(hv) = header::HeaderValue::from_str(&result.clear_cookie_header) {
-                    resp.headers_mut().append(header::SET_COOKIE, hv);
-                }
+                append_set_cookie(&mut resp, &result.clear_cookie_header);
                 return resp;
             }
 
-            let wants_json = wants_oauth_json(headers, query_session_type);
             let sanitized_redirect = safe_oauth_redirect(&result.redirect_url);
 
             let mut resp = if wants_json {
@@ -371,7 +400,7 @@ async fn handle_callback_internal(
                 Ok(hv) => {
                     resp.headers_mut().append(header::SET_COOKIE, hv);
                 }
-                Err(e) => return oauth_error_response(state, e),
+                Err(e) => return oauth_error_response(state, provider, e),
             }
 
             if let Some(ref csrf) = result.session.csrf_token {
@@ -379,14 +408,11 @@ async fn handle_callback_internal(
                     Ok(hv) => {
                         resp.headers_mut().append(header::SET_COOKIE, hv);
                     }
-                    Err(e) => return oauth_error_response(state, e),
+                    Err(e) => return oauth_error_response(state, provider, e),
                 }
             }
 
-            if let Ok(hv) = header::HeaderValue::from_str(&result.clear_cookie_header) {
-                resp.headers_mut().append(header::SET_COOKIE, hv);
-            }
-
+            append_set_cookie(&mut resp, &result.clear_cookie_header);
             resp
         }
         OAuthCallbackOutcome::Linked {
@@ -395,19 +421,14 @@ async fn handle_callback_internal(
             redirect_url,
             clear_cookie_header,
         } => {
-            let wants_json = wants_oauth_json(headers, query_session_type);
-            let sanitized_redirect = safe_oauth_redirect(&redirect_url);
-
             let mut resp = if wants_json {
                 (StatusCode::OK, Json(account)).into_response()
             } else {
+                let sanitized_redirect = safe_oauth_redirect(&redirect_url);
                 (StatusCode::FOUND, [(header::LOCATION, sanitized_redirect)]).into_response()
             };
 
-            if let Ok(hv) = header::HeaderValue::from_str(&clear_cookie_header) {
-                resp.headers_mut().append(header::SET_COOKIE, hv);
-            }
-
+            append_set_cookie(&mut resp, &clear_cookie_header);
             resp
         }
     }
@@ -433,11 +454,13 @@ pub async fn link_account(
     Path(provider): Path<String>,
     headers: HeaderMap,
     Json(req): Json<LinkRequest>,
-) -> Result<Response, AppError> {
+) -> Response {
     if !SUPPORTED_PROVIDERS.contains(&provider.as_str()) {
-        return Err(AppError::OAuthProviderNotFound);
+        return oauth_error_response(&state, &provider, AppError::OAuthProviderNotFound);
     }
-    check_oauth_rate_limit(&state, &headers, &provider, "callback")?;
+    if let Err(e) = check_oauth_rate_limit(&state, &headers, &provider, "link") {
+        return oauth_error_response(&state, &provider, e);
+    }
     let cookie_header = headers.get(header::COOKIE).and_then(|v| v.to_str().ok());
     let account = match state
         .oauth_service
@@ -445,14 +468,11 @@ pub async fn link_account(
         .await
     {
         Ok(acc) => acc,
-        Err(e) => return Ok(oauth_error_response(&state, e)),
+        Err(e) => return oauth_error_response(&state, &provider, e),
     };
-    let clear_cookie = state.oauth_service.clear_state_cookie();
     let mut resp = Json(account).into_response();
-    if let Ok(hv) = header::HeaderValue::from_str(&clear_cookie) {
-        resp.headers_mut().append(header::SET_COOKIE, hv);
-    }
-    Ok(resp)
+    clear_state_cookie(&mut resp, &state, &provider);
+    resp
 }
 
 /// POST /auth/oauth/{provider}/unlink (and /api/auth/oauth/{provider}/unlink)
@@ -462,23 +482,27 @@ pub async fn unlink_account(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
     Path(provider): Path<String>,
-) -> Result<Json<MessageResponse>, AppError> {
+) -> Response {
     if !SUPPORTED_PROVIDERS.contains(&provider.as_str()) {
-        return Err(AppError::OAuthProviderNotFound);
+        return oauth_error_response(&state, &provider, AppError::OAuthProviderNotFound);
     }
-    state
-        .oauth_service
-        .unlink_account(user_id, &provider)
-        .await?;
-    Ok(Json(MessageResponse {
+    if let Err(e) = state.oauth_service.unlink_account(user_id, &provider).await {
+        return oauth_error_response(&state, &provider, e);
+    }
+    Json(MessageResponse {
         message: "account unlinked",
-    }))
+    })
+    .into_response()
 }
 
 /// Constructs the OAuth sub-router.
 pub fn routes(state: AppState) -> Router {
     let authenticated_csrf_routes = Router::new()
-        .route("/oauth/{provider}/link", axum::routing::post(link_account))
+        .route(
+            "/oauth/{provider}/link",
+            axum::routing::post(link_account)
+                .layer(axum::extract::DefaultBodyLimit::max(OAUTH_BODY_LIMIT)),
+        )
         .route(
             "/oauth/{provider}/unlink",
             axum::routing::post(unlink_account),
@@ -541,6 +565,64 @@ mod tests {
         assert_eq!(safe_oauth_redirect("/\u{7f}del"), "/");
     }
 
+    #[test]
+    fn test_safe_oauth_redirect_rejects_percent_encoded_and_all_c0_controls() {
+        // Percent-encoded separators are not decoded here; they stay inert path text.
+        assert_eq!(safe_oauth_redirect("/%2F%2Fevil.com"), "/%2F%2Fevil.com");
+        assert_eq!(safe_oauth_redirect("/%5Cevil.com"), "/%5Cevil.com");
+        assert_eq!(
+            safe_oauth_redirect("/%252F%252Fevil.com"),
+            "/%252F%252Fevil.com"
+        );
+
+        for control in 0u8..=0x1f {
+            let target = format!("/x{}y", char::from(control));
+            assert_eq!(
+                safe_oauth_redirect(&target),
+                "/",
+                "C0 control {control:#04x} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_check_redirect_url_caps_length() {
+        assert!(check_redirect_url(None).unwrap().is_none());
+
+        let at_limit = format!("/{}", "a".repeat(MAX_REDIRECT_URL_LEN - 1));
+        assert_eq!(at_limit.len(), MAX_REDIRECT_URL_LEN);
+        assert!(check_redirect_url(Some(at_limit)).is_ok());
+
+        let over_limit = format!("/{}", "a".repeat(MAX_REDIRECT_URL_LEN));
+        assert!(matches!(
+            check_redirect_url(Some(over_limit)),
+            Err(AppError::ValidationError(_))
+        ));
+    }
+
+    #[test]
+    fn test_wants_oauth_json_matches_exact_media_type() {
+        let with_accept = |value: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::ACCEPT, header::HeaderValue::from_static(value));
+            headers
+        };
+
+        assert!(wants_oauth_json(&with_accept("application/json"), None));
+        assert!(wants_oauth_json(
+            &with_accept("text/html, application/json; q=0.9"),
+            None
+        ));
+        assert!(wants_oauth_json(&with_accept("APPLICATION/JSON"), None));
+        assert!(!wants_oauth_json(&with_accept("application/jsonx"), None));
+        assert!(!wants_oauth_json(
+            &with_accept("text/plain;note=application/json"),
+            None
+        ));
+        assert!(!wants_oauth_json(&HeaderMap::new(), None));
+        assert!(wants_oauth_json(&HeaderMap::new(), Some("bearer")));
+    }
+
     #[tokio::test]
     async fn test_oauth_initiate_then_callback_pass_single_attempt_budget() {
         use crate::config::{AppConfig, Config};
@@ -585,7 +667,7 @@ mod tests {
         let ip = "203.0.113.7";
         state
             .rate_limiter
-            .check_rate_limit(&rate_limit_key("oauth:callback:google", ip))
+            .check_rate_limit(&rate_limit_key("oauth:link:google", ip))
             .unwrap();
 
         let mut headers = HeaderMap::new();
@@ -593,7 +675,7 @@ mod tests {
             "x-forwarded-for",
             header::HeaderValue::from_static("203.0.113.7"),
         );
-        let result = link_account(
+        let resp = link_account(
             State(state),
             AuthUser {
                 user_id: Uuid::new_v4(),
@@ -608,6 +690,6 @@ mod tests {
             }),
         )
         .await;
-        assert!(matches!(result, Err(AppError::RateLimitExceeded)));
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

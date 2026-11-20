@@ -34,6 +34,17 @@ impl std::fmt::Debug for User {
     }
 }
 
+/// Prefix of password-hash sentinels marking an account with no usable password.
+pub(crate) const UNUSABLE_PASSWORD_PREFIX: &str = "$unusable$";
+
+/// Password hash stored for users provisioned through OAuth.
+pub(crate) const OAUTH_UNUSABLE_PASSWORD_HASH: &str = "$unusable$oauth$";
+
+/// Whether `hash` marks an account that cannot authenticate with a password.
+pub(crate) fn is_unusable_password_hash(hash: &str) -> bool {
+    hash.is_empty() || hash.starts_with(UNUSABLE_PASSWORD_PREFIX)
+}
+
 /// Session entity stored with a cryptographic hash of the session token.
 ///
 /// Intentionally does NOT derive `Serialize` to prevent `token_hash`

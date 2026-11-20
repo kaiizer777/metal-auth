@@ -953,3 +953,165 @@ async fn test_security_zero_secret_leakage_in_tracing_logs() {
         "authorization code leaked in tracing logs: {logs}"
     );
 }
+
+#[tokio::test]
+async fn test_security_callback_post_body_over_limit_rejected() {
+    let _guard = DB_LOCK.lock().await;
+
+    let Some(app) = setup_oauth_test_app(HashMap::new()).await else {
+        return;
+    };
+
+    let oversized = format!("code={}&state=x", "a".repeat(metal_auth::OAUTH_BODY_LIMIT));
+    assert!(oversized.len() > metal_auth::OAUTH_BODY_LIMIT);
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/auth/oauth/apple/callback")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(oversized))
+        .unwrap();
+    let resp = app.dispatch(req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "callback POST must be capped at OAUTH_BODY_LIMIT"
+    );
+}
+
+#[tokio::test]
+async fn test_security_callback_post_for_non_apple_provider_processed() {
+    let _guard = DB_LOCK.lock().await;
+    let server = MockServer::start().await;
+
+    let test_email = dynamic_email();
+
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "google-form-post-at",
+            "token_type": "Bearer",
+            "expires_in": 3600
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/userinfo"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "sub": format!("google-form-post-{}", uuid::Uuid::new_v4()),
+            "email": test_email,
+            "email_verified": true,
+            "name": "Form Post User"
+        })))
+        .mount(&server)
+        .await;
+
+    let google_cfg = ProviderConfig {
+        client_id: "google-id".to_string(),
+        client_secret: "google-secret".to_string(),
+        redirect_uri: "https://example.com/auth/oauth/google/callback".to_string(),
+        scopes: vec![],
+        enabled: true,
+        team_id: None,
+        key_id: None,
+        private_key: None,
+    };
+    let google = GoogleProvider::with_endpoints(
+        &google_cfg,
+        reqwest::Client::new(),
+        format!("{}/auth", server.uri()),
+        format!("{}/token", server.uri()),
+        format!("{}/userinfo", server.uri()),
+    )
+    .unwrap();
+
+    let mut providers: HashMap<String, Arc<dyn OAuthProvider>> = HashMap::new();
+    providers.insert("google".to_string(), Arc::new(google));
+
+    let Some(app) = setup_oauth_test_app(providers).await else {
+        return;
+    };
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/auth/oauth/google")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.dispatch(req).await;
+    let state_token = extract_state_from_location(&resp.headers);
+    let state_cookie = extract_cookie_value(&resp.headers, "oauth_state").unwrap();
+
+    // The POST callback route is provider-agnostic; only Apple needs it in production.
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/auth/oauth/google/callback")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::ACCEPT, "application/json")
+        .header(header::COOKIE, format!("oauth_state={state_cookie}"))
+        .body(Body::from(format!("code=google_code&state={state_token}")))
+        .unwrap();
+    let resp = app.dispatch(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.json()["user_id"].is_string());
+}
+
+#[tokio::test]
+async fn test_security_callback_provider_error_maps_to_502() {
+    let _guard = DB_LOCK.lock().await;
+
+    let Some(app) = setup_oauth_test_app(HashMap::new()).await else {
+        return;
+    };
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/auth/oauth/google/callback?error=access_denied&state=irrelevant")
+        .header(header::ACCEPT, "application/json")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.dispatch(req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(resp.error_code(), Some(ErrorCode::OAuthProviderError));
+    assert!(
+        resp.header(header::SET_COOKIE.as_str())
+            .unwrap_or_default()
+            .contains("oauth_state="),
+        "provider error must clear the state cookie"
+    );
+}
+
+#[tokio::test]
+async fn test_security_callback_rejects_missing_code_and_state() {
+    let _guard = DB_LOCK.lock().await;
+
+    let Some(app) = setup_oauth_test_app(HashMap::new()).await else {
+        return;
+    };
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/auth/oauth/google/callback?state=some_state")
+        .header(header::ACCEPT, "application/json")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.dispatch(req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.error_code(), Some(ErrorCode::OAuthCodeInvalid));
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/auth/oauth/google/callback?code=some_code")
+        .header(header::ACCEPT, "application/json")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.dispatch(req).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.error_code(), Some(ErrorCode::OAuthStateInvalid));
+    assert!(
+        resp.header(header::SET_COOKIE.as_str())
+            .unwrap_or_default()
+            .contains("oauth_state="),
+        "state failure must clear the state cookie"
+    );
+}

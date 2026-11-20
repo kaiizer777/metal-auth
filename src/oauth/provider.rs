@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::ProviderConfig;
 use crate::error::AppError;
 
-pub const SUPPORTED_PROVIDERS: &[&str] = &["google", "github", "apple"];
+pub use crate::config::SUPPORTED_PROVIDERS;
 pub const OAUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 pub const OAUTH_BODY_LIMIT: usize = 1024 * 1024; // 1 MiB
 pub const USER_AGENT: &str = "metal-auth";
@@ -57,6 +57,12 @@ impl std::fmt::Debug for TokenResponse {
 }
 
 /// Trait defining the contract required for any OAuth2 / OIDC identity provider.
+///
+/// - `id` is the canonical slug and must match both `ProviderConfig` key and `SUPPORTED_PROVIDERS`.
+/// - `provider_user_id` must be stable across logins: Google `sub`, GitHub numeric id, Apple `sub`.
+/// - `email_verified` is `true` only when the provider asserts the address is verified **and** the
+///   address is non-empty; callers refuse to provision or link an identity on `false`.
+/// - `fetch_user_info` rejects malformed provider responses with `AppError::OAuthProviderError`.
 #[async_trait]
 pub trait OAuthProvider: Send + Sync + std::fmt::Debug {
     /// Canonical provider slug (e.g. "google", "github", "apple").
@@ -65,7 +71,7 @@ pub trait OAuthProvider: Send + Sync + std::fmt::Debug {
     /// Constructs the provider authorization URL with PKCE challenge, state, and scopes.
     fn auth_url(&self, state: &str, code_challenge: &str) -> String;
 
-    /// Alias for `auth_url`.
+    /// Alias for `auth_url`, retained for API compatibility.
     fn get_authorization_url(&self, state: &str, code_challenge: &str) -> String {
         self.auth_url(state, code_challenge)
     }
@@ -104,6 +110,40 @@ pub fn scopes_or_default(configured: &[String], defaults: &[&str]) -> String {
     }
 }
 
+/// Parses a provider endpoint at construction time.
+///
+/// A malformed endpoint is a configuration error: it must never degrade into a redirect to the
+/// hardcoded canonical host, which would start a real login round-trip at a provider the operator
+/// did not configure.
+pub(crate) fn parse_endpoint(endpoint: &str) -> Result<reqwest::Url, AppError> {
+    reqwest::Url::parse(endpoint).map_err(|_| AppError::OAuthProviderError)
+}
+
+/// Appends `params` as query pairs to an already-validated authorize endpoint.
+pub(crate) fn authorize_url(base: &reqwest::Url, params: &[(&str, &str)]) -> String {
+    let mut url = base.clone(); // a clone per authorize call is the allocation the former parse paid
+    url.query_pairs_mut().extend_pairs(params);
+    url.to_string()
+}
+
+/// Form fields for the authorization-code token exchange, identical across providers.
+pub(crate) fn token_exchange_params<'a>(
+    client_id: &'a str,
+    client_secret: &'a str,
+    code: &'a str,
+    redirect_uri: &'a str,
+    code_verifier: &'a str,
+) -> [(&'a str, &'a str); 6] {
+    [
+        ("client_id", client_id),
+        ("client_secret", client_secret),
+        ("code", code),
+        ("grant_type", "authorization_code"),
+        ("redirect_uri", redirect_uri),
+        ("code_verifier", code_verifier),
+    ]
+}
+
 /// Reads an HTTP response body up to `OAUTH_BODY_LIMIT` (1 MiB) and parses it as JSON.
 /// Returns AppError::OAuthProviderError if the Content-Length or streamed body exceeds the limit.
 pub async fn read_json_limited<T: serde::de::DeserializeOwned>(
@@ -128,6 +168,33 @@ pub async fn read_json_limited<T: serde::de::DeserializeOwned>(
     }
 
     serde_json::from_slice(&body).map_err(|_| AppError::OAuthProviderError)
+}
+
+/// GETs `url`, attaching a bearer token when supplied, and parses the JSON body under the 1 MiB cap.
+pub(crate) async fn get_json_limited<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    url: &str,
+    accept: &str,
+    bearer: Option<&str>,
+) -> Result<T, AppError> {
+    let mut request = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, accept)
+        .header(reqwest::header::USER_AGENT, USER_AGENT);
+    if let Some(token) = bearer {
+        request = request.bearer_auth(token);
+    }
+
+    let resp = request
+        .send()
+        .await
+        .map_err(|_| AppError::OAuthProviderError)?;
+
+    if !resp.status().is_success() {
+        return Err(AppError::OAuthProviderError);
+    }
+
+    read_json_limited(resp).await
 }
 
 /// Sends an HTTP POST form request for token exchange, parsing the JSON token response.
@@ -161,11 +228,12 @@ pub async fn post_token_form(
 
 /// Parses a token response from a generic JSON map.
 pub fn token_from_raw(raw: HashMap<String, serde_json::Value>) -> TokenResponse {
+    // A missing or non-string `access_token` yields `""` rather than an error: Apple authorizes on
+    // `id_token` alone and every provider checks emptiness where it matters.
     let access_token = raw
         .get("access_token")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(String::new, ToString::to_string);
 
     let token_type = raw
         .get("token_type")
@@ -281,6 +349,31 @@ mod tests {
         }
     }
 
+    /// Guards the three provider tables (constant, env parsing, factory) against drift: a slug
+    /// added to only one of them would compile, pass every other test, and 404 at runtime.
+    #[test]
+    fn every_supported_provider_round_trips_config_and_factory() {
+        let config = crate::config::Config::from_lookup(|key| match key {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        })
+        .expect("minimal config");
+
+        let client = reqwest::Client::new();
+        let provider_cfg = test_provider_cfg(true);
+
+        for slug in SUPPORTED_PROVIDERS {
+            assert!(
+                config.oauth.providers.contains_key(*slug),
+                "config env parsing has no provider entry for {slug}"
+            );
+            let provider = create_provider(slug, &provider_cfg, client.clone())
+                .unwrap_or_else(|e| panic!("provider factory rejects {slug}: {e:?}"));
+            assert_eq!(provider.id(), *slug);
+        }
+    }
+
     #[test]
     fn test_token_from_raw_parsing() {
         let mut raw = HashMap::new();
@@ -312,6 +405,17 @@ mod tests {
 
         let custom = vec!["custom_a".to_string(), "custom_b".to_string()];
         assert_eq!(scopes_or_default(&custom, defaults), "custom_a custom_b");
+    }
+
+    #[test]
+    fn test_token_from_raw_missing_or_non_string_access_token() {
+        let missing = token_from_raw(HashMap::new());
+        assert!(missing.access_token.is_empty());
+        assert_eq!(missing.token_type, "Bearer");
+
+        let mut non_string = HashMap::new();
+        non_string.insert("access_token".to_string(), serde_json::json!(123));
+        assert!(token_from_raw(non_string).access_token.is_empty());
     }
 
     #[test]
@@ -351,5 +455,69 @@ mod tests {
 
         let res: Result<serde_json::Value, AppError> = read_json_limited(resp).await;
         assert!(matches!(res, Err(AppError::OAuthProviderError)));
+    }
+
+    #[tokio::test]
+    async fn test_read_json_limited_accepts_body_at_exact_limit() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // `{"k":"..."}` padded to exactly OAUTH_BODY_LIMIT: the cap is inclusive.
+        let prefix = r#"{"k":""#;
+        let suffix = r#""}"#;
+        let payload_len = OAUTH_BODY_LIMIT - prefix.len() - suffix.len();
+        let mut body = String::from(prefix);
+        body.push_str(&"a".repeat(payload_len));
+        body.push_str(suffix);
+        assert_eq!(body.len(), OAUTH_BODY_LIMIT);
+
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let resp = client.get(server.uri()).send().await.unwrap();
+
+        let parsed: serde_json::Value = read_json_limited(resp).await.expect("at-limit body");
+        assert_eq!(parsed["k"].as_str().map(str::len), Some(payload_len));
+    }
+
+    #[tokio::test]
+    async fn test_post_token_form_rejects_error_field_with_200() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path("/error"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "error": "invalid_grant"
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path("/null-error"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "error": null,
+                "access_token": "tok_ok"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+
+        let rejected = post_token_form(&client, &format!("{}/error", server.uri()), &[]).await;
+        assert!(matches!(rejected, Err(AppError::OAuthProviderError)));
+
+        let accepted = post_token_form(&client, &format!("{}/null-error", server.uri()), &[]).await;
+        assert_eq!(
+            accepted.expect("null error is not a failure").access_token,
+            "tok_ok"
+        );
     }
 }

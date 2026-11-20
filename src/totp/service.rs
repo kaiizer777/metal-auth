@@ -15,8 +15,8 @@ use crate::{
     totp::{
         backup,
         crypto::{
-            DecryptedSecret, build_otpauth_uri, decode_totp_secret, decrypt_secret, encrypt_secret,
-            generate_totp_secret, verify_totp_code,
+            DecryptedSecret, build_otpauth_uri, compute_code_replay_hash, decode_totp_secret,
+            decrypt_secret, encrypt_secret, generate_totp_secret, verify_totp_code,
         },
     },
 };
@@ -150,6 +150,48 @@ impl TotpService {
         Ok(())
     }
 
+    /// Verify a live TOTP code and burn it in the same step window.
+    ///
+    /// The replay insert is a single autocommitted statement: the `uq_totp_used_codes`
+    /// constraint arbitrates concurrent submissions, so there is no read-then-write gap.
+    pub async fn verify_totp(&self, user_id: Uuid, code: &str, _ip: &str) -> Result<(), AppError> {
+        let record =
+            sqlx::query("SELECT encrypted_secret, enabled FROM totp_secrets WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(AppError::Database)?
+                .ok_or(AppError::TotpNotEnrolled)?;
+        if !record
+            .try_get::<bool, _>("enabled")
+            .map_err(AppError::Database)?
+        {
+            return Err(AppError::TotpNotEnrolled);
+        }
+
+        let encrypted_secret: Vec<u8> = record
+            .try_get("encrypted_secret")
+            .map_err(AppError::Database)?;
+        let secret = self.decrypt_totp_secret(&encrypted_secret)?;
+        let step = verify_totp_code(secret.as_ref(), code)?;
+        let replay_hash = compute_code_replay_hash(code, step);
+
+        sqlx::query("INSERT INTO totp_used_codes (user_id, code_hash) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(&replay_hash[..])
+            .execute(&self.pool)
+            .await
+            .map_err(classify_used_code_error)?;
+
+        tracing::debug!(
+            event = "totp_code_verified",
+            user_id = %user_id,
+            step,
+            outcome = "accepted",
+        );
+        Ok(())
+    }
+
     /// Return true when `totp_secrets.enabled` is set for `user_id`.
     pub async fn is_totp_enabled(&self, user_id: Uuid) -> Result<bool, AppError> {
         sqlx::query_scalar::<_, bool>("SELECT enabled FROM totp_secrets WHERE user_id = $1")
@@ -178,6 +220,20 @@ impl TotpService {
             AppError::TotpCodeInvalid
         })
     }
+}
+
+/// Map the replay insert failure: only `uq_totp_used_codes` means a replay.
+///
+/// Any other `23505` (or any other error) stays a database error instead of being
+/// blanket-labelled as a reused code.
+fn classify_used_code_error(error: sqlx::Error) -> AppError {
+    if let sqlx::Error::Database(database_error) = &error
+        && database_error.code().as_deref() == Some("23505")
+        && database_error.constraint() == Some("uq_totp_used_codes")
+    {
+        return AppError::TotpCodeReplayed;
+    }
+    AppError::Database(error)
 }
 
 /// Input to [`TotpService::disable_totp`]: one fresh-auth proof, never a boolean toggle.

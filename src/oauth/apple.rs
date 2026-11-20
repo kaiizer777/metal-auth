@@ -193,10 +193,16 @@ impl AppleProvider {
         let jwks: JwksResponse =
             get_json_limited(&self.client, &self.jwks_url, "application/json", None).await?;
 
-        let keys = jwks
+        let (usable, unusable): (Vec<_>, Vec<_>) = jwks
             .keys
             .into_iter()
-            .filter(|k| !k.kid.is_empty() && !k.n.is_empty() && !k.e.is_empty())
+            .partition(|k| !k.kid.is_empty() && !k.n.is_empty() && !k.e.is_empty());
+        if !unusable.is_empty() {
+            tracing::debug!(dropped = unusable.len(), "apple jwks: ignored non-RSA keys");
+        }
+
+        let keys = usable
+            .into_iter()
             .map(|k| (k.kid, (k.n, k.e)))
             .collect::<HashMap<_, _>>();
 

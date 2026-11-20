@@ -11,6 +11,7 @@ use metal_auth::{
     AppleProvider, ErrorCode, GoogleProvider, OAuthProvider, OAuthService, ProviderConfig,
     SessionService, User,
 };
+use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -976,6 +977,127 @@ async fn test_security_callback_post_body_over_limit_rejected() {
         resp.status(),
         StatusCode::PAYLOAD_TOO_LARGE,
         "callback POST must be capped at OAUTH_BODY_LIMIT"
+    );
+}
+
+// The link endpoint sits behind require_auth + csrf_middleware, so the oversized
+// body must be sent by an authenticated, CSRF-bearing request to reach the cap.
+#[tokio::test]
+async fn test_security_link_post_body_over_limit_rejected() {
+    let _guard = DB_LOCK.lock().await;
+    let server = MockServer::start().await;
+    let email = dynamic_email();
+
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "google-link-body-at",
+            "token_type": "Bearer",
+            "expires_in": 3600
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/userinfo"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "sub": format!("goog-link-body-{}", Uuid::new_v4()),
+            "email": email,
+            "email_verified": true,
+            "name": "Link Body"
+        })))
+        .mount(&server)
+        .await;
+
+    let google_cfg = ProviderConfig {
+        client_id: "google-id".to_string(),
+        client_secret: "google-secret".to_string(),
+        redirect_uri: "https://example.com/auth/oauth/google/callback".to_string(),
+        scopes: vec![],
+        enabled: true,
+        team_id: None,
+        key_id: None,
+        private_key: None,
+    };
+    let google = GoogleProvider::with_endpoints(
+        &google_cfg,
+        reqwest::Client::new(),
+        format!("{}/auth", server.uri()),
+        format!("{}/token", server.uri()),
+        format!("{}/userinfo", server.uri()),
+    )
+    .unwrap();
+
+    let mut providers: HashMap<String, Arc<dyn OAuthProvider>> = HashMap::new();
+    providers.insert("google".to_string(), Arc::new(google));
+
+    let Some(app) = setup_oauth_test_app(providers).await else {
+        return;
+    };
+
+    // 1. Log in to obtain a session and CSRF pair.
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/auth/oauth/google")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.dispatch(req).await;
+    let state_token = extract_state_from_location(&resp.headers);
+    let state_cookie = extract_cookie_value(&resp.headers, "oauth_state").unwrap();
+
+    let callback_uri = format!("/auth/oauth/google/callback?code=gcode&state={state_token}");
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(&callback_uri)
+        .header(header::ACCEPT, "application/json")
+        .header(header::COOKIE, format!("oauth_state={state_cookie}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.dispatch(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let session_cookie_name = app.state.config.session.cookie_name.clone();
+    let session_cookie = extract_cookie_value(&resp.headers, &session_cookie_name).unwrap();
+    let csrf_cookie = extract_cookie_value(&resp.headers, "csrf_token").unwrap();
+    let cookie_header = format!(
+        "{session_cookie_name}={session_cookie}; csrf_token={csrf_cookie}; oauth_state={state_cookie}"
+    );
+
+    let link_request = |body: Vec<u8>| {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/auth/oauth/google/link")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-csrf-token", &csrf_cookie)
+            .header(header::COOKIE, &cookie_header)
+            .body(Body::from(body))
+            .unwrap()
+    };
+
+    // 2. Control: auth + CSRF pass, so only the body size decides the status.
+    let control = serde_json::to_vec(&serde_json::json!({ "code": "x", "state": "x" })).unwrap();
+    let resp = app.dispatch(link_request(control)).await;
+    assert!(
+        matches!(
+            resp.status(),
+            StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN
+        ),
+        "control request must clear auth and CSRF, got {}",
+        resp.status()
+    );
+
+    // 3. Oversized JSON body trips the route-scoped DefaultBodyLimit.
+    let oversized = serde_json::to_vec(
+        &serde_json::json!({ "code": "a".repeat(metal_auth::OAUTH_BODY_LIMIT), "state": "x" }),
+    )
+    .unwrap();
+    assert!(oversized.len() > metal_auth::OAUTH_BODY_LIMIT);
+
+    let resp = app.dispatch(link_request(oversized)).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "link POST must be capped at OAUTH_BODY_LIMIT"
     );
 }
 

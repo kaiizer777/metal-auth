@@ -181,13 +181,17 @@ pub fn build_otpauth_uri(secret_base32: &str, account_email: &str, issuer: &str)
     )
 }
 
-/// Percent-encode a URI component, keeping RFC 3986 unreserved characters.
+/// Percent-encode a URI component, keeping RFC 3986 unreserved characters plus `:` and `@`.
+///
+/// Both are legal in path and query tokens, and the canonical `otpauth://` label keeps
+/// them literal (`Issuer:account@example.com`). Everything that could break either
+/// component — spaces, `&`, `=`, `#`, `?` — is encoded.
 fn percent_encode(value: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b':' | b'@') {
             encoded.push(char::from(byte));
         } else {
             encoded.push('%');
@@ -196,4 +200,222 @@ fn percent_encode(value: &str) -> String {
         }
     }
     encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_key() -> [u8; TOTP_ENCRYPTION_KEY_BYTES] {
+        *b"0123456789abcdef0123456789abcdef"
+    }
+
+    /// RFC 6238 Appendix B SHA-1 seed. Test vector, never a production secret.
+    const RFC_SECRET: &[u8] = b"12345678901234567890";
+
+    #[test]
+    fn aes_gcm_round_trips() {
+        let plaintext = b"JBSWY3DPEHPK3PXP";
+        let blob = encrypt_secret(&test_key(), plaintext).expect("encrypt");
+        assert_eq!(blob.len(), plaintext.len() + MIN_BLOB_LEN);
+        assert_eq!(
+            decrypt_secret(&test_key(), &blob).expect("decrypt"),
+            plaintext
+        );
+    }
+
+    #[test]
+    fn aes_gcm_uses_a_fresh_nonce_per_call() {
+        let mut nonces = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let blob = encrypt_secret(&test_key(), b"same plaintext").expect("encrypt");
+            assert!(nonces.insert(blob[..NONCE_LEN].to_vec()), "nonce reused");
+        }
+    }
+
+    #[test]
+    fn aes_gcm_rejects_tampered_tag() {
+        let mut blob = encrypt_secret(&test_key(), b"secret").expect("encrypt");
+        let last = blob.len() - 1;
+        blob[last] ^= 0x01;
+        assert!(matches!(
+            decrypt_secret(&test_key(), &blob),
+            Err(AppError::Internal)
+        ));
+    }
+
+    #[test]
+    fn aes_gcm_rejects_tampered_nonce() {
+        let mut blob = encrypt_secret(&test_key(), b"secret").expect("encrypt");
+        blob[0] ^= 0x01;
+        assert!(decrypt_secret(&test_key(), &blob).is_err());
+    }
+
+    #[test]
+    fn aes_gcm_rejects_wrong_key() {
+        let blob = encrypt_secret(&test_key(), b"secret").expect("encrypt");
+        let mut wrong_key = test_key();
+        wrong_key[0] ^= 0xff;
+        assert!(decrypt_secret(&wrong_key, &blob).is_err());
+    }
+
+    #[test]
+    fn aes_gcm_rejects_truncated_blob() {
+        for len in 0..MIN_BLOB_LEN {
+            assert!(decrypt_secret(&test_key(), &vec![0u8; len]).is_err());
+        }
+    }
+
+    #[test]
+    fn parse_encryption_key_accepts_64_hex_chars() {
+        let key = parse_encryption_key(
+            "00112233445566778899AABBCCDDEEFF00112233445566778899aabbccddeeff",
+        )
+        .expect("valid key");
+        assert_eq!(key.len(), TOTP_ENCRYPTION_KEY_BYTES);
+        assert_eq!(key[0], 0x00);
+        assert_eq!(key[1], 0x11);
+        assert_eq!(key[31], 0xff);
+    }
+
+    #[test]
+    fn parse_encryption_key_rejects_bad_shape() {
+        for raw in [
+            "",
+            &"00".repeat(31),
+            &"00".repeat(33),
+            &"zz".repeat(32),
+            &" 0".repeat(32),
+        ] {
+            assert!(parse_encryption_key(raw).is_err(), "accepted {raw:?}");
+        }
+    }
+
+    #[test]
+    fn rfc6238_known_vectors_match() {
+        // Published 8-digit vectors reduced mod 10^6 for six digits.
+        let vectors = [
+            (59 / TOTP_STEP_SECS, 287_082),
+            (1_111_111_109 / TOTP_STEP_SECS, 81_804),
+            (1_111_111_111 / TOTP_STEP_SECS, 50_471),
+            (1_234_567_890 / TOTP_STEP_SECS, 5_924),
+            (2_000_000_000 / TOTP_STEP_SECS, 279_037),
+            (20_000_000_000 / TOTP_STEP_SECS, 353_130),
+        ];
+        for (counter, expected) in vectors {
+            assert_eq!(
+                generate_totp(RFC_SECRET, counter).expect("generate"),
+                expected,
+                "counter {counter}"
+            );
+        }
+    }
+
+    #[test]
+    fn codes_render_as_six_digits() {
+        assert_eq!(
+            format!("{:06}", generate_totp(RFC_SECRET, 1).expect("generate")),
+            "287082"
+        );
+        assert_eq!(
+            format!(
+                "{:06}",
+                generate_totp(RFC_SECRET, 1_111_111_109 / TOTP_STEP_SECS).expect("generate")
+            ),
+            "081804"
+        );
+    }
+
+    #[test]
+    fn verify_accepts_one_step_drift() {
+        let base = 987_654u64;
+        for delta in -TOTP_WINDOW_STEPS..=TOTP_WINDOW_STEPS {
+            let step = base.checked_add_signed(delta).expect("step");
+            let code = format!("{:06}", generate_totp(RFC_SECRET, step).expect("generate"));
+            assert_eq!(
+                verify_totp_code_at(RFC_SECRET, &code, base).expect("accepted"),
+                step
+            );
+        }
+    }
+
+    #[test]
+    fn verify_rejects_two_step_drift() {
+        let base = 987_654u64;
+        for delta in [-2i64, 2] {
+            let step = base.checked_add_signed(delta).expect("step");
+            let code = format!("{:06}", generate_totp(RFC_SECRET, step).expect("generate"));
+            assert!(matches!(
+                verify_totp_code_at(RFC_SECRET, &code, base),
+                Err(AppError::TotpCodeInvalid)
+            ));
+        }
+    }
+
+    #[test]
+    fn verify_rejects_malformed_codes() {
+        for code in ["", "12345", "1234567", "abcdef", "12 345", "12345x"] {
+            assert!(matches!(
+                verify_totp_code_at(RFC_SECRET, code, 100),
+                Err(AppError::TotpCodeInvalid)
+            ));
+        }
+    }
+
+    #[test]
+    fn verify_rejects_wrong_secret() {
+        let code = format!("{:06}", generate_totp(RFC_SECRET, 500).expect("generate"));
+        assert!(
+            verify_totp_code_at(b"another-secret-value", &code, 500).is_err(),
+            "code from a different secret must not verify"
+        );
+    }
+
+    #[test]
+    fn replay_hash_binds_code_and_step() {
+        let hash = compute_code_replay_hash("012345", 100);
+        assert_eq!(hash.len(), 32);
+        assert_eq!(hash, compute_code_replay_hash("012345", 100));
+        assert_ne!(hash, compute_code_replay_hash("012345", 101));
+        assert_ne!(hash, compute_code_replay_hash("012346", 100));
+        assert_eq!(
+            hash,
+            compute_code_replay_hash(" 012345 ", 100),
+            "surrounding whitespace must not fork the hash"
+        );
+    }
+
+    #[test]
+    fn totp_secret_is_unpadded_base32_of_160_bits() {
+        let mut secrets = std::collections::HashSet::new();
+        for _ in 0..32 {
+            let secret = generate_totp_secret();
+            assert_eq!(secret.len(), 32);
+            assert!(
+                secret
+                    .bytes()
+                    .all(|byte| matches!(byte, b'A'..=b'Z' | b'2'..=b'7'))
+            );
+            assert!(secrets.insert(secret), "secret reused");
+        }
+    }
+
+    #[test]
+    fn otpauth_uri_carries_rfc6238_parameters() {
+        let uri = build_otpauth_uri("JBSWY3DPEHPK3PXP", "alice@example.com", "metal-auth");
+        assert_eq!(
+            uri,
+            "otpauth://totp/metal-auth:alice@example.com?secret=JBSWY3DPEHPK3PXP&issuer=metal-auth&algorithm=SHA1&digits=6&period=30"
+        );
+    }
+
+    #[test]
+    fn otpauth_uri_percent_encodes_label_parts() {
+        let uri = build_otpauth_uri("JBSWY3DPEHPK3PXP", "alice@example.com", "Acme Corp");
+        assert!(
+            uri.starts_with("otpauth://totp/Acme%20Corp:alice@example.com?secret="),
+            "{uri}"
+        );
+        assert!(uri.contains("issuer=Acme%20Corp"), "{uri}");
+    }
 }

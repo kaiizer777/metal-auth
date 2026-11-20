@@ -6,12 +6,13 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Duration, Utc};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::{
     config::{AppConfig, Config},
-    crypto::verify_password,
+    crypto::{generate_token, hash_token, verify_password},
     error::AppError,
     totp::{
         backup,
@@ -320,6 +321,62 @@ impl TotpService {
             user_id = %user_id,
             outcome = "disabled",
         );
+        Ok(())
+    }
+
+    /// Mint a half-authenticated challenge token; only its SHA-256 hash is stored.
+    pub async fn generate_two_factor_token(&self, user_id: Uuid) -> Result<String, AppError> {
+        let (raw_token, token_hash) = generate_token();
+        let ttl_seconds = i64::try_from(self.config.totp.challenge_token_ttl_secs)
+            .map_err(|_| AppError::Internal)?;
+        let expires_at = Utc::now() + Duration::seconds(ttl_seconds);
+
+        sqlx::query(
+            "INSERT INTO two_factor_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
+        )
+        .bind(user_id)
+        .bind(&token_hash[..])
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await
+        .map_err(AppError::Database)?;
+
+        Ok(raw_token)
+    }
+
+    /// Resolve a challenge token to its user without consuming it, so a mistyped code
+    /// can be retried until the token expires or the handler's limits trip.
+    pub async fn validate_two_factor_token(&self, token: &str) -> Result<Uuid, AppError> {
+        let token_hash = hash_token(token).map_err(|_| AppError::TwoFactorTokenInvalid)?;
+        let record =
+            sqlx::query("SELECT user_id, expires_at FROM two_factor_tokens WHERE token_hash = $1")
+                .bind(&token_hash[..])
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(AppError::Database)?
+                .ok_or(AppError::TwoFactorTokenInvalid)?;
+
+        let expires_at: DateTime<Utc> = record.try_get("expires_at").map_err(AppError::Database)?;
+        if expires_at < Utc::now() {
+            return Err(AppError::TwoFactorTokenExpired);
+        }
+        record.try_get("user_id").map_err(AppError::Database)
+    }
+
+    /// Atomically delete a challenge token after successful verification.
+    ///
+    /// Reports whether a row was actually deleted, so a double consume cannot mint a
+    /// second session from the same token.
+    pub async fn consume_two_factor_token(&self, token: &str) -> Result<(), AppError> {
+        let token_hash = hash_token(token).map_err(|_| AppError::TwoFactorTokenInvalid)?;
+        let deleted = sqlx::query("DELETE FROM two_factor_tokens WHERE token_hash = $1")
+            .bind(&token_hash[..])
+            .execute(&self.pool)
+            .await
+            .map_err(AppError::Database)?;
+        if deleted.rows_affected() == 0 {
+            return Err(AppError::TwoFactorTokenInvalid);
+        }
         Ok(())
     }
 

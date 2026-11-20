@@ -35,11 +35,8 @@ const TOTP_ALPHABET: base32::Alphabet = base32::Alphabet::RFC4648 { padding: fal
 
 type HmacSha1 = Hmac<Sha1>;
 
-
 /// Parse a 64-character hex string into a raw AES-256-GCM key.
-pub fn parse_encryption_key(
-    hex_key: &str,
-) -> Result<[u8; TOTP_ENCRYPTION_KEY_BYTES], AppError> {
+pub fn parse_encryption_key(hex_key: &str) -> Result<[u8; TOTP_ENCRYPTION_KEY_BYTES], AppError> {
     if hex_key.len() != TOTP_ENCRYPTION_KEY_BYTES * 2
         || !hex_key.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
@@ -116,7 +113,7 @@ pub fn current_totp_counter() -> u64 {
 
 /// Generate the TOTP code for `secret` at `counter` (RFC 4226 §5.3 dynamic truncation).
 pub fn generate_totp(secret: &[u8], counter: u64) -> Result<u32, AppError> {
-    let mut mac = HmacSha1::new_from_slice(secret).map_err(|_| AppError::Internal)?;
+    let mut mac = <HmacSha1 as Mac>::new_from_slice(secret).map_err(|_| AppError::Internal)?;
     mac.update(&counter.to_be_bytes());
     let digest = mac.finalize().into_bytes();
 

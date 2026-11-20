@@ -37,9 +37,12 @@ pub mod oauth;
 pub mod ratelimit;
 pub mod session;
 pub mod state;
+pub mod totp;
 
 pub use auth::{Auth, AuthService, AuthServiceImpl, AuthenticatedLogin, UserResponse};
-pub use config::{AppConfig, Config, OAuthConfig, ProviderConfig, RateLimitConfig, SessionConfig};
+pub use config::{
+    AppConfig, Config, OAuthConfig, ProviderConfig, RateLimitConfig, SessionConfig, TotpConfig,
+};
 pub use db::models::{
     EmailOutbox, OAuthAccount, PasswordResetToken, Session, User, VerificationToken,
 };
@@ -67,6 +70,14 @@ pub use session::{
     read_session_cookie, set_csrf_cookie, set_session_cookie,
 };
 pub use state::AppState;
+pub use totp::backup::{
+    BACKUP_CODE_COUNT, BACKUP_CODE_LEN, generate_backup_codes, verify_backup_code,
+};
+pub use totp::crypto::{
+    TOTP_DIGITS, TOTP_STEP_SECS, build_otpauth_uri, compute_code_replay_hash, current_totp_counter,
+    decrypt_secret, encrypt_secret, generate_totp, generate_totp_secret, parse_encryption_key,
+    verify_totp_code, verify_totp_code_at,
+};
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use email::test_utils;

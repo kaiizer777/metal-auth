@@ -1539,32 +1539,21 @@ impl TotpConfig {
                 field: "totp.encryption_key",
                 reason: "must be set to enable totp",
             })?;
-        if raw.len() != TOTP_ENCRYPTION_KEY_HEX_LEN
-            || !raw.bytes().all(|byte| byte.is_ascii_hexdigit())
+        crate::totp::crypto::parse_encryption_key(raw).map_err(|_| ConfigError::InvalidValue {
+            field: "totp.encryption_key",
+            reason: "must be exactly 64 hexadecimal characters",
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(raw) = &self.encryption_key
+            && (raw.len() != TOTP_ENCRYPTION_KEY_HEX_LEN
+                || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()))
         {
             return Err(ConfigError::InvalidValue {
                 field: "totp.encryption_key",
                 reason: "must be exactly 64 hexadecimal characters",
             });
-        }
-        let mut key = [0u8; TOTP_ENCRYPTION_KEY_BYTES];
-        hex::decode_to_slice(raw, &mut key).map_err(|_| ConfigError::InvalidValue {
-            field: "totp.encryption_key",
-            reason: "must be exactly 64 hexadecimal characters",
-        })?;
-        Ok(key)
-    }
-
-    pub fn validate(&self) -> Result<(), ConfigError> {
-        if let Some(raw) = &self.encryption_key {
-            if raw.len() != TOTP_ENCRYPTION_KEY_HEX_LEN
-                || !raw.bytes().all(|byte| byte.is_ascii_hexdigit())
-            {
-                return Err(ConfigError::InvalidValue {
-                    field: "totp.encryption_key",
-                    reason: "must be exactly 64 hexadecimal characters",
-                });
-            }
         }
         if self.issuer.trim().is_empty() {
             return Err(ConfigError::InvalidValue {

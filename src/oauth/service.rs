@@ -444,14 +444,9 @@ impl OAuthService {
         let provider_id = ctx.provider_id;
         let mut tx = self.db.begin().await.map_err(AppError::Database)?;
 
-        // Read before write: a post-commit read failure is an unretryable Err-after-commit.
-        let user = fetch_user_by_id(&mut *tx, link_user_id)
-            .await?
-            .ok_or_else(|| AppError::Database(sqlx::Error::RowNotFound))?;
-
-        // The initiating session must still be live. A logout or revoke-all in
-        // flight blocks the link; the row lock serializes this check with
-        // revocation. Fail closed pre-commit.
+        // The initiating session must still be live. A logout, revoke-all, or
+        // account deletion in flight blocks the link; the row lock serializes
+        // this check with revocation. Fail closed pre-commit.
         let session_live = self
             .session_is_live(&mut tx, link_user_id, payload.session_hash.as_deref())
             .await?;
@@ -460,6 +455,12 @@ impl OAuthService {
             self.log_callback_failure(provider_id, "link_session_revoked");
             return Err(AppError::OAuthStateInvalid);
         }
+
+        // The session gate above covers a deleted account (sessions cascade), so
+        // this is the same contract error rather than a server fault.
+        let user = fetch_user_by_id(&mut *tx, link_user_id)
+            .await?
+            .ok_or(AppError::OAuthStateInvalid)?;
 
         let redirect_url = payload.redirect_url.unwrap_or_else(|| "/".to_string());
 

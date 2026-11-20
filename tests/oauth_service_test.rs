@@ -853,12 +853,12 @@ async fn link_callback_missing_user_fails_before_commit() {
     let svc = create_test_oauth_service(&app, google_mock, None);
 
     let (auth_url, set_cookie) = svc
-        // missing user owns no session; the pre-commit user read fails first
+        // missing user owns no session; the pre-commit session gate rejects first
         .initiate_link_flow("google", missing_user_id, Some("/settings".to_string()), None)
         .expect("initiate link flow");
     let state_token = extract_state_from_url(&auth_url);
 
-    // user read must fail fast pre-commit, never Err-after-write
+    // A vanished initiator is an invalid state, never a server fault.
     let err = svc
         .handle_callback_extended(
             "google",
@@ -872,8 +872,8 @@ async fn link_callback_missing_user_fails_before_commit() {
         .await
         .expect_err("missing user must fail");
     assert!(
-        matches!(err, AppError::Database(_)),
-        "expected pre-commit Database read error, got {err:?}"
+        matches!(err, AppError::OAuthStateInvalid),
+        "expected OAuthStateInvalid for a missing initiator, got {err:?}"
     );
 
     let link_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM oauth_accounts")
@@ -1052,6 +1052,89 @@ async fn link_callback_rejects_when_revoke_commits_before_link_check() {
     assert!(
         matches!(err, AppError::OAuthStateInvalid),
         "expected OAuthStateInvalid for revoked initiating session, got {err:?}"
+    );
+
+    let link_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM oauth_accounts")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(link_count.0, 0, "no link row may be committed");
+}
+
+// Deleted initiator: the account and its session cascade away between link
+// initiation and the callback. The link must fail as invalid state, not a 500.
+#[tokio::test]
+async fn link_callback_rejects_deleted_initiating_user() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    truncate_tables(&app.pool).await.expect("truncate");
+
+    let email = dynamic_email();
+    let user_id = Uuid::new_v4();
+
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(user_id)
+    .bind(&email)
+    .bind("argon2id$somehash")
+    .bind(true)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+
+    let google_mock = Arc::new(MockOAuthProvider::new(
+        "google",
+        UserInfo {
+            provider_id: "google".to_string(),
+            provider_user_id: format!("goog-deleted-user-{}", Uuid::new_v4()),
+            email: email.clone(),
+            email_verified: true,
+            name: None,
+            avatar_url: None,
+        },
+    ));
+
+    let svc = create_test_oauth_service(&app, google_mock, None);
+
+    let session_svc = SessionService::new(app.pool.clone(), Arc::new(app.state.config.clone()));
+    let (session, _raw) = session_svc
+        .create_session(user_id, "cookie", None, None)
+        .await
+        .unwrap();
+    let (auth_url, set_cookie) = svc
+        .initiate_link_flow(
+            "google",
+            user_id,
+            Some("/settings".to_string()),
+            Some(session.token_hash.clone()),
+        )
+        .expect("initiate link flow");
+    let state_token = extract_state_from_url(&auth_url).to_string();
+
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&app.pool)
+        .await
+        .expect("delete initiating user");
+
+    let err = svc
+        .handle_callback_extended(
+            "google",
+            "valid_code",
+            &state_token,
+            Some(&set_cookie),
+            "cookie",
+            None,
+            None,
+        )
+        .await
+        .expect_err("deleted initiating user must reject the link");
+    assert!(
+        matches!(err, AppError::OAuthStateInvalid),
+        "expected OAuthStateInvalid for a deleted initiator, got {err:?}"
     );
 
     let link_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM oauth_accounts")

@@ -33,6 +33,7 @@ use crate::{
         },
     },
     state::AppState,
+    totp::service::TotpService,
 };
 
 // ─── Shared app state for handlers ───────────────────────────────────────────
@@ -43,6 +44,7 @@ pub struct AuthHandlerState {
     pub session_service: Option<Arc<SessionService>>,
     pub rate_limiter: Option<Arc<RateLimiter>>,
     pub config: Option<Arc<Config>>,
+    pub totp_service: Option<Arc<TotpService>>,
 }
 
 async fn method_not_allowed() -> impl IntoResponse {
@@ -59,6 +61,7 @@ pub fn routes(service: Arc<AuthServiceImpl>) -> Router {
         session_service: None,
         rate_limiter: None,
         config: None,
+        totp_service: None,
     })
 }
 
@@ -68,6 +71,7 @@ pub fn routes_with_app_state(state: AppState) -> Router {
         session_service: Some(Arc::clone(&state.session_service)),
         rate_limiter: Some(Arc::clone(&state.rate_limiter)),
         config: Some(Arc::new(state.config.clone())),
+        totp_service: Some(Arc::clone(&state.totp_service)),
     };
 
     let csrf_layer =
@@ -307,6 +311,31 @@ pub async fn login(
     // Reset rate limit attempts upon successful authentication for account only
     if let Some(limiter) = &state.rate_limiter {
         limiter.reset_account(&normalized_email);
+    }
+
+    // Second factor gate: password verified, no session until the code is accepted.
+    if let Some(totp_service) = &state.totp_service {
+        match totp_service.is_totp_enabled(user_id).await {
+            Ok(true) => {
+                let challenge_token = match totp_service.generate_two_factor_token(user_id).await {
+                    Ok(token) => token,
+                    Err(e) => return service_error_response(e),
+                };
+                tracing::info!(
+                    event = "two_factor_challenge_issued",
+                    user_id = %user_id,
+                    ip = %client_ip,
+                    user_agent = %user_agent.as_deref().unwrap_or("unknown"),
+                );
+                return (
+                    StatusCode::OK,
+                    Json(LoginResponse::two_factor_required(challenge_token)),
+                )
+                    .into_response();
+            }
+            Ok(false) => {}
+            Err(e) => return service_error_response(e),
+        }
     }
 
     let is_bearer = headers
@@ -597,6 +626,7 @@ mod tests {
             session_service: None,
             rate_limiter: None,
             config: None,
+            totp_service: None,
         }
     }
 

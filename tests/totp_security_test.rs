@@ -9,6 +9,24 @@ use axum::http::StatusCode;
 use common::*;
 use metal_auth::ErrorCode;
 use serde_json::json;
+use sqlx::PgPool;
+use uuid::Uuid;
+
+async fn backup_code_count(pool: &PgPool, user_id: Uuid) -> i32 {
+    sqlx::query_scalar("SELECT jsonb_array_length(backup_codes) FROM totp_secrets WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .expect("totp secret row with a backup-code array")
+}
+
+async fn pending_challenge_count(pool: &PgPool, user_id: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM two_factor_tokens WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .expect("count challenge tokens")
+}
 
 /// Scenario 1: a challenge token past its TTL cannot mint a session.
 #[tokio::test]
@@ -112,5 +130,58 @@ async fn replayed_totp_code_is_rejected() {
         count_sessions_for_user(&app.pool, user_id).await,
         sessions_before + 1,
         "a replayed code must not mint a second session"
+    );
+}
+
+/// Scenario 3: an unknown backup code is rejected without touching any state.
+#[tokio::test]
+async fn unknown_backup_code_is_rejected_without_state_change() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let (email, password, _secret, backup_codes, _session) =
+        enabled_user(&app, &dynamic_ip()).await;
+    let user_id = user_id_for_email(&app.pool, &email).await;
+    let sessions_before = count_sessions_for_user(&app.pool, user_id).await;
+    let token = challenge(&app, &email, &password).await;
+
+    // Sixteen base32 characters: shape-valid, but not one of the issued codes.
+    let fabricated = "AAAAAAAAAAAAAAAA";
+    assert!(
+        !backup_codes.iter().any(|code| code == fabricated),
+        "the fabricated code must not collide with a real backup code"
+    );
+
+    let resp = app
+        .post_json_with_ip(
+            "/auth/totp/backup",
+            json!({ "challenge_token": token, "code": fabricated }),
+            &dynamic_ip(),
+        )
+        .await;
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        resp.body_str
+    );
+    assert_eq!(resp.error_code(), Some(ErrorCode::TotpBackupCodeInvalid));
+    assert_eq!(
+        count_sessions_for_user(&app.pool, user_id).await,
+        sessions_before,
+        "a rejected backup code must not issue a session"
+    );
+    assert_eq!(
+        backup_code_count(&app.pool, user_id).await,
+        10,
+        "a rejected backup code must not consume a stored hash"
+    );
+    assert_eq!(
+        pending_challenge_count(&app.pool, user_id).await,
+        1,
+        "a rejected backup code must leave the challenge retryable"
     );
 }

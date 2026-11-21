@@ -561,6 +561,7 @@ mod tests {
             database_url: url,
             totp: TotpConfig {
                 encryption_key: Some(TEST_KEY_HEX.into()),
+                used_code_prune_age_secs: crate::totp::crypto::MIN_USED_CODE_PRUNE_AGE_SECS,
                 ..TotpConfig::default()
             },
             ..Config::default()
@@ -810,6 +811,40 @@ mod tests {
                 "same code was accepted at counter {counter}"
             );
         }
+        assert_eq!(count_rows(&ctx.pool, "totp_used_codes", user_id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn code_accepted_at_t_minus_one_still_replays_at_t_plus_one() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let response = enroll_and_confirm(&ctx, user_id).await;
+        let raw = decode_totp_secret(&response.secret_base32).expect("decode");
+        let step = current_totp_counter();
+        let code = format!("{:06}", generate_totp(&raw, step).expect("generate"));
+
+        ctx.service
+            .verify_totp_at(user_id, &code, step.saturating_sub(1))
+            .await
+            .expect("accepted at T-1");
+
+        // A row written at the start of T-1 is 60s old when T+1 begins. At the minimum
+        // legal horizon it must still be present when the same code is replayed.
+        sqlx::query(
+            "UPDATE totp_used_codes SET used_at = CURRENT_TIMESTAMP - INTERVAL '61 seconds' \
+             WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .execute(&ctx.pool)
+        .await
+        .expect("backdate row");
+
+        assert!(matches!(
+            ctx.service.verify_totp_at(user_id, &code, step + 1).await,
+            Err(AppError::TotpCodeReplayed)
+        ));
         assert_eq!(count_rows(&ctx.pool, "totp_used_codes", user_id).await, 1);
     }
 

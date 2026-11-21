@@ -31,6 +31,11 @@ pub const TOTP_STEP_SECS: u64 = 30;
 pub const TOTP_DIGITS: u32 = 6;
 /// Accepted clock-drift window in steps (±1, i.e. three steps total).
 const TOTP_WINDOW_STEPS: i64 = 1;
+/// Minimum used-code prune horizon: the three accepted steps plus one margin step.
+///
+/// A code stays valid at `T-1`, `T`, and `T+1`; pruning at the bare three-step span
+/// would delete the row exactly when the last accepted step begins.
+pub const MIN_USED_CODE_PRUNE_AGE_SECS: u64 = 3 * TOTP_STEP_SECS + TOTP_STEP_SECS;
 /// Raw TOTP secret entropy in bytes (160-bit, RFC 4226 §4 recommendation).
 const TOTP_SECRET_BYTES: usize = 20;
 /// RFC 4648 base32 without padding, as authenticator apps expect secrets.
@@ -389,6 +394,11 @@ mod tests {
             ),
             "081804"
         );
+    }
+
+    #[test]
+    fn prune_horizon_outlives_the_acceptance_window() {
+        assert_eq!(MIN_USED_CODE_PRUNE_AGE_SECS, 120);
     }
 
     #[test]

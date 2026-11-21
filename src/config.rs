@@ -1,7 +1,7 @@
 use std::str::FromStr;
 use std::time::Duration;
 
-use crate::error::ConfigError;
+use crate::{error::ConfigError, totp::crypto::MIN_USED_CODE_PRUNE_AGE_SECS};
 
 pub const DEFAULT_PORT: u16 = 3000;
 pub const DEFAULT_MAX_CONNECTIONS: u32 = 25;
@@ -1477,7 +1477,7 @@ pub const DEFAULT_TOTP_RATE_LIMIT_IP_MAX_ATTEMPTS: u32 = 10;
 pub const DEFAULT_TOTP_RATE_LIMIT_USER_MAX_ATTEMPTS: u32 = 5;
 pub const DEFAULT_TOTP_RATE_LIMIT_WINDOW_SECS: u64 = 600;
 pub const DEFAULT_TOTP_CHALLENGE_TOKEN_TTL_SECS: u64 = 900;
-pub const DEFAULT_TOTP_USED_CODE_PRUNE_AGE_SECS: u64 = 120;
+pub const DEFAULT_TOTP_USED_CODE_PRUNE_AGE_SECS: u64 = MIN_USED_CODE_PRUNE_AGE_SECS;
 
 /// AES-256-GCM key size in bytes.
 pub const TOTP_ENCRYPTION_KEY_BYTES: usize = 32;
@@ -1589,11 +1589,12 @@ impl TotpConfig {
                 reason: "must be between 300 and 1800 seconds",
             });
         }
-        // Pruning sooner than two TOTP steps would erase live replay records.
-        if self.used_code_prune_age_secs < 60 {
+        // A code is accepted across three TOTP steps; pruning inside that span plus a
+        // margin would erase a replay record while the same code is still redeemable.
+        if self.used_code_prune_age_secs < MIN_USED_CODE_PRUNE_AGE_SECS {
             return Err(ConfigError::InvalidValue {
                 field: "totp.used_code_prune_age_secs",
-                reason: "must be at least 60 seconds",
+                reason: "must cover three TOTP steps plus a margin",
             });
         }
         Ok(())
@@ -3576,11 +3577,19 @@ mod tests {
         };
         assert!(zero_window.validate().is_err());
 
-        let short_prune = TotpConfig {
-            used_code_prune_age_secs: 59,
+        for rejected in [59, 60, 89] {
+            let short_prune = TotpConfig {
+                used_code_prune_age_secs: rejected,
+                ..TotpConfig::default()
+            };
+            assert!(short_prune.validate().is_err(), "accepted {rejected}");
+        }
+
+        let floor = TotpConfig {
+            used_code_prune_age_secs: crate::totp::crypto::MIN_USED_CODE_PRUNE_AGE_SECS,
             ..TotpConfig::default()
         };
-        assert!(short_prune.validate().is_err());
+        assert!(floor.validate().is_ok());
     }
 
     #[test]

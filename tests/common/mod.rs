@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,6 +22,23 @@ use uuid::Uuid;
 /// Global table truncation (`truncate_tables`) must not be called during parallel multi-binary
 /// test runs without PostgreSQL-level advisory locking (`pg_advisory_lock`).
 pub static DB_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Worker threads for the concurrency tests.
+pub const CONCURRENT_WORKER_THREADS: usize = 5;
+
+/// Runs `body` on a multi-thread runtime so simultaneously dispatched requests actually race.
+///
+/// A current-thread runtime serializes them at their first await, which would make a
+/// concurrency assertion pass without ever racing. Blocks the calling test thread, so use it
+/// from a plain `#[test]`, not from `#[tokio::test]`.
+pub fn block_on_concurrent<F: Future>(body: F) -> F::Output {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(CONCURRENT_WORKER_THREADS)
+        .enable_all()
+        .build()
+        .expect("build multi-thread test runtime")
+        .block_on(body)
+}
 
 /// Truncates all authentication and session domain tables with CASCADE.
 pub async fn truncate_tables(pool: &PgPool) -> Result<(), sqlx::Error> {

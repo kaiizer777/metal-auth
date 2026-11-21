@@ -156,7 +156,7 @@ pub fn routes_with_state(state: AuthHandlerState) -> Router {
 // ─── Error mapping helpers ────────────────────────────────────────────────────
 
 /// Map a JSON extraction failure to a `VALIDATION_ERROR` 400.
-fn json_rejection_response(rejection: JsonRejection) -> Response {
+pub(crate) fn json_rejection_response(rejection: JsonRejection) -> Response {
     tracing::debug!(error = %rejection, "JSON parse/validation error");
     let payload = ErrorResponse {
         code: ErrorCode::ValidationError,
@@ -194,7 +194,7 @@ fn attach_login_cookies(
 /// Extract client IP from proxy headers, falling back to 127.0.0.1.
 ///
 /// Spoofable unless a trusted proxy strips these headers; audit/rate-limit use only.
-fn extract_client_ip(headers: &HeaderMap) -> String {
+pub(crate) fn extract_client_ip(headers: &HeaderMap) -> String {
     untrusted_client_ip(headers)
         .unwrap_or("127.0.0.1")
         .to_string()

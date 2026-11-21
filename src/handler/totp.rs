@@ -9,12 +9,18 @@ use serde::Deserialize;
 
 use axum::{
     Json,
-    extract::State,
-    http::StatusCode,
+    extract::{State, rejection::JsonRejection},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 
-use crate::{handler::auth::service_error_response, middleware::auth::AuthUser, state::AppState};
+use crate::{
+    auth::models::MessageResponse,
+    error::AppError,
+    handler::auth::{extract_client_ip, json_rejection_response, service_error_response},
+    middleware::auth::AuthUser,
+    state::AppState,
+};
 
 /// `POST /auth/totp/confirm` body.
 #[derive(Deserialize)]
@@ -74,4 +80,54 @@ pub async fn totp_enroll(State(state): State<AppState>, auth_user: AuthUser) -> 
         Ok(enrollment) => (StatusCode::OK, Json(enrollment)).into_response(),
         Err(error) => service_error_response(error),
     }
+}
+
+/// `POST /auth/totp/confirm`
+///
+/// Verifies the first code against the pending secret and enables 2FA.
+pub async fn totp_confirm(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    headers: HeaderMap,
+    body: Result<Json<ConfirmTotpRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(rejection) => return json_rejection_response(rejection),
+    };
+
+    let client_ip = extract_client_ip(&headers);
+
+    if state
+        .rate_limiter
+        .check_totp_ip_limit(&client_ip, &state.config.totp)
+        .is_err()
+    {
+        return totp_rate_limit_exceeded();
+    }
+    if state
+        .rate_limiter
+        .check_totp_user_limit(auth_user.user_id, &state.config.totp)
+        .is_err()
+    {
+        return totp_rate_limit_exceeded();
+    }
+
+    match state
+        .totp_service
+        .confirm_enrollment(auth_user.user_id, &request.code, &client_ip)
+        .await
+    {
+        Ok(()) => (StatusCode::OK, Json(MessageResponse::new("totp confirmed"))).into_response(),
+        Err(error) => service_error_response(error),
+    }
+}
+
+/// 429 for either TOTP dimension.
+///
+/// No `Retry-After`: the limiter rejects with `Exceeded` (sliding window), which has
+/// no exact retry instant to advertise; a one-window `Lockout` header would misstate
+/// when the budget actually reopens.
+fn totp_rate_limit_exceeded() -> Response {
+    service_error_response(AppError::TotpRateLimitExceeded)
 }

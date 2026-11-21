@@ -137,6 +137,103 @@ async fn enroll_rejects_already_enabled() {
     assert_eq!(resp.error_code(), Some(ErrorCode::TotpAlreadyEnabled));
 }
 
+#[tokio::test]
+async fn enroll_rate_limits_the_user_dimension() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app_with(|cfg| {
+        cfg.totp.rate_limit_user_max_attempts = 3;
+    })
+    .await
+    else {
+        return;
+    };
+
+    let (email, password) = create_verified_user(&app).await;
+    let session = login(&app, &email, &password).await;
+
+    for attempt in 0..3 {
+        let resp = app
+            .dispatch(session_request(
+                &app,
+                Method::POST,
+                "/auth/totp/enroll",
+                json!({}),
+                &session,
+                &dynamic_ip(),
+            ))
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK, "attempt {attempt}: {resp:?}");
+    }
+
+    let rejected = app
+        .dispatch(session_request(
+            &app,
+            Method::POST,
+            "/auth/totp/enroll",
+            json!({}),
+            &session,
+            &dynamic_ip(),
+        ))
+        .await;
+    assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        rejected.error_code(),
+        Some(ErrorCode::TotpRateLimitExceeded)
+    );
+    let retry_after: u64 = rejected
+        .header("retry-after")
+        .expect("a 429 must advertise Retry-After")
+        .parse()
+        .expect("Retry-After is whole seconds");
+    assert!((1..=app.state.config.totp.rate_limit_window_secs).contains(&retry_after));
+}
+
+#[tokio::test]
+async fn enroll_rate_limits_the_ip_dimension() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app_with(|cfg| {
+        cfg.totp.rate_limit_ip_max_attempts = 3;
+    })
+    .await
+    else {
+        return;
+    };
+
+    let (email, password) = create_verified_user(&app).await;
+    let session = login(&app, &email, &password).await;
+    let ip = dynamic_ip();
+
+    for attempt in 0..3 {
+        let resp = app
+            .dispatch(session_request(
+                &app,
+                Method::POST,
+                "/auth/totp/enroll",
+                json!({}),
+                &session,
+                &ip,
+            ))
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK, "attempt {attempt}: {resp:?}");
+    }
+
+    let rejected = app
+        .dispatch(session_request(
+            &app,
+            Method::POST,
+            "/auth/totp/enroll",
+            json!({}),
+            &session,
+            &ip,
+        ))
+        .await;
+    assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        rejected.error_code(),
+        Some(ErrorCode::TotpRateLimitExceeded)
+    );
+}
+
 // ─── Confirmation ────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -240,8 +337,9 @@ async fn confirm_rate_limits_user_dimension() {
 
     assert!(tripped, "the user budget must trip within six attempts");
     assert_eq!(
-        rejected_codes, app.state.config.totp.rate_limit_user_max_attempts,
-        "confirm must admit exactly the configured user budget"
+        rejected_codes,
+        app.state.config.totp.rate_limit_user_max_attempts - 1,
+        "enrollment spends one user attempt, so confirm must admit the rest of the budget"
     );
 }
 
@@ -676,8 +774,9 @@ async fn verify_rate_limits_user_dimension() {
         enabled_user(&app, &dynamic_ip()).await;
     let token = challenge(&app, &email, &password).await;
 
-    // Confirm already spent one of the five user attempts, so four rejected codes fit
-    // before the budget trips; a fresh IP per attempt keeps the dimension isolated.
+    // Enrollment and confirmation already spent two of the five user attempts, so three
+    // rejected codes fit before the budget trips; a fresh IP per attempt keeps the
+    // dimension isolated.
     let mut rejected_codes = 0;
     let mut tripped = None;
     for _ in 0..6 {
@@ -716,8 +815,9 @@ async fn verify_rate_limits_user_dimension() {
         "the user budget must trip within six attempts"
     );
     assert_eq!(
-        rejected_codes, 4,
-        "the user dimension must admit exactly the budget left after confirmation"
+        rejected_codes,
+        app.state.config.totp.rate_limit_user_max_attempts - 2,
+        "enrollment and confirmation spend two user attempts, so verify must admit the rest"
     );
 }
 

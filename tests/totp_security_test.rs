@@ -587,8 +587,8 @@ async fn user_budget_admits_exactly_three_attempts_then_returns_429() {
         metal_auth::totp::crypto::current_totp_counter() + 3,
     );
 
-    // Confirmation already spent one attempt on this user; clear it so the boundary
-    // under test is exactly the configured three, not two.
+    // Enrollment and confirmation already spent attempts on this user; clear the budget so
+    // the boundary under test is exactly the configured three, not the residual.
     app.state
         .rate_limiter
         .reset(&RateLimiter::totp_user_key(user_id));

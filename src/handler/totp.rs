@@ -98,7 +98,9 @@ impl DisableTotpRequest {
 /// `POST /auth/totp/enroll`
 ///
 /// Rotates the pending secret and returns the QR URI plus the backup codes once.
-/// Refuses unverified emails and an already enabled secret.
+/// Refuses unverified emails and an already enabled secret. Rate-limited like every other
+/// TOTP route: enrollment spends ten Argon2id hashes on the shared blocking pool, so an
+/// unthrottled reroll loop is a CPU-exhaustion vector for the whole instance.
 pub async fn totp_enroll(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -106,6 +108,31 @@ pub async fn totp_enroll(
 ) -> Response {
     let client_ip = extract_client_ip(&headers);
     let user_agent = user_agent(&headers);
+
+    if state
+        .rate_limiter
+        .check_totp_ip_limit(&client_ip, &state.config.totp)
+        .is_err()
+    {
+        return totp_rate_limit_exceeded(
+            &state,
+            &client_ip,
+            "ip",
+            &RateLimiter::totp_ip_key(&client_ip),
+        );
+    }
+    if state
+        .rate_limiter
+        .check_totp_user_limit(auth_user.user_id, &state.config.totp)
+        .is_err()
+    {
+        return totp_rate_limit_exceeded(
+            &state,
+            &client_ip,
+            "user",
+            &RateLimiter::totp_user_key(auth_user.user_id),
+        );
+    }
 
     match state.totp_service.enroll_totp(auth_user.user_id).await {
         Ok(enrollment) => {

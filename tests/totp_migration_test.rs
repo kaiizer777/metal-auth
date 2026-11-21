@@ -235,7 +235,7 @@ where
     .expect("create isolated test schema");
 
     let search_path = schema_name.clone();
-    let schema_pool = PgPoolOptions::new()
+    let connected = PgPoolOptions::new()
         .max_connections(2)
         .after_connect(move |conn, _meta| {
             let search_path = search_path.clone();
@@ -249,8 +249,21 @@ where
             })
         })
         .connect(&url)
-        .await
-        .expect("connect to isolated test schema pool");
+        .await;
+
+    let schema_pool = match connected {
+        Ok(pool) => pool,
+        Err(err) => {
+            // The body teardown never runs when the pool itself cannot be built.
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP SCHEMA \"{schema_name}\" CASCADE"
+            )))
+            .execute(&base_pool)
+            .await
+            .expect("drop the schema orphaned by the failed pool connect");
+            panic!("connect to isolated test schema pool: {err}");
+        }
+    };
 
     // Teardown must survive an assertion failure, so the body runs in its own task.
     let task_pool = schema_pool.clone();

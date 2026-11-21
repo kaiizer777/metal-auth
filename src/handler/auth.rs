@@ -417,12 +417,15 @@ pub async fn login(
         ip = %client_ip,
         user_agent = %user_agent.as_deref().unwrap_or("unknown"),
     );
+    // `session_id_hash` is a SHA-256 of a 256-bit token, never the token: a correlator,
+    // not a credential. Every authentication event carries it; lifecycle events do not.
     tracing::info!(
         event = "login_success",
         user_id = %user_id,
         session_type = session_type,
         ip = %client_ip,
         user_agent = %user_agent.as_deref().unwrap_or("unknown"),
+        session_id_hash = %session.token_hash,
     );
 
     if is_bearer {

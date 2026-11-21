@@ -524,6 +524,8 @@ async fn redeem_challenge(
         ip = %client_ip,
         user_agent = %user_agent,
     );
+    // `session_id_hash` is a SHA-256 of a 256-bit token, never the token: a correlator,
+    // not a credential. Every authentication event carries it; lifecycle events do not.
     tracing::info!(
         target: "security_event",
         event = verified.event(),

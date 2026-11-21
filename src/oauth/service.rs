@@ -612,6 +612,8 @@ impl OAuthService {
             user_agent = ctx.user_agent.unwrap_or("unknown"),
         );
 
+        // `session_id_hash` is a SHA-256 of a 256-bit token, never the token: a correlator,
+        // not a credential. Every authentication event carries it; lifecycle events do not.
         tracing::info!(
             event = "oauth_callback_success",
             provider = ctx.provider_id,

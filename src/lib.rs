@@ -70,7 +70,6 @@ pub use session::{
     read_session_cookie, set_csrf_cookie, set_session_cookie,
 };
 pub use state::AppState;
-pub use totp::service::{EnrollTotpResponse, FreshAuthProof, TotpService};
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use email::test_utils;

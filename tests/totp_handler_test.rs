@@ -1064,23 +1064,28 @@ async fn disable_requires_exactly_one_proof() {
     let (_email, password, _secret, _backup_codes, session) =
         enabled_user(&app, &dynamic_ip()).await;
 
-    for body in [
-        json!({}),
-        json!({ "password": "" }),
-        json!({ "password": password, "totp_code": "000000" }),
-    ] {
-        let resp = app
-            .dispatch(session_request(
-                &app,
-                Method::DELETE,
-                "/auth/totp",
-                body,
-                &session,
-                &dynamic_ip(),
-            ))
-            .await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(resp.error_code(), Some(ErrorCode::ValidationError));
+    // More malformed bodies than the user budget: rejection must happen before the
+    // limiter is consulted, so none of them may come back as 429.
+    let attempts = app.state.config.totp.rate_limit_user_max_attempts + 1;
+    for _ in 0..attempts {
+        for body in [
+            json!({}),
+            json!({ "password": "" }),
+            json!({ "password": password, "totp_code": "000000" }),
+        ] {
+            let resp = app
+                .dispatch(session_request(
+                    &app,
+                    Method::DELETE,
+                    "/auth/totp",
+                    body,
+                    &session,
+                    &dynamic_ip(),
+                ))
+                .await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(resp.error_code(), Some(ErrorCode::ValidationError));
+        }
     }
 }
 

@@ -16,7 +16,6 @@ pub const BACKUP_CODE_LEN: usize = 10;
 /// Random bytes per code: 7 bytes encode to 12 base32 chars, trimmed to 10 (50 bits).
 const BACKUP_CODE_RAW_BYTES: usize = 7;
 /// Base32 alphabet selector, not cryptographic key material.
-// codeql[rust/hard-coded-cryptographic-value]
 const BACKUP_CODE_ALPHABET: Alphabet = Alphabet::RFC4648 { padding: false };
 
 /// Generate [`BACKUP_CODE_COUNT`] codes, returning `(raw_codes, phc_hashes)`.
@@ -30,12 +29,12 @@ pub fn generate_backup_codes(config: &AppConfig) -> Result<(Vec<String>, Vec<Str
     for _ in 0..BACKUP_CODE_COUNT {
         let mut bytes = [0u8; BACKUP_CODE_RAW_BYTES];
         OsRng.fill_bytes(&mut bytes);
-        let mut code = base32::encode(BACKUP_CODE_ALPHABET, &bytes);
+        let encoded = base32::encode(BACKUP_CODE_ALPHABET, &bytes);
         crate::crypto::zeroize_bytes(&mut bytes);
-        code.truncate(BACKUP_CODE_LEN);
+        let code = &encoded[..BACKUP_CODE_LEN];
 
-        hashed_codes.push(hash_password(&code, config)?);
-        raw_codes.push(code);
+        hashed_codes.push(hash_password(code, config)?);
+        raw_codes.push(code.to_owned());
     }
 
     Ok((raw_codes, hashed_codes))

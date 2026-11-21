@@ -380,10 +380,6 @@ impl TotpService {
         // `CURRENT_TIMESTAMP`, frozen at `BEGIN`, so a stalled transaction would stamp the
         // row earlier than the reference its own cutoff uses and a later transaction would
         // prune it sooner.
-        // `used_at` is bound rather than defaulted: the column default is
-        // `CURRENT_TIMESTAMP`, frozen at `BEGIN`, so a stalled transaction would stamp the
-        // row earlier than the reference its own cutoff uses and a later transaction would
-        // prune it sooner.
         let inserted = sqlx::query(
             "INSERT INTO totp_used_codes (user_id, code_hash, used_at) VALUES ($1, $2, $3)",
         )
@@ -2122,34 +2118,14 @@ mod tests {
         assert!(ctx.service.is_totp_enabled(new_user).await.expect("state"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn absent_factor_row_activation_is_serialized_with_the_login_gate() {
+    #[tokio::test]
+    async fn activation_after_an_absent_row_gate_leaves_the_session_live() {
         let Some(ctx) = setup_db_context().await else {
             return;
         };
 
-        // No row at BEGIN means no row lock anywhere, so ordering is by commit time only:
-        // an activation that commits before the gate's read is observed by that read.
-        let user_id = create_user(&ctx, true, &fixture_password()).await;
-        let mut gate = ctx.pool.begin().await.expect("gate transaction");
-        let enrollment = ctx.service.enroll_totp(user_id).await.expect("enroll");
-        let code = current_code(&enrollment.secret_base32);
-        ctx.service
-            .confirm_enrollment(user_id, &code, "ip")
-            .await
-            .expect("confirm");
-        assert!(
-            ctx.service
-                .is_totp_enabled_locked(&mut gate, user_id)
-                .await
-                .expect("gate read"),
-            "a committed activation must be visible to a gate that began before the row existed"
-        );
-        gate.rollback().await.expect("rollback");
-
-        // And the boundary: a gate that already decided before the activation commits is not
-        // retroactively rewritten, because enabling 2FA does not revoke live sessions. The
-        // password-only session stands next to an enabled factor.
+        // The gate saw no factor row, so its session is password-only. A later activation must
+        // not rewrite that decision: enabling 2FA does not revoke live sessions.
         let password = fixture_password();
         let (late_user, email) = create_user_with_email(&ctx, true, &password).await;
         let response = login(

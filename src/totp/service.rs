@@ -166,14 +166,38 @@ impl TotpService {
         let secret = self.decrypt_totp_secret(&encrypted_secret)?;
         verify_totp_code(secret.as_ref(), code)?;
 
-        sqlx::query(
+        self.activate_pending_secret(user_id, &encrypted_secret)
+            .await
+    }
+
+    /// Enable the exact pending secret that was just verified.
+    ///
+    /// Keyed on the secret fingerprint, not the user: a concurrent enrollment replaces the
+    /// secret in place (`ON CONFLICT DO UPDATE` keeps the row), so a user-scoped update
+    /// would enable a secret whose code was never presented. `enabled = FALSE` makes the
+    /// first confirmation the only winner.
+    async fn activate_pending_secret(
+        &self,
+        user_id: Uuid,
+        encrypted_secret: &[u8],
+    ) -> Result<(), AppError> {
+        let activated = sqlx::query(
             "UPDATE totp_secrets SET enabled = TRUE, updated_at = CURRENT_TIMESTAMP \
-             WHERE user_id = $1",
+             WHERE user_id = $1 AND encrypted_secret = $2 AND enabled = FALSE",
         )
         .bind(user_id)
+        .bind(encrypted_secret)
         .execute(&self.pool)
         .await
         .map_err(AppError::Database)?;
+        if activated.rows_affected() == 0 {
+            // Either the verified enrollment was replaced or it was confirmed first.
+            return Err(if self.is_totp_enabled(user_id).await? {
+                AppError::TotpAlreadyEnabled
+            } else {
+                AppError::TotpNotEnrolled
+            });
+        }
         Ok(())
     }
 
@@ -814,6 +838,45 @@ mod tests {
                 .await,
             Err(AppError::TotpAlreadyEnabled)
         ));
+    }
+
+    #[tokio::test]
+    async fn confirm_cannot_activate_a_replaced_pending_enrollment() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        ctx.service
+            .enroll_totp(user_id)
+            .await
+            .expect("first enroll");
+        let verified_secret: Vec<u8> =
+            sqlx::query_scalar("SELECT encrypted_secret FROM totp_secrets WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(&ctx.pool)
+                .await
+                .expect("first secret");
+
+        // A second enrollment replaces the secret before the first confirmation lands.
+        let second = ctx
+            .service
+            .enroll_totp(user_id)
+            .await
+            .expect("second enroll");
+
+        assert!(matches!(
+            ctx.service
+                .activate_pending_secret(user_id, &verified_secret)
+                .await,
+            Err(AppError::TotpNotEnrolled)
+        ));
+        assert!(!ctx.service.is_totp_enabled(user_id).await.expect("state"));
+
+        let second_code = current_code(&second.secret_base32);
+        ctx.service
+            .confirm_enrollment(user_id, &second_code, "127.0.0.1")
+            .await
+            .expect("the live pending enrollment still confirms");
     }
 
     #[tokio::test]

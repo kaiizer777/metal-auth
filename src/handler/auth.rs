@@ -205,11 +205,16 @@ pub(crate) fn extract_client_ip(headers: &HeaderMap) -> String {
         .to_string()
 }
 
-/// Construct HTTP 429 response with dynamic Retry-After header derived from rejection reason.
-/// Omitted if rejection occurred due to capacity saturation or attempt limit without lockout.
+/// Construct an HTTP 429 response, carrying `Retry-After` only for a lockout.
+///
+/// The auth routes pass a cooldown to every limiter call, so their window rejections are
+/// always lockouts; capacity saturation admits no attempt and has no window to advertise.
+/// A bare window rejection is not emitted here on purpose — the TOTP routes advertise
+/// theirs through `handler::totp::totp_rate_limit_exceeded`, which keeps their header a
+/// statement about the rejection that produced it.
 fn rate_limit_response(rejection: RateLimitRejection) -> Response {
     let mut resp = service_error_response(AppError::RateLimitExceeded);
-    if let Some(secs) = rejection.retry_after()
+    if let RateLimitRejection::Lockout(secs) = rejection
         && let Ok(val) = header::HeaderValue::from_str(&secs.to_string())
     {
         resp.headers_mut().insert(header::RETRY_AFTER, val);
@@ -963,6 +968,24 @@ mod tests {
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
         let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(err.code, ErrorCode::RateLimitExceeded);
+    }
+
+    #[test]
+    fn rate_limit_response_omits_retry_after_without_a_lockout() {
+        let window = rate_limit_response(RateLimitRejection::Exceeded(42));
+        assert!(
+            !window.headers().contains_key(header::RETRY_AFTER),
+            "an auth-route window rejection must keep the pre-existing header behaviour"
+        );
+
+        let lockout = rate_limit_response(RateLimitRejection::Lockout(42));
+        assert_eq!(
+            lockout
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("42")
+        );
     }
 
     #[tokio::test]

@@ -663,9 +663,12 @@ impl TotpService {
     /// row until that transaction ends.
     ///
     /// A login that couples this read with its session insert excludes a concurrent
-    /// `confirm_enrollment`: the activation update blocks on the lock and commits after the
-    /// session, never between the decision and the insert. An absent row locks nothing,
-    /// but only an existing row can be activated, so the pending case is covered too.
+    /// `confirm_enrollment` for a row that exists at read time: the activation update blocks
+    /// on the lock and commits after the session, never between the decision and the
+    /// insert. Coverage stops at that row — a factor created after this read is not
+    /// observed, because `enroll_totp` inserts a new row and an absent row takes no lock.
+    /// Closing that case would require the gate to lock the user row for update, which would
+    /// serialize every login against enrollment and every other user-row writer.
     pub(crate) async fn is_totp_enabled_locked(
         &self,
         connection: &mut PgConnection,
@@ -1781,6 +1784,69 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(body["two_factor_required"], true);
         assert_eq!(count_rows(&ctx.pool, "sessions", user_id).await, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gate_lock_covers_only_the_factor_row_present_at_read_time() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+
+        // Present row: the activation cannot land before the gate transaction ends.
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let enrollment = ctx.service.enroll_totp(user_id).await.expect("enroll");
+        let code = current_code(&enrollment.secret_base32);
+
+        let mut gate = ctx.pool.begin().await.expect("gate transaction");
+        assert!(
+            !ctx.service
+                .is_totp_enabled_locked(&mut gate, user_id)
+                .await
+                .expect("gate read")
+        );
+        let confirmer = {
+            let service = ctx.service.clone();
+            tokio::spawn(async move { service.confirm_enrollment(user_id, &code, "ip").await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !confirmer.is_finished(),
+            "a row present at read time must not be activated before the gate commits"
+        );
+        gate.commit().await.expect("release the gate");
+        confirmer
+            .await
+            .expect("join")
+            .expect("the activation proceeds once the gate releases the row");
+
+        // Absent row: the gate takes no lock, so an enrollment created afterwards is not
+        // excluded. That is the documented boundary of this helper, pinned here so a
+        // future change to the coverage has to update the claim.
+        let new_user = create_user(&ctx, true, &fixture_password()).await;
+        let mut gate = ctx.pool.begin().await.expect("gate transaction");
+        assert!(
+            !ctx.service
+                .is_totp_enabled_locked(&mut gate, new_user)
+                .await
+                .expect("gate read")
+        );
+        let enrollment = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            ctx.service.enroll_totp(new_user),
+        )
+        .await
+        .expect("an absent row must not block a concurrent enrollment")
+        .expect("enroll");
+        let code = current_code(&enrollment.secret_base32);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            ctx.service.confirm_enrollment(new_user, &code, "ip"),
+        )
+        .await
+        .expect("an absent row must not block a concurrent confirmation")
+        .expect("confirm");
+        gate.commit().await.expect("release the gate");
+        assert!(ctx.service.is_totp_enabled(new_user).await.expect("state"));
     }
 
     #[tokio::test]

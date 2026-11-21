@@ -5,12 +5,43 @@
 
 mod common;
 
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use common::*;
 use metal_auth::ErrorCode;
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
+
+/// Cookies, CSRF header, and client IP for a protected TOTP route, minus the body.
+///
+/// Without all three the request would test CSRF or auth middleware instead of the
+/// fresh-proof check.
+fn session_headers(app: &TestApp, session: &Session, ip: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::COOKIE,
+        format!(
+            "{}={}; csrf_token={}",
+            app.state.config.session.cookie_name, session.sid, session.csrf
+        )
+        .parse()
+        .expect("cookie header"),
+    );
+    headers.insert(
+        "x-csrf-token",
+        session.csrf.parse().expect("csrf header"),
+    );
+    headers.insert("x-forwarded-for", ip.parse().expect("ip header"));
+    headers
+}
+
+async fn enrollment_count(pool: &PgPool, user_id: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM totp_secrets WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .expect("count enrollments")
+}
 
 async fn backup_code_count(pool: &PgPool, user_id: Uuid) -> i32 {
     sqlx::query_scalar("SELECT jsonb_array_length(backup_codes) FROM totp_secrets WHERE user_id = $1")
@@ -290,5 +321,94 @@ async fn unenrolled_user_verify_is_rejected() {
         count_sessions_for_user(&app.pool, user_id).await,
         sessions_before,
         "an unenrolled verify must not issue a session"
+    );
+}
+
+/// Scenario 6a: disabling without any fresh proof is a validation error, not a toggle.
+#[tokio::test]
+async fn disable_without_a_fresh_proof_is_a_validation_error() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let (email, _password, _secret, _backup_codes, session) =
+        enabled_user(&app, &dynamic_ip()).await;
+    let user_id = user_id_for_email(&app.pool, &email).await;
+
+    let absent = app
+        .dispatch(empty_request_with_headers(
+            Method::DELETE,
+            "/auth/totp",
+            session_headers(&app, &session, &dynamic_ip()),
+        ))
+        .await;
+    assert_eq!(
+        absent.status(),
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        absent.body_str
+    );
+    assert_eq!(absent.error_code(), Some(ErrorCode::ValidationError));
+
+    let empty = app
+        .dispatch(session_request(
+            &app,
+            Method::DELETE,
+            "/auth/totp",
+            json!({}),
+            &session,
+            &dynamic_ip(),
+        ))
+        .await;
+    assert_eq!(
+        empty.status(),
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        empty.body_str
+    );
+    assert_eq!(empty.error_code(), Some(ErrorCode::ValidationError));
+
+    assert_eq!(
+        enrollment_count(&app.pool, user_id).await,
+        1,
+        "a missing proof must leave 2fa enabled"
+    );
+}
+
+/// Scenario 6b: a wrong password is a credential failure and keeps 2FA on.
+#[tokio::test]
+async fn disable_with_a_wrong_password_is_rejected() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let (email, _password, _secret, _backup_codes, session) =
+        enabled_user(&app, &dynamic_ip()).await;
+    let user_id = user_id_for_email(&app.pool, &email).await;
+
+    let resp = app
+        .dispatch(session_request(
+            &app,
+            Method::DELETE,
+            "/auth/totp",
+            json!({ "password": dynamic_password() }),
+            &session,
+            &dynamic_ip(),
+        ))
+        .await;
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "body: {}",
+        resp.body_str
+    );
+    assert_eq!(resp.error_code(), Some(ErrorCode::InvalidCredentials));
+    assert_eq!(
+        enrollment_count(&app.pool, user_id).await,
+        1,
+        "a rejected proof must leave 2fa enabled"
     );
 }

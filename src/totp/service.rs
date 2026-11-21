@@ -561,6 +561,11 @@ mod tests {
         )
         .await
         .expect("DATABASE_URL is set, so the DB-backed test must connect");
+        // Same global claim as the integration binaries: a prior run's claimable rows would
+        // otherwise reach the next test's capturing sender.
+        crate::db::outbox::discard_claimable_outbox(&pool)
+            .await
+            .expect("clear claimable outbox residue");
         let auth_config = Arc::new(AppConfig {
             argon2_m_cost: 8,
             argon2_t_cost: 1,

@@ -70,6 +70,22 @@ pub async fn claim_pending_outbox(
     .await
 }
 
+/// Deletes every row [`claim_pending_outbox`] could still claim.
+///
+/// Tests run as separate binaries against one database while the claim is global, so a row a
+/// previous binary left pending or leased is delivered to the next test's sender regardless
+/// of recipient. Test setup calls this to drop that residue; the `sent` and `failed` history
+/// other tests assert on is untouched.
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn discard_claimable_outbox(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM email_outbox WHERE status = $1 OR status = $2")
+        .bind(OUTBOX_STATUS_PENDING)
+        .bind(OUTBOX_STATUS_PROCESSING)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 /// Resets stale processing records whose lease has expired back to pending status.
 pub async fn recover_stale_processing(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(

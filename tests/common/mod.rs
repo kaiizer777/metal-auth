@@ -446,6 +446,12 @@ async fn setup_test_app_with_auth_config_and(
     .await
     .expect("DATABASE_URL is set, so the DB-backed test must connect");
 
+    // The claim is global and the binaries share this database: drop claimable rows a
+    // previous binary left behind before this app can deliver them to its own sender.
+    metal_auth::db::outbox::discard_claimable_outbox(&pool)
+        .await
+        .expect("clear claimable outbox residue");
+
     let email_sender = Arc::new(CapturingEmailSender::new());
     let dispatcher = Arc::new(
         EmailDispatcher::new_blocking(

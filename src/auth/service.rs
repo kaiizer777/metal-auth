@@ -720,6 +720,11 @@ mod tests {
         )
         .await
         .expect("DATABASE_URL is set, so the DB-backed test must connect");
+        // Same global claim as the integration binaries: a prior run's claimable rows would
+        // otherwise reach this test's capturing sender.
+        crate::db::outbox::discard_claimable_outbox(&pool)
+            .await
+            .expect("clear claimable outbox residue");
         let config = Arc::new(AppConfig {
             argon2_m_cost: 19456,
             argon2_t_cost: 2,
@@ -1534,6 +1539,31 @@ mod tests {
         assert!(sender.delivered.load(std::sync::atomic::Ordering::SeqCst));
     }
 
+    /// Waits for the detached worker to settle the row it claimed as `sent`.
+    ///
+    /// The mailer returns before the worker marks the row, and ending the test right there
+    /// drops that task: the row stays leased until the next test's dispatcher claims it.
+    async fn wait_outbox_sent(pool: &PgPool, recipient: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let sent: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM email_outbox WHERE recipient = $1 AND status = 'sent'",
+            )
+            .bind(recipient)
+            .fetch_one(pool)
+            .await
+            .expect("poll outbox status");
+            if sent > 0 {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "detached worker must settle the row it claimed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// Regression guard for the signup request path: returning before the mailer does is
     /// the whole point. Re-awaiting the dispatch handle blocks past the 5 s guard.
     #[tokio::test]
@@ -1561,6 +1591,7 @@ mod tests {
 
         sender.release.notify_one();
         wait_mailer_delivered(&sender).await;
+        wait_outbox_sent(&ctx.pool, &email).await;
     }
 
     /// Same guard for the password-reset request path.
@@ -1599,6 +1630,7 @@ mod tests {
 
         sender.release.notify_one();
         wait_mailer_delivered(&sender).await;
+        wait_outbox_sent(&ctx.pool, &email).await;
     }
 
     // ─── Group B: no-DB early-return guard tests ─────────────────────────────

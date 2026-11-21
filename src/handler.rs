@@ -7,6 +7,7 @@ pub mod auth;
 pub mod cors;
 pub mod oauth;
 pub mod session;
+pub mod totp;
 
 pub use auth::routes as auth_routes;
 pub use cors::cors_layer;

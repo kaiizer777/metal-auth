@@ -5,7 +5,7 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use common::*;
@@ -29,10 +29,7 @@ fn session_headers(app: &TestApp, session: &Session, ip: &str) -> HeaderMap {
         .parse()
         .expect("cookie header"),
     );
-    headers.insert(
-        "x-csrf-token",
-        session.csrf.parse().expect("csrf header"),
-    );
+    headers.insert("x-csrf-token", session.csrf.parse().expect("csrf header"));
     headers.insert("x-forwarded-for", ip.parse().expect("ip header"));
     headers
 }
@@ -46,11 +43,13 @@ async fn enrollment_count(pool: &PgPool, user_id: Uuid) -> i64 {
 }
 
 async fn backup_code_count(pool: &PgPool, user_id: Uuid) -> i32 {
-    sqlx::query_scalar("SELECT jsonb_array_length(backup_codes) FROM totp_secrets WHERE user_id = $1")
-        .bind(user_id)
-        .fetch_one(pool)
-        .await
-        .expect("totp secret row with a backup-code array")
+    sqlx::query_scalar(
+        "SELECT jsonb_array_length(backup_codes) FROM totp_secrets WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .expect("totp secret row with a backup-code array")
 }
 
 async fn pending_challenge_count(pool: &PgPool, user_id: Uuid) -> i64 {
@@ -79,7 +78,8 @@ async fn expired_challenge_token_is_rejected() {
         return;
     };
 
-    let (email, password, secret, _backup_codes, _session) = enabled_user(&app, &dynamic_ip()).await;
+    let (email, password, secret, _backup_codes, _session) =
+        enabled_user(&app, &dynamic_ip()).await;
     let user_id = user_id_for_email(&app.pool, &email).await;
     let sessions_before = count_sessions_for_user(&app.pool, user_id).await;
 
@@ -127,7 +127,8 @@ async fn replayed_totp_code_is_rejected() {
         return;
     };
 
-    let (email, password, secret, _backup_codes, _session) = enabled_user(&app, &dynamic_ip()).await;
+    let (email, password, secret, _backup_codes, _session) =
+        enabled_user(&app, &dynamic_ip()).await;
     let user_id = user_id_for_email(&app.pool, &email).await;
     let sessions_before = count_sessions_for_user(&app.pool, user_id).await;
 
@@ -294,7 +295,8 @@ async fn unenrolled_user_verify_is_rejected() {
         return;
     };
 
-    let (email, password, secret, _backup_codes, _session) = enabled_user(&app, &dynamic_ip()).await;
+    let (email, password, secret, _backup_codes, _session) =
+        enabled_user(&app, &dynamic_ip()).await;
     let user_id = user_id_for_email(&app.pool, &email).await;
     let sessions_before = count_sessions_for_user(&app.pool, user_id).await;
 
@@ -732,7 +734,8 @@ async fn clock_drift_accepts_the_next_step_and_rejects_two_steps_out() {
         return;
     };
 
-    let (email, password, secret, _backup_codes, _session) = enabled_user(&app, &dynamic_ip()).await;
+    let (email, password, secret, _backup_codes, _session) =
+        enabled_user(&app, &dynamic_ip()).await;
     let user_id = user_id_for_email(&app.pool, &email).await;
     let sessions_before = count_sessions_for_user(&app.pool, user_id).await;
 
@@ -810,6 +813,191 @@ async fn clock_drift_accepts_the_next_step_and_rejects_two_steps_out() {
     );
 }
 
+// ─── Tier 4 §10 — zero-leak telemetry ───────────────────────────────────────
+
+#[derive(Clone)]
+struct TestLogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for TestLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("log buffer lock")
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TestLogWriter {
+    type Writer = TestLogWriter;
+    fn make_writer(&self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Captures the thread-local `tracing` output for the duration of a test.
+///
+/// The default subscriber is thread-scoped, so this only works on a `current_thread`
+/// runtime where every poll of the test future stays on this thread.
+struct TestLogScope {
+    buf: Arc<Mutex<Vec<u8>>>,
+    _guard: tracing::subscriber::DefaultGuard,
+}
+
+impl TestLogScope {
+    fn new() -> Self {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(TestLogWriter(Arc::clone(&buf)))
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        Self { buf, _guard: guard }
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8(self.buf.lock().expect("log buffer lock").clone())
+            .expect("logs are UTF-8")
+    }
+}
+
+/// True when `code` appears as a value rather than inside a longer hash or id.
+///
+/// A leaked six-digit code shows up delimited (`code=123456,` or `"123456"`). The same
+/// digits can coincidentally sit inside a hex session hash, which is not a leak.
+fn contains_standalone(text: &str, code: &str) -> bool {
+    let bytes = text.as_bytes();
+    text.match_indices(code).any(|(index, _)| {
+        let before = index.checked_sub(1).map(|i| bytes[i]);
+        let after = bytes.get(index + code.len()).copied();
+        !before.is_some_and(|byte| byte.is_ascii_hexdigit())
+            && !after.is_some_and(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
+/// Tier 4 §10: no audit event may carry a secret, a code, a token, or the AES key.
+#[tokio::test(flavor = "current_thread")]
+async fn totp_audit_events_leak_no_secret_material() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    let log = TestLogScope::new();
+
+    let ip = dynamic_ip();
+    let (email, password) = create_verified_user(&app).await;
+    let session = login(&app, &email, &password).await;
+    let enrollment = enroll(&app, &session, &ip).await;
+    let secret = enrollment["secret_base32"]
+        .as_str()
+        .expect("secret_base32")
+        .to_string();
+    let backup_code = enrollment["backup_codes"][0]
+        .as_str()
+        .expect("backup code")
+        .to_string();
+
+    let confirm_code = totp_code(&secret);
+    let confirmed = confirm(&app, &session, &secret, &ip).await;
+    assert_eq!(
+        confirmed.status(),
+        StatusCode::OK,
+        "confirm failed: {}",
+        confirmed.body_str
+    );
+
+    let cookie_name = app.state.config.session.cookie_name.clone();
+    let challenge_token = challenge(&app, &email, &password).await;
+    let verify_code = code_at(
+        &secret,
+        metal_auth::totp::crypto::current_totp_counter() + 1,
+    );
+    let verified = app
+        .post_json(
+            "/auth/totp/verify",
+            json!({ "challenge_token": challenge_token, "code": verify_code }),
+        )
+        .await;
+    assert_eq!(
+        verified.status(),
+        StatusCode::OK,
+        "verify failed: {}",
+        verified.body_str
+    );
+    let session_id = extract_cookie_val(&verified.headers, &cookie_name).expect("session cookie");
+
+    let backup_token = challenge(&app, &email, &password).await;
+    let backed_up = app
+        .post_json(
+            "/auth/totp/backup",
+            json!({ "challenge_token": backup_token, "code": backup_code }),
+        )
+        .await;
+    assert_eq!(
+        backed_up.status(),
+        StatusCode::OK,
+        "backup failed: {}",
+        backed_up.body_str
+    );
+    let backup_session_id =
+        extract_cookie_val(&backed_up.headers, &cookie_name).expect("session cookie");
+
+    let disabled = app
+        .dispatch(session_request(
+            &app,
+            Method::DELETE,
+            "/auth/totp",
+            json!({ "password": password }),
+            &session,
+            &dynamic_ip(),
+        ))
+        .await;
+    assert_eq!(
+        disabled.status(),
+        StatusCode::OK,
+        "disable failed: {}",
+        disabled.body_str
+    );
+
+    let text = log.text();
+    // Positive control: an empty capture would make every absence assertion vacuous.
+    assert!(
+        text.contains("totp_verified"),
+        "the log scope must capture the verification audit event"
+    );
+    assert!(
+        text.contains("session_id_hash"),
+        "the audit event logs the hash field this test audits"
+    );
+
+    let encryption_key = "00".repeat(32);
+    for (label, value) in [
+        ("totp secret", secret.as_str()),
+        ("challenge token", challenge_token.as_str()),
+        ("backup challenge token", backup_token.as_str()),
+        ("backup code", backup_code.as_str()),
+        ("raw session id", session_id.as_str()),
+        ("raw backup session id", backup_session_id.as_str()),
+        ("encryption key", encryption_key.as_str()),
+    ] {
+        assert!(!text.contains(value), "the log leaked the {label}");
+    }
+
+    for (label, value) in [
+        ("confirm code", confirm_code.as_str()),
+        ("verify code", verify_code.as_str()),
+    ] {
+        assert!(
+            !contains_standalone(&text, value),
+            "the log leaked the {label}"
+        );
+    }
+}
+
 /// Scenario 8b: the IP budget is independent of the user budget and trips at 11.
 #[tokio::test]
 async fn ip_budget_admits_exactly_ten_attempts_then_returns_429() {
@@ -824,9 +1012,7 @@ async fn ip_budget_admits_exactly_ten_attempts_then_returns_429() {
 
     let ip = dynamic_ip();
     // No enrollment: the token fails validation, so only the IP dimension is charged.
-    app.state
-        .rate_limiter
-        .reset(&RateLimiter::totp_ip_key(&ip));
+    app.state.rate_limiter.reset(&RateLimiter::totp_ip_key(&ip));
 
     for attempt in 0..10 {
         let resp = app

@@ -26,6 +26,7 @@ use crate::{
         auth::{AuthUser, require_auth},
         csrf_middleware,
     },
+    ratelimit::RateLimiter,
     state::AppState,
     totp::service::FreshAuthProof,
 };
@@ -142,14 +143,24 @@ pub async fn totp_confirm(
         .check_totp_ip_limit(&client_ip, &state.config.totp)
         .is_err()
     {
-        return totp_rate_limit_exceeded(&client_ip, "ip");
+        return totp_rate_limit_exceeded(
+            &state,
+            &client_ip,
+            "ip",
+            &RateLimiter::totp_ip_key(&client_ip),
+        );
     }
     if state
         .rate_limiter
         .check_totp_user_limit(auth_user.user_id, &state.config.totp)
         .is_err()
     {
-        return totp_rate_limit_exceeded(&client_ip, "user");
+        return totp_rate_limit_exceeded(
+            &state,
+            &client_ip,
+            "user",
+            &RateLimiter::totp_user_key(auth_user.user_id),
+        );
     }
 
     match state
@@ -191,7 +202,12 @@ pub async fn totp_backup(
         .check_totp_ip_limit(&client_ip, &state.config.totp)
         .is_err()
     {
-        return totp_rate_limit_exceeded(&client_ip, "ip");
+        return totp_rate_limit_exceeded(
+            &state,
+            &client_ip,
+            "ip",
+            &RateLimiter::totp_ip_key(&client_ip),
+        );
     }
 
     let user_id = match state
@@ -208,7 +224,12 @@ pub async fn totp_backup(
         .check_totp_user_limit(user_id, &state.config.totp)
         .is_err()
     {
-        return totp_rate_limit_exceeded(&client_ip, "user");
+        return totp_rate_limit_exceeded(
+            &state,
+            &client_ip,
+            "user",
+            &RateLimiter::totp_user_key(user_id),
+        );
     }
 
     if let Err(error) = state
@@ -270,14 +291,24 @@ pub async fn totp_disable(
         .check_totp_ip_limit(&client_ip, &state.config.totp)
         .is_err()
     {
-        return totp_rate_limit_exceeded(&client_ip, "ip");
+        return totp_rate_limit_exceeded(
+            &state,
+            &client_ip,
+            "ip",
+            &RateLimiter::totp_ip_key(&client_ip),
+        );
     }
     if state
         .rate_limiter
         .check_totp_user_limit(auth_user.user_id, &state.config.totp)
         .is_err()
     {
-        return totp_rate_limit_exceeded(&client_ip, "user");
+        return totp_rate_limit_exceeded(
+            &state,
+            &client_ip,
+            "user",
+            &RateLimiter::totp_user_key(auth_user.user_id),
+        );
     }
 
     match state
@@ -306,17 +337,33 @@ pub async fn totp_disable(
 
 /// 429 for either TOTP dimension.
 ///
-/// No `Retry-After`: the limiter rejects with `Exceeded` (sliding window), which has
-/// no exact retry instant to advertise; a one-window `Lockout` header would misstate
-/// when the budget actually reopens.
-fn totp_rate_limit_exceeded(client_ip: &str, dimension: &'static str) -> Response {
+/// `Retry-After` is the remaining window of the key that actually tripped, derived from
+/// the limiter's own entry; the configured window is the fallback when the entry has no
+/// recorded attempt.
+fn totp_rate_limit_exceeded(
+    state: &AppState,
+    client_ip: &str,
+    dimension: &'static str,
+    key: &str,
+) -> Response {
+    let retry_after_secs = state
+        .rate_limiter
+        .remaining_window(key)
+        .unwrap_or(state.config.totp.rate_limit_window_secs);
+
     tracing::warn!(
         event = "rate_limit_exceeded",
         ip = %client_ip,
         key_prefix = "totp",
         dimension,
+        retry_after_secs,
     );
-    service_error_response(AppError::TotpRateLimitExceeded)
+
+    let mut response = service_error_response(AppError::TotpRateLimitExceeded);
+    if let Ok(value) = header::HeaderValue::from_str(&retry_after_secs.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
 }
 
 /// `POST /auth/totp/verify`
@@ -340,7 +387,12 @@ pub async fn totp_verify(
         .check_totp_ip_limit(&client_ip, &state.config.totp)
         .is_err()
     {
-        return totp_rate_limit_exceeded(&client_ip, "ip");
+        return totp_rate_limit_exceeded(
+            &state,
+            &client_ip,
+            "ip",
+            &RateLimiter::totp_ip_key(&client_ip),
+        );
     }
 
     // Non-destructive: holding the challenge while the code is retyped is the point.
@@ -358,7 +410,12 @@ pub async fn totp_verify(
         .check_totp_user_limit(user_id, &state.config.totp)
         .is_err()
     {
-        return totp_rate_limit_exceeded(&client_ip, "user");
+        return totp_rate_limit_exceeded(
+            &state,
+            &client_ip,
+            "user",
+            &RateLimiter::totp_user_key(user_id),
+        );
     }
 
     if let Err(error) = state

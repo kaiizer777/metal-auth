@@ -146,6 +146,31 @@ impl RateLimiter {
         format!("{prefix}:{bounded}")
     }
 
+    /// Format the `totp:ip:<ip>` budget key.
+    #[must_use]
+    pub fn totp_ip_key(ip: &str) -> String {
+        Self::format_account_key("totp:ip", ip)
+    }
+
+    /// Format the `totp:user:<user_id>` budget key.
+    #[must_use]
+    pub fn totp_user_key(user_id: uuid::Uuid) -> String {
+        Self::format_account_key("totp:user", &user_id.to_string())
+    }
+
+    /// Seconds until the oldest admitted attempt leaves `key`'s sliding window.
+    ///
+    /// `None` when the key is unknown or holds no recorded attempt. A caller that
+    /// reopens the budget at that point admits the next request, so the value is the
+    /// exact `Retry-After` for a sliding-window rejection.
+    #[must_use]
+    pub fn remaining_window(&self, key: &str) -> Option<u64> {
+        let entry = self.windows.get(key)?;
+        let oldest = entry.attempts.iter().min()?;
+        let remaining = entry.window.saturating_sub(oldest.elapsed());
+        Some((remaining.as_secs_f64().ceil() as u64).max(1))
+    }
+
     /// Evaluate an entry's sliding window and lockout state.
     fn evaluate_entry(
         entry: &mut WindowEntry,
@@ -348,14 +373,15 @@ impl RateLimiter {
     /// silently disable second-factor brute-force protection, and these keys are
     /// disjoint from the `ip:` / `account:` / `reset_account:` dimensions.
     ///
-    /// Rejects with [`RateLimitRejection::Exceeded`], never `Lockout`: a one-window
-    /// lockout would misstate a sliding window, so no `Retry-After` is claimed.
+    /// Rejects with [`RateLimitRejection::Exceeded`], never `Lockout`: the rejection is a
+    /// sliding-window exhaustion, so the handler advertises the exact reopening instant
+    /// via [`Self::remaining_window`] instead of a synthetic lockout duration.
     pub fn check_totp_ip_limit(
         &self,
         ip: &str,
         totp: &TotpConfig,
     ) -> Result<(), RateLimitRejection> {
-        let key = Self::format_account_key("totp:ip", ip);
+        let key = Self::totp_ip_key(ip);
         self.check_totp_window(
             &key,
             totp.rate_limit_ip_max_attempts,
@@ -371,7 +397,7 @@ impl RateLimiter {
         user_id: uuid::Uuid,
         totp: &TotpConfig,
     ) -> Result<(), RateLimitRejection> {
-        let key = Self::format_account_key("totp:user", &user_id.to_string());
+        let key = Self::totp_user_key(user_id);
         self.check_totp_window(
             &key,
             totp.rate_limit_user_max_attempts,
@@ -1115,6 +1141,21 @@ mod tests {
         // A different user is unaffected, and no IP key was consumed by user checks.
         assert!(limiter.check_totp_user_limit(other, &totp).is_ok());
         assert_eq!(limiter.entry_count(), 2);
+    }
+
+    #[test]
+    fn remaining_window_tracks_the_oldest_attempt() {
+        let limiter = RateLimiter::new();
+        let totp = totp_test_config();
+        for _ in 0..3 {
+            assert!(limiter.check_totp_ip_limit("198.51.100.11", &totp).is_ok());
+        }
+        assert!(limiter.check_totp_ip_limit("198.51.100.11", &totp).is_err());
+
+        let key = RateLimiter::totp_ip_key("198.51.100.11");
+        let secs = limiter.remaining_window(&key).expect("window entry");
+        assert!((59..=60).contains(&secs));
+        assert!(limiter.remaining_window("totp:ip:unknown").is_none());
     }
 
     #[test]

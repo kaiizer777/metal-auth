@@ -469,8 +469,7 @@ async fn verify_and_backup_ignore_an_ambient_session_cookie() {
         return;
     };
 
-    let (email, password, secret, backup_codes, session) =
-        enabled_user(&app, &dynamic_ip()).await;
+    let (email, password, secret, backup_codes, session) = enabled_user(&app, &dynamic_ip()).await;
     let cookie_name = app.state.config.session.cookie_name.clone();
     let cookie = format!(
         "{}={}; csrf_token={}",
@@ -498,10 +497,7 @@ async fn verify_and_backup_ignore_an_ambient_session_cookie() {
 
     let token = challenge(&app, &email, &password).await;
     let mut headers = HeaderMap::new();
-    headers.insert(
-        header::COOKIE,
-        cookie.parse().expect("cookie header"),
-    );
+    headers.insert(header::COOKIE, cookie.parse().expect("cookie header"));
     let req = json_request_with_headers(
         Method::POST,
         "/auth/totp/backup",
@@ -546,7 +542,12 @@ async fn verify_with_an_ambient_cookie_reaches_the_code_check() {
     );
     let resp = app.dispatch(req).await;
 
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "body: {}", resp.body_str);
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        resp.body_str
+    );
     assert_eq!(resp.error_code(), Some(ErrorCode::TotpCodeInvalid));
 }
 
@@ -701,6 +702,7 @@ async fn verify_rate_limits_ip_dimension() {
 
     let ip = dynamic_ip();
     let mut last_status = StatusCode::OK;
+    let mut retry_after = None;
     for _ in 0..11 {
         let resp = app
             .post_json_with_ip(
@@ -712,6 +714,7 @@ async fn verify_rate_limits_ip_dimension() {
         last_status = resp.status();
         if last_status == StatusCode::TOO_MANY_REQUESTS {
             assert_eq!(resp.error_code(), Some(ErrorCode::TotpRateLimitExceeded));
+            retry_after = resp.header("retry-after").map(str::to_string);
         }
     }
 
@@ -719,6 +722,14 @@ async fn verify_rate_limits_ip_dimension() {
         last_status,
         StatusCode::TOO_MANY_REQUESTS,
         "the 11th attempt from one IP must trip `totp:ip`"
+    );
+    let retry_after: u64 = retry_after
+        .expect("a 429 must advertise Retry-After")
+        .parse()
+        .expect("Retry-After is whole seconds");
+    assert!(
+        (1..=app.state.config.totp.rate_limit_window_secs).contains(&retry_after),
+        "Retry-After must stay inside the configured window"
     );
 }
 
@@ -752,6 +763,15 @@ async fn verify_rate_limits_user_dimension() {
             }
             StatusCode::TOO_MANY_REQUESTS => {
                 assert_eq!(resp.error_code(), Some(ErrorCode::TotpRateLimitExceeded));
+                let retry_after: u64 = resp
+                    .header("retry-after")
+                    .expect("a 429 must advertise Retry-After")
+                    .parse()
+                    .expect("Retry-After is whole seconds");
+                assert!(
+                    (1..=app.state.config.totp.rate_limit_window_secs).contains(&retry_after),
+                    "Retry-After must stay inside the configured window"
+                );
                 tripped = Some(());
                 break;
             }

@@ -340,30 +340,29 @@ pub async fn totp_disable(
 /// 429 for either TOTP dimension.
 ///
 /// `Retry-After` is the remaining window of the key that actually tripped, derived from
-/// the limiter's own entry; the configured window is the fallback when the entry has no
-/// recorded attempt.
+/// the limiter's own entry. Capacity exhaustion retains no attempt window for the key,
+/// so that rejection carries no header rather than an invented duration.
 fn totp_rate_limit_exceeded(
     state: &AppState,
     client_ip: &str,
     dimension: &'static str,
     key: &str,
 ) -> Response {
-    let retry_after_secs = state
-        .rate_limiter
-        .remaining_window(key)
-        .unwrap_or(state.config.totp.rate_limit_window_secs);
+    let retry_after_secs = state.rate_limiter.remaining_window(key);
 
     tracing::warn!(
         event = "rate_limit_exceeded",
         ip = %client_ip,
         key_prefix = "totp",
         dimension,
-        retry_after_secs,
+        retry_after_secs = ?retry_after_secs,
     );
 
     let mut response = service_error_response(AppError::TotpRateLimitExceeded);
-    if let Ok(value) = header::HeaderValue::from_str(&retry_after_secs.to_string()) {
-        response.headers_mut().insert(header::RETRY_AFTER, value);
+    if let Some(secs) = retry_after_secs {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, header::HeaderValue::from(secs));
     }
     response
 }

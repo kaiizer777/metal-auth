@@ -10,14 +10,17 @@ use serde::Deserialize;
 use axum::{
     Json,
     extract::{State, rejection::JsonRejection},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use uuid::Uuid;
 
 use crate::{
-    auth::models::MessageResponse,
+    auth::models::{LoginResponse, MessageResponse},
     error::AppError,
-    handler::auth::{extract_client_ip, json_rejection_response, service_error_response},
+    handler::auth::{
+        attach_login_cookies, extract_client_ip, json_rejection_response, service_error_response,
+    },
     middleware::auth::AuthUser,
     state::AppState,
 };
@@ -130,4 +133,110 @@ pub async fn totp_confirm(
 /// when the budget actually reopens.
 fn totp_rate_limit_exceeded() -> Response {
     service_error_response(AppError::TotpRateLimitExceeded)
+}
+
+/// `POST /auth/totp/verify`
+///
+/// Order is load-bearing: IP budget, then non-destructive token validation, then the
+/// user budget, then the code check, then token consumption on success only.
+pub async fn totp_verify(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<TwoFactorChallengeRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(rejection) => return json_rejection_response(rejection),
+    };
+
+    let client_ip = extract_client_ip(&headers);
+
+    if state
+        .rate_limiter
+        .check_totp_ip_limit(&client_ip, &state.config.totp)
+        .is_err()
+    {
+        return totp_rate_limit_exceeded();
+    }
+
+    // Non-destructive: holding the challenge while the code is retyped is the point.
+    let user_id = match state
+        .totp_service
+        .validate_two_factor_token(&request.challenge_token)
+        .await
+    {
+        Ok(user_id) => user_id,
+        Err(error) => return service_error_response(error),
+    };
+
+    if state
+        .rate_limiter
+        .check_totp_user_limit(user_id, &state.config.totp)
+        .is_err()
+    {
+        return totp_rate_limit_exceeded();
+    }
+
+    if let Err(error) = state
+        .totp_service
+        .verify_totp(user_id, &request.code, &client_ip)
+        .await
+    {
+        return service_error_response(error);
+    }
+
+    if let Err(error) = state
+        .totp_service
+        .consume_two_factor_token(&request.challenge_token)
+        .await
+    {
+        return service_error_response(error);
+    }
+
+    issue_two_factor_session(&state, user_id, &headers, &client_ip).await
+}
+
+/// Issue the post-challenge session using the same wire shape as a password login.
+async fn issue_two_factor_session(
+    state: &AppState,
+    user_id: Uuid,
+    headers: &HeaderMap,
+    client_ip: &str,
+) -> Response {
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok());
+    let is_bearer = headers
+        .get("x-auth-type")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("bearer"));
+    let session_type = if is_bearer { "bearer" } else { "cookie" };
+
+    let (session, raw_id) = match state
+        .session_service
+        .create_session(user_id, session_type, Some(client_ip), user_agent)
+        .await
+    {
+        Ok(session) => session,
+        Err(error) => return service_error_response(error),
+    };
+
+    if is_bearer {
+        (
+            StatusCode::OK,
+            Json(LoginResponse::with_token(user_id, raw_id)),
+        )
+            .into_response()
+    } else {
+        let response = (StatusCode::OK, Json(LoginResponse::new(user_id))).into_response();
+        match attach_login_cookies(
+            response,
+            &state.config,
+            raw_id.as_str(),
+            session.csrf_token.as_deref(),
+        ) {
+            Ok(response) => response,
+            Err(error) => service_error_response(error),
+        }
+    }
 }

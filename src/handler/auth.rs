@@ -174,7 +174,7 @@ pub(crate) fn service_error_response(err: AppError) -> Response {
 ///
 /// Fails closed: a cookie that cannot encode (server-side bug — tokens are hex)
 /// becomes a 500 via `AppError::Internal`, never an empty `Set-Cookie`.
-fn attach_login_cookies(
+pub(crate) fn attach_login_cookies(
     mut response: Response,
     cfg: &Config,
     raw_id: &str,

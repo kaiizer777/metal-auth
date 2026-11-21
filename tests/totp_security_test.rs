@@ -215,8 +215,8 @@ async fn unknown_backup_code_is_rejected_without_state_change() {
     let sessions_before = count_sessions_for_user(&app.pool, user_id).await;
     let token = challenge(&app, &email, &password).await;
 
-    // Sixteen base32 characters: shape-valid, but not one of the issued codes.
-    let fabricated = "AAAAAAAAAAAAAAAA";
+    // Ten base32 characters, the issued shape (`BACKUP_CODE_LEN`), but not one of the codes.
+    let fabricated = "AAAAAAAAAA";
     assert!(
         !backup_codes.iter().any(|code| code == fabricated),
         "the fabricated code must not collide with a real backup code"

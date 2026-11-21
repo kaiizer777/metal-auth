@@ -295,12 +295,18 @@ async fn enroll_returns_secret_uri_and_ten_backup_codes() {
             .as_str()
             .is_some_and(|uri| uri.starts_with("otpauth://totp/"))
     );
-    assert_eq!(
-        resp.json["backup_codes"]
-            .as_array()
-            .expect("backup_codes array")
-            .len(),
-        10
+    let backup_codes = resp.json["backup_codes"]
+        .as_array()
+        .expect("backup_codes array");
+    assert_eq!(backup_codes.len(), 10);
+    let distinct: std::collections::HashSet<&str> = backup_codes
+        .iter()
+        .map(|code| code.as_str().expect("backup code string"))
+        .collect();
+    assert_eq!(distinct.len(), 10, "backup codes must be distinct");
+    assert!(
+        distinct.iter().all(|code| !code.is_empty()),
+        "backup codes must not be empty"
     );
 }
 

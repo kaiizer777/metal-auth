@@ -789,6 +789,78 @@ async fn verify_rate_limits_user_dimension() {
     );
 }
 
+#[tokio::test]
+async fn verify_checks_ip_before_the_token_and_keeps_dimensions_separate() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let (email, password, _secret, _backup_codes, _session) =
+        enabled_user(&app, &dynamic_ip()).await;
+    let token = challenge(&app, &email, &password).await;
+    let ip = dynamic_ip();
+
+    for attempt in 0..11 {
+        let resp = app
+            .post_json_with_ip(
+                "/auth/totp/verify",
+                json!({ "challenge_token": "00".repeat(32), "code": "000000" }),
+                &ip,
+            )
+            .await;
+        let expected = if attempt < 10 {
+            StatusCode::UNAUTHORIZED
+        } else {
+            StatusCode::TOO_MANY_REQUESTS
+        };
+        assert_eq!(
+            resp.status(),
+            expected,
+            "attempt {attempt}: {}",
+            resp.body_str
+        );
+    }
+
+    // IP check precedes token validation: an unparsable token from an exhausted IP is
+    // still a 429, not a 401.
+    let resp = app
+        .post_json_with_ip(
+            "/auth/totp/verify",
+            json!({ "challenge_token": "00".repeat(32), "code": "000000" }),
+            &ip,
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // A valid challenge from the exhausted IP is rejected without being consumed.
+    let resp = app
+        .post_json_with_ip(
+            "/auth/totp/verify",
+            json!({ "challenge_token": token, "code": "000000" }),
+            &ip,
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // Same token, fresh IP: not consumed by the IP rejection, and the user budget was
+    // not charged by those rejections either (a 429 here would prove cross-consumption).
+    let resp = app
+        .post_json_with_ip(
+            "/auth/totp/verify",
+            json!({ "challenge_token": token, "code": "000000" }),
+            &dynamic_ip(),
+        )
+        .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        resp.body_str
+    );
+    assert_eq!(resp.error_code(), Some(ErrorCode::TotpCodeInvalid));
+}
+
 // ─── Backup codes ────────────────────────────────────────────────────────────
 
 #[tokio::test]

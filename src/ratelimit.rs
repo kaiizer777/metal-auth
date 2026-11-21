@@ -1159,6 +1159,24 @@ mod tests {
     }
 
     #[test]
+    fn totp_dimensions_do_not_consume_each_other() {
+        let limiter = RateLimiter::new();
+        let totp = totp_test_config();
+        let user = uuid::Uuid::new_v4();
+
+        for _ in 0..3 {
+            assert!(limiter.check_totp_ip_limit("198.51.100.12", &totp).is_ok());
+        }
+        assert!(limiter.check_totp_ip_limit("198.51.100.12", &totp).is_err());
+
+        // The IP trip must leave the user dimension's full budget intact.
+        for _ in 0..2 {
+            assert!(limiter.check_totp_user_limit(user, &totp).is_ok());
+        }
+        assert!(limiter.check_totp_user_limit(user, &totp).is_err());
+    }
+
+    #[test]
     fn totp_limits_ignore_the_phase5_enabled_switch() {
         let limiter = RateLimiter::with_config(RateLimitConfig {
             enabled: false,

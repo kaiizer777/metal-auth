@@ -1264,7 +1264,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stalled_request_counter_and_prune_cutoff_share_one_clock() {
+    async fn stalled_request_counter_comes_from_the_reference() {
         let Some(ctx) = setup_db_context().await else {
             return;
         };

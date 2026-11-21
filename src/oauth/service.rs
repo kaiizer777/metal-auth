@@ -555,8 +555,26 @@ impl OAuthService {
         }
 
         // Second factor gate: an enabled factor blocks session issuance on every login
-        // path, not only the password one. Fail closed — a lookup error aborts the login.
-        if self.totp_service.is_totp_enabled(user.id).await? {
+        // path, not only the password one. The gate read and the session insert share one
+        // transaction, so an activation that lands after the read waits for this commit
+        // instead of slipping between the decision and the insert. This is the same shape
+        // as `handler::auth::issue_session_after_gate`. Fail closed — a gate read error
+        // aborts the login.
+        let mut transaction = self.db.begin().await.map_err(AppError::Database)?;
+        let enabled = match self
+            .totp_service
+            .is_totp_enabled_locked(&mut transaction, user.id)
+            .await
+        {
+            Ok(enabled) => enabled,
+            Err(error) => {
+                rollback_quietly(transaction).await;
+                return Err(error);
+            }
+        };
+
+        if enabled {
+            rollback_quietly(transaction).await;
             let challenge_token = self.totp_service.generate_two_factor_token(user.id).await?;
             tracing::info!(
                 target: "security_event",
@@ -571,10 +589,28 @@ impl OAuthService {
             });
         }
 
-        let (session, raw_token) = self
+        let (session, raw_token) = match self
             .session_service
-            .create_session(user.id, ctx.session_type, ctx.ip, ctx.user_agent)
-            .await?;
+            .create_session_in(&mut transaction, user.id, None, ctx.session_type)
+            .await
+        {
+            Ok(created) => created,
+            Err(error) => {
+                rollback_quietly(transaction).await;
+                return Err(error);
+            }
+        };
+        transaction.commit().await.map_err(AppError::Database)?;
+
+        // `create_session_in` leaves logging to its caller; keep the standalone path's
+        // `session_created` event on this one.
+        tracing::info!(
+            event = "session_created",
+            user_id = %user.id,
+            session_type = ctx.session_type,
+            ip = ctx.ip.unwrap_or("unknown"),
+            user_agent = ctx.user_agent.unwrap_or("unknown"),
+        );
 
         tracing::info!(
             event = "oauth_callback_success",

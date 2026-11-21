@@ -513,6 +513,117 @@ async fn test_oauth_login_for_totp_user_issues_challenge_and_no_session() {
 }
 
 #[tokio::test]
+async fn oauth_login_cannot_issue_a_session_while_an_activation_is_in_flight() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    truncate_tables(&app.pool).await.expect("truncate");
+
+    let google_mock = Arc::new(MockOAuthProvider::new(
+        "google",
+        UserInfo {
+            provider_id: "google".to_string(),
+            provider_user_id: format!("goog_race_{}", Uuid::new_v4().simple()),
+            email: dynamic_email(),
+            email_verified: true,
+            name: None,
+            avatar_url: None,
+        },
+    ));
+    let svc = create_test_oauth_service(&app, google_mock, None);
+
+    let (auth_url, set_cookie) = svc
+        .get_authorization_url("google", None)
+        .expect("get auth url");
+    let state_token = extract_state_from_url(&auth_url).to_string();
+    let first = svc
+        .handle_callback_extended(
+            "google",
+            "valid_code",
+            &state_token,
+            Some(&set_cookie),
+            "cookie",
+            Some("127.0.0.1"),
+            Some("test-agent"),
+        )
+        .await
+        .expect("first callback");
+    let user_id = match first {
+        OAuthCallbackOutcome::Login(result) => result.user.id,
+        other => panic!("expected login, got {other:?}"),
+    };
+
+    // Pending enrollment: the factor row exists and `enabled` is still FALSE.
+    app.state
+        .totp_service
+        .enroll_totp(user_id)
+        .await
+        .expect("enroll");
+
+    // The activation is committed by `confirm_enrollment`, here held open to race the gate.
+    let mut activation = app.pool.begin().await.expect("activation transaction");
+    sqlx::query(
+        "UPDATE totp_secrets SET enabled = TRUE, updated_at = CURRENT_TIMESTAMP \
+         WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .execute(&mut *activation)
+    .await
+    .expect("hold the activation");
+
+    let sessions_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("count sessions");
+
+    let (auth_url, set_cookie) = svc
+        .get_authorization_url("google", None)
+        .expect("get auth url");
+    let state_token = extract_state_from_url(&auth_url).to_string();
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    let worker = svc.clone();
+    tokio::spawn(async move {
+        let outcome = worker
+            .handle_callback_extended(
+                "google",
+                "valid_code",
+                &state_token,
+                Some(&set_cookie),
+                "cookie",
+                Some("127.0.0.1"),
+                Some("test-agent"),
+            )
+            .await;
+        let _ = tx.send(outcome);
+    });
+
+    // Give the callback time to reach the gate, then require the gate to still be open.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let early = tokio::time::timeout(Duration::from_millis(300), &mut rx).await;
+    assert!(
+        early.is_err(),
+        "the oauth gate must wait for an in-flight enrollment activation"
+    );
+
+    activation.commit().await.expect("release the activation");
+
+    let outcome = rx.await.expect("callback task").expect("callback result");
+    let OAuthCallbackOutcome::TwoFactorRequired { .. } = outcome else {
+        panic!("an account activated during the callback must not receive a session");
+    };
+    let sessions_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("count sessions");
+    assert_eq!(sessions_after, sessions_before, "no session may be created");
+}
+
+#[tokio::test]
 async fn test_oauth_link_and_unlink_account_lifecycle() {
     let _guard = DB_LOCK.lock().await;
     let Some(app) = setup_test_app().await else {

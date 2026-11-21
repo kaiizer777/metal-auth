@@ -13,6 +13,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use uuid::Uuid;
 
 use crate::{
     auth::models::{
@@ -21,6 +22,7 @@ use crate::{
     },
     auth::service::AuthServiceImpl,
     config::Config,
+    db::models::Session,
     error::{AppError, ErrorCode, ErrorResponse},
     handler::untrusted_client_ip,
     ratelimit::{RateLimitRejection, RateLimiter},
@@ -335,19 +337,46 @@ pub async fn login(
 
     // Second factor gate: password verified, no session until the code is accepted.
     // Fail closed: an unavailable service or lookup error aborts login, never bypasses it.
-    match state.totp_service.is_totp_enabled(user_id).await {
-        Ok(true) => {
-            // Without a session service this router also has no way to redeem the
-            // challenge it would mint, so it must not hand one out at all.
-            if state.session_service.is_none() {
+    let Some(session_service) = &state.session_service else {
+        // Without a session service this router also has no way to redeem a challenge,
+        // so it must not hand one out at all.
+        return match state.totp_service.is_totp_enabled(user_id).await {
+            Ok(false) => (StatusCode::OK, Json(LoginResponse::new(user_id))).into_response(),
+            Ok(true) => {
                 tracing::error!(
                     event = "two_factor_unavailable",
                     reason = "router_without_session_service",
                     user_id = %user_id,
                     "login refused: this router cannot redeem a totp challenge"
                 );
-                return service_error_response(AppError::Internal);
+                service_error_response(AppError::Internal)
             }
+            Err(e) => service_error_response(e),
+        };
+    };
+
+    let is_bearer = headers
+        .get("x-auth-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.eq_ignore_ascii_case("bearer"));
+
+    let session_type = if is_bearer { "bearer" } else { "cookie" };
+
+    let outcome = match issue_session_after_gate(
+        &state,
+        session_service,
+        user_id,
+        &proof.credential_hash,
+        session_type,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => return service_error_response(e),
+    };
+
+    let (session, raw_id) = match outcome {
+        PasswordLoginOutcome::SecondFactorRequired => {
             let challenge_token = match state.totp_service.generate_two_factor_token(user_id).await
             {
                 Ok(token) => token,
@@ -366,63 +395,114 @@ pub async fn login(
             )
                 .into_response();
         }
-        Ok(false) => {}
-        Err(e) => return service_error_response(e),
+        PasswordLoginOutcome::Session(session, raw_id) => (session, raw_id),
+    };
+
+    tracing::info!(
+        event = "session_created",
+        user_id = %user_id,
+        session_type = session_type,
+        ip = %client_ip,
+        user_agent = %user_agent.as_deref().unwrap_or("unknown"),
+    );
+    tracing::info!(
+        event = "login_success",
+        user_id = %user_id,
+        session_type = session_type,
+        ip = %client_ip,
+        user_agent = %user_agent.as_deref().unwrap_or("unknown"),
+    );
+
+    if is_bearer {
+        (
+            StatusCode::OK,
+            Json(LoginResponse::with_token(user_id, raw_id)),
+        )
+            .into_response()
+    } else {
+        let response = (StatusCode::OK, Json(LoginResponse::new(user_id))).into_response();
+        if let Some(cfg) = &state.config {
+            return match attach_login_cookies(
+                response,
+                cfg.as_ref(),
+                raw_id.as_str(),
+                session.csrf_token.as_deref(),
+            ) {
+                Ok(resp) => resp,
+                Err(e) => service_error_response(e),
+            };
+        }
+        response
+    }
+}
+
+/// What the password login gate decided.
+enum PasswordLoginOutcome {
+    /// 2FA is enabled: no session was written, and the caller must mint a challenge.
+    SecondFactorRequired,
+    Session(Session, String),
+}
+
+/// Decide the second-factor gate and commit the session in one transaction.
+///
+/// The factor row is share-locked until commit, so `confirm_enrollment` — the only path
+/// that sets `enabled` — waits instead of landing between the gate read and the session
+/// insert. The session therefore reflects the factor state at the instant it was written,
+/// never a read that a concurrent activation made stale.
+///
+/// Still not enforced: the challenge token carries no credential state, so one minted
+/// before a password reset stays redeemable (#58).
+///
+/// Lock order is factor row, then user row — the same order [`crate::handler::totp`]
+/// redemption takes, so the two cannot deadlock.
+async fn issue_session_after_gate(
+    state: &AuthHandlerState,
+    session_service: &SessionService,
+    user_id: Uuid,
+    credential_hash: &str,
+    session_type: &str,
+) -> Result<PasswordLoginOutcome, AppError> {
+    let mut transaction = session_service.db().begin().await.map_err(|error| {
+        tracing::error!(error = %error, "failed to begin the login gate transaction");
+        AppError::Database(error)
+    })?;
+
+    let enabled = match state
+        .totp_service
+        .is_totp_enabled_locked(&mut transaction, user_id)
+        .await
+    {
+        Ok(enabled) => enabled,
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            return Err(error);
+        }
+    };
+    if enabled {
+        let _ = transaction.rollback().await;
+        return Ok(PasswordLoginOutcome::SecondFactorRequired);
     }
 
-    let is_bearer = headers
-        .get("x-auth-type")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|s| s.eq_ignore_ascii_case("bearer"));
-
-    let session_type = if is_bearer { "bearer" } else { "cookie" };
-
-    if let Some(session_svc) = &state.session_service {
-        let (session, raw_id) = match session_svc
-            .create_session_checked(
-                user_id,
-                &proof.credential_hash,
-                session_type,
-                Some(&client_ip),
-                user_agent.as_deref(),
-            )
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => return service_error_response(e),
-        };
-
-        tracing::info!(
-            event = "login_success",
-            user_id = %user_id,
-            session_type = session_type,
-            ip = %client_ip,
-            user_agent = %user_agent.as_deref().unwrap_or("unknown"),
-        );
-
-        if is_bearer {
-            (
-                StatusCode::OK,
-                Json(LoginResponse::with_token(user_id, raw_id)),
-            )
-                .into_response()
-        } else {
-            let response = (StatusCode::OK, Json(LoginResponse::new(user_id))).into_response();
-            if let Some(cfg) = &state.config {
-                return match attach_login_cookies(
-                    response,
-                    cfg.as_ref(),
-                    raw_id.as_str(),
-                    session.csrf_token.as_deref(),
-                ) {
-                    Ok(resp) => resp,
-                    Err(e) => service_error_response(e),
-                };
-            }
-            response
+    match session_service
+        .create_session_in(
+            &mut transaction,
+            user_id,
+            Some(credential_hash),
+            session_type,
+        )
+        .await
+    {
+        Ok((session, raw_id)) => {
+            transaction.commit().await.map_err(|error| {
+                tracing::error!(error = %error, "failed to commit the login gate transaction");
+                AppError::Database(error)
+            })?;
+            Ok(PasswordLoginOutcome::Session(session, raw_id))
         }
-    } else {
-        (StatusCode::OK, Json(LoginResponse::new(user_id))).into_response()
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            Err(error)
+        }
     }
 }
 

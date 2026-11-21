@@ -626,6 +626,28 @@ impl TotpService {
             .map_err(AppError::Database)
     }
 
+    /// Read `totp_secrets.enabled` on the caller's transaction, holding a share lock on the
+    /// row until that transaction ends.
+    ///
+    /// A login that couples this read with its session insert excludes a concurrent
+    /// `confirm_enrollment`: the activation update blocks on the lock and commits after the
+    /// session, never between the decision and the insert. An absent row locks nothing,
+    /// but only an existing row can be activated, so the pending case is covered too.
+    pub(crate) async fn is_totp_enabled_locked(
+        &self,
+        connection: &mut PgConnection,
+        user_id: Uuid,
+    ) -> Result<bool, AppError> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT enabled FROM totp_secrets WHERE user_id = $1 FOR SHARE",
+        )
+        .bind(user_id)
+        .fetch_optional(&mut *connection)
+        .await
+        .map(Option::unwrap_or_default)
+        .map_err(AppError::Database)
+    }
+
     fn encryption_key(&self) -> Result<[u8; crate::totp::crypto::AES_KEY_BYTES], AppError> {
         self.config
             .totp
@@ -1633,6 +1655,62 @@ mod tests {
             0,
             "a router that cannot redeem a challenge must not mint one"
         );
+        assert_eq!(count_rows(&ctx.pool, "sessions", user_id).await, 0);
+    }
+
+    #[tokio::test]
+    async fn activation_cannot_land_between_the_gate_read_and_the_session_commit() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let password = fixture_password();
+        let (user_id, email) = create_user_with_email(&ctx, true, &password).await;
+        // Pending enrollment: the row exists and `enabled` is still FALSE.
+        ctx.service.enroll_totp(user_id).await.expect("enroll");
+
+        let mut blocker = ctx.pool.begin().await.expect("blocking transaction");
+        sqlx::query("SELECT id FROM totp_secrets WHERE user_id = $1 FOR UPDATE")
+            .bind(user_id)
+            .execute(&mut *blocker)
+            .await
+            .expect("hold the factor row");
+
+        let attempt = tokio::spawn(login(
+            State(handler_state(&ctx)),
+            HeaderMap::new(),
+            Ok(Json(LoginRequest { email, password })),
+        ));
+
+        // The gate read must wait on the factor row: a decision taken before the
+        // activation commits is not allowed to reach the session insert.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !attempt.is_finished(),
+            "login must hold the factor row until the session is committed"
+        );
+        assert_eq!(
+            count_rows(&ctx.pool, "sessions", user_id).await,
+            0,
+            "no session may be visible while the gate decision is still open"
+        );
+
+        // `confirm_enrollment`'s activation commits, then the login resumes and must see it.
+        sqlx::query("UPDATE totp_secrets SET enabled = TRUE WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&mut *blocker)
+            .await
+            .expect("activate");
+        blocker.commit().await.expect("release");
+
+        let response = attempt.await.expect("join");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers().get(header::SET_COOKIE).is_none(),
+            "an account activated mid-login must not receive a session"
+        );
+        let body = to_bytes(response.into_body(), 4096).await.expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(body["two_factor_required"], true);
         assert_eq!(count_rows(&ctx.pool, "sessions", user_id).await, 0);
     }
 

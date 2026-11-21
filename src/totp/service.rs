@@ -515,6 +515,7 @@ mod tests {
         db::DbPoolOptions,
         email::EmailDispatcher,
         handler::auth::{AuthHandlerState, login},
+        session::SessionService,
         totp::crypto::{current_totp_counter, generate_totp},
     };
     use axum::{
@@ -644,6 +645,7 @@ mod tests {
             "totp_secrets" => "SELECT COUNT(*) FROM totp_secrets WHERE user_id = $1",
             "totp_used_codes" => "SELECT COUNT(*) FROM totp_used_codes WHERE user_id = $1",
             "two_factor_tokens" => "SELECT COUNT(*) FROM two_factor_tokens WHERE user_id = $1",
+            "sessions" => "SELECT COUNT(*) FROM sessions WHERE user_id = $1",
             other => panic!("unexpected table {other}"),
         };
         sqlx::query_scalar(sql)
@@ -1190,7 +1192,10 @@ mod tests {
         );
         AuthHandlerState {
             service: auth_service,
-            session_service: None,
+            session_service: Some(Arc::new(SessionService::new(
+                ctx.pool.clone(),
+                Arc::clone(&ctx.config),
+            ))),
             rate_limiter: None,
             config: Some(Arc::clone(&ctx.config)),
             totp_service: Arc::new(ctx.service.clone()),
@@ -1226,6 +1231,7 @@ mod tests {
         let token = body["challenge_token"].as_str().expect("challenge token");
         assert_eq!(token.len(), 64);
         assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(count_rows(&ctx.pool, "sessions", user_id).await, 0);
     }
 
     #[tokio::test]
@@ -1248,5 +1254,6 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(body["user_id"], user_id.to_string());
         assert!(body.get("two_factor_required").is_none());
+        assert_eq!(count_rows(&ctx.pool, "sessions", user_id).await, 1);
     }
 }

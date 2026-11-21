@@ -176,6 +176,9 @@ pub fn totp_counter_at(instant: DateTime<Utc>) -> u64 {
 }
 
 /// Current TOTP step counter from the local wall clock.
+///
+/// Display and fixture generation only: verification derives its counter from the
+/// database transaction clock, so a window computed here would disagree across hosts.
 #[must_use]
 pub fn current_totp_counter() -> u64 {
     totp_counter_at(Utc::now())
@@ -199,13 +202,6 @@ pub fn generate_totp(secret: &[u8], counter: u64) -> Result<u32, AppError> {
         digest[offset + 3],
     ]);
     Ok(truncated % 10u32.pow(TOTP_DIGITS))
-}
-
-/// Verify `code` against `secret` within ±1 step of the current time.
-///
-/// Returns the matching step, which the caller stores to reject replays.
-pub fn verify_totp_code(secret: &[u8], code: &str) -> Result<u64, AppError> {
-    verify_totp_code_at(secret, code, current_totp_counter())
 }
 
 /// Verify `code` against `secret` within ±1 step of `counter`.

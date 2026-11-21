@@ -160,8 +160,11 @@ impl TotpService {
 
     /// Confirmation body against one explicit clock reference.
     ///
-    /// The seam exists so a test can present a reference the application clock does not
-    /// agree with, which is the only way to observe which clock this path reads.
+    /// Every production call reaches this body through [`Self::confirm_enrollment`] with
+    /// `transaction_now`, and no other code-check entry point exists on this path, so an
+    /// application-clock window cannot be reintroduced beside it. The seam lets a test pin
+    /// the body against a reference the application clock does not agree with; it does not
+    /// observe which source the wrapper chose, which is covered by that single entry point.
     async fn confirm_enrollment_at(
         &self,
         connection: &mut PgConnection,
@@ -1140,6 +1143,20 @@ mod tests {
             .verify_totp_at_reference(user_id, &code, reference)
             .await
             .expect("a code accepted at confirmation must be accepted at verification");
+
+        // The public entry point is the only production caller of the pinned body; drive it
+        // so the wrapper stays on the path the test exercises.
+        let production_user = create_user(&ctx, true, &fixture_password()).await;
+        let production = ctx
+            .service
+            .enroll_totp(production_user)
+            .await
+            .expect("enroll");
+        let production_code = current_code(&production.secret_base32);
+        ctx.service
+            .confirm_enrollment(production_user, &production_code, "127.0.0.1")
+            .await
+            .expect("the public entry point confirms on the same anchor");
     }
 
     #[tokio::test]

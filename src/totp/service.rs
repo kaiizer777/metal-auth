@@ -17,8 +17,9 @@ use crate::{
     totp::{
         backup,
         crypto::{
-            DecryptedSecret, build_otpauth_uri, compute_code_replay_hash, decode_totp_secret,
-            decrypt_secret, encrypt_secret, generate_totp_secret, verify_totp_code,
+            DecryptedSecret, build_otpauth_uri, compute_code_replay_hash, current_totp_counter,
+            decode_totp_secret, decrypt_secret, encrypt_secret, generate_totp_secret,
+            verify_totp_code, verify_totp_code_at,
         },
     },
 };
@@ -157,6 +158,18 @@ impl TotpService {
     /// The replay insert is a single autocommitted statement: the `uq_totp_used_codes`
     /// constraint arbitrates concurrent submissions, so there is no read-then-write gap.
     pub async fn verify_totp(&self, user_id: Uuid, code: &str, _ip: &str) -> Result<(), AppError> {
+        self.verify_totp_at(user_id, code, current_totp_counter())
+            .await
+    }
+
+    /// Verify at an explicit step counter. Production always passes the live counter;
+    /// tests use this to prove a code cannot be replayed at `T-1` or `T+1`.
+    async fn verify_totp_at(
+        &self,
+        user_id: Uuid,
+        code: &str,
+        counter: u64,
+    ) -> Result<(), AppError> {
         let record =
             sqlx::query("SELECT encrypted_secret, enabled FROM totp_secrets WHERE user_id = $1")
                 .bind(user_id)
@@ -175,15 +188,36 @@ impl TotpService {
             .try_get("encrypted_secret")
             .map_err(AppError::Database)?;
         let secret = self.decrypt_totp_secret(&encrypted_secret)?;
-        let step = verify_totp_code(secret.as_ref(), code)?;
+        let step = verify_totp_code_at(secret.as_ref(), code, counter)?;
         let replay_hash = compute_code_replay_hash(code);
 
-        sqlx::query("INSERT INTO totp_used_codes (user_id, code_hash) VALUES ($1, $2)")
-            .bind(user_id)
-            .bind(&replay_hash[..])
-            .execute(&self.pool)
-            .await
-            .map_err(classify_used_code_error)?;
+        // Prune and insert share one unit so no stale row can split them. A 23505 rolls
+        // the prune back with the insert; the failed insert is still the replay arbiter.
+        let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
+        let pruned = sqlx::query(
+            "DELETE FROM totp_used_codes WHERE user_id = $1 \
+             AND used_at < CURRENT_TIMESTAMP - make_interval(secs => $2)",
+        )
+        .bind(user_id)
+        .bind(self.config.totp.used_code_prune_age_secs as f64)
+        .execute(&mut *transaction)
+        .await;
+        if let Err(error) = pruned {
+            let _ = transaction.rollback().await;
+            return Err(AppError::Database(error));
+        }
+
+        let inserted =
+            sqlx::query("INSERT INTO totp_used_codes (user_id, code_hash) VALUES ($1, $2)")
+                .bind(user_id)
+                .bind(&replay_hash[..])
+                .execute(&mut *transaction)
+                .await;
+        if let Err(error) = inserted {
+            let _ = transaction.rollback().await;
+            return Err(classify_used_code_error(error));
+        }
+        transaction.commit().await.map_err(AppError::Database)?;
 
         tracing::debug!(
             event = "totp_code_verified",
@@ -724,6 +758,62 @@ mod tests {
             ctx.service.verify_totp(user_id, &code, "ip").await,
             Err(AppError::TotpCodeReplayed)
         ));
+        assert_eq!(count_rows(&ctx.pool, "totp_used_codes", user_id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn code_is_single_use_across_the_whole_window() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let response = enroll_and_confirm(&ctx, user_id).await;
+        let raw = decode_totp_secret(&response.secret_base32).expect("decode");
+        let step = current_totp_counter();
+        let code = format!("{:06}", generate_totp(&raw, step).expect("generate"));
+
+        ctx.service
+            .verify_totp_at(user_id, &code, step)
+            .await
+            .expect("accepted at T");
+        for counter in [step + 1, step.saturating_sub(1)] {
+            assert!(
+                matches!(
+                    ctx.service.verify_totp_at(user_id, &code, counter).await,
+                    Err(AppError::TotpCodeReplayed)
+                ),
+                "same code was accepted at counter {counter}"
+            );
+        }
+        assert_eq!(count_rows(&ctx.pool, "totp_used_codes", user_id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn stale_used_codes_are_pruned_before_the_insert() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let response = enroll_and_confirm(&ctx, user_id).await;
+        let raw = decode_totp_secret(&response.secret_base32).expect("decode");
+        let step = current_totp_counter();
+        let code = format!("{:06}", generate_totp(&raw, step).expect("generate"));
+        let replay_hash = compute_code_replay_hash(&code);
+
+        sqlx::query(
+            "INSERT INTO totp_used_codes (user_id, code_hash, used_at) \
+             VALUES ($1, $2, CURRENT_TIMESTAMP - INTERVAL '1 hour')",
+        )
+        .bind(user_id)
+        .bind(&replay_hash[..])
+        .execute(&ctx.pool)
+        .await
+        .expect("seed stale row");
+
+        ctx.service
+            .verify_totp_at(user_id, &code, step)
+            .await
+            .expect("stale row must be pruned");
         assert_eq!(count_rows(&ctx.pool, "totp_used_codes", user_id).await, 1);
     }
 

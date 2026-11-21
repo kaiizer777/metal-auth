@@ -35,6 +35,8 @@ use crate::{
 const TOTP_KEY_PREFIX: &str = "totp";
 /// Log prefix for rejections from the enrollment budgets (`totp:enroll:*`).
 const ENROLL_KEY_PREFIX: &str = "totp:enroll";
+/// Log prefix for rejections from the confirmation budgets (`totp:confirm:*`).
+const CONFIRM_KEY_PREFIX: &str = "totp:confirm";
 
 /// `POST /auth/totp/confirm` body.
 #[derive(Deserialize)]
@@ -145,9 +147,9 @@ pub async fn totp_enroll(
 
 /// `POST /auth/totp/confirm`
 ///
-/// Verifies the first code against the pending secret and enables 2FA. Confirmation is the
-/// second half of enrollment, so it shares the enrollment budget rather than the
-/// verification one.
+/// Verifies the first code against the pending secret and enables 2FA. One code check, unlike
+/// enrollment's ten Argon2id hashes, so it charges its own `totp:confirm:*` budget: neither
+/// step can exhaust the other's attempts.
 pub async fn totp_confirm(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -163,15 +165,15 @@ pub async fn totp_confirm(
 
     if let Err(rejection) = state
         .rate_limiter
-        .check_totp_enroll_ip_limit(&client_ip, &state.config.totp)
+        .check_totp_confirm_ip_limit(&client_ip, &state.config.totp)
     {
-        return totp_rate_limit_exceeded(&client_ip, ENROLL_KEY_PREFIX, "ip", rejection);
+        return totp_rate_limit_exceeded(&client_ip, CONFIRM_KEY_PREFIX, "ip", rejection);
     }
     if let Err(rejection) = state
         .rate_limiter
-        .check_totp_enroll_user_limit(auth_user.user_id, &state.config.totp)
+        .check_totp_confirm_user_limit(auth_user.user_id, &state.config.totp)
     {
-        return totp_rate_limit_exceeded(&client_ip, ENROLL_KEY_PREFIX, "user", rejection);
+        return totp_rate_limit_exceeded(&client_ip, CONFIRM_KEY_PREFIX, "user", rejection);
     }
 
     match state

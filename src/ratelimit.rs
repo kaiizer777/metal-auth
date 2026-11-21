@@ -176,6 +176,18 @@ impl RateLimiter {
         Self::format_account_key("totp:enroll:user", &user_id.to_string())
     }
 
+    /// Format the `totp:confirm:ip:<ip>` budget key.
+    #[must_use]
+    pub fn totp_confirm_ip_key(ip: &str) -> String {
+        Self::format_account_key("totp:confirm:ip", ip)
+    }
+
+    /// Format the `totp:confirm:user:<user_id>` budget key.
+    #[must_use]
+    pub fn totp_confirm_user_key(user_id: uuid::Uuid) -> String {
+        Self::format_account_key("totp:confirm:user", &user_id.to_string())
+    }
+
     /// Seconds until the oldest admitted attempt leaves `key`'s sliding window.
     ///
     /// `None` when the key is unknown or holds no recorded attempt. A caller that
@@ -440,9 +452,9 @@ impl RateLimiter {
 
     /// Check the enrollment IP budget (`totp:enroll:ip:<ip>`).
     ///
-    /// Enrollment (secret rotation plus confirmation) hashes ten Argon2id codes per call, so
-    /// it needs its own throttle. Separate keys keep a reroll loop from spending the attempts
-    /// `/auth/totp/verify` and `/auth/totp/backup` need after login.
+    /// Enrollment rotates a secret and hashes ten Argon2id codes per call, so it needs its own
+    /// throttle. Separate keys keep a reroll loop from spending the attempts `/auth/totp/verify`
+    /// and `/auth/totp/backup` need after login.
     pub fn check_totp_enroll_ip_limit(
         &self,
         ip: &str,
@@ -465,6 +477,40 @@ impl RateLimiter {
         totp: &TotpConfig,
     ) -> Result<(), RateLimitRejection> {
         let key = Self::totp_enroll_user_key(user_id);
+        self.check_totp_window(
+            &key,
+            totp.rate_limit_user_max_attempts,
+            totp.rate_limit_window_secs,
+        )
+    }
+
+    /// Check the confirmation IP budget (`totp:confirm:ip:<ip>`).
+    ///
+    /// Confirmation checks one code, not the ten Argon2id hashes enrollment pays for, so it
+    /// keeps its own budget: a reroll loop cannot lock a user out of finishing enrollment, and
+    /// repeated bad confirmations cannot block a fresh enrollment.
+    pub fn check_totp_confirm_ip_limit(
+        &self,
+        ip: &str,
+        totp: &TotpConfig,
+    ) -> Result<(), RateLimitRejection> {
+        let key = Self::totp_confirm_ip_key(ip);
+        self.check_totp_window(
+            &key,
+            totp.rate_limit_ip_max_attempts,
+            totp.rate_limit_window_secs,
+        )
+    }
+
+    /// Check the confirmation per-user budget (`totp:confirm:user:<user_id>`).
+    ///
+    /// Same independence and rejection semantics as [`Self::check_totp_confirm_ip_limit`].
+    pub fn check_totp_confirm_user_limit(
+        &self,
+        user_id: uuid::Uuid,
+        totp: &TotpConfig,
+    ) -> Result<(), RateLimitRejection> {
+        let key = Self::totp_confirm_user_key(user_id);
         self.check_totp_window(
             &key,
             totp.rate_limit_user_max_attempts,
@@ -1314,6 +1360,45 @@ mod tests {
             assert!(limiter.check_totp_ip_limit(ip, &totp).is_ok());
         }
         for _ in 0..2 {
+            assert!(limiter.check_totp_user_limit(user, &totp).is_ok());
+        }
+    }
+
+    #[test]
+    fn confirmation_limits_key_separately_from_enrollment() {
+        let limiter = RateLimiter::new();
+        let totp = totp_test_config();
+        let user = uuid::Uuid::new_v4();
+        let ip = "198.51.100.21";
+
+        for _ in 0..3 {
+            assert!(limiter.check_totp_confirm_ip_limit(ip, &totp).is_ok());
+        }
+        assert!(limiter.check_totp_confirm_ip_limit(ip, &totp).is_err());
+        assert!(
+            limiter
+                .windows
+                .contains_key(&RateLimiter::totp_confirm_ip_key(ip))
+        );
+        assert!(
+            !limiter
+                .windows
+                .contains_key(&RateLimiter::totp_enroll_ip_key(ip)),
+            "confirmation must not spend the enrollment IP budget"
+        );
+
+        for _ in 0..2 {
+            assert!(limiter.check_totp_confirm_user_limit(user, &totp).is_ok());
+        }
+        assert!(limiter.check_totp_confirm_user_limit(user, &totp).is_err());
+
+        // Both enrollment and verification keep their full budget after confirmation trips.
+        for _ in 0..3 {
+            assert!(limiter.check_totp_enroll_ip_limit(ip, &totp).is_ok());
+            assert!(limiter.check_totp_ip_limit(ip, &totp).is_ok());
+        }
+        for _ in 0..2 {
+            assert!(limiter.check_totp_enroll_user_limit(user, &totp).is_ok());
             assert!(limiter.check_totp_user_limit(user, &totp).is_ok());
         }
     }

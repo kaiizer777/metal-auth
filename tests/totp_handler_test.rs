@@ -297,7 +297,7 @@ async fn confirm_enables_totp_and_rejects_repeat() {
 }
 
 #[tokio::test]
-async fn confirm_rate_limits_enrollment_dimension() {
+async fn confirm_rate_limits_its_own_dimension() {
     let _guard = DB_LOCK.lock().await;
     let Some(app) = setup_test_app().await else {
         return;
@@ -337,10 +337,88 @@ async fn confirm_rate_limits_enrollment_dimension() {
 
     assert!(tripped, "the user budget must trip within six attempts");
     assert_eq!(
-        rejected_codes,
-        app.state.config.totp.rate_limit_user_max_attempts - 1,
-        "enroll shares the enrollment budget, so confirm must admit the rest of it"
+        rejected_codes, app.state.config.totp.rate_limit_user_max_attempts,
+        "confirm has its own budget, so the enrollment attempt it just spent is not charged"
     );
+}
+
+#[tokio::test]
+async fn confirm_does_not_spend_the_enrollment_budget() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    let max = app.state.config.totp.rate_limit_user_max_attempts;
+
+    // An enrollment reroll loop spends the whole enrollment budget...
+    let (email, password) = create_verified_user(&app).await;
+    let session = login(&app, &email, &password).await;
+    let ip = dynamic_ip();
+    for _ in 0..max {
+        enroll(&app, &session, &ip).await;
+    }
+
+    // ...and the first code check still reaches the verifier instead of a 429.
+    let confirm_response = app
+        .dispatch(session_request(
+            &app,
+            Method::POST,
+            "/auth/totp/confirm",
+            json!({ "code": "000000" }),
+            &session,
+            &ip,
+        ))
+        .await;
+    assert_eq!(
+        confirm_response.status(),
+        StatusCode::BAD_REQUEST,
+        "a spent enrollment budget must not reject confirmation: {}",
+        confirm_response.body_str
+    );
+    assert_eq!(
+        confirm_response.error_code(),
+        Some(ErrorCode::TotpCodeInvalid)
+    );
+
+    // The mirror: a spent confirmation budget leaves enrollment its own attempts.
+    let (email, password) = create_verified_user(&app).await;
+    let session = login(&app, &email, &password).await;
+    let ip = dynamic_ip();
+    enroll(&app, &session, &ip).await;
+    for _ in 0..max {
+        let resp = app
+            .dispatch(session_request(
+                &app,
+                Method::POST,
+                "/auth/totp/confirm",
+                json!({ "code": "000000" }),
+                &session,
+                &ip,
+            ))
+            .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "body: {}",
+            resp.body_str
+        );
+    }
+    let tripped = app
+        .dispatch(session_request(
+            &app,
+            Method::POST,
+            "/auth/totp/confirm",
+            json!({ "code": "000000" }),
+            &session,
+            &ip,
+        ))
+        .await;
+    assert_eq!(
+        tripped.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the confirmation budget must still trip"
+    );
+    enroll(&app, &session, &ip).await;
 }
 
 // ─── CSRF (R15) ──────────────────────────────────────────────────────────────

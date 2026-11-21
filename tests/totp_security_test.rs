@@ -724,6 +724,92 @@ fn concurrent_replay_admits_exactly_one_request() {
     });
 }
 
+/// Tier 4 §1: the ±1 step window accepts the next step and rejects two steps out.
+#[tokio::test]
+async fn clock_drift_accepts_the_next_step_and_rejects_two_steps_out() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let (email, password, secret, _backup_codes, _session) = enabled_user(&app, &dynamic_ip()).await;
+    let user_id = user_id_for_email(&app.pool, &email).await;
+    let sessions_before = count_sessions_for_user(&app.pool, user_id).await;
+
+    // `T-1` can decay to `T-2` across a 30-second boundary, so the accepted case uses the
+    // forward drift direction where the code only moves deeper into the window.
+    let token = challenge(&app, &email, &password).await;
+    let next_step = code_at(
+        &secret,
+        metal_auth::totp::crypto::current_totp_counter() + 1,
+    );
+    let accepted = app
+        .post_json_with_ip(
+            "/auth/totp/verify",
+            json!({ "challenge_token": token, "code": next_step }),
+            &dynamic_ip(),
+        )
+        .await;
+    assert_eq!(
+        accepted.status(),
+        StatusCode::OK,
+        "T+1 must be inside the window: {}",
+        accepted.body_str
+    );
+
+    let ahead_token = challenge(&app, &email, &password).await;
+    let too_new = code_at(
+        &secret,
+        metal_auth::totp::crypto::current_totp_counter() + 2,
+    );
+    let rejected_ahead = app
+        .post_json_with_ip(
+            "/auth/totp/verify",
+            json!({ "challenge_token": ahead_token, "code": too_new }),
+            &dynamic_ip(),
+        )
+        .await;
+    assert_eq!(
+        rejected_ahead.status(),
+        StatusCode::BAD_REQUEST,
+        "T+2 must be outside the window: {}",
+        rejected_ahead.body_str
+    );
+    assert_eq!(
+        rejected_ahead.error_code(),
+        Some(ErrorCode::TotpCodeInvalid)
+    );
+
+    let behind_token = challenge(&app, &email, &password).await;
+    let too_old = code_at(
+        &secret,
+        metal_auth::totp::crypto::current_totp_counter().saturating_sub(2),
+    );
+    let rejected_behind = app
+        .post_json_with_ip(
+            "/auth/totp/verify",
+            json!({ "challenge_token": behind_token, "code": too_old }),
+            &dynamic_ip(),
+        )
+        .await;
+    assert_eq!(
+        rejected_behind.status(),
+        StatusCode::BAD_REQUEST,
+        "T-2 must be outside the window: {}",
+        rejected_behind.body_str
+    );
+    assert_eq!(
+        rejected_behind.error_code(),
+        Some(ErrorCode::TotpCodeInvalid)
+    );
+
+    assert_eq!(
+        count_sessions_for_user(&app.pool, user_id).await,
+        sessions_before + 1,
+        "only the in-window presentation may issue a session"
+    );
+}
+
 /// Scenario 8b: the IP budget is independent of the user budget and trips at 11.
 #[tokio::test]
 async fn ip_budget_admits_exactly_ten_attempts_then_returns_429() {

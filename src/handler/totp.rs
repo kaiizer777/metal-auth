@@ -239,9 +239,10 @@ pub async fn totp_backup(
 
 /// `DELETE /auth/totp`
 ///
-/// Requires a fresh-auth proof: the current password or a live TOTP code. A missing or
-/// malformed proof is a 400 before any budget is spent; a wrong proof is a 401 from the
-/// service. An absent session is rejected by `require_auth` before this runs.
+/// Requires a fresh-auth proof: the current password or a live TOTP code. A missing,
+/// blank, or ambiguous proof is a 400 `VALIDATION_ERROR` before any budget is spent; a
+/// wrong password or TOTP code is a 401 `INVALID_CREDENTIALS`. An absent session is
+/// rejected by `require_auth` before this runs.
 pub async fn totp_disable(
     State(state): State<AppState>,
     auth_user: AuthUser,

@@ -62,6 +62,10 @@ impl std::fmt::Debug for OAuthCallbackResult {
 }
 
 /// Outcome of processing an OAuth callback, distinguishing between standard login and account linking.
+///
+/// Non-exhaustive: embedders consume this from their own HTTP layer, so a new outcome
+/// (the second-factor challenge, for one) must not break an exhaustive `match`.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum OAuthCallbackOutcome {
     Login(OAuthCallbackResult),
@@ -155,6 +159,11 @@ impl std::fmt::Debug for OAuthService {
 impl OAuthService {
     /// Constructs a new OAuth service instance with active providers instantiated
     /// from application configuration.
+    ///
+    /// `totp_service` is required: the login path gates session issuance on an enabled
+    /// second factor, so a service built without it could not enforce that gate.
+    /// Callers upgrading from a three-argument form must pass one built from the same
+    /// pool and [`Config`].
     pub fn new(
         db: PgPool,
         config: Arc<Config>,
@@ -194,6 +203,8 @@ impl OAuthService {
     }
 
     /// Constructs a service with custom/mock providers for testing.
+    ///
+    /// Takes the same required `totp_service` as [`Self::new`].
     pub fn with_providers(
         db: PgPool,
         config: Arc<Config>,
@@ -213,6 +224,8 @@ impl OAuthService {
     }
 
     /// Constructs a service with explicit state manager.
+    ///
+    /// Takes the same required `totp_service` as [`Self::new`].
     pub fn new_with_manager(
         db: PgPool,
         providers: HashMap<String, Arc<dyn OAuthProvider>>,

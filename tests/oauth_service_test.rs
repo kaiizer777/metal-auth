@@ -386,8 +386,7 @@ async fn test_oauth_auto_provisions_new_verified_user() {
         .expect("handle callback");
     let res = match outcome {
         OAuthCallbackOutcome::Login(r) => r,
-        OAuthCallbackOutcome::TwoFactorRequired { .. } => panic!("expected login"),
-        OAuthCallbackOutcome::Linked { .. } => panic!("expected login"),
+        other => panic!("expected login, got {other:?}"),
     };
 
     assert!(res.is_created);
@@ -840,8 +839,7 @@ async fn test_oauth_email_normalization_on_provisioning() {
         .expect("handle callback");
     let res = match outcome {
         OAuthCallbackOutcome::Login(r) => r,
-        OAuthCallbackOutcome::TwoFactorRequired { .. } => panic!("expected login"),
-        OAuthCallbackOutcome::Linked { .. } => panic!("expected login"),
+        other => panic!("expected login, got {other:?}"),
     };
 
     assert_eq!(res.user.email, normalized_expected);
@@ -949,10 +947,7 @@ async fn test_oauth_link_intent_in_callback_attaches_identity_without_session() 
             assert_eq!(redirect_url, "/settings");
             assert!(clear_cookie_header.contains("Max-Age=0"));
         }
-        OAuthCallbackOutcome::Login(_) => panic!("expected Linked outcome, got Login"),
-        OAuthCallbackOutcome::TwoFactorRequired { .. } => {
-            panic!("expected Linked outcome, got TwoFactorRequired")
-        }
+        other => panic!("expected Linked outcome, got {other:?}"),
     }
 
     // 3. Invariant: the callback issued no session beyond the initiating one
@@ -1040,10 +1035,7 @@ async fn link_callback_succeeds_without_500_after_commit() {
             clear_cookie_header,
             ..
         } => (user, redirect_url, clear_cookie_header),
-        OAuthCallbackOutcome::Login(_) => panic!("expected Linked outcome, got Login"),
-        OAuthCallbackOutcome::TwoFactorRequired { .. } => {
-            panic!("expected Linked outcome, got TwoFactorRequired")
-        }
+        other => panic!("expected Linked outcome, got {other:?}"),
     };
     assert_eq!(linked_user.id, user_id);
     assert_eq!(redirect_url, "/settings");
@@ -1485,10 +1477,7 @@ async fn link_callback_race_with_revoke_stays_legal() {
         Ok(OAuthCallbackOutcome::Linked { .. }) => {
             assert_eq!(link_count.0, 1, "committed link must have its row");
         }
-        Ok(OAuthCallbackOutcome::Login(_)) => panic!("link intent must not log in"),
-        Ok(OAuthCallbackOutcome::TwoFactorRequired { .. }) => {
-            panic!("link intent must not issue a challenge")
-        }
+        Ok(other) => panic!("unexpected outcome under revoke race: {other:?}"),
         Err(AppError::OAuthStateInvalid) => {
             assert_eq!(link_count.0, 0, "rejected link must leave no row");
         }

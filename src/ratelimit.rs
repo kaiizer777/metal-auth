@@ -38,6 +38,10 @@ pub enum KeyAdmission {
 }
 
 /// Detailed reason for a rate limit rejection.
+///
+/// Non-exhaustive: [`RateLimitRejection::Exceeded`] gained its window payload in `0.1.0`,
+/// and further rejection detail must land without breaking callers. Match with a wildcard.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RateLimitRejection {
     /// Active lockout duration in whole seconds (minimum 1s, ceiling rounded).

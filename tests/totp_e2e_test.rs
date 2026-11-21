@@ -165,7 +165,10 @@ async fn journey_2_backup_code_login_purges_the_used_hash() {
     let user_id = user_id_for_email(&app.pool, &email).await;
     assert_eq!(backup_codes.len(), 10);
     let used_code = backup_codes[0].clone();
-    assert_eq!(stored_backup_hashes(&app.pool, user_id).await.len(), 10);
+    let before = stored_backup_hashes(&app.pool, user_id).await;
+    assert_eq!(before.len(), 10, "enrollment must store ten hashes");
+    let used_index = metal_auth::totp::backup::verify_backup_code(&used_code, &before)
+        .expect("the used code must match exactly one stored hash");
 
     let sessions_before = count_sessions_for_user(&app.pool, user_id).await;
     let challenge_token = challenge(&app, &email, &password).await;
@@ -213,10 +216,17 @@ async fn journey_2_backup_code_login_purges_the_used_hash() {
         "the backup-issued session must belong to the same user"
     );
 
-    // The stored values are Argon2id PHC strings with per-code salts, so the consumed hash
-    // cannot be named from outside: the array must shrink by exactly one intact hash.
+    // The index of the used code is knowable: verification is public and pure. The service
+    // purges by value with a JSONB array delete, which preserves order, so the expected
+    // array is `before` minus that one entry.
+    let mut expected = before;
+    expected.remove(used_index);
+
     let remaining = stored_backup_hashes(&app.pool, user_id).await;
-    assert_eq!(remaining.len(), 9, "one backup code must be purged");
+    assert_eq!(
+        remaining, expected,
+        "exactly the hash matching the used code must be purged"
+    );
     assert!(
         remaining.iter().all(|hash| hash.starts_with("$argon2id$")),
         "the remaining nine hashes must stay intact: {remaining:?}"

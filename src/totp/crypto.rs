@@ -159,6 +159,10 @@ pub fn decode_totp_secret(secret_base32: &str) -> Result<Vec<u8>, AppError> {
     if bit_count >= 5 || accumulator != 0 {
         return Err(AppError::Internal);
     }
+    // RFC 4226 seeds are 160 bits; a shorter or longer canonical string is not a TOTP key.
+    if decoded.len() != TOTP_SECRET_BYTES {
+        return Err(AppError::Internal);
+    }
     Ok(decoded)
 }
 
@@ -503,6 +507,25 @@ mod tests {
             assert_eq!(raw.len(), TOTP_SECRET_BYTES);
             assert_eq!(base32::encode(TOTP_ALPHABET, &raw), secret);
         }
+    }
+
+    #[test]
+    fn base32_decoder_requires_exactly_160_bits() {
+        for raw in [
+            vec![0x42u8; TOTP_SECRET_BYTES - 1],
+            vec![0x42u8; TOTP_SECRET_BYTES + 1],
+        ] {
+            let encoded = base32::encode(TOTP_ALPHABET, &raw);
+            assert!(
+                matches!(decode_totp_secret(&encoded), Err(AppError::Internal)),
+                "accepted {}-byte secret ({encoded})",
+                raw.len()
+            );
+        }
+
+        let raw = [0x42u8; TOTP_SECRET_BYTES];
+        let encoded = base32::encode(TOTP_ALPHABET, &raw);
+        assert_eq!(decode_totp_secret(&encoded).expect("20-byte secret"), raw);
     }
 
     #[test]

@@ -376,12 +376,22 @@ impl TotpService {
             return Err(AppError::Database(error));
         }
 
-        let inserted =
-            sqlx::query("INSERT INTO totp_used_codes (user_id, code_hash) VALUES ($1, $2)")
-                .bind(user_id)
-                .bind(&replay_hash[..])
-                .execute(&mut *connection)
-                .await;
+        // `used_at` is bound rather than defaulted: the column default is
+        // `CURRENT_TIMESTAMP`, frozen at `BEGIN`, so a stalled transaction would stamp the
+        // row earlier than the reference its own cutoff uses and a later transaction would
+        // prune it sooner.
+        // `used_at` is bound rather than defaulted: the column default is
+        // `CURRENT_TIMESTAMP`, frozen at `BEGIN`, so a stalled transaction would stamp the
+        // row earlier than the reference its own cutoff uses and a later transaction would
+        // prune it sooner.
+        let inserted = sqlx::query(
+            "INSERT INTO totp_used_codes (user_id, code_hash, used_at) VALUES ($1, $2, $3)",
+        )
+        .bind(user_id)
+        .bind(&replay_hash[..])
+        .bind(reference)
+        .execute(&mut *connection)
+        .await;
         if let Err(error) = inserted {
             return Err(classify_used_code_error(error));
         }
@@ -763,10 +773,13 @@ impl TotpService {
 
 /// Single clock reference for one verification transaction.
 ///
-/// `transaction_timestamp()` is frozen at `BEGIN`, so the prune cutoff, the counter
-/// derived from it, and replay rows written under it share one timeline.
+/// `clock_timestamp()` is read when this statement executes, so a transaction that stalls
+/// after `BEGIN` verifies against the instant the code is checked. `transaction_timestamp()`
+/// is frozen at `BEGIN`: a transaction stalled past the prune age would then accept a code
+/// whose replay row a later transaction has already pruned, and write `used_at` in the past.
+/// One reference still feeds the counter, the prune cutoff, and the replay row's `used_at`.
 async fn transaction_now(connection: &mut PgConnection) -> Result<DateTime<Utc>, AppError> {
-    sqlx::query_scalar("SELECT transaction_timestamp()")
+    sqlx::query_scalar("SELECT clock_timestamp()")
         .fetch_one(&mut *connection)
         .await
         .map_err(AppError::Database)
@@ -1325,6 +1338,83 @@ mod tests {
             matches!(replay, Err(AppError::TotpCodeInvalid)),
             "a stalled request must reject the code as out of window, not as a replay: {replay:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn transaction_reference_is_execution_time_not_begin() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+
+        let mut transaction = ctx.pool.begin().await.expect("transaction");
+        let begin: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")
+            .fetch_one(&mut *transaction)
+            .await
+            .expect("begin reference");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        let reference = transaction_now(&mut transaction).await.expect("reference");
+        let frozen: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")
+            .fetch_one(&mut *transaction)
+            .await
+            .expect("frozen reference");
+
+        assert!(
+            reference - begin >= Duration::seconds(1),
+            "the reference must be read when the statement runs, not at BEGIN: reference is \
+             {reference}, begin is {begin}"
+        );
+        assert!(
+            frozen - begin < Duration::seconds(1),
+            "the probe must stay transaction-frozen, otherwise it proves nothing"
+        );
+        transaction.rollback().await.expect("rollback");
+    }
+
+    #[tokio::test]
+    async fn used_code_row_is_stamped_with_the_reference() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let response = enroll_and_confirm(&ctx, user_id).await;
+        let code = current_code(&response.secret_base32);
+
+        let mut transaction = ctx.pool.begin().await.expect("transaction");
+        let begin: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")
+            .fetch_one(&mut *transaction)
+            .await
+            .expect("begin reference");
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+        let reference = transaction_now(&mut transaction).await.expect("reference");
+        ctx.service
+            .record_totp_use(
+                &mut transaction,
+                user_id,
+                &code,
+                totp_counter_at(reference),
+                reference,
+            )
+            .await
+            .expect("record");
+
+        let used_at: DateTime<Utc> =
+            sqlx::query_scalar("SELECT used_at FROM totp_used_codes WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .expect("stored used_at");
+
+        assert_eq!(
+            used_at, reference,
+            "the replay row must carry the reference, not the transaction default"
+        );
+        assert!(
+            used_at - begin >= Duration::milliseconds(500),
+            "a row stamped with the frozen default would be {begin} or earlier"
+        );
+        transaction.rollback().await.expect("rollback");
     }
 
     #[tokio::test]

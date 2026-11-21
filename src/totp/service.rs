@@ -19,7 +19,7 @@ use crate::{
         crypto::{
             DecryptedSecret, build_otpauth_uri, compute_code_replay_hash, decode_totp_secret,
             decrypt_secret, encrypt_secret, generate_totp_secret, totp_counter_at,
-            verify_totp_code, verify_totp_code_at,
+            verify_totp_code_at,
         },
     },
 };
@@ -139,6 +139,11 @@ impl TotpService {
 
     /// Step 2 of enrollment: verify the first code against the pending secret and enable.
     ///
+    /// The counter derives from one database timestamp read on this transaction, the same
+    /// anchor [`Self::verify_totp`] uses. Taking it from the application clock instead
+    /// would let inter-host skew admit a code here and reject the same code at every later
+    /// login.
+    ///
     /// `ip` is part of the Part 3 handler contract; rate limiting is handler-owned.
     pub async fn confirm_enrollment(
         &self,
@@ -146,10 +151,28 @@ impl TotpService {
         code: &str,
         _ip: &str,
     ) -> Result<(), AppError> {
+        let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
+        let reference = transaction_now(&mut transaction).await?;
+        self.confirm_enrollment_at(&mut transaction, user_id, code, reference)
+            .await?;
+        transaction.commit().await.map_err(AppError::Database)
+    }
+
+    /// Confirmation body against one explicit clock reference.
+    ///
+    /// The seam exists so a test can present a reference the application clock does not
+    /// agree with, which is the only way to observe which clock this path reads.
+    async fn confirm_enrollment_at(
+        &self,
+        connection: &mut PgConnection,
+        user_id: Uuid,
+        code: &str,
+        reference: DateTime<Utc>,
+    ) -> Result<(), AppError> {
         let record =
             sqlx::query("SELECT encrypted_secret, enabled FROM totp_secrets WHERE user_id = $1")
                 .bind(user_id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *connection)
                 .await
                 .map_err(AppError::Database)?
                 .ok_or(AppError::TotpNotEnrolled)?;
@@ -164,9 +187,9 @@ impl TotpService {
             .try_get("encrypted_secret")
             .map_err(AppError::Database)?;
         let secret = self.decrypt_totp_secret(&encrypted_secret)?;
-        verify_totp_code(secret.as_ref(), code)?;
+        verify_totp_code_at(secret.as_ref(), code, totp_counter_at(reference))?;
 
-        self.activate_pending_secret(user_id, &encrypted_secret)
+        self.activate_pending_secret(connection, user_id, &encrypted_secret)
             .await
     }
 
@@ -178,6 +201,7 @@ impl TotpService {
     /// first confirmation the only winner.
     async fn activate_pending_secret(
         &self,
+        connection: &mut PgConnection,
         user_id: Uuid,
         encrypted_secret: &[u8],
     ) -> Result<(), AppError> {
@@ -187,12 +211,21 @@ impl TotpService {
         )
         .bind(user_id)
         .bind(encrypted_secret)
-        .execute(&self.pool)
+        .execute(&mut *connection)
         .await
         .map_err(AppError::Database)?;
         if activated.rows_affected() == 0 {
-            // Either the verified enrollment was replaced or it was confirmed first.
-            return Err(if self.is_totp_enabled(user_id).await? {
+            // Either the verified enrollment was replaced or it was confirmed first. Read
+            // on the same connection: a pool read here could block on this transaction's
+            // own row lock.
+            let enabled: bool =
+                sqlx::query_scalar("SELECT enabled FROM totp_secrets WHERE user_id = $1")
+                    .bind(user_id)
+                    .fetch_optional(&mut *connection)
+                    .await
+                    .map_err(AppError::Database)?
+                    .unwrap_or_default();
+            return Err(if enabled {
                 AppError::TotpAlreadyEnabled
             } else {
                 AppError::TotpNotEnrolled
@@ -1039,12 +1072,14 @@ mod tests {
             .await
             .expect("second enroll");
 
+        let mut transaction = ctx.pool.begin().await.expect("transaction");
         assert!(matches!(
             ctx.service
-                .activate_pending_secret(user_id, &verified_secret)
+                .activate_pending_secret(&mut transaction, user_id, &verified_secret)
                 .await,
             Err(AppError::TotpNotEnrolled)
         ));
+        transaction.rollback().await.expect("rollback");
         assert!(!ctx.service.is_totp_enabled(user_id).await.expect("state"));
 
         let second_code = current_code(&second.secret_base32);
@@ -1052,6 +1087,40 @@ mod tests {
             .confirm_enrollment(user_id, &second_code, "127.0.0.1")
             .await
             .expect("the live pending enrollment still confirms");
+    }
+
+    #[tokio::test]
+    async fn confirmation_and_verification_verify_against_the_same_database_clock() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let enrollment = ctx.service.enroll_totp(user_id).await.expect("enroll");
+        let raw = decode_totp_secret(&enrollment.secret_base32).expect("decode");
+
+        // Stands in for a database host whose clock is three steps ahead of the application
+        // host: a code derived from the application clock is outside the ±1 step window.
+        let reference: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")
+            .fetch_one(&ctx.pool)
+            .await
+            .expect("database clock");
+        let reference = reference + Duration::seconds(90);
+        let code = format!(
+            "{:06}",
+            generate_totp(&raw, totp_counter_at(reference)).expect("generate")
+        );
+
+        let mut transaction = ctx.pool.begin().await.expect("transaction");
+        ctx.service
+            .confirm_enrollment_at(&mut transaction, user_id, &code, reference)
+            .await
+            .expect("confirmation must verify against the database clock");
+        transaction.commit().await.expect("commit");
+
+        ctx.service
+            .verify_totp_at_reference(user_id, &code, reference)
+            .await
+            .expect("a code accepted at confirmation must be accepted at verification");
     }
 
     #[tokio::test]

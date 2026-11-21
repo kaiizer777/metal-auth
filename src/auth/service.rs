@@ -1057,10 +1057,24 @@ mod tests {
             ctx.service.reset_password(&raw_tok1, &new_password),
             ctx.service.reset_password(&raw_tok2, &new_password)
         );
+
+        // A completed reset invalidates every remaining reset token for the user. Both
+        // interleavings are valid: both tokens can be consumed before either commits, or
+        // the winner can invalidate the loser's token first. At least one reset must
+        // succeed and a loser must fail as an already-consumed token, never as a stale
+        // credential.
         assert!(
-            first.is_ok() && second.is_ok(),
-            "both distinct-token consumes must succeed: {first:?} / {second:?}"
+            first.is_ok() || second.is_ok(),
+            "at least one reset must succeed: {first:?} / {second:?}"
         );
+        for result in [&first, &second] {
+            if let Err(error) = result {
+                assert!(
+                    matches!(error, &AppError::InvalidToken),
+                    "a losing concurrent reset must report a consumed token, got {error:?}"
+                );
+            }
+        }
 
         // No tokens survive and the single final password verifies.
         let count_row =

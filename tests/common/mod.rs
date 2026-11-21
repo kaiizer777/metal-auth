@@ -331,6 +331,12 @@ pub async fn get_outbox_rows_for_recipient(
     .await
 }
 
+/// Test-only pool ceiling.
+///
+/// Concurrency tests dispatch five requests at once and each holds more than one connection
+/// in flight; the old ceiling of 5 sat exactly at the request count and timed out.
+pub const TEST_POOL_MAX_CONNECTIONS: u32 = 10;
+
 /// Test-only Argon2id cost floor: the cheapest parameters `AppConfig::validate` accepts.
 ///
 /// Production defaults (65536/3/4) stay untouched; integration tests would otherwise need
@@ -386,7 +392,7 @@ async fn setup_test_app_with_auth_config_and(
         allowed_origins: vec!["https://app.example.com".into()],
         allowed_methods: vec!["GET".into(), "POST".into(), "OPTIONS".into()],
         allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
-        max_connections: 5,
+        max_connections: TEST_POOL_MAX_CONNECTIONS,
         min_connections: 1,
         base_url: "https://example.com".into(),
         email_dispatch_timeout: Duration::from_secs(10),
@@ -412,8 +418,8 @@ async fn setup_test_app_with_auth_config_and(
     let pool = metal_auth::db::init_pool_with_options(
         &url,
         metal_auth::db::DbPoolOptions {
-            max_connections: 5,
-            min_connections: 1,
+            max_connections: cfg.max_connections,
+            min_connections: cfg.min_connections,
             ..Default::default()
         },
     )

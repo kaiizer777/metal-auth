@@ -544,7 +544,12 @@ impl TotpService {
     }
 
     /// Mint a half-authenticated challenge token; only its SHA-256 hash is stored.
+    ///
+    /// Refuses without a usable key: redeeming this challenge requires decrypting the
+    /// stored secret, so a keyless deployment would hand the user a token that can only
+    /// fail instead of a server error.
     pub async fn generate_two_factor_token(&self, user_id: Uuid) -> Result<String, AppError> {
+        self.encryption_key()?;
         let (raw_token, token_hash) = generate_token();
         let ttl_seconds = i64::try_from(self.config.totp.challenge_token_ttl_secs)
             .map_err(|_| AppError::Internal)?;
@@ -1479,6 +1484,11 @@ mod tests {
     }
 
     fn handler_state(ctx: &DbTestContext) -> AuthHandlerState {
+        handler_state_with_config(ctx, &ctx.config)
+    }
+
+    /// Login state whose TOTP and session services both run against `config`.
+    fn handler_state_with_config(ctx: &DbTestContext, config: &Arc<Config>) -> AuthHandlerState {
         // AuthServiceImpl validates the production Argon2 floor; the TOTP hash fixtures
         // use cheaper parameters because verification reads the PHC header.
         let auth_config = Arc::new(AppConfig {
@@ -1502,12 +1512,56 @@ mod tests {
             service: auth_service,
             session_service: Some(Arc::new(SessionService::new(
                 ctx.pool.clone(),
-                Arc::clone(&ctx.config),
+                Arc::clone(config),
             ))),
             rate_limiter: None,
-            config: Some(Arc::clone(&ctx.config)),
-            totp_service: Arc::new(ctx.service.clone()),
+            config: Some(Arc::clone(config)),
+            totp_service: Arc::new(TotpService::new(
+                ctx.pool.clone(),
+                Arc::clone(config),
+                Arc::clone(&ctx.auth_config),
+            )),
         }
+    }
+
+    #[tokio::test]
+    async fn keyless_deployment_refuses_to_mint_a_challenge() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let password = fixture_password();
+        let (user_id, email) = create_user_with_email(&ctx, true, &password).await;
+        enroll_and_confirm(&ctx, user_id).await;
+
+        let keyless = Arc::new(Config {
+            totp: TotpConfig {
+                encryption_key: None,
+                ..TotpConfig::default()
+            },
+            ..Config::default()
+        });
+
+        let response = login(
+            State(handler_state_with_config(&ctx, &keyless)),
+            HeaderMap::new(),
+            Ok(Json(LoginRequest { email, password })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            response.headers().get(header::SET_COOKIE).is_none(),
+            "a refused challenge must not carry a session cookie"
+        );
+        let body = to_bytes(response.into_body(), 4096).await.expect("body");
+        let error: crate::error::ErrorResponse = serde_json::from_slice(&body).expect("json");
+        assert_eq!(error.code, crate::error::ErrorCode::InvalidConfig);
+        assert_eq!(
+            count_rows(&ctx.pool, "two_factor_tokens", user_id).await,
+            0,
+            "no challenge token may be issued when the factor cannot be verified"
+        );
+        assert_eq!(count_rows(&ctx.pool, "sessions", user_id).await, 0);
     }
 
     #[tokio::test]

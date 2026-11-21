@@ -210,7 +210,7 @@ pub async fn totp_backup(
     let client_ip = extract_client_ip(&headers);
     let user_id = match challenge_user_id(&state, &client_ip, &request.challenge_token).await {
         Ok(user_id) => user_id,
-        Err(response) => return response,
+        Err(rejection) => return rejection.into_response(&client_ip),
     };
 
     let matched_hash = match state
@@ -333,6 +333,32 @@ fn totp_rate_limit_exceeded(
     response
 }
 
+/// Why [`challenge_user_id`] refused a challenge.
+///
+/// `Response` exceeds the 128-byte `Err` size Clippy allows, so the response is built at the
+/// handler boundary instead of being carried here.
+enum ChallengeRejection {
+    /// A verification budget is exhausted; `dimension` records which one.
+    RateLimited {
+        dimension: &'static str,
+        rejection: RateLimitRejection,
+    },
+    /// The challenge token failed validation.
+    Service(AppError),
+}
+
+impl ChallengeRejection {
+    fn into_response(self, client_ip: &str) -> Response {
+        match self {
+            Self::RateLimited {
+                dimension,
+                rejection,
+            } => totp_rate_limit_exceeded(client_ip, TOTP_KEY_PREFIX, dimension, rejection),
+            Self::Service(error) => service_error_response(error),
+        }
+    }
+}
+
 /// Charge the IP budget, resolve the challenge token without consuming it, then charge the
 /// user budget. Token validation sits between the dimensions so an unparsable token costs
 /// the IP budget only.
@@ -340,38 +366,31 @@ async fn challenge_user_id(
     state: &AppState,
     client_ip: &str,
     challenge_token: &str,
-) -> Result<Uuid, Response> {
+) -> Result<Uuid, ChallengeRejection> {
     if let Err(rejection) = state
         .rate_limiter
         .check_totp_ip_limit(client_ip, &state.config.totp)
     {
-        return Err(totp_rate_limit_exceeded(
-            client_ip,
-            TOTP_KEY_PREFIX,
-            "ip",
+        return Err(ChallengeRejection::RateLimited {
+            dimension: "ip",
             rejection,
-        ));
+        });
     }
 
-    let user_id = match state
+    let user_id = state
         .totp_service
         .validate_two_factor_token(challenge_token)
         .await
-    {
-        Ok(user_id) => user_id,
-        Err(error) => return Err(service_error_response(error)),
-    };
+        .map_err(ChallengeRejection::Service)?;
 
     if let Err(rejection) = state
         .rate_limiter
         .check_totp_user_limit(user_id, &state.config.totp)
     {
-        return Err(totp_rate_limit_exceeded(
-            client_ip,
-            TOTP_KEY_PREFIX,
-            "user",
+        return Err(ChallengeRejection::RateLimited {
+            dimension: "user",
             rejection,
-        ));
+        });
     }
 
     Ok(user_id)
@@ -395,7 +414,7 @@ pub async fn totp_verify(
     let client_ip = extract_client_ip(&headers);
     let user_id = match challenge_user_id(&state, &client_ip, &request.challenge_token).await {
         Ok(user_id) => user_id,
-        Err(response) => return response,
+        Err(rejection) => return rejection.into_response(&client_ip),
     };
 
     redeem_challenge(

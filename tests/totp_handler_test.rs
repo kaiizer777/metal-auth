@@ -462,6 +462,94 @@ async fn protected_routes_reject_missing_csrf_token() {
     }
 }
 
+#[tokio::test]
+async fn verify_and_backup_ignore_an_ambient_session_cookie() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let (email, password, secret, backup_codes, session) =
+        enabled_user(&app, &dynamic_ip()).await;
+    let cookie_name = app.state.config.session.cookie_name.clone();
+    let cookie = format!(
+        "{}={}; csrf_token={}",
+        cookie_name, session.sid, session.csrf
+    );
+
+    // Deliberately no `x-csrf-token`: the CSRF middleware would reject a two-of-three
+    // request, so a 200 proves these routes stay outside the protected router.
+    let token = challenge(&app, &email, &password).await;
+    let mut headers = HeaderMap::new();
+    headers.insert(header::COOKIE, cookie.parse().expect("cookie header"));
+    let req = json_request_with_headers(
+        Method::POST,
+        "/auth/totp/verify",
+        json!({ "challenge_token": token, "code": totp_code(&secret) }),
+        headers,
+    );
+    let verify = app.dispatch(req).await;
+    assert_eq!(
+        verify.status(),
+        StatusCode::OK,
+        "verify must stay outside CSRF: {}",
+        verify.body_str
+    );
+
+    let token = challenge(&app, &email, &password).await;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::COOKIE,
+        cookie.parse().expect("cookie header"),
+    );
+    let req = json_request_with_headers(
+        Method::POST,
+        "/auth/totp/backup",
+        json!({ "challenge_token": token, "code": backup_codes[0].clone() }),
+        headers,
+    );
+    let backup = app.dispatch(req).await;
+    assert_eq!(
+        backup.status(),
+        StatusCode::OK,
+        "backup must stay outside CSRF: {}",
+        backup.body_str
+    );
+}
+
+#[tokio::test]
+async fn verify_with_an_ambient_cookie_reaches_the_code_check() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let (email, password, _secret, _backup_codes, session) =
+        enabled_user(&app, &dynamic_ip()).await;
+    let token = challenge(&app, &email, &password).await;
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::COOKIE,
+        format!(
+            "{}={}; csrf_token={}",
+            app.state.config.session.cookie_name, session.sid, session.csrf
+        )
+        .parse()
+        .expect("cookie header"),
+    );
+    let req = json_request_with_headers(
+        Method::POST,
+        "/auth/totp/verify",
+        json!({ "challenge_token": token, "code": "000000" }),
+        headers,
+    );
+    let resp = app.dispatch(req).await;
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "body: {}", resp.body_str);
+    assert_eq!(resp.error_code(), Some(ErrorCode::TotpCodeInvalid));
+}
+
 // ─── Verification ────────────────────────────────────────────────────────────
 
 #[tokio::test]

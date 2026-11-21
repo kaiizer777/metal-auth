@@ -505,13 +505,22 @@ impl TotpService {
     /// Deletes the secret (and its backup codes) plus the user's replay log. Any live
     /// challenge token therefore has no secret left to satisfy.
     ///
-    /// The code branch is one transaction: the code is verified and its replay row written
-    /// against the same in-transaction clock the verification path uses, then the secret
-    /// and the whole replay log are deleted together. The insert is not redundant: while
-    /// it exists, `uq_totp_used_codes` rejects a code already spent at login or as an
-    /// earlier disable proof, so the delete at the end of this transaction cannot turn a
-    /// spent code into a valid one. Rolling back a failed disable rolls the row back with
-    /// it, leaving the still-valid code retryable instead of reporting it as replayed.
+    /// The code branch is one transaction that takes `FOR UPDATE` on the user's factor row
+    /// before reading the proof. That lock is what serializes two disables presenting the
+    /// same code: the second waits here and, once the first commits its delete, finds no
+    /// row and fails `TotpNotEnrolled` rather than reporting a second success. It covers
+    /// only that row and only for the life of this transaction — an enrollment committing a
+    /// new factor afterwards is not observed (an absent row takes no lock), and the password
+    /// branch takes no lock at all, because two password proofs present no code and
+    /// converge on the same end state.
+    ///
+    /// The replay row is then written against the same in-transaction clock the verification
+    /// path uses, and while it exists `uq_totp_used_codes` rejects a code already spent at
+    /// login. Rolling back a failed disable rolls the row back with it, leaving the
+    /// still-valid code retryable instead of reporting it as replayed. The delete that
+    /// follows still wipes the whole replay log — that is what disabling means — but the
+    /// wipe runs after the proof is accepted, so it is no longer the arbiter of whether the
+    /// proof was spent.
     pub async fn disable_totp(
         &self,
         user_id: Uuid,
@@ -525,6 +534,8 @@ impl TotpService {
             }
             FreshAuthProof::TotpCode(code) => {
                 let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
+                self.lock_factor_for_disable(&mut transaction, user_id)
+                    .await?;
                 self.verify_and_record_totp(&mut transaction, user_id, &code)
                     .await?;
                 self.delete_factor_state_in(&mut transaction, user_id)
@@ -532,6 +543,29 @@ impl TotpService {
                 transaction.commit().await.map_err(AppError::Database)
             }
         }
+    }
+
+    /// Lock the caller's factor row until this transaction ends, or report it unusable.
+    ///
+    /// Taken before the disable proof is read so a second disable presenting the same code
+    /// blocks here instead of racing the replay insert. The absent row takes no lock: an
+    /// enrollment committed after this point is not excluded, the same boundary as
+    /// [`Self::is_totp_enabled_locked`].
+    async fn lock_factor_for_disable(
+        &self,
+        connection: &mut PgConnection,
+        user_id: Uuid,
+    ) -> Result<(), AppError> {
+        let enabled: Option<bool> =
+            sqlx::query_scalar("SELECT enabled FROM totp_secrets WHERE user_id = $1 FOR UPDATE")
+                .bind(user_id)
+                .fetch_optional(&mut *connection)
+                .await
+                .map_err(AppError::Database)?;
+        if enabled != Some(true) {
+            return Err(AppError::TotpNotEnrolled);
+        }
+        Ok(())
     }
 
     /// Check a password proof on the pool: Argon2id is CPU-bound and must run off the
@@ -1561,6 +1595,60 @@ mod tests {
             .await
             .expect("disable");
         assert!(!ctx.service.is_totp_enabled(user_id).await.expect("state"));
+        assert_eq!(count_rows(&ctx.pool, "totp_used_codes", user_id).await, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_disables_with_the_same_code_admit_exactly_one() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let response = enroll_and_confirm(&ctx, user_id).await;
+        let code = current_code(&response.secret_base32);
+
+        // Hold the factor row so a loser cannot simply arrive after the wipe and be
+        // rejected for the wrong reason: both disables must present a proof first.
+        let mut blocker = ctx.pool.begin().await.expect("blocking transaction");
+        sqlx::query("SELECT id FROM totp_secrets WHERE user_id = $1 FOR UPDATE")
+            .bind(user_id)
+            .execute(&mut *blocker)
+            .await
+            .expect("hold the factor row");
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let service = ctx.service.clone();
+            let attempt = code.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                service
+                    .disable_totp(user_id, FreshAuthProof::TotpCode(attempt), "ip")
+                    .await
+            }));
+        }
+        barrier.wait().await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            handles.iter().all(|handle| !handle.is_finished()),
+            "both disables must be waiting on the factor row, not past it"
+        );
+        blocker.commit().await.expect("release the factor row");
+
+        let mut accepted = 0;
+        let mut rejected = 0;
+        for handle in handles {
+            match handle.await.expect("join") {
+                Ok(()) => accepted += 1,
+                Err(AppError::TotpNotEnrolled) => rejected += 1,
+                Err(other) => panic!("unexpected result: {other:?}"),
+            }
+        }
+        assert_eq!(accepted, 1, "exactly one disable may succeed");
+        assert_eq!(rejected, 1, "the second disable must find no factor");
+        assert_eq!(count_rows(&ctx.pool, "totp_secrets", user_id).await, 0);
         assert_eq!(count_rows(&ctx.pool, "totp_used_codes", user_id).await, 0);
     }
 

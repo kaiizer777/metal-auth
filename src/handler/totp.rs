@@ -7,6 +7,15 @@
 
 use serde::Deserialize;
 
+use axum::{
+    Json,
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
+
+use crate::{handler::auth::service_error_response, middleware::auth::AuthUser, state::AppState};
+
 /// `POST /auth/totp/confirm` body.
 #[derive(Deserialize)]
 pub struct ConfirmTotpRequest {
@@ -53,5 +62,16 @@ impl std::fmt::Debug for DisableTotpRequest {
             .field("password", &self.password.as_ref().map(|_| "[redacted]"))
             .field("totp_code", &self.totp_code.as_ref().map(|_| "[redacted]"))
             .finish()
+    }
+}
+
+/// `POST /auth/totp/enroll`
+///
+/// Rotates the pending secret and returns the QR URI plus the backup codes once.
+/// Refuses unverified emails and an already enabled secret.
+pub async fn totp_enroll(State(state): State<AppState>, auth_user: AuthUser) -> Response {
+    match state.totp_service.enroll_totp(auth_user.user_id).await {
+        Ok(enrollment) => (StatusCode::OK, Json(enrollment)).into_response(),
+        Err(error) => service_error_response(error),
     }
 }

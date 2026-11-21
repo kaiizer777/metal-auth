@@ -166,7 +166,7 @@ fn json_rejection_response(rejection: JsonRejection) -> Response {
 }
 
 /// Map `AppError` to HTTP response following spec wire codes.
-fn service_error_response(err: AppError) -> Response {
+pub(crate) fn service_error_response(err: AppError) -> Response {
     err.into_response()
 }
 

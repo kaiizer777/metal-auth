@@ -261,9 +261,11 @@ pub async fn totp_backup(
 /// `DELETE /auth/totp`
 ///
 /// Requires a fresh-auth proof: the current password or a live TOTP code. A missing,
-/// blank, or ambiguous proof is a 400 `VALIDATION_ERROR` before any budget is spent; a
-/// wrong password or TOTP code is a 401 `INVALID_CREDENTIALS`. An absent session is
-/// rejected by `require_auth` before this runs.
+/// blank, or ambiguous proof is a 400 `VALIDATION_ERROR` before any budget is spent.
+/// A rejected proof keeps the status of the check that rejected it: a wrong password
+/// fails a credential comparison, so 401 `INVALID_CREDENTIALS`; a wrong TOTP code is
+/// reported by the shared code check as 400 `TOTP_CODE_INVALID`, same as every other
+/// code verification. An absent session is rejected by `require_auth` before this runs.
 pub async fn totp_disable(
     State(state): State<AppState>,
     auth_user: AuthUser,

@@ -308,8 +308,11 @@ impl TotpService {
 
     /// Disable 2FA after a fresh password or live TOTP proof.
     ///
-    /// A wrong password or code returns `InvalidCredentials` (401); a missing or
-    /// ambiguous body proof is rejected as `ValidationError` (400) before this call.
+    /// Rejections keep the status of the check that rejected the proof: a wrong password
+    /// is `InvalidCredentials` (401), while a wrong TOTP code is passed through from
+    /// `verify_totp` as `TotpCodeInvalid` (400), matching every other code check. A
+    /// missing or ambiguous body proof is rejected as `ValidationError` (400) before
+    /// this call.
     /// Deletes the secret (and its backup codes) plus the user's replay log. Any live
     /// challenge token therefore has no secret left to satisfy.
     pub async fn disable_totp(

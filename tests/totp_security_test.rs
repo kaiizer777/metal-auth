@@ -914,6 +914,7 @@ async fn totp_audit_events_leak_no_secret_material() {
 
     let ip = dynamic_ip();
     let (email, password) = create_verified_user(&app).await;
+    let user_id = user_id_for_email(&app.pool, &email).await;
     let session = login(&app, &email, &password).await;
     let enrollment = enroll(&app, &session, &ip).await;
     let secret = enrollment["secret_base32"]
@@ -932,6 +933,21 @@ async fn totp_audit_events_leak_no_secret_material() {
         StatusCode::OK,
         "confirm failed: {}",
         confirmed.body_str
+    );
+
+    // The stored ciphertext is on the spec's zero-leak list; read it before the disable below
+    // drops the row.
+    let stored_ciphertext: String = sqlx::query_scalar(
+        "SELECT encode(encrypted_secret, 'hex') FROM totp_secrets WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("stored encrypted secret");
+    assert_eq!(
+        stored_ciphertext.len(),
+        96,
+        "nonce (12) || ciphertext (20) || tag (16) is 96 hex characters"
     );
 
     let cookie_name = app.state.config.session.cookie_name.clone();
@@ -1001,6 +1017,7 @@ async fn totp_audit_events_leak_no_secret_material() {
     let encryption_key = "00".repeat(32);
     for (label, value) in [
         ("totp secret", secret.as_str()),
+        ("encrypted secret", stored_ciphertext.as_str()),
         ("challenge token", challenge_token.as_str()),
         ("backup challenge token", backup_token.as_str()),
         ("backup code", backup_code.as_str()),

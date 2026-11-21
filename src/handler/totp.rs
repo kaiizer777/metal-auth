@@ -8,7 +8,7 @@
 use serde::Deserialize;
 
 use axum::{
-    Json,
+    Json, Router,
     extract::{State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
@@ -19,9 +19,13 @@ use crate::{
     auth::models::{LoginResponse, MessageResponse},
     error::AppError,
     handler::auth::{
-        attach_login_cookies, extract_client_ip, json_rejection_response, service_error_response,
+        attach_login_cookies, extract_client_ip, json_rejection_response, method_not_allowed,
+        service_error_response,
     },
-    middleware::auth::AuthUser,
+    middleware::{
+        auth::{AuthUser, require_auth},
+        csrf_middleware,
+    },
     state::AppState,
     totp::service::FreshAuthProof,
 };
@@ -366,4 +370,49 @@ async fn issue_two_factor_session(
             Err(error) => service_error_response(error),
         }
     }
+}
+
+/// Router for the TOTP endpoints, merged under `/auth` by [`crate::handler::create_router`].
+///
+/// CSRF split is deliberate. `enroll`, `confirm`, and `DELETE /totp` mutate state on an
+/// ambient session cookie and sit behind `require_auth` + CSRF (guard outermost, so an
+/// anonymous request gets 401 before CSRF can answer 403). `verify` and `backup`
+/// authenticate with a body-borne `challenge_token` and carry no ambient authority;
+/// inside the CSRF layer a browser holding any unrelated `sid` cookie would be rejected
+/// before the challenge is read, while cookie-less clients would still pass.
+pub fn routes(state: AppState) -> Router {
+    let protected = Router::new()
+        .route(
+            "/totp/enroll",
+            axum::routing::post(totp_enroll).fallback(method_not_allowed),
+        )
+        .route(
+            "/totp/confirm",
+            axum::routing::post(totp_confirm).fallback(method_not_allowed),
+        )
+        // No JSON 405 fallback here: the shared helper advertises POST only.
+        .route("/totp", axum::routing::delete(totp_disable))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            csrf_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_auth,
+        ))
+        .with_state(state.clone());
+
+    // CSRF-exempt by design: see the type-level note above.
+    let public = Router::new()
+        .route(
+            "/totp/verify",
+            axum::routing::post(totp_verify).fallback(method_not_allowed),
+        )
+        .route(
+            "/totp/backup",
+            axum::routing::post(totp_backup).fallback(method_not_allowed),
+        )
+        .with_state(state);
+
+    protected.merge(public)
 }

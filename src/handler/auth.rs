@@ -48,7 +48,7 @@ pub struct AuthHandlerState {
     pub totp_service: Arc<TotpService>,
 }
 
-async fn method_not_allowed() -> impl IntoResponse {
+pub(crate) async fn method_not_allowed() -> impl IntoResponse {
     (
         StatusCode::METHOD_NOT_ALLOWED,
         [(header::ALLOW, "POST")],

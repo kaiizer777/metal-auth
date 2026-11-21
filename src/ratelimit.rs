@@ -1069,7 +1069,12 @@ mod tests {
         // Phase 5 IP budget untouched by the TOTP dimension.
         assert!(limiter.check_ip("198.51.100.7").is_ok());
         assert_eq!(
-            limiter.windows.get("ip:198.51.100.7").unwrap().attempts.len(),
+            limiter
+                .windows
+                .get("ip:198.51.100.7")
+                .unwrap()
+                .attempts
+                .len(),
             1
         );
     }

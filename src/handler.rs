@@ -13,6 +13,7 @@ pub use auth::routes as auth_routes;
 pub use cors::cors_layer;
 pub use oauth::routes as oauth_routes;
 pub use session::routes as session_routes;
+pub use totp::routes as totp_routes;
 
 async fn fallback_not_found() -> AppError {
     AppError::NotFound
@@ -42,6 +43,7 @@ pub fn create_router(state: AppState) -> Result<Router, AppError> {
     let oauth_router = oauth::routes(state.clone());
     let auth_router = auth::routes_with_app_state(state.clone())
         .merge(session::routes(state.clone()))
+        .merge(totp::routes(state.clone()))
         .merge(oauth_router.clone());
 
     Ok(Router::new()

@@ -1479,6 +1479,13 @@ pub const DEFAULT_TOTP_RATE_LIMIT_WINDOW_SECS: u64 = 600;
 pub const DEFAULT_TOTP_CHALLENGE_TOKEN_TTL_SECS: u64 = 900;
 pub const DEFAULT_TOTP_USED_CODE_PRUNE_AGE_SECS: u64 = MIN_USED_CODE_PRUNE_AGE_SECS;
 
+/// Upper bound for the replay-log prune horizon.
+///
+/// The value reaches SQL as `make_interval(secs => $2)`, whose time field is a 64-bit
+/// microsecond count. A year is far beyond any replay-log retention need and stays well
+/// inside that range, so an operator value cannot turn the prune into a range error.
+pub const MAX_TOTP_USED_CODE_PRUNE_AGE_SECS: u64 = 365 * 24 * 60 * 60;
+
 /// AES-256-GCM key size in bytes.
 pub const TOTP_ENCRYPTION_KEY_BYTES: usize = 32;
 
@@ -1595,6 +1602,12 @@ impl TotpConfig {
             return Err(ConfigError::InvalidValue {
                 field: "totp.used_code_prune_age_secs",
                 reason: "must cover three TOTP steps plus a margin",
+            });
+        }
+        if self.used_code_prune_age_secs > MAX_TOTP_USED_CODE_PRUNE_AGE_SECS {
+            return Err(ConfigError::InvalidValue {
+                field: "totp.used_code_prune_age_secs",
+                reason: "must stay inside PostgreSQL's interval range",
             });
         }
         Ok(())
@@ -3590,6 +3603,23 @@ mod tests {
             ..TotpConfig::default()
         };
         assert!(floor.validate().is_ok());
+    }
+
+    #[test]
+    fn totp_validate_rejects_prune_age_beyond_postgres_interval() {
+        let at_max = TotpConfig {
+            used_code_prune_age_secs: MAX_TOTP_USED_CODE_PRUNE_AGE_SECS,
+            ..TotpConfig::default()
+        };
+        assert!(at_max.validate().is_ok());
+
+        for rejected in [MAX_TOTP_USED_CODE_PRUNE_AGE_SECS + 1, u64::MAX] {
+            let over = TotpConfig {
+                used_code_prune_age_secs: rejected,
+                ..TotpConfig::default()
+            };
+            assert!(over.validate().is_err(), "accepted {rejected}");
+        }
     }
 
     #[test]

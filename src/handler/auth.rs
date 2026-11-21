@@ -462,8 +462,8 @@ enum PasswordLoginOutcome {
 ///
 /// `is_totp_enabled_locked` holds a share lock on the factor row for this transaction, so
 /// `confirm_enrollment` — the only path that sets `enabled` — cannot commit between this read
-/// and the session insert *when the row exists at read time*: its update blocks, and this
-/// transaction's read is re-evaluated against the committed value.
+/// and the session insert when the row exists at read time. Lock first and the activation
+/// waits for the commit; activation first and this read waits, then re-reads the new value.
 ///
 /// A missing row takes no lock, and the guarantee stops there: `enroll_totp` can create the
 /// row and `confirm_enrollment` enable it between this read and the session insert, leaving a

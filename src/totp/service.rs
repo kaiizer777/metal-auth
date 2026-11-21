@@ -17,9 +17,9 @@ use crate::{
     totp::{
         backup,
         crypto::{
-            DecryptedSecret, build_otpauth_uri, compute_code_replay_hash, decode_totp_secret,
-            decrypt_secret, encrypt_secret, generate_totp_secret, totp_counter_at,
-            verify_totp_code_at,
+            DecryptedSecret, TOTP_STEP_SECS, build_otpauth_uri, compute_code_replay_hash,
+            decode_totp_secret, decrypt_secret, encrypt_secret, generate_totp_secret,
+            totp_counter_at, verify_totp_code_at,
         },
     },
 };
@@ -376,20 +376,33 @@ impl TotpService {
             return Err(AppError::Database(error));
         }
 
+        // The insert is the replay arbiter only while the tombstone survives. Re-check the
+        // matched step's window at write time `clock_timestamp()`, because `reference` was
+        // frozen before any stall: a verifier stalled past its own window must not
+        // re-create a tombstone a concurrent transaction legitimately pruned.
+        //
         // `used_at` is bound rather than defaulted: the column default is
         // `CURRENT_TIMESTAMP`, frozen at `BEGIN`, so a stalled transaction would stamp the
         // row earlier than the reference its own cutoff uses and a later transaction would
         // prune it sooner.
+        let window_end = code_window_end(step).ok_or(AppError::TotpCodeInvalid)?;
         let inserted = sqlx::query(
-            "INSERT INTO totp_used_codes (user_id, code_hash, used_at) VALUES ($1, $2, $3)",
+            "INSERT INTO totp_used_codes (user_id, code_hash, used_at) \
+             SELECT $1, $2, $3 WHERE clock_timestamp() < $4",
         )
         .bind(user_id)
         .bind(&replay_hash[..])
         .bind(reference)
+        .bind(window_end)
         .execute(&mut *connection)
         .await;
-        if let Err(error) = inserted {
-            return Err(classify_used_code_error(error));
+        let inserted = match inserted {
+            Ok(result) => result,
+            Err(error) => return Err(classify_used_code_error(error)),
+        };
+        // Zero rows: the write landed after the code's last accepted step, so it expired.
+        if inserted.rows_affected() == 0 {
+            return Err(AppError::TotpCodeInvalid);
         }
 
         tracing::debug!(
@@ -781,6 +794,15 @@ async fn transaction_now(connection: &mut PgConnection) -> Result<DateTime<Utc>,
         .map_err(AppError::Database)
 }
 
+/// Exclusive end of the last reference at which a step-`step` code verifies.
+///
+/// A code of step `S` matches any counter in `{S-1, S, S+1}`, so it stays acceptable
+/// while the reference is below `(S+2) * TOTP_STEP_SECS`.
+fn code_window_end(step: u64) -> Option<DateTime<Utc>> {
+    let seconds = step.checked_add(2)?.checked_mul(TOTP_STEP_SECS)?;
+    DateTime::from_timestamp(i64::try_from(seconds).ok()?, 0)
+}
+
 /// Map the replay insert failure: only `uq_totp_used_codes` means a replay.
 ///
 /// Any other `23505` (or any other error) stays a database error instead of being
@@ -848,7 +870,7 @@ mod tests {
         email::EmailDispatcher,
         handler::auth::{AuthHandlerState, login},
         session::SessionService,
-        totp::crypto::{current_totp_counter, generate_totp},
+        totp::crypto::{TOTP_STEP_SECS, current_totp_counter, generate_totp},
     };
     use axum::{
         Json,
@@ -988,6 +1010,17 @@ mod tests {
             .fetch_one(pool)
             .await
             .expect("count")
+    }
+
+    async fn count_used_code(pool: &PgPool, user_id: Uuid, code: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM totp_used_codes WHERE user_id = $1 AND code_hash = $2",
+        )
+        .bind(user_id)
+        .bind(compute_code_replay_hash(code))
+        .fetch_one(pool)
+        .await
+        .expect("count")
     }
 
     #[tokio::test]
@@ -1334,6 +1367,60 @@ mod tests {
             matches!(replay, Err(AppError::TotpCodeInvalid)),
             "a stalled request must reject the code as out of window, not as a replay: {replay:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn stalled_replay_is_rejected_after_its_tombstone_is_pruned() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let response = enroll_and_confirm(&ctx, user_id).await;
+        let raw = decode_totp_secret(&response.secret_base32).expect("decode");
+
+        // Eight steps back: the code's last accepted step closed well before a write can
+        // land now, and the fresher verify below still reads a step far from the boundary.
+        let step = current_totp_counter() - 8;
+        let code = format!("{:06}", generate_totp(&raw, step).expect("generate"));
+        let used_at =
+            DateTime::from_timestamp(i64::try_from(step * TOTP_STEP_SECS).expect("fits"), 0)
+                .expect("timestamp");
+
+        // The original redemption, committed while the code was live.
+        sqlx::query(
+            "INSERT INTO totp_used_codes (user_id, code_hash, used_at) VALUES ($1, $2, $3)",
+        )
+        .bind(user_id)
+        .bind(compute_code_replay_hash(&code))
+        .bind(used_at)
+        .execute(&ctx.pool)
+        .await
+        .expect("seed redemption");
+
+        // A verify 241s later outlives the minimum 120s prune age and removes the row.
+        let fresher = format!("{:06}", generate_totp(&raw, step + 8).expect("generate"));
+        ctx.service
+            .verify_totp_at_reference(user_id, &fresher, used_at + Duration::seconds(241))
+            .await
+            .expect("a later verify prunes the stale row");
+        assert_eq!(
+            count_used_code(&ctx.pool, user_id, &code).await,
+            0,
+            "the later verify must prune the tombstone"
+        );
+
+        // The stalled verifier resumes holding its pre-stall reference, still in the code's
+        // window. The pruned tombstone left no conflict, so only the write-time window
+        // check can refuse to re-create it.
+        let replay = ctx
+            .service
+            .verify_totp_at_reference(user_id, &code, used_at)
+            .await;
+        assert!(
+            matches!(replay, Err(AppError::TotpCodeInvalid)),
+            "a stalled replay must expire, not be accepted or labelled a replay: {replay:?}"
+        );
+        assert_eq!(count_used_code(&ctx.pool, user_id, &code).await, 0);
     }
 
     #[tokio::test]

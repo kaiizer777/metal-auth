@@ -402,7 +402,8 @@ async fn confirm_rate_limits_user_dimension() {
     enroll(&app, &session, &dynamic_ip()).await;
     let ip = dynamic_ip();
 
-    let mut last_status = StatusCode::OK;
+    let mut rejected_codes = 0u32;
+    let mut tripped = false;
     for _ in 0..6 {
         let resp = app
             .dispatch(session_request(
@@ -414,13 +415,25 @@ async fn confirm_rate_limits_user_dimension() {
                 &ip,
             ))
             .await;
-        last_status = resp.status();
-        if last_status == StatusCode::TOO_MANY_REQUESTS {
-            assert_eq!(resp.error_code(), Some(ErrorCode::TotpRateLimitExceeded));
+        match resp.status() {
+            StatusCode::BAD_REQUEST => {
+                assert_eq!(resp.error_code(), Some(ErrorCode::TotpCodeInvalid));
+                rejected_codes += 1;
+            }
+            StatusCode::TOO_MANY_REQUESTS => {
+                assert_eq!(resp.error_code(), Some(ErrorCode::TotpRateLimitExceeded));
+                tripped = true;
+                break;
+            }
+            other => panic!("unexpected {other}: {}", resp.body_str),
         }
     }
 
-    assert_eq!(last_status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(tripped, "the user budget must trip within six attempts");
+    assert_eq!(
+        rejected_codes, app.state.config.totp.rate_limit_user_max_attempts,
+        "confirm must admit exactly the configured user budget"
+    );
 }
 
 // ─── CSRF (R15) ──────────────────────────────────────────────────────────────

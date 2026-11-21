@@ -521,10 +521,16 @@ async fn user_budget_admits_exactly_three_attempts_then_returns_429() {
         return;
     };
 
-    let (email, password, _secret, _backup_codes, _session) =
+    let (email, password, secret, _backup_codes, _session) =
         enabled_user(&app, &dynamic_ip()).await;
     let user_id = user_id_for_email(&app.pool, &email).await;
     let token = challenge(&app, &email, &password).await;
+    // Three steps out survives a step rollover mid-request and stays outside the ±1 window,
+    // unlike a literal that can collide with the live code.
+    let out_of_window = code_at(
+        &secret,
+        metal_auth::totp::crypto::current_totp_counter() + 3,
+    );
 
     // Confirmation already spent one attempt on this user; clear it so the boundary
     // under test is exactly the configured three, not two.
@@ -536,7 +542,7 @@ async fn user_budget_admits_exactly_three_attempts_then_returns_429() {
         let resp = app
             .post_json_with_ip(
                 "/auth/totp/verify",
-                json!({ "challenge_token": token, "code": "000000" }),
+                json!({ "challenge_token": token, "code": out_of_window }),
                 &dynamic_ip(),
             )
             .await;
@@ -552,7 +558,7 @@ async fn user_budget_admits_exactly_three_attempts_then_returns_429() {
     let rejected = app
         .post_json_with_ip(
             "/auth/totp/verify",
-            json!({ "challenge_token": token, "code": "000000" }),
+            json!({ "challenge_token": token, "code": out_of_window }),
             &dynamic_ip(),
         )
         .await;

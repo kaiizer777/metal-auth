@@ -1110,6 +1110,56 @@ async fn disable_rejects_wrong_password() {
 }
 
 #[tokio::test]
+async fn disable_rejects_wrong_totp_code() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let (email, password, secret, _backup_codes, session) = enabled_user(&app, &dynamic_ip()).await;
+    // Three steps ahead of the ±1 acceptance window: never a valid code.
+    let wrong_code = code_at(
+        &secret,
+        metal_auth::totp::crypto::current_totp_counter() + 3,
+    );
+
+    let resp = app
+        .dispatch(session_request(
+            &app,
+            Method::DELETE,
+            "/auth/totp",
+            json!({ "totp_code": wrong_code }),
+            &session,
+            &dynamic_ip(),
+        ))
+        .await;
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.error_code(), Some(ErrorCode::TotpCodeInvalid));
+
+    let user_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM users WHERE email = $1")
+        .bind(&email)
+        .fetch_one(&app.pool)
+        .await
+        .expect("user row");
+    let secrets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM totp_secrets WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_one(&app.pool)
+        .await
+        .expect("totp secrets count");
+    assert_eq!(secrets, 1, "a rejected code must leave 2FA enabled");
+
+    let login_resp = app
+        .post_json(
+            "/auth/login",
+            json!({ "email": email, "password": password }),
+        )
+        .await;
+    assert_eq!(login_resp.status(), StatusCode::OK);
+    assert_eq!(login_resp.json["two_factor_required"], json!(true));
+}
+
+#[tokio::test]
 async fn disable_with_password_drops_the_login_challenge() {
     let _guard = DB_LOCK.lock().await;
     let Some(app) = setup_test_app().await else {

@@ -13,6 +13,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::email::hook::DynError;
 
+/// Wire-level error code returned to API clients.
+///
+/// Non-exhaustive: every phase adds codes, and a caller matching on this type must not break
+/// when one lands. Match with a wildcard.
+#[non_exhaustive]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ErrorCode {
@@ -130,6 +135,9 @@ pub enum ConfigError {
     },
 }
 
+/// Non-exhaustive: each phase adds variants, and embedders match on this type in their own
+/// error mapping. Match with a wildcard.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("configuration error")]

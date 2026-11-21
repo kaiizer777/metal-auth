@@ -116,6 +116,8 @@ impl TotpService {
     }
 
     /// Step 2 of enrollment: verify the first code against the pending secret and enable.
+    ///
+    /// `ip` is part of the Part 3 handler contract; rate limiting is handler-owned.
     pub async fn confirm_enrollment(
         &self,
         user_id: Uuid,
@@ -155,8 +157,10 @@ impl TotpService {
 
     /// Verify a live TOTP code and burn it in the same step window.
     ///
-    /// The replay insert is a single autocommitted statement: the `uq_totp_used_codes`
-    /// constraint arbitrates concurrent submissions, so there is no read-then-write gap.
+    /// The replay insert is the arbiter: `uq_totp_used_codes` rejects concurrent or
+    /// window-shifted reuse, so there is no read-then-write gap.
+    ///
+    /// `ip` is part of the Part 3 handler contract; rate limiting is handler-owned.
     pub async fn verify_totp(&self, user_id: Uuid, code: &str, _ip: &str) -> Result<(), AppError> {
         self.verify_totp_at(user_id, code, current_totp_counter())
             .await
@@ -232,6 +236,8 @@ impl TotpService {
     ///
     /// The removal is one atomic statement keyed on the matched hash, so two concurrent
     /// submissions cannot both consume a code or delete a neighbouring one.
+    ///
+    /// `ip` is part of the Part 3 handler contract; rate limiting is handler-owned.
     pub async fn verify_backup_code(
         &self,
         user_id: Uuid,

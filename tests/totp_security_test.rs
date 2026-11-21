@@ -412,3 +412,47 @@ async fn disable_with_a_wrong_password_is_rejected() {
         "a rejected proof must leave 2fa enabled"
     );
 }
+
+/// Scenario 7: enrollment on an unverified email is refused before any write.
+#[tokio::test]
+async fn unverified_email_enrollment_is_rejected() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    // Login rejects unverified accounts, so the session is minted first and the email
+    // is unverified underneath it — the state the enrollment guard must catch.
+    let (email, password) = create_verified_user(&app).await;
+    let session = login(&app, &email, &password).await;
+    let user_id = user_id_for_email(&app.pool, &email).await;
+    sqlx::query("UPDATE users SET email_verified = false WHERE id = $1")
+        .bind(user_id)
+        .execute(&app.pool)
+        .await
+        .expect("unverify the email");
+
+    let resp = app
+        .dispatch(session_request(
+            &app,
+            Method::POST,
+            "/auth/totp/enroll",
+            json!({}),
+            &session,
+            &dynamic_ip(),
+        ))
+        .await;
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        resp.body_str
+    );
+    assert_eq!(resp.error_code(), Some(ErrorCode::EmailNotVerified));
+    assert_eq!(
+        enrollment_count(&app.pool, user_id).await,
+        0,
+        "a rejected enrollment must not create a secret row"
+    );
+}

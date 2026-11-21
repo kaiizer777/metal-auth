@@ -98,9 +98,25 @@ impl DisableTotpRequest {
 ///
 /// Rotates the pending secret and returns the QR URI plus the backup codes once.
 /// Refuses unverified emails and an already enabled secret.
-pub async fn totp_enroll(State(state): State<AppState>, auth_user: AuthUser) -> Response {
+pub async fn totp_enroll(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    headers: HeaderMap,
+) -> Response {
+    let client_ip = extract_client_ip(&headers);
+    let user_agent = user_agent(&headers);
+
     match state.totp_service.enroll_totp(auth_user.user_id).await {
-        Ok(enrollment) => (StatusCode::OK, Json(enrollment)).into_response(),
+        Ok(enrollment) => {
+            tracing::info!(
+                target: "security_event",
+                event = "totp_enrolled",
+                user_id = %auth_user.user_id,
+                ip = %client_ip,
+                user_agent = %user_agent,
+            );
+            (StatusCode::OK, Json(enrollment)).into_response()
+        }
         Err(error) => service_error_response(error),
     }
 }
@@ -141,7 +157,16 @@ pub async fn totp_confirm(
         .confirm_enrollment(auth_user.user_id, &request.code, &client_ip)
         .await
     {
-        Ok(()) => (StatusCode::OK, Json(MessageResponse::new("totp confirmed"))).into_response(),
+        Ok(()) => {
+            tracing::info!(
+                target: "security_event",
+                event = "totp_confirmed",
+                user_id = %auth_user.user_id,
+                ip = %client_ip,
+                user_agent = %user_agent(&headers),
+            );
+            (StatusCode::OK, Json(MessageResponse::new("totp confirmed"))).into_response()
+        }
         Err(error) => service_error_response(error),
     }
 }
@@ -202,7 +227,14 @@ pub async fn totp_backup(
         return service_error_response(error);
     }
 
-    issue_two_factor_session(&state, user_id, &headers, &client_ip).await
+    issue_two_factor_session(
+        &state,
+        user_id,
+        &headers,
+        &client_ip,
+        VerifiedFactor::BackupCode,
+    )
+    .await
 }
 
 /// `DELETE /auth/totp`
@@ -224,6 +256,10 @@ pub async fn totp_disable(
     let proof = match request.into_proof() {
         Ok(proof) => proof,
         Err(error) => return service_error_response(error),
+    };
+    let proof_method = match &proof {
+        FreshAuthProof::Password(_) => "password",
+        FreshAuthProof::TotpCode(_) => "totp_code",
     };
 
     let client_ip = extract_client_ip(&headers);
@@ -248,11 +284,21 @@ pub async fn totp_disable(
         .disable_totp(auth_user.user_id, proof, &client_ip)
         .await
     {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(MessageResponse::new("two-factor authentication disabled")),
-        )
-            .into_response(),
+        Ok(()) => {
+            tracing::info!(
+                target: "security_event",
+                event = "totp_disabled",
+                user_id = %auth_user.user_id,
+                ip = %client_ip,
+                user_agent = %user_agent(&headers),
+                method = proof_method,
+            );
+            (
+                StatusCode::OK,
+                Json(MessageResponse::new("two-factor authentication disabled")),
+            )
+                .into_response()
+        }
         Err(error) => service_error_response(error),
     }
 }
@@ -324,7 +370,31 @@ pub async fn totp_verify(
         return service_error_response(error);
     }
 
-    issue_two_factor_session(&state, user_id, &headers, &client_ip).await
+    issue_two_factor_session(&state, user_id, &headers, &client_ip, VerifiedFactor::Totp).await
+}
+
+/// Which factor redeemed the challenge, and therefore which audit event fires.
+#[derive(Clone, Copy)]
+enum VerifiedFactor {
+    Totp,
+    BackupCode,
+}
+
+impl VerifiedFactor {
+    fn event(self) -> &'static str {
+        match self {
+            Self::Totp => "totp_verified",
+            Self::BackupCode => "backup_code_used",
+        }
+    }
+}
+
+/// Best-effort user agent for audit events, `"unknown"` when absent (login convention).
+fn user_agent(headers: &HeaderMap) -> &str {
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown")
 }
 
 /// Issue the post-challenge session using the same wire shape as a password login.
@@ -333,10 +403,9 @@ async fn issue_two_factor_session(
     user_id: Uuid,
     headers: &HeaderMap,
     client_ip: &str,
+    factor: VerifiedFactor,
 ) -> Response {
-    let user_agent = headers
-        .get(header::USER_AGENT)
-        .and_then(|value| value.to_str().ok());
+    let user_agent = user_agent(headers);
     let is_bearer = headers
         .get("x-auth-type")
         .and_then(|value| value.to_str().ok())
@@ -358,13 +427,22 @@ async fn issue_two_factor_session(
             &credential_hash,
             session_type,
             Some(client_ip),
-            user_agent,
+            Some(user_agent),
         )
         .await
     {
         Ok(session) => session,
         Err(error) => return service_error_response(error),
     };
+
+    tracing::info!(
+        target: "security_event",
+        event = factor.event(),
+        user_id = %user_id,
+        ip = %client_ip,
+        user_agent = %user_agent,
+        session_id_hash = %session.token_hash,
+    );
 
     if is_bearer {
         (

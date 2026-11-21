@@ -66,6 +66,19 @@ impl SessionService {
             .await
     }
 
+    /// Read the user's current Argon2id PHC string for a credential-freshness check.
+    ///
+    /// A missing row and a failed lookup both surface as `SessionInvalid`, so this path
+    /// gains no user-enumerating error variant.
+    pub async fn current_credential_hash(&self, user_id: Uuid) -> Result<String, AppError> {
+        sqlx::query_scalar::<_, String>("SELECT password_hash FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(AppError::Database)?
+            .ok_or(AppError::SessionInvalid)
+    }
+
     /// Session creation gated on credential freshness (issue #37).
     ///
     /// `expected_credential_hash` is the Argon2id PHC string verified at login.

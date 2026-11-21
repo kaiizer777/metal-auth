@@ -750,6 +750,47 @@ fn concurrent_replay_admits_exactly_one_request() {
     });
 }
 
+/// Response to a code `offset` steps from the live window, taken from an attempt whose step
+/// counter did not move under it.
+///
+/// A step boundary between generation and dispatch slides the code into the neighbouring
+/// window and can flip the expectation, so such an attempt proves nothing and is retried. An
+/// accepted rollover consumes its challenge and mints a session; that count is returned so the
+/// caller's session delta stays exact.
+async fn out_of_window_response(
+    app: &TestApp,
+    user_id: Uuid,
+    email: &str,
+    password: &str,
+    secret: &str,
+    offset: i64,
+) -> (TestResponse, i64) {
+    let mut slipped = 0;
+    for _ in 0..5 {
+        let counter = metal_auth::totp::crypto::current_totp_counter();
+        let token = challenge(app, email, password).await;
+        let code = code_at(secret, counter.saturating_add_signed(offset));
+        let resp = app
+            .post_json_with_ip(
+                "/auth/totp/verify",
+                json!({ "challenge_token": token, "code": code }),
+                &dynamic_ip(),
+            )
+            .await;
+        if metal_auth::totp::crypto::current_totp_counter() == counter {
+            return (resp, slipped);
+        }
+        if resp.status() == StatusCode::OK {
+            slipped += 1;
+        }
+        // Retries are not the behaviour under test, so they must not spend the user budget.
+        app.state
+            .rate_limiter
+            .reset(&RateLimiter::totp_user_key(user_id));
+    }
+    panic!("the totp step rolled over during every out-of-window probe");
+}
+
 /// Tier 4 §1: the ±1 step window accepts the next step and rejects two steps out.
 #[tokio::test]
 async fn clock_drift_accepts_the_next_step_and_rejects_two_steps_out() {
@@ -784,18 +825,8 @@ async fn clock_drift_accepts_the_next_step_and_rejects_two_steps_out() {
         accepted.body_str
     );
 
-    let ahead_token = challenge(&app, &email, &password).await;
-    let too_new = code_at(
-        &secret,
-        metal_auth::totp::crypto::current_totp_counter() + 2,
-    );
-    let rejected_ahead = app
-        .post_json_with_ip(
-            "/auth/totp/verify",
-            json!({ "challenge_token": ahead_token, "code": too_new }),
-            &dynamic_ip(),
-        )
-        .await;
+    let (rejected_ahead, ahead_slips) =
+        out_of_window_response(&app, user_id, &email, &password, &secret, 2).await;
     assert_eq!(
         rejected_ahead.status(),
         StatusCode::BAD_REQUEST,
@@ -807,18 +838,8 @@ async fn clock_drift_accepts_the_next_step_and_rejects_two_steps_out() {
         Some(ErrorCode::TotpCodeInvalid)
     );
 
-    let behind_token = challenge(&app, &email, &password).await;
-    let too_old = code_at(
-        &secret,
-        metal_auth::totp::crypto::current_totp_counter().saturating_sub(2),
-    );
-    let rejected_behind = app
-        .post_json_with_ip(
-            "/auth/totp/verify",
-            json!({ "challenge_token": behind_token, "code": too_old }),
-            &dynamic_ip(),
-        )
-        .await;
+    let (rejected_behind, behind_slips) =
+        out_of_window_response(&app, user_id, &email, &password, &secret, -2).await;
     assert_eq!(
         rejected_behind.status(),
         StatusCode::BAD_REQUEST,
@@ -832,8 +853,9 @@ async fn clock_drift_accepts_the_next_step_and_rejects_two_steps_out() {
 
     assert_eq!(
         count_sessions_for_user(&app.pool, user_id).await,
-        sessions_before + 1,
-        "only the in-window presentation may issue a session"
+        sessions_before + 1 + ahead_slips + behind_slips,
+        "only the in-window presentation may issue a session ({ahead_slips} and \
+         {behind_slips} out-of-window probes were accepted on a step rollover)"
     );
 }
 

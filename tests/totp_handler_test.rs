@@ -4,7 +4,7 @@ use axum::http::{HeaderMap, Method, StatusCode, header};
 use common::*;
 use metal_auth::{AppConfig, ErrorCode};
 use serde_json::json;
-use sqlx::PgPool;
+use sqlx::{Connection, PgConnection, PgPool};
 use uuid::Uuid;
 
 // ─── Enrollment ──────────────────────────────────────────────────────────────
@@ -683,14 +683,14 @@ async fn failed_session_issue_leaves_the_totp_code_unspent() {
     let token = challenge(&app, &email, &password).await;
     let code = totp_code(&secret);
 
-    reject_session_inserts_for(&app.pool, user_id).await;
+    let injection = reject_session_inserts_for(&app.pool, user_id).await;
     let failed = app
         .post_json(
             "/auth/totp/verify",
             json!({ "challenge_token": token, "code": code }),
         )
         .await;
-    allow_session_inserts(&app.pool).await;
+    injection.disarm().await;
 
     assert_eq!(
         failed.status(),
@@ -1061,14 +1061,14 @@ async fn failed_session_issue_leaves_the_backup_code_unspent() {
     let code = backup_codes[0].clone();
     let token = challenge(&app, &email, &password).await;
 
-    reject_session_inserts_for(&app.pool, user_id).await;
+    let injection = reject_session_inserts_for(&app.pool, user_id).await;
     let failed = app
         .post_json(
             "/auth/totp/backup",
             json!({ "challenge_token": token, "code": code }),
         )
         .await;
-    allow_session_inserts(&app.pool).await;
+    injection.disarm().await;
 
     assert_eq!(
         failed.status(),
@@ -1237,14 +1237,14 @@ async fn login_without_a_mintable_challenge_reports_authentication_unavailable()
     let user_id = user_id_for_email(&app.pool, &email).await;
     let sessions_before = count_sessions_for_user(&app.pool, user_id).await;
 
-    reject_challenge_inserts_for(&app.pool, user_id).await;
+    let injection = reject_challenge_inserts_for(&app.pool, user_id).await;
     let refused = app
         .post_json(
             "/auth/login",
             json!({ "email": email, "password": password }),
         )
         .await;
-    allow_challenge_inserts(&app.pool).await;
+    injection.disarm().await;
 
     assert_eq!(
         refused.status(),
@@ -1351,7 +1351,7 @@ async fn failed_disable_keeps_the_totp_proof_retryable() {
     let user_id = user_id_for_email(&app.pool, &email).await;
     let code = totp_code(&secret);
 
-    reject_factor_deletes_for(&app.pool, user_id).await;
+    let injection = reject_factor_deletes_for(&app.pool, user_id).await;
     let failed = app
         .dispatch(session_request(
             &app,
@@ -1362,7 +1362,7 @@ async fn failed_disable_keeps_the_totp_proof_retryable() {
             &dynamic_ip(),
         ))
         .await;
-    allow_factor_deletes(&app.pool).await;
+    injection.disarm().await;
 
     assert_eq!(
         failed.status(),
@@ -1401,98 +1401,215 @@ async fn failed_disable_keeps_the_totp_proof_retryable() {
 
 // ─── Failure injection ───────────────────────────────────────────────────────
 
+/// A panicking assertion must not leave the injected trigger behind for the next test.
+#[tokio::test]
+async fn injected_trigger_is_removed_when_an_assertion_panics() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let (email, _password, _secret, _backup_codes, _session) =
+        enabled_user(&app, &dynamic_ip()).await;
+    let user_id = user_id_for_email(&app.pool, &email).await;
+
+    let armed = std::sync::Mutex::new(Some(reject_challenge_inserts_for(&app.pool, user_id).await));
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _injection = armed.lock().expect("injection slot").take().expect("armed");
+        panic!("simulated assertion failure");
+    }));
+    assert!(unwound.is_err(), "the simulated assertion must unwind");
+
+    let triggers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pg_trigger WHERE tgname = $1")
+        .bind(CHALLENGE_INSERT.name)
+        .fetch_one(&app.pool)
+        .await
+        .expect("count triggers");
+    assert_eq!(
+        triggers, 0,
+        "an unwinding assertion must still remove the injected trigger"
+    );
+
+    // A later test installs the same name: it must not collide with a leftover.
+    reject_challenge_inserts_for(&app.pool, user_id)
+        .await
+        .disarm()
+        .await;
+}
+
+/// Where an injected failure fires, and the name its trigger and function share.
+struct InjectionTarget {
+    name: &'static str,
+    table: &'static str,
+    event: &'static str,
+    /// Row variable the per-user predicate reads; `DELETE` has only `OLD`.
+    row: &'static str,
+}
+
 /// Make `sessions` inserts fail for one user, so a redemption fails after its factor is
 /// verified without any test-only branch in production code.
-async fn reject_session_inserts_for(pool: &PgPool, user_id: Uuid) {
-    sqlx::query(
-        "CREATE OR REPLACE FUNCTION totp_test_reject_session() RETURNS trigger \
-         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected session insert failure'; END $$",
-    )
-    .execute(pool)
-    .await
-    .expect("create session failure function");
-    // The only interpolated value is a `Uuid`; a trigger predicate cannot take binds.
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE TRIGGER totp_test_reject_session BEFORE INSERT ON sessions \
-         FOR EACH ROW WHEN (NEW.user_id = '{user_id}') \
-         EXECUTE FUNCTION totp_test_reject_session()"
-    )))
-    .execute(pool)
-    .await
-    .expect("create session failure trigger");
-}
-
-async fn allow_session_inserts(pool: &PgPool) {
-    sqlx::query("DROP TRIGGER IF EXISTS totp_test_reject_session ON sessions")
-        .execute(pool)
-        .await
-        .expect("drop session failure trigger");
-    sqlx::query("DROP FUNCTION IF EXISTS totp_test_reject_session()")
-        .execute(pool)
-        .await
-        .expect("drop session failure function");
-}
+const SESSION_INSERT: InjectionTarget = InjectionTarget {
+    name: "totp_test_reject_session",
+    table: "sessions",
+    event: "INSERT",
+    row: "NEW",
+};
 
 /// Make `two_factor_tokens` inserts fail for one user, so a login cannot mint its challenge.
-async fn reject_challenge_inserts_for(pool: &PgPool, user_id: Uuid) {
-    sqlx::query(
-        "CREATE OR REPLACE FUNCTION totp_test_reject_challenge() RETURNS trigger \
-         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected challenge insert failure'; END $$",
-    )
-    .execute(pool)
-    .await
-    .expect("create challenge failure function");
-    // The only interpolated value is a `Uuid`; a trigger predicate cannot take binds.
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE TRIGGER totp_test_reject_challenge BEFORE INSERT ON two_factor_tokens \
-         FOR EACH ROW WHEN (NEW.user_id = '{user_id}') \
-         EXECUTE FUNCTION totp_test_reject_challenge()"
-    )))
-    .execute(pool)
-    .await
-    .expect("create challenge failure trigger");
-}
-
-async fn allow_challenge_inserts(pool: &PgPool) {
-    sqlx::query("DROP TRIGGER IF EXISTS totp_test_reject_challenge ON two_factor_tokens")
-        .execute(pool)
-        .await
-        .expect("drop challenge failure trigger");
-    sqlx::query("DROP FUNCTION IF EXISTS totp_test_reject_challenge()")
-        .execute(pool)
-        .await
-        .expect("drop challenge failure function");
-}
+const CHALLENGE_INSERT: InjectionTarget = InjectionTarget {
+    name: "totp_test_reject_challenge",
+    table: "two_factor_tokens",
+    event: "INSERT",
+    row: "NEW",
+};
 
 /// Make `totp_secrets` deletes fail for one user, so a disable fails after its proof.
-async fn reject_factor_deletes_for(pool: &PgPool, user_id: Uuid) {
-    sqlx::query(
-        "CREATE OR REPLACE FUNCTION totp_test_reject_secret_delete() RETURNS trigger \
-         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected factor delete failure'; END $$",
-    )
-    .execute(pool)
-    .await
-    .expect("create delete failure function");
-    // The only interpolated value is a `Uuid`; a trigger predicate cannot take binds.
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE TRIGGER totp_test_reject_secret_delete BEFORE DELETE ON totp_secrets \
-         FOR EACH ROW WHEN (OLD.user_id = '{user_id}') \
-         EXECUTE FUNCTION totp_test_reject_secret_delete()"
-    )))
-    .execute(pool)
-    .await
-    .expect("create delete failure trigger");
+const SECRET_DELETE: InjectionTarget = InjectionTarget {
+    name: "totp_test_reject_secret_delete",
+    table: "totp_secrets",
+    event: "DELETE",
+    row: "OLD",
+};
+
+/// An injected failure, removed when it goes out of scope.
+///
+/// `Drop` cannot await, and blocking a current-thread test runtime would stall the driver
+/// the pool's sockets are registered on, so an armed guard opens its own connection on a
+/// scratch thread and finishes the drops there. A panicking assertion therefore cannot
+/// leave the trigger behind to collide with the next test in this binary.
+struct FailureInjection {
+    pool: PgPool,
+    name: &'static str,
+    table: &'static str,
+    armed: bool,
 }
 
-async fn allow_factor_deletes(pool: &PgPool) {
-    sqlx::query("DROP TRIGGER IF EXISTS totp_test_reject_secret_delete ON totp_secrets")
-        .execute(pool)
-        .await
-        .expect("drop delete failure trigger");
-    sqlx::query("DROP FUNCTION IF EXISTS totp_test_reject_secret_delete()")
-        .execute(pool)
-        .await
-        .expect("drop delete failure function");
+impl FailureInjection {
+    async fn install(
+        pool: &PgPool,
+        target: &InjectionTarget,
+        raise_message: &str,
+        user_id: Uuid,
+    ) -> Self {
+        let InjectionTarget {
+            name,
+            table,
+            event,
+            row,
+        } = *target;
+        let create_function = format!(
+            "CREATE OR REPLACE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql \
+             AS $$ BEGIN RAISE EXCEPTION '{raise_message}'; END $$"
+        );
+        // The only interpolated value is a `Uuid`; a trigger predicate cannot take binds.
+        let create_trigger = format!(
+            "CREATE TRIGGER {name} BEFORE {event} ON {table} FOR EACH ROW \
+             WHEN ({row}.user_id = '{user_id}') EXECUTE FUNCTION {name}()"
+        );
+        // A process killed before its guard dropped leaves the trigger behind; clear the
+        // name first so a later run can install the same injection.
+        let drop_trigger = format!("DROP TRIGGER IF EXISTS {name} ON {table}");
+        for statement in [drop_trigger, create_function, create_trigger] {
+            sqlx::query(sqlx::AssertSqlSafe(statement))
+                .execute(pool)
+                .await
+                .expect("install failure injection");
+        }
+        Self {
+            // Arc-backed handle; the guard outlives the call and needs its own.
+            pool: pool.clone(),
+            name,
+            table,
+            armed: true,
+        }
+    }
+
+    /// Remove the injection now, on a path that is about to assert.
+    async fn disarm(mut self) {
+        self.armed = false;
+        for statement in self.drop_statements() {
+            sqlx::query(sqlx::AssertSqlSafe(statement))
+                .execute(&self.pool)
+                .await
+                .expect("drop failure injection");
+        }
+    }
+
+    fn drop_statements(&self) -> [String; 2] {
+        [
+            format!("DROP TRIGGER IF EXISTS {} ON {}", self.name, self.table),
+            format!("DROP FUNCTION IF EXISTS {}()", self.name),
+        ]
+    }
+}
+
+impl Drop for FailureInjection {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let options = self.pool.connect_options();
+        let statements = self.drop_statements();
+        // Wait for the cleanup: the next test takes `DB_LOCK` only after this frame has
+        // finished unwinding.
+        let cleanup = std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("failure injection cleanup skipped: {error}");
+                    return;
+                }
+            };
+            let dropped = runtime.block_on(async move {
+                let mut connection = PgConnection::connect_with(&options).await?;
+                for statement in statements {
+                    sqlx::query(sqlx::AssertSqlSafe(statement))
+                        .execute(&mut connection)
+                        .await?;
+                }
+                Ok::<(), sqlx::Error>(())
+            });
+            if let Err(error) = dropped {
+                eprintln!("failure injection cleanup failed: {error}");
+            }
+        });
+        if cleanup.join().is_err() {
+            eprintln!("failure injection cleanup thread panicked");
+        }
+    }
+}
+
+async fn reject_session_inserts_for(pool: &PgPool, user_id: Uuid) -> FailureInjection {
+    FailureInjection::install(
+        pool,
+        &SESSION_INSERT,
+        "injected session insert failure",
+        user_id,
+    )
+    .await
+}
+
+async fn reject_challenge_inserts_for(pool: &PgPool, user_id: Uuid) -> FailureInjection {
+    FailureInjection::install(
+        pool,
+        &CHALLENGE_INSERT,
+        "injected challenge insert failure",
+        user_id,
+    )
+    .await
+}
+
+async fn reject_factor_deletes_for(pool: &PgPool, user_id: Uuid) -> FailureInjection {
+    FailureInjection::install(
+        pool,
+        &SECRET_DELETE,
+        "injected factor delete failure",
+        user_id,
+    )
+    .await
 }
 
 async fn used_code_rows(pool: &PgPool, user_id: Uuid) -> i64 {

@@ -164,6 +164,26 @@ async fn assert_phase7_absent(pool: &PgPool, schema: &str) -> Result<(), String>
         ));
     }
 
+    // A future 0008 object would be invisible to the name lists above, so require the whole
+    // phase 7 namespace to be empty.
+    let leftovers: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name FROM information_schema.tables \
+          WHERE table_schema = $1 AND (table_name LIKE 'totp%' OR table_name LIKE 'two_factor%') \
+         UNION ALL \
+         SELECT indexname FROM pg_indexes \
+          WHERE schemaname = $1 \
+            AND (indexname LIKE 'idx_totp%' OR indexname LIKE 'idx_two_factor%')",
+    )
+    .bind(schema)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("inspect schema {schema}: {e}"))?;
+    if !leftovers.is_empty() {
+        return Err(format!(
+            "phase 7 namespace is not empty after the down: {leftovers:?}"
+        ));
+    }
+
     Ok(())
 }
 

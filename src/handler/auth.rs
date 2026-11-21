@@ -631,7 +631,10 @@ mod tests {
     }
 
     fn create_test_state() -> AuthHandlerState {
-        let pool = PgPool::connect_lazy("postgres://localhost/test").expect("lazy pool");
+        // The gate is mandatory, so never let its pool default to an unrelated database.
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://localhost/metal_auth_test".into());
+        let pool = PgPool::connect_lazy(&database_url).expect("lazy pool");
         let config = Arc::new(AppConfig {
             argon2_m_cost: 19456,
             argon2_t_cost: 2,

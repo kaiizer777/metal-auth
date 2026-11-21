@@ -95,18 +95,19 @@ async fn create_verified_user(app: &TestApp) -> (String, String) {
         signup_resp.body_str
     );
 
-    if let Some(token) = app.email_sender.verification_token_for(&email) {
-        let verify_resp = app
-            .post_json("/auth/verify", json!({ "token": token }))
-            .await;
-        assert_eq!(verify_resp.status(), StatusCode::OK);
-    }
-
-    sqlx::query("UPDATE users SET email_verified = true WHERE email = $1")
-        .bind(&email)
-        .execute(&app.pool)
-        .await
-        .expect("ensure email verified");
+    let token = app
+        .email_sender
+        .verification_token_for(&email)
+        .expect("signup must capture a verification token");
+    let verify_resp = app
+        .post_json("/auth/verify", json!({ "token": token }))
+        .await;
+    assert_eq!(
+        verify_resp.status(),
+        StatusCode::OK,
+        "email verification failed: {}",
+        verify_resp.body_str
+    );
 
     (email, password)
 }

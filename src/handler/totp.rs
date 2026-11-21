@@ -26,7 +26,7 @@ use crate::{
         auth::{AuthUser, require_auth},
         csrf_middleware,
     },
-    ratelimit::RateLimiter,
+    ratelimit::RateLimitRejection,
     state::AppState,
     totp::service::FreshAuthProof,
 };
@@ -109,29 +109,17 @@ pub async fn totp_enroll(
     let client_ip = extract_client_ip(&headers);
     let user_agent = user_agent(&headers);
 
-    if state
+    if let Err(rejection) = state
         .rate_limiter
         .check_totp_ip_limit(&client_ip, &state.config.totp)
-        .is_err()
     {
-        return totp_rate_limit_exceeded(
-            &state,
-            &client_ip,
-            "ip",
-            &RateLimiter::totp_ip_key(&client_ip),
-        );
+        return totp_rate_limit_exceeded(&client_ip, "ip", rejection);
     }
-    if state
+    if let Err(rejection) = state
         .rate_limiter
         .check_totp_user_limit(auth_user.user_id, &state.config.totp)
-        .is_err()
     {
-        return totp_rate_limit_exceeded(
-            &state,
-            &client_ip,
-            "user",
-            &RateLimiter::totp_user_key(auth_user.user_id),
-        );
+        return totp_rate_limit_exceeded(&client_ip, "user", rejection);
     }
 
     match state.totp_service.enroll_totp(auth_user.user_id).await {
@@ -165,29 +153,17 @@ pub async fn totp_confirm(
 
     let client_ip = extract_client_ip(&headers);
 
-    if state
+    if let Err(rejection) = state
         .rate_limiter
         .check_totp_ip_limit(&client_ip, &state.config.totp)
-        .is_err()
     {
-        return totp_rate_limit_exceeded(
-            &state,
-            &client_ip,
-            "ip",
-            &RateLimiter::totp_ip_key(&client_ip),
-        );
+        return totp_rate_limit_exceeded(&client_ip, "ip", rejection);
     }
-    if state
+    if let Err(rejection) = state
         .rate_limiter
         .check_totp_user_limit(auth_user.user_id, &state.config.totp)
-        .is_err()
     {
-        return totp_rate_limit_exceeded(
-            &state,
-            &client_ip,
-            "user",
-            &RateLimiter::totp_user_key(auth_user.user_id),
-        );
+        return totp_rate_limit_exceeded(&client_ip, "user", rejection);
     }
 
     match state
@@ -280,29 +256,17 @@ pub async fn totp_disable(
 
     let client_ip = extract_client_ip(&headers);
 
-    if state
+    if let Err(rejection) = state
         .rate_limiter
         .check_totp_ip_limit(&client_ip, &state.config.totp)
-        .is_err()
     {
-        return totp_rate_limit_exceeded(
-            &state,
-            &client_ip,
-            "ip",
-            &RateLimiter::totp_ip_key(&client_ip),
-        );
+        return totp_rate_limit_exceeded(&client_ip, "ip", rejection);
     }
-    if state
+    if let Err(rejection) = state
         .rate_limiter
         .check_totp_user_limit(auth_user.user_id, &state.config.totp)
-        .is_err()
     {
-        return totp_rate_limit_exceeded(
-            &state,
-            &client_ip,
-            "user",
-            &RateLimiter::totp_user_key(auth_user.user_id),
-        );
+        return totp_rate_limit_exceeded(&client_ip, "user", rejection);
     }
 
     match state
@@ -331,16 +295,17 @@ pub async fn totp_disable(
 
 /// 429 for either TOTP dimension.
 ///
-/// `Retry-After` is the remaining window of the key that actually tripped, derived from
-/// the limiter's own entry. Capacity exhaustion retains no attempt window for the key,
-/// so that rejection carries no header rather than an invented duration.
+/// `Retry-After` comes from the rejection value itself, so the header always describes the
+/// decision that produced it rather than whatever the key holds by the time the response is
+/// built. A window rejection carries the remaining time of the attempt that tripped it;
+/// capacity exhaustion carries none, so that response omits the header instead of
+/// inventing a duration (RFC 6585 §4 permits either).
 fn totp_rate_limit_exceeded(
-    state: &AppState,
     client_ip: &str,
     dimension: &'static str,
-    key: &str,
+    rejection: RateLimitRejection,
 ) -> Response {
-    let retry_after_secs = state.rate_limiter.remaining_window(key);
+    let retry_after_secs = rejection.retry_after();
 
     tracing::warn!(
         event = "rate_limit_exceeded",
@@ -367,17 +332,11 @@ async fn challenge_user_id(
     client_ip: &str,
     challenge_token: &str,
 ) -> Result<Uuid, Response> {
-    if state
+    if let Err(rejection) = state
         .rate_limiter
         .check_totp_ip_limit(client_ip, &state.config.totp)
-        .is_err()
     {
-        return Err(totp_rate_limit_exceeded(
-            state,
-            client_ip,
-            "ip",
-            &RateLimiter::totp_ip_key(client_ip),
-        ));
+        return Err(totp_rate_limit_exceeded(client_ip, "ip", rejection));
     }
 
     let user_id = match state
@@ -389,17 +348,11 @@ async fn challenge_user_id(
         Err(error) => return Err(service_error_response(error)),
     };
 
-    if state
+    if let Err(rejection) = state
         .rate_limiter
         .check_totp_user_limit(user_id, &state.config.totp)
-        .is_err()
     {
-        return Err(totp_rate_limit_exceeded(
-            state,
-            client_ip,
-            "user",
-            &RateLimiter::totp_user_key(user_id),
-        ));
+        return Err(totp_rate_limit_exceeded(client_ip, "user", rejection));
     }
 
     Ok(user_id)

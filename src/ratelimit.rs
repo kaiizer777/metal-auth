@@ -42,8 +42,9 @@ pub enum KeyAdmission {
 pub enum RateLimitRejection {
     /// Active lockout duration in whole seconds (minimum 1s, ceiling rounded).
     Lockout(u64),
-    /// Attempt limit exceeded for the sliding window without cooldown.
-    Exceeded,
+    /// Attempt limit exceeded for the sliding window; carries the whole seconds until the
+    /// oldest admitted attempt leaves the window (minimum 1s, ceiling rounded).
+    Exceeded(u64),
     /// Maximum capacity of rate limiter entries exceeded.
     CapacityExhausted,
 }
@@ -51,12 +52,13 @@ pub enum RateLimitRejection {
 impl RateLimitRejection {
     /// Return the `Retry-After` header value in seconds, if applicable.
     ///
-    /// Omitted for [`RateLimitRejection::CapacityExhausted`] or [`RateLimitRejection::Exceeded`].
+    /// `None` only for [`RateLimitRejection::CapacityExhausted`]: that rejection admitted no
+    /// attempt, so it has no window to advertise.
     #[must_use]
     pub fn retry_after(&self) -> Option<u64> {
         match self {
-            Self::Lockout(secs) => Some(*secs),
-            Self::Exceeded | Self::CapacityExhausted => None,
+            Self::Lockout(secs) | Self::Exceeded(secs) => Some(*secs),
+            Self::CapacityExhausted => None,
         }
     }
 
@@ -77,7 +79,7 @@ impl std::fmt::Display for RateLimitRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Lockout(secs) => write!(f, "rate limit lockout: retry after {secs}s"),
-            Self::Exceeded => write!(f, "rate limit exceeded"),
+            Self::Exceeded(secs) => write!(f, "rate limit exceeded: retry after {secs}s"),
             Self::CapacityExhausted => write!(f, "rate limiter capacity exhausted"),
         }
     }
@@ -198,7 +200,12 @@ impl RateLimiter {
                 let secs = (cd.as_secs_f64().ceil() as u64).max(1);
                 return Err(RateLimitRejection::Lockout(secs));
             }
-            return Err(RateLimitRejection::Exceeded);
+            // The window reopens when its oldest attempt expires; the rejection carries
+            // that instant so the caller never has to re-read the key for `Retry-After`.
+            let oldest = entry.attempts.iter().min().copied().unwrap_or(now);
+            let remaining = window.saturating_sub(now.duration_since(oldest));
+            let secs = (remaining.as_secs_f64().ceil() as u64).max(1);
+            return Err(RateLimitRejection::Exceeded(secs));
         }
 
         entry.attempts.push(now);
@@ -374,8 +381,8 @@ impl RateLimiter {
     /// disjoint from the `ip:` / `account:` / `reset_account:` dimensions.
     ///
     /// Rejects with [`RateLimitRejection::Exceeded`], never `Lockout`: the rejection is a
-    /// sliding-window exhaustion, so the handler advertises the exact reopening instant
-    /// via [`Self::remaining_window`] instead of a synthetic lockout duration.
+    /// sliding-window exhaustion, and it carries the exact reopening instant for the
+    /// handler's `Retry-After` instead of a synthetic lockout duration.
     pub fn check_totp_ip_limit(
         &self,
         ip: &str,
@@ -1112,10 +1119,10 @@ mod tests {
         for _ in 0..3 {
             assert!(limiter.check_totp_ip_limit("198.51.100.8", &totp).is_ok());
         }
-        assert_eq!(
-            limiter.check_totp_ip_limit("198.51.100.8", &totp),
-            Err(RateLimitRejection::Exceeded)
-        );
+        let rejection = limiter
+            .check_totp_ip_limit("198.51.100.8", &totp)
+            .expect_err("the IP budget must trip");
+        assert!(matches!(rejection, RateLimitRejection::Exceeded(_)));
         // Another IP still has its own budget.
         assert!(limiter.check_totp_ip_limit("198.51.100.9", &totp).is_ok());
     }
@@ -1130,10 +1137,10 @@ mod tests {
         for _ in 0..2 {
             assert!(limiter.check_totp_user_limit(user, &totp).is_ok());
         }
-        assert_eq!(
-            limiter.check_totp_user_limit(user, &totp),
-            Err(RateLimitRejection::Exceeded)
-        );
+        let rejection = limiter
+            .check_totp_user_limit(user, &totp)
+            .expect_err("the user budget must trip");
+        assert!(matches!(rejection, RateLimitRejection::Exceeded(_)));
         assert!(
             limiter.windows.contains_key(&format!("totp:user:{user}")),
             "user dimension must use the `totp:user:<user_id>` key"
@@ -1156,6 +1163,56 @@ mod tests {
         let secs = limiter.remaining_window(&key).expect("window entry");
         assert!((59..=60).contains(&secs));
         assert!(limiter.remaining_window("totp:ip:unknown").is_none());
+    }
+
+    #[test]
+    fn window_rejection_reports_its_own_remaining_time_after_the_key_is_reclaimed() {
+        let limiter = RateLimiter::new();
+        let totp = totp_test_config();
+        let ip = "198.51.100.13";
+        for _ in 0..3 {
+            assert!(limiter.check_totp_ip_limit(ip, &totp).is_ok());
+        }
+        let rejection = limiter
+            .check_totp_ip_limit(ip, &totp)
+            .expect_err("the IP budget must trip");
+        let advertised = rejection
+            .retry_after()
+            .expect("a window rejection advertises its reopening instant");
+        assert!((59..=60).contains(&advertised));
+
+        // Reclaim the slot and let a different request claim the same key with a shorter
+        // window: a re-read of the key would now advertise that request's value.
+        limiter.reset(&RateLimiter::totp_ip_key(ip));
+        assert!(limiter.allow(&RateLimiter::totp_ip_key(ip), 5, Duration::from_secs(5)));
+        let reread = limiter
+            .remaining_window(&RateLimiter::totp_ip_key(ip))
+            .expect("the replacement request registered the key");
+        assert!(reread <= 5);
+        assert_eq!(rejection.retry_after(), Some(advertised));
+    }
+
+    #[test]
+    fn capacity_rejection_has_no_retry_after() {
+        let config = RateLimitConfig {
+            enabled: true,
+            max_attempts: 5,
+            window_secs: 60,
+            login_cooldown_secs: 60,
+        };
+        let limiter = RateLimiter::with_config_and_capacity(config, 1);
+        assert!(limiter.check_ip("192.0.2.10").is_ok());
+
+        let rejection = limiter
+            .check_totp_ip_limit("192.0.2.11", &totp_test_config())
+            .expect_err("capacity must reject a key that was never admitted");
+        assert_eq!(rejection, RateLimitRejection::CapacityExhausted);
+        assert_eq!(rejection.retry_after(), None);
+        assert!(
+            limiter
+                .remaining_window(&RateLimiter::totp_ip_key("192.0.2.11"))
+                .is_none()
+        );
     }
 
     #[test]

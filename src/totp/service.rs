@@ -956,6 +956,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verify_backup_code_requires_an_enabled_secret() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        assert!(matches!(
+            ctx.service
+                .verify_backup_code(user_id, "AAAAAAAAAA", "ip")
+                .await,
+            Err(AppError::TotpNotEnrolled)
+        ));
+
+        let response = ctx.service.enroll_totp(user_id).await.expect("enroll");
+        assert!(matches!(
+            ctx.service
+                .verify_backup_code(user_id, &response.backup_codes[0], "ip")
+                .await,
+            Err(AppError::TotpNotEnrolled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn disable_rejects_an_invalid_totp_proof() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let response = enroll_and_confirm(&ctx, user_id).await;
+        let raw = decode_totp_secret(&response.secret_base32).expect("decode");
+        let distant_code = format!(
+            "{:06}",
+            generate_totp(&raw, current_totp_counter() + 3).expect("generate")
+        );
+
+        assert!(matches!(
+            ctx.service
+                .disable_totp(user_id, FreshAuthProof::TotpCode(distant_code), "ip")
+                .await,
+            Err(AppError::TotpCodeInvalid)
+        ));
+        assert!(ctx.service.is_totp_enabled(user_id).await.expect("state"));
+    }
+
+    #[tokio::test]
     async fn disable_requires_a_valid_password_and_wipes_state() {
         let Some(ctx) = setup_db_context().await else {
             return;

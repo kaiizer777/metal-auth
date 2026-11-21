@@ -261,6 +261,21 @@ async fn enroll_rejects_unverified_email() {
 
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert_eq!(resp.error_code(), Some(ErrorCode::EmailNotVerified));
+
+    let user_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM users WHERE email = $1")
+        .bind(&email)
+        .fetch_one(&app.pool)
+        .await
+        .expect("user row");
+    let secrets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM totp_secrets WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_one(&app.pool)
+        .await
+        .expect("totp secrets count");
+    assert_eq!(
+        secrets, 0,
+        "an unverified enrollment must not create a secret row"
+    );
 }
 
 #[tokio::test]

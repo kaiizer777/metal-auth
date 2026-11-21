@@ -297,7 +297,7 @@ async fn confirm_enables_totp_and_rejects_repeat() {
 }
 
 #[tokio::test]
-async fn confirm_rate_limits_user_dimension() {
+async fn confirm_rate_limits_enrollment_dimension() {
     let _guard = DB_LOCK.lock().await;
     let Some(app) = setup_test_app().await else {
         return;
@@ -339,7 +339,7 @@ async fn confirm_rate_limits_user_dimension() {
     assert_eq!(
         rejected_codes,
         app.state.config.totp.rate_limit_user_max_attempts - 1,
-        "enrollment spends one user attempt, so confirm must admit the rest of the budget"
+        "enroll shares the enrollment budget, so confirm must admit the rest of it"
     );
 }
 
@@ -774,9 +774,8 @@ async fn verify_rate_limits_user_dimension() {
         enabled_user(&app, &dynamic_ip()).await;
     let token = challenge(&app, &email, &password).await;
 
-    // Enrollment and confirmation already spent two of the five user attempts, so three
-    // rejected codes fit before the budget trips; a fresh IP per attempt keeps the
-    // dimension isolated.
+    // Enrollment spends only the `totp:enroll:*` dimensions, so the whole user budget is
+    // available to verification; a fresh IP per attempt keeps the dimensions isolated.
     let mut rejected_codes = 0;
     let mut tripped = None;
     for _ in 0..6 {
@@ -815,9 +814,8 @@ async fn verify_rate_limits_user_dimension() {
         "the user budget must trip within six attempts"
     );
     assert_eq!(
-        rejected_codes,
-        app.state.config.totp.rate_limit_user_max_attempts - 2,
-        "enrollment and confirmation spend two user attempts, so verify must admit the rest"
+        rejected_codes, app.state.config.totp.rate_limit_user_max_attempts,
+        "enrollment uses its own dimension, so verify must admit the whole user budget"
     );
 }
 

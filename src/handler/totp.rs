@@ -31,6 +31,11 @@ use crate::{
     totp::service::FreshAuthProof,
 };
 
+/// Log prefix for rejections from the verification budgets (`totp:*`).
+const TOTP_KEY_PREFIX: &str = "totp";
+/// Log prefix for rejections from the enrollment budgets (`totp:enroll:*`).
+const ENROLL_KEY_PREFIX: &str = "totp:enroll";
+
 /// `POST /auth/totp/confirm` body.
 #[derive(Deserialize)]
 pub struct ConfirmTotpRequest {
@@ -100,7 +105,8 @@ impl DisableTotpRequest {
 /// Rotates the pending secret and returns the QR URI plus the backup codes once.
 /// Refuses unverified emails and an already enabled secret. Rate-limited like every other
 /// TOTP route: enrollment spends ten Argon2id hashes on the shared blocking pool, so an
-/// unthrottled reroll loop is a CPU-exhaustion vector for the whole instance.
+/// unthrottled reroll loop is a CPU-exhaustion vector for the whole instance. Its own
+/// `totp:enroll:*` keys keep that throttle off the budget code verification needs.
 pub async fn totp_enroll(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -111,15 +117,15 @@ pub async fn totp_enroll(
 
     if let Err(rejection) = state
         .rate_limiter
-        .check_totp_ip_limit(&client_ip, &state.config.totp)
+        .check_totp_enroll_ip_limit(&client_ip, &state.config.totp)
     {
-        return totp_rate_limit_exceeded(&client_ip, "ip", rejection);
+        return totp_rate_limit_exceeded(&client_ip, ENROLL_KEY_PREFIX, "ip", rejection);
     }
     if let Err(rejection) = state
         .rate_limiter
-        .check_totp_user_limit(auth_user.user_id, &state.config.totp)
+        .check_totp_enroll_user_limit(auth_user.user_id, &state.config.totp)
     {
-        return totp_rate_limit_exceeded(&client_ip, "user", rejection);
+        return totp_rate_limit_exceeded(&client_ip, ENROLL_KEY_PREFIX, "user", rejection);
     }
 
     match state.totp_service.enroll_totp(auth_user.user_id).await {
@@ -139,7 +145,9 @@ pub async fn totp_enroll(
 
 /// `POST /auth/totp/confirm`
 ///
-/// Verifies the first code against the pending secret and enables 2FA.
+/// Verifies the first code against the pending secret and enables 2FA. Confirmation is the
+/// second half of enrollment, so it shares the enrollment budget rather than the
+/// verification one.
 pub async fn totp_confirm(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -155,15 +163,15 @@ pub async fn totp_confirm(
 
     if let Err(rejection) = state
         .rate_limiter
-        .check_totp_ip_limit(&client_ip, &state.config.totp)
+        .check_totp_enroll_ip_limit(&client_ip, &state.config.totp)
     {
-        return totp_rate_limit_exceeded(&client_ip, "ip", rejection);
+        return totp_rate_limit_exceeded(&client_ip, ENROLL_KEY_PREFIX, "ip", rejection);
     }
     if let Err(rejection) = state
         .rate_limiter
-        .check_totp_user_limit(auth_user.user_id, &state.config.totp)
+        .check_totp_enroll_user_limit(auth_user.user_id, &state.config.totp)
     {
-        return totp_rate_limit_exceeded(&client_ip, "user", rejection);
+        return totp_rate_limit_exceeded(&client_ip, ENROLL_KEY_PREFIX, "user", rejection);
     }
 
     match state
@@ -260,13 +268,13 @@ pub async fn totp_disable(
         .rate_limiter
         .check_totp_ip_limit(&client_ip, &state.config.totp)
     {
-        return totp_rate_limit_exceeded(&client_ip, "ip", rejection);
+        return totp_rate_limit_exceeded(&client_ip, TOTP_KEY_PREFIX, "ip", rejection);
     }
     if let Err(rejection) = state
         .rate_limiter
         .check_totp_user_limit(auth_user.user_id, &state.config.totp)
     {
-        return totp_rate_limit_exceeded(&client_ip, "user", rejection);
+        return totp_rate_limit_exceeded(&client_ip, TOTP_KEY_PREFIX, "user", rejection);
     }
 
     match state
@@ -302,6 +310,7 @@ pub async fn totp_disable(
 /// inventing a duration (RFC 6585 §4 permits either).
 fn totp_rate_limit_exceeded(
     client_ip: &str,
+    key_prefix: &'static str,
     dimension: &'static str,
     rejection: RateLimitRejection,
 ) -> Response {
@@ -310,7 +319,7 @@ fn totp_rate_limit_exceeded(
     tracing::warn!(
         event = "rate_limit_exceeded",
         ip = %client_ip,
-        key_prefix = "totp",
+        key_prefix,
         dimension,
         retry_after_secs = ?retry_after_secs,
     );
@@ -336,7 +345,12 @@ async fn challenge_user_id(
         .rate_limiter
         .check_totp_ip_limit(client_ip, &state.config.totp)
     {
-        return Err(totp_rate_limit_exceeded(client_ip, "ip", rejection));
+        return Err(totp_rate_limit_exceeded(
+            client_ip,
+            TOTP_KEY_PREFIX,
+            "ip",
+            rejection,
+        ));
     }
 
     let user_id = match state
@@ -352,7 +366,12 @@ async fn challenge_user_id(
         .rate_limiter
         .check_totp_user_limit(user_id, &state.config.totp)
     {
-        return Err(totp_rate_limit_exceeded(client_ip, "user", rejection));
+        return Err(totp_rate_limit_exceeded(
+            client_ip,
+            TOTP_KEY_PREFIX,
+            "user",
+            rejection,
+        ));
     }
 
     Ok(user_id)

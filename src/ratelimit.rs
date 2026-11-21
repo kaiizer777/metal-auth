@@ -160,6 +160,18 @@ impl RateLimiter {
         Self::format_account_key("totp:user", &user_id.to_string())
     }
 
+    /// Format the `totp:enroll:ip:<ip>` budget key.
+    #[must_use]
+    pub fn totp_enroll_ip_key(ip: &str) -> String {
+        Self::format_account_key("totp:enroll:ip", ip)
+    }
+
+    /// Format the `totp:enroll:user:<user_id>` budget key.
+    #[must_use]
+    pub fn totp_enroll_user_key(user_id: uuid::Uuid) -> String {
+        Self::format_account_key("totp:enroll:user", &user_id.to_string())
+    }
+
     /// Seconds until the oldest admitted attempt leaves `key`'s sliding window.
     ///
     /// `None` when the key is unknown or holds no recorded attempt. A caller that
@@ -420,6 +432,40 @@ impl RateLimiter {
     ) -> Result<(), RateLimitRejection> {
         let (_, res) = self.check_internal(key, max, Duration::from_secs(window_secs), None);
         res
+    }
+
+    /// Check the enrollment IP budget (`totp:enroll:ip:<ip>`).
+    ///
+    /// Enrollment (secret rotation plus confirmation) hashes ten Argon2id codes per call, so
+    /// it needs its own throttle. Separate keys keep a reroll loop from spending the attempts
+    /// `/auth/totp/verify` and `/auth/totp/backup` need after login.
+    pub fn check_totp_enroll_ip_limit(
+        &self,
+        ip: &str,
+        totp: &TotpConfig,
+    ) -> Result<(), RateLimitRejection> {
+        let key = Self::totp_enroll_ip_key(ip);
+        self.check_totp_window(
+            &key,
+            totp.rate_limit_ip_max_attempts,
+            totp.rate_limit_window_secs,
+        )
+    }
+
+    /// Check the enrollment per-user budget (`totp:enroll:user:<user_id>`).
+    ///
+    /// Same independence and rejection semantics as [`Self::check_totp_enroll_ip_limit`].
+    pub fn check_totp_enroll_user_limit(
+        &self,
+        user_id: uuid::Uuid,
+        totp: &TotpConfig,
+    ) -> Result<(), RateLimitRejection> {
+        let key = Self::totp_enroll_user_key(user_id);
+        self.check_totp_window(
+            &key,
+            totp.rate_limit_user_max_attempts,
+            totp.rate_limit_window_secs,
+        )
     }
 
     /// Check rate limit for password reset requests.
@@ -1231,6 +1277,41 @@ mod tests {
             assert!(limiter.check_totp_user_limit(user, &totp).is_ok());
         }
         assert!(limiter.check_totp_user_limit(user, &totp).is_err());
+    }
+
+    #[test]
+    fn enrollment_limits_key_separately_from_verification() {
+        let limiter = RateLimiter::new();
+        let totp = totp_test_config();
+        let user = uuid::Uuid::new_v4();
+        let ip = "198.51.100.20";
+
+        for _ in 0..3 {
+            assert!(limiter.check_totp_enroll_ip_limit(ip, &totp).is_ok());
+        }
+        assert!(limiter.check_totp_enroll_ip_limit(ip, &totp).is_err());
+        assert!(
+            limiter
+                .windows
+                .contains_key(&RateLimiter::totp_enroll_ip_key(ip))
+        );
+        assert!(
+            !limiter.windows.contains_key(&RateLimiter::totp_ip_key(ip)),
+            "enrollment must not spend the verification IP budget"
+        );
+
+        for _ in 0..2 {
+            assert!(limiter.check_totp_enroll_user_limit(user, &totp).is_ok());
+        }
+        assert!(limiter.check_totp_enroll_user_limit(user, &totp).is_err());
+
+        // Both verification dimensions keep their full budget after enrollment trips.
+        for _ in 0..3 {
+            assert!(limiter.check_totp_ip_limit(ip, &totp).is_ok());
+        }
+        for _ in 0..2 {
+            assert!(limiter.check_totp_user_limit(user, &totp).is_ok());
+        }
     }
 
     #[test]

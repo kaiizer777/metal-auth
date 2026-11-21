@@ -280,10 +280,9 @@ fn percent_encode(value: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Any valid 32-byte key will do; it carries no secret material.
     fn test_key() -> [u8; AES_KEY_BYTES] {
-        // Test-only AES key, never a production secret.
-        // codeql[rust/hard-coded-cryptographic-value]
-        *b"0123456789abcdef0123456789abcdef"
+        Aes256Gcm::generate_key(&mut OsRng).into()
     }
 
     /// RFC 6238 Appendix B SHA-1 seed. Test vector, never a production secret.
@@ -291,19 +290,21 @@ mod tests {
 
     #[test]
     fn aes_gcm_round_trips() {
+        let key = test_key();
         let plaintext = b"JBSWY3DPEHPK3PXP";
-        let blob = encrypt_secret(&test_key(), plaintext).expect("encrypt");
+        let blob = encrypt_secret(&key, plaintext).expect("encrypt");
         assert_eq!(blob.len(), plaintext.len() + MIN_BLOB_LEN);
 
-        let decrypted = decrypt_secret(&test_key(), &blob).expect("decrypt");
+        let decrypted = decrypt_secret(&key, &blob).expect("decrypt");
         assert_eq!(&*decrypted, &plaintext[..]);
     }
 
     #[test]
     fn decrypted_secret_debug_redacts_bytes() {
+        let key = test_key();
         let plaintext = b"JBSWY3DPEHPK3PXP";
-        let blob = encrypt_secret(&test_key(), plaintext).expect("encrypt");
-        let decrypted = decrypt_secret(&test_key(), &blob).expect("decrypt");
+        let blob = encrypt_secret(&key, plaintext).expect("encrypt");
+        let decrypted = decrypt_secret(&key, &blob).expect("decrypt");
         let rendered = format!("{decrypted:?}");
         assert!(!rendered.contains("JBSWY3DPEHPK3PXP"));
         assert!(rendered.contains("bytes: \"[redacted]\""));
@@ -312,38 +313,42 @@ mod tests {
 
     #[test]
     fn aes_gcm_uses_a_fresh_nonce_per_call() {
+        let key = test_key();
         let mut nonces = std::collections::HashSet::new();
         for _ in 0..100 {
-            let blob = encrypt_secret(&test_key(), b"same plaintext").expect("encrypt");
+            let blob = encrypt_secret(&key, b"same plaintext").expect("encrypt");
             assert!(nonces.insert(blob[..NONCE_LEN].to_vec()), "nonce reused");
         }
     }
 
     #[test]
     fn aes_gcm_rejects_tampered_tag() {
-        let mut blob = encrypt_secret(&test_key(), b"secret").expect("encrypt");
+        let key = test_key();
+        let mut blob = encrypt_secret(&key, b"secret").expect("encrypt");
         let last = blob.len() - 1;
         blob[last] ^= 0x01;
         assert!(matches!(
-            decrypt_secret(&test_key(), &blob),
+            decrypt_secret(&key, &blob),
             Err(AppError::Internal)
         ));
     }
 
     #[test]
     fn aes_gcm_rejects_tampered_nonce() {
-        let mut blob = encrypt_secret(&test_key(), b"secret").expect("encrypt");
+        let key = test_key();
+        let mut blob = encrypt_secret(&key, b"secret").expect("encrypt");
         blob[0] ^= 0x01;
         assert!(matches!(
-            decrypt_secret(&test_key(), &blob),
+            decrypt_secret(&key, &blob),
             Err(AppError::Internal)
         ));
     }
 
     #[test]
     fn aes_gcm_rejects_wrong_key() {
-        let blob = encrypt_secret(&test_key(), b"secret").expect("encrypt");
-        let mut wrong_key = test_key();
+        let key = test_key();
+        let blob = encrypt_secret(&key, b"secret").expect("encrypt");
+        let mut wrong_key = key;
         wrong_key[0] ^= 0xff;
         assert!(matches!(
             decrypt_secret(&wrong_key, &blob),
@@ -353,9 +358,10 @@ mod tests {
 
     #[test]
     fn aes_gcm_rejects_truncated_blob() {
+        let key = test_key();
         for len in 0..MIN_BLOB_LEN {
             assert!(matches!(
-                decrypt_secret(&test_key(), &vec![0u8; len]),
+                decrypt_secret(&key, &vec![0u8; len]),
                 Err(AppError::Internal)
             ));
         }

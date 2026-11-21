@@ -531,6 +531,53 @@ async fn user_budget_admits_exactly_three_attempts_then_returns_429() {
     retry_after_secs(&rejected, app.state.config.totp.rate_limit_window_secs);
 }
 
+/// Scenario 9: a 2FA password login yields a challenge envelope and no session.
+#[tokio::test]
+async fn login_with_2fa_returns_only_a_challenge() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let (email, password, _secret, _backup_codes, _session) =
+        enabled_user(&app, &dynamic_ip()).await;
+    let user_id = user_id_for_email(&app.pool, &email).await;
+    let sessions_before = count_sessions_for_user(&app.pool, user_id).await;
+
+    let token = challenge(&app, &email, &password).await;
+    assert_eq!(token.len(), 64, "the challenge token is 32-byte hex");
+
+    let login = app
+        .post_json(
+            "/auth/login",
+            json!({ "email": email, "password": password }),
+        )
+        .await;
+    assert_eq!(login.status(), StatusCode::OK, "body: {}", login.body_str);
+    let body = login.json.as_object().expect("login body is an object");
+    assert_eq!(
+        body.len(),
+        2,
+        "a 2FA login carries only the two challenge fields: {}",
+        login.body_str
+    );
+    assert_eq!(body["two_factor_required"], json!(true));
+    assert!(body["challenge_token"].is_string());
+    assert!(
+        !body.contains_key("expires_at"),
+        "a half-authenticated login must not advertise a session expiry"
+    );
+    assert!(
+        !login.headers.contains_key(header::SET_COOKIE),
+        "a 2FA login must not set any cookie"
+    );
+    assert_eq!(
+        count_sessions_for_user(&app.pool, user_id).await,
+        sessions_before,
+        "a 2FA login must not create a session row"
+    );
+}
+
 /// Scenario 8b: the IP budget is independent of the user budget and trips at 11.
 #[tokio::test]
 async fn ip_budget_admits_exactly_ten_attempts_then_returns_429() {

@@ -23,6 +23,7 @@ use crate::{
     },
     middleware::auth::AuthUser,
     state::AppState,
+    totp::service::FreshAuthProof,
 };
 
 /// `POST /auth/totp/confirm` body.
@@ -71,6 +72,21 @@ impl std::fmt::Debug for DisableTotpRequest {
             .field("password", &self.password.as_ref().map(|_| "[redacted]"))
             .field("totp_code", &self.totp_code.as_ref().map(|_| "[redacted]"))
             .finish()
+    }
+}
+
+impl DisableTotpRequest {
+    /// Reject an absent, blank, or ambiguous proof before any rate-limit budget is spent.
+    fn into_proof(self) -> Result<FreshAuthProof, AppError> {
+        match (self.password, self.totp_code) {
+            (Some(password), None) if !password.is_empty() => {
+                Ok(FreshAuthProof::Password(password))
+            }
+            (None, Some(code)) if !code.is_empty() => Ok(FreshAuthProof::TotpCode(code)),
+            _ => Err(AppError::ValidationError(
+                "provide exactly one of password or totp_code".into(),
+            )),
+        }
     }
 }
 
@@ -183,6 +199,58 @@ pub async fn totp_backup(
     }
 
     issue_two_factor_session(&state, user_id, &headers, &client_ip).await
+}
+
+/// `DELETE /auth/totp`
+///
+/// Requires a fresh-auth proof: the current password or a live TOTP code. A missing or
+/// malformed proof is a 400 before any budget is spent; a wrong proof is a 401 from the
+/// service. An absent session is rejected by `require_auth` before this runs.
+pub async fn totp_disable(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    headers: HeaderMap,
+    body: Result<Json<DisableTotpRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(rejection) => return json_rejection_response(rejection),
+    };
+
+    let proof = match request.into_proof() {
+        Ok(proof) => proof,
+        Err(error) => return service_error_response(error),
+    };
+
+    let client_ip = extract_client_ip(&headers);
+
+    if state
+        .rate_limiter
+        .check_totp_ip_limit(&client_ip, &state.config.totp)
+        .is_err()
+    {
+        return totp_rate_limit_exceeded();
+    }
+    if state
+        .rate_limiter
+        .check_totp_user_limit(auth_user.user_id, &state.config.totp)
+        .is_err()
+    {
+        return totp_rate_limit_exceeded();
+    }
+
+    match state
+        .totp_service
+        .disable_totp(auth_user.user_id, proof, &client_ip)
+        .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(MessageResponse::new("two-factor authentication disabled")),
+        )
+            .into_response(),
+        Err(error) => service_error_response(error),
+    }
 }
 
 /// 429 for either TOTP dimension.

@@ -56,21 +56,28 @@ async fn method_not_allowed() -> impl IntoResponse {
     )
 }
 
-pub fn routes(service: Arc<AuthServiceImpl>) -> Router {
-    // The convenience constructor still gets a live gate. Only TOTP config defaults are
-    // used; the enabled lookup and challenge insert always hit the shared database.
+/// Build the auth router with a live second-factor gate.
+///
+/// Fails at startup when `config` has no usable TOTP key: a challenge that can never be
+/// redeemed must not be issued silently.
+pub fn routes(service: Arc<AuthServiceImpl>, config: Arc<Config>) -> Result<Router, AppError> {
+    config.validate().map_err(AppError::Config)?;
+    config
+        .totp
+        .encryption_key_bytes()
+        .map_err(AppError::Config)?;
     let totp_service = Arc::new(TotpService::new(
         service.pool().clone(),
-        Arc::new(Config::default()),
+        Arc::clone(&config),
         Arc::clone(&service.config),
     ));
-    routes_with_state(AuthHandlerState {
+    Ok(routes_with_state(AuthHandlerState {
         service,
         session_service: None,
         rate_limiter: None,
-        config: None,
+        config: Some(config),
         totp_service,
-    })
+    }))
 }
 
 pub fn routes_with_app_state(state: AppState) -> Router {
@@ -613,6 +620,16 @@ mod tests {
     use axum::body::to_bytes;
     use sqlx::PgPool;
 
+    fn test_config_with_totp_key() -> Arc<Config> {
+        Arc::new(Config {
+            totp: crate::config::TotpConfig {
+                encryption_key: Some("00".repeat(32)),
+                ..crate::config::TotpConfig::default()
+            },
+            ..Config::default()
+        })
+    }
+
     fn create_test_state() -> AuthHandlerState {
         let pool = PgPool::connect_lazy("postgres://localhost/test").expect("lazy pool");
         let config = Arc::new(AppConfig {
@@ -749,7 +766,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_json_body_returns_400_validation_error() {
         use tower::ServiceExt;
-        let app = routes(create_test_state().service);
+        let app = routes(create_test_state().service, test_config_with_totp_key()).expect("routes");
         let req = axum::http::Request::builder()
             .method(axum::http::Method::POST)
             .uri("/signup")
@@ -769,7 +786,7 @@ mod tests {
     #[tokio::test]
     async fn route_method_not_allowed_returns_405_json_envelope() {
         use tower::ServiceExt;
-        let app = routes(create_test_state().service);
+        let app = routes(create_test_state().service, test_config_with_totp_key()).expect("routes");
         let req = axum::http::Request::builder()
             .method(axum::http::Method::GET)
             .uri("/signup")

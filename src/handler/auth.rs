@@ -460,10 +460,17 @@ enum PasswordLoginOutcome {
 
 /// Decide the second-factor gate and commit the session in one transaction.
 ///
-/// The factor row is share-locked until commit, so `confirm_enrollment` — the only path
-/// that sets `enabled` — waits instead of landing between the gate read and the session
-/// insert. The session therefore reflects the factor state at the instant it was written,
-/// never a read that a concurrent activation made stale.
+/// `is_totp_enabled_locked` holds a share lock on the factor row for this transaction, so
+/// `confirm_enrollment` — the only path that sets `enabled` — cannot commit between this read
+/// and the session insert *when the row exists at read time*: its update blocks, and this
+/// transaction's read is re-evaluated against the committed value.
+///
+/// A missing row takes no lock, and the guarantee stops there: `enroll_totp` can create the
+/// row and `confirm_enrollment` enable it between this read and the session insert, leaving a
+/// password-only session. The enrollment window opens before the password check too, so a
+/// login already past that gate can outrun a confirmation that started earlier. Neither is a
+/// bypass: enabling 2FA does not revoke live sessions, so a session minted before activation
+/// survives, exactly like any session older than the factor.
 ///
 /// Still not enforced: the challenge token carries no credential state, so one minted
 /// before a password reset stays redeemable (#58).

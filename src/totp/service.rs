@@ -2032,6 +2032,63 @@ mod tests {
         assert!(ctx.service.is_totp_enabled(new_user).await.expect("state"));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn absent_factor_row_activation_is_serialized_with_the_login_gate() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+
+        // No row at BEGIN means no row lock anywhere, so ordering is by commit time only:
+        // an activation that commits before the gate's read is observed by that read.
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let mut gate = ctx.pool.begin().await.expect("gate transaction");
+        let enrollment = ctx.service.enroll_totp(user_id).await.expect("enroll");
+        let code = current_code(&enrollment.secret_base32);
+        ctx.service
+            .confirm_enrollment(user_id, &code, "ip")
+            .await
+            .expect("confirm");
+        assert!(
+            ctx.service
+                .is_totp_enabled_locked(&mut gate, user_id)
+                .await
+                .expect("gate read"),
+            "a committed activation must be visible to a gate that began before the row existed"
+        );
+        gate.rollback().await.expect("rollback");
+
+        // And the boundary: a gate that already decided before the activation commits is not
+        // retroactively rewritten, because enabling 2FA does not revoke live sessions. The
+        // password-only session stands next to an enabled factor.
+        let password = fixture_password();
+        let (late_user, email) = create_user_with_email(&ctx, true, &password).await;
+        let response = login(
+            State(handler_state(&ctx)),
+            HeaderMap::new(),
+            Ok(Json(LoginRequest { email, password })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(count_rows(&ctx.pool, "sessions", late_user).await, 1);
+
+        let enrollment = ctx.service.enroll_totp(late_user).await.expect("enroll");
+        let code = current_code(&enrollment.secret_base32);
+        ctx.service
+            .confirm_enrollment(late_user, &code, "ip")
+            .await
+            .expect("confirm");
+
+        assert!(
+            ctx.service.is_totp_enabled(late_user).await.expect("state"),
+            "the activation itself must succeed behind a committed gate"
+        );
+        assert_eq!(
+            count_rows(&ctx.pool, "sessions", late_user).await,
+            1,
+            "activation must not revoke the session minted before it"
+        );
+    }
+
     #[tokio::test]
     async fn login_without_totp_keeps_the_session_body() {
         let Some(ctx) = setup_db_context().await else {

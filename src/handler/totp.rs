@@ -343,9 +343,23 @@ async fn issue_two_factor_session(
         .is_some_and(|value| value.eq_ignore_ascii_case("bearer"));
     let session_type = if is_bearer { "bearer" } else { "cookie" };
 
+    // Re-read the live credential hash: `create_session_checked` compares it under the
+    // user row lock, so a password reset committing after the challenge was issued
+    // rejects here instead of minting a session from superseded credentials.
+    let credential_hash = match current_credential_hash(state, user_id).await {
+        Ok(hash) => hash,
+        Err(error) => return service_error_response(error),
+    };
+
     let (session, raw_id) = match state
         .session_service
-        .create_session(user_id, session_type, Some(client_ip), user_agent)
+        .create_session_checked(
+            user_id,
+            &credential_hash,
+            session_type,
+            Some(client_ip),
+            user_agent,
+        )
         .await
     {
         Ok(session) => session,
@@ -370,6 +384,19 @@ async fn issue_two_factor_session(
             Err(error) => service_error_response(error),
         }
     }
+}
+
+/// Read the user's current Argon2id PHC string for the freshness check.
+///
+/// A missing row and a failed lookup both surface as `SessionInvalid`, so this path
+/// gains no user-enumerating error variant.
+async fn current_credential_hash(state: &AppState, user_id: Uuid) -> Result<String, AppError> {
+    sqlx::query_scalar::<_, String>("SELECT password_hash FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(AppError::Database)?
+        .ok_or(AppError::SessionInvalid)
 }
 
 /// Router for the TOTP endpoints, merged under `/auth` by [`crate::handler::create_router`].

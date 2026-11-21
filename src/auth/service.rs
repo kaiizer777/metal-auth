@@ -1015,7 +1015,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_dual_reset_tokens_serialized() {
+    async fn concurrent_dual_reset_tokens_leave_one_password_and_no_live_tokens() {
         let Some(ctx) = setup_db_context().await else {
             return;
         };
@@ -1034,8 +1034,9 @@ mod tests {
         .unwrap();
         let user_id: Uuid = row.get("id");
 
-        // Two distinct valid tokens: both DELETEs target different rows, so both
-        // consumes succeed; FOR UPDATE serializes the final UPDATEs.
+        // Two distinct valid tokens. Both deletes target different rows, but a completed
+        // reset blanket-deletes the user's remaining tokens, so whether the second call
+        // still finds its own token is a race.
         let (raw_tok1, hash1) = generate_token();
         let (raw_tok2, hash2) = generate_token();
         let future_time = Utc::now() + chrono::Duration::hours(1);

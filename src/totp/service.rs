@@ -17,8 +17,8 @@ use crate::{
     totp::{
         backup,
         crypto::{
-            DecryptedSecret, build_otpauth_uri, compute_code_replay_hash, current_totp_counter,
-            decode_totp_secret, decrypt_secret, encrypt_secret, generate_totp_secret,
+            DecryptedSecret, build_otpauth_uri, compute_code_replay_hash, decode_totp_secret,
+            decrypt_secret, encrypt_secret, generate_totp_secret, totp_counter_at,
             verify_totp_code, verify_totp_code_at,
         },
     },
@@ -216,21 +216,46 @@ impl TotpService {
 
     /// Verify `code` and record the use on the caller's transaction.
     ///
-    /// The caller owns the commit so factor use, challenge deletion, and session issuance
-    /// can share one unit of work.
+    /// The counter and the prune cutoff both derive from one database timestamp read on
+    /// this transaction. Two independent references — a wall-clock pre-read for the
+    /// counter, the transaction time for the cutoff — let a stalled request prune the row
+    /// that blocks its own replay, because the cutoff outruns the counter.
     pub(crate) async fn verify_and_record_totp(
         &self,
         connection: &mut PgConnection,
         user_id: Uuid,
         code: &str,
     ) -> Result<(), AppError> {
-        self.record_totp_use(connection, user_id, code, current_totp_counter())
+        let reference = transaction_now(connection).await?;
+        self.verify_totp_within(connection, user_id, code, reference)
             .await
-            .map(|_step| ())
     }
 
-    /// Verify at an explicit step counter. Production always passes the live counter; tests
-    /// use this to prove a code cannot be replayed at `T-1` or `T+1`.
+    /// Verify `code` and record the use against one explicit clock reference.
+    ///
+    /// The counter and the prune cutoff are both derived here, from the same value: two
+    /// references let a stalled request prune the row that blocks its own replay.
+    async fn verify_totp_within(
+        &self,
+        connection: &mut PgConnection,
+        user_id: Uuid,
+        code: &str,
+        reference: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        self.record_totp_use(
+            connection,
+            user_id,
+            code,
+            totp_counter_at(reference),
+            reference,
+        )
+        .await
+        .map(|_step| ())
+    }
+
+    /// Verify at an explicit step counter, pruning against `reference`.
+    ///
+    /// Tests use the explicit counter to prove a code cannot be replayed at `T-1`/`T+1`.
     #[cfg(test)]
     async fn verify_totp_at(
         &self,
@@ -239,7 +264,25 @@ impl TotpService {
         counter: u64,
     ) -> Result<(), AppError> {
         let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
-        self.record_totp_use(&mut transaction, user_id, code, counter)
+        let reference = transaction_now(&mut transaction).await?;
+        self.record_totp_use(&mut transaction, user_id, code, counter, reference)
+            .await?;
+        transaction.commit().await.map_err(AppError::Database)
+    }
+
+    /// Verify and record with a supplied database reference.
+    ///
+    /// Production always reads the reference inside its own transaction; this seam lets a
+    /// test simulate a stalled request without waiting out the acceptance window.
+    #[cfg(test)]
+    async fn verify_totp_at_reference(
+        &self,
+        user_id: Uuid,
+        code: &str,
+        reference: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
+        self.verify_totp_within(&mut transaction, user_id, code, reference)
             .await?;
         transaction.commit().await.map_err(AppError::Database)
     }
@@ -250,6 +293,7 @@ impl TotpService {
         user_id: Uuid,
         code: &str,
         counter: u64,
+        reference: DateTime<Utc>,
     ) -> Result<u64, AppError> {
         let record =
             sqlx::query("SELECT encrypted_secret, enabled FROM totp_secrets WHERE user_id = $1")
@@ -276,9 +320,10 @@ impl TotpService {
         // the prune back with the insert; the failed insert is still the replay arbiter.
         let pruned = sqlx::query(
             "DELETE FROM totp_used_codes WHERE user_id = $1 \
-             AND used_at < CURRENT_TIMESTAMP - make_interval(secs => $2)",
+             AND used_at < $2 - make_interval(secs => $3)",
         )
         .bind(user_id)
+        .bind(reference)
         .bind(self.config.totp.used_code_prune_age_secs as f64)
         .execute(&mut *connection)
         .await;
@@ -594,6 +639,17 @@ impl TotpService {
             AppError::TotpCodeInvalid
         })
     }
+}
+
+/// Single clock reference for one verification transaction.
+///
+/// `transaction_timestamp()` is frozen at `BEGIN`, so the prune cutoff, the counter
+/// derived from it, and replay rows written under it share one timeline.
+async fn transaction_now(connection: &mut PgConnection) -> Result<DateTime<Utc>, AppError> {
+    sqlx::query_scalar("SELECT transaction_timestamp()")
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(AppError::Database)
 }
 
 /// Map the replay insert failure: only `uq_totp_used_codes` means a replay.
@@ -1069,6 +1125,36 @@ mod tests {
             Err(AppError::TotpCodeReplayed)
         ));
         assert_eq!(count_rows(&ctx.pool, "totp_used_codes", user_id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn stalled_request_cannot_prune_the_row_that_blocks_its_replay() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let response = enroll_and_confirm(&ctx, user_id).await;
+        let code = current_code(&response.secret_base32);
+
+        ctx.service
+            .verify_totp(user_id, &code, "ip")
+            .await
+            .expect("first use");
+
+        // A stalled request: its counter and its prune cutoff are one instant, 121s past
+        // the row's write. Deriving the counter from a wall-clock pre-read instead would
+        // accept the code while the cutoff deletes the very row that blocks the replay.
+        let replay = ctx
+            .service
+            .verify_totp_at_reference(user_id, &code, Utc::now() + Duration::seconds(121))
+            .await;
+
+        assert!(replay.is_err(), "a code must never be accepted twice");
+        assert_eq!(
+            count_rows(&ctx.pool, "totp_used_codes", user_id).await,
+            1,
+            "the row that blocks the replay must not be pruned by a later clock reference"
+        );
     }
 
     #[tokio::test]

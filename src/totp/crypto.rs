@@ -7,11 +7,11 @@ use aes_gcm::{
     Aes256Gcm, Key, Nonce,
     aead::{Aead, AeadCore, KeyInit},
 };
+use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use rand_core::{OsRng, RngCore};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::AppError;
 
@@ -169,14 +169,16 @@ pub fn decode_totp_secret(secret_base32: &str) -> Result<Vec<u8>, AppError> {
     Ok(decoded)
 }
 
-/// Current TOTP step counter: Unix time divided by the step, `T0 = 0`.
+/// TOTP step counter for an explicit instant: Unix time divided by the step, `T0 = 0`.
+#[must_use]
+pub fn totp_counter_at(instant: DateTime<Utc>) -> u64 {
+    u64::try_from(instant.timestamp()).unwrap_or_default() / TOTP_STEP_SECS
+}
+
+/// Current TOTP step counter from the local wall clock.
 #[must_use]
 pub fn current_totp_counter() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        / TOTP_STEP_SECS
+    totp_counter_at(Utc::now())
 }
 
 /// Generate the TOTP code for `secret` at `counter` (RFC 4226 §5.3 dynamic truncation).

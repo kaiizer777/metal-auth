@@ -1068,6 +1068,8 @@ mod tests {
             ctx.service
                 .disable_totp(
                     user_id,
+                    // Test-only wrong password, never a production secret.
+                    // codeql[rust/hard-coded-cryptographic-value]
                     FreshAuthProof::Password("wrong-password".into()),
                     "ip",
                 )

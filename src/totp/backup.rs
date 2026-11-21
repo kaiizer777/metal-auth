@@ -15,6 +15,8 @@ pub const BACKUP_CODE_COUNT: usize = 10;
 pub const BACKUP_CODE_LEN: usize = 10;
 /// Random bytes per code: 7 bytes encode to 12 base32 chars, trimmed to 10 (50 bits).
 const BACKUP_CODE_RAW_BYTES: usize = 7;
+/// Base32 alphabet selector, not cryptographic key material.
+// codeql[rust/hard-coded-cryptographic-value]
 const BACKUP_CODE_ALPHABET: Alphabet = Alphabet::RFC4648 { padding: false };
 
 /// Generate [`BACKUP_CODE_COUNT`] codes, returning `(raw_codes, phc_hashes)`.

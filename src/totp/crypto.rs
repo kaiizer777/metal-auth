@@ -5,7 +5,7 @@
 
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
-    aead::{Aead, KeyInit},
+    aead::{Aead, AeadCore, KeyInit},
 };
 use hmac::{Hmac, Mac};
 use rand_core::{OsRng, RngCore};
@@ -84,17 +84,15 @@ impl std::fmt::Debug for DecryptedSecret {
 /// Output layout: `nonce (12 bytes) || ciphertext || tag (16 bytes)`.
 pub fn encrypt_secret(key: &[u8; AES_KEY_BYTES], plaintext: &[u8]) -> Result<Vec<u8>, AppError> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    let mut nonce_bytes = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
-        .map_err(|err| {
-            tracing::error!(error = %err, "totp secret encryption failed");
-            AppError::Internal
-        })?;
+    // Drawn straight from the CSPRNG: no caller-visible buffer exists before it is filled.
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let ciphertext = cipher.encrypt(&nonce, plaintext).map_err(|err| {
+        tracing::error!(error = %err, "totp secret encryption failed");
+        AppError::Internal
+    })?;
 
     let mut blob = Vec::with_capacity(MIN_BLOB_LEN + plaintext.len());
-    blob.extend_from_slice(&nonce_bytes);
+    blob.extend_from_slice(&nonce);
     blob.extend_from_slice(&ciphertext);
     Ok(blob)
 }
@@ -283,6 +281,8 @@ mod tests {
     use super::*;
 
     fn test_key() -> [u8; AES_KEY_BYTES] {
+        // Test-only AES key, never a production secret.
+        // codeql[rust/hard-coded-cryptographic-value]
         *b"0123456789abcdef0123456789abcdef"
     }
 

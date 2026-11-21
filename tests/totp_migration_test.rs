@@ -66,8 +66,10 @@ async fn migration_0008_down_removes_every_phase7_object() {
         assert_phase7_absent(&pool, &schema).await?;
 
         // sqlx records 0008 as applied even after the manual drops, so the row must go
-        // before the up script can run again.
-        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = $1")
+        // before the up script can run again. Schema-qualified so a wrong pool cannot delete
+        // the real record.
+        let delete_record = format!("DELETE FROM \"{schema}\"._sqlx_migrations WHERE version = $1");
+        sqlx::query(sqlx::AssertSqlSafe(delete_record))
             .bind(MIGRATION_VERSION)
             .execute(&pool)
             .await

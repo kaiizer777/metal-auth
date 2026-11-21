@@ -338,6 +338,7 @@ pub async fn login(
                 Err(e) => return service_error_response(e),
             };
             tracing::info!(
+                target: "security_event",
                 event = "two_factor_challenge_issued",
                 user_id = %user_id,
                 ip = %client_ip,

@@ -5,6 +5,8 @@
 
 mod common;
 
+use std::sync::Arc;
+
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use common::*;
 use metal_auth::{ErrorCode, RateLimiter};
@@ -627,6 +629,99 @@ async fn used_backup_code_is_purged_from_storage() {
         after.iter().all(|hash| !hash.contains(&code)),
         "no stored hash may contain the raw backup code"
     );
+}
+
+/// Scenario 11: five simultaneous presentations of one live code admit exactly one.
+#[test]
+fn concurrent_replay_admits_exactly_one_request() {
+    block_on_concurrent(async {
+        let _guard = DB_LOCK.lock().await;
+        let Some(app) = setup_test_app_with(|cfg| {
+            // Confirmation plus five attempts must fit both budgets, otherwise a loser
+            // could be a 429 and the barrier would prove nothing.
+            cfg.totp.rate_limit_user_max_attempts = 10;
+            cfg.totp.rate_limit_ip_max_attempts = 10;
+        })
+        .await
+        else {
+            return;
+        };
+
+        let ip = dynamic_ip();
+        let (email, password, secret, _backup_codes, _session) = enabled_user(&app, &ip).await;
+        let user_id = user_id_for_email(&app.pool, &email).await;
+        let sessions_before = count_sessions_for_user(&app.pool, user_id).await;
+        let token = challenge(&app, &email, &password).await;
+        let code = totp_code(&secret);
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(5));
+        let mut tasks = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let app = app.clone();
+            let barrier = Arc::clone(&barrier);
+            let token = token.clone();
+            let code = code.clone();
+            let ip = ip.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                app.post_json_with_ip(
+                    "/auth/totp/verify",
+                    json!({ "challenge_token": token, "code": code }),
+                    &ip,
+                )
+                .await
+            }));
+        }
+
+        let mut accepted = 0;
+        let mut replayed = 0;
+        let mut token_rejected = 0;
+        for task in tasks {
+            let resp = task.await.expect("verification task must not panic");
+            match resp.status() {
+                StatusCode::OK => accepted += 1,
+                StatusCode::BAD_REQUEST => {
+                    assert_eq!(
+                        resp.error_code(),
+                        Some(ErrorCode::TotpCodeReplayed),
+                        "a 400 loser must be the replay rejection: {}",
+                        resp.body_str
+                    );
+                    replayed += 1;
+                }
+                StatusCode::UNAUTHORIZED => {
+                    assert_eq!(
+                        resp.error_code(),
+                        Some(ErrorCode::TwoFactorTokenInvalid),
+                        "a 401 loser must be the consumption rejection: {}",
+                        resp.body_str
+                    );
+                    token_rejected += 1;
+                }
+                other => panic!("unexpected loser status {other}: {}", resp.body_str),
+            }
+        }
+
+        assert_eq!(accepted, 1, "exactly one request may win the code");
+        assert_eq!(
+            replayed + token_rejected,
+            4,
+            "the other four must be replay or token-consumption rejections"
+        );
+
+        let used: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM totp_used_codes WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(&app.pool)
+                .await
+                .expect("count used codes");
+        assert_eq!(used, 1, "the replay log must hold exactly one row");
+        assert_eq!(
+            count_sessions_for_user(&app.pool, user_id).await,
+            sessions_before + 1,
+            "the race must issue exactly one new session"
+        );
+    });
 }
 
 /// Scenario 8b: the IP budget is independent of the user budget and trips at 11.

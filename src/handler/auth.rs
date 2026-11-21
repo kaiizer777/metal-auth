@@ -56,10 +56,13 @@ pub(crate) async fn method_not_allowed() -> impl IntoResponse {
     )
 }
 
-/// Build the auth router with a live second-factor gate.
+/// Build the auth router for callers that hold only the auth service.
 ///
-/// Fails at startup when `config` has no usable TOTP key: a challenge that can never be
-/// redeemed must not be issued silently.
+/// Fails at startup when `config` has no usable TOTP key. This router has no session
+/// service and mounts no `/totp/verify` or `/totp/backup` route, so it cannot redeem a
+/// challenge: a TOTP-enabled login is refused here instead of answered with a token that
+/// nothing on this router can consume. Serve 2FA through [`routes_with_app_state`] (or
+/// [`crate::handler::create_router`]), which mount the TOTP routes alongside.
 pub fn routes(service: Arc<AuthServiceImpl>, config: Arc<Config>) -> Result<Router, AppError> {
     config.validate().map_err(AppError::Config)?;
     config
@@ -267,6 +270,8 @@ pub async fn signup(
 /// Returns 401 for wrong password OR unknown email (identical response — anti-enum).
 /// Returns 403 when `require_email_verification = true` and email unverified.
 /// Returns 429 when login rate limit is exceeded.
+/// Returns 500 when the account has 2FA enabled but this router carries no session
+/// service, and therefore no route that could redeem the challenge.
 pub async fn login(
     State(state): State<AuthHandlerState>,
     headers: HeaderMap,
@@ -332,6 +337,17 @@ pub async fn login(
     // Fail closed: an unavailable service or lookup error aborts login, never bypasses it.
     match state.totp_service.is_totp_enabled(user_id).await {
         Ok(true) => {
+            // Without a session service this router also has no way to redeem the
+            // challenge it would mint, so it must not hand one out at all.
+            if state.session_service.is_none() {
+                tracing::error!(
+                    event = "two_factor_unavailable",
+                    reason = "router_without_session_service",
+                    user_id = %user_id,
+                    "login refused: this router cannot redeem a totp challenge"
+                );
+                return service_error_response(AppError::Internal);
+            }
             let challenge_token = match state.totp_service.generate_two_factor_token(user_id).await
             {
                 Ok(token) => token,

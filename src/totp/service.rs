@@ -1543,6 +1543,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auth_router_without_totp_routes_refuses_a_two_factor_login() {
+        use crate::handler::auth::routes_with_state;
+        use axum::{
+            body::Body,
+            http::{Request, header as http_header},
+        };
+        use tower::ServiceExt;
+
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let password = fixture_password();
+        let (user_id, email) = create_user_with_email(&ctx, true, &password).await;
+        enroll_and_confirm(&ctx, user_id).await;
+
+        // Exactly what `routes()` builds: no session service, and no `/totp/*` route.
+        let mut handler = handler_state(&ctx);
+        handler.session_service = None;
+        let app = routes_with_state(handler);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header(http_header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&LoginRequest { email, password }).expect("body"),
+            ))
+            .expect("request");
+        let response = app.oneshot(request).await.expect("response");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            count_rows(&ctx.pool, "two_factor_tokens", user_id).await,
+            0,
+            "a router that cannot redeem a challenge must not mint one"
+        );
+        assert_eq!(count_rows(&ctx.pool, "sessions", user_id).await, 0);
+    }
+
+    #[tokio::test]
     async fn login_without_totp_keeps_the_session_body() {
         let Some(ctx) = setup_db_context().await else {
             return;

@@ -578,11 +578,10 @@ impl TotpService {
 
     /// Mint a half-authenticated challenge token; only its SHA-256 hash is stored.
     ///
-    /// Refuses without a usable key: redeeming this challenge requires decrypting the
-    /// stored secret, so a keyless deployment would hand the user a token that can only
-    /// fail instead of a server error.
+    /// Minting never needs the encryption key: a keyless deployment must still be able to
+    /// present the backup-code leg, which matches Argon2id hashes and never decrypts the
+    /// secret. The TOTP-code leg fails closed on its own when the key is missing.
     pub async fn generate_two_factor_token(&self, user_id: Uuid) -> Result<String, AppError> {
-        self.encryption_key()?;
         let (raw_token, token_hash) = generate_token();
         let ttl_seconds = i64::try_from(self.config.totp.challenge_token_ttl_secs)
             .map_err(|_| AppError::Internal)?;
@@ -694,9 +693,13 @@ impl TotpService {
     /// Decrypt a stored secret, treating decryption failure as an invalid code.
     ///
     /// A failed decrypt can only mean corruption or a rotated key; surfacing it as
-    /// `TotpCodeInvalid` keeps the client response indistinguishable from a wrong code.
+    /// `TotpCodeInvalid` keeps the client response indistinguishable from a wrong code. A
+    /// missing key is not a statement about the code, so it stays a server fault.
     fn decrypt_totp_secret(&self, encrypted_secret: &[u8]) -> Result<DecryptedSecret, AppError> {
-        let key = self.encryption_key()?;
+        let key = self.encryption_key().map_err(|error| {
+            tracing::error!(error = %error, "totp verification is unavailable without a key");
+            AppError::TwoFactorUnavailable
+        })?;
         decrypt_secret(&key, encrypted_secret).map_err(|err| {
             tracing::error!(error = %err, "stored totp secret could not be decrypted");
             AppError::TotpCodeInvalid
@@ -1619,7 +1622,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keyless_deployment_refuses_to_mint_a_challenge() {
+    async fn keyless_deployment_still_mints_a_challenge() {
         let Some(ctx) = setup_db_context().await else {
             return;
         };
@@ -1642,18 +1645,19 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.status(), StatusCode::OK);
         assert!(
             response.headers().get(header::SET_COOKIE).is_none(),
-            "a refused challenge must not carry a session cookie"
+            "a 2fa challenge must not carry a session cookie"
         );
         let body = to_bytes(response.into_body(), 4096).await.expect("body");
-        let error: crate::error::ErrorResponse = serde_json::from_slice(&body).expect("json");
-        assert_eq!(error.code, crate::error::ErrorCode::InvalidConfig);
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(body["two_factor_required"], true);
+        assert!(body["challenge_token"].as_str().is_some());
         assert_eq!(
             count_rows(&ctx.pool, "two_factor_tokens", user_id).await,
-            0,
-            "no challenge token may be issued when the factor cannot be verified"
+            1,
+            "the backup-code leg needs a challenge even without a key"
         );
         assert_eq!(count_rows(&ctx.pool, "sessions", user_id).await, 0);
     }

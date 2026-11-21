@@ -75,6 +75,9 @@ pub enum ErrorCode {
     TwoFactorTokenInvalid,
     #[serde(rename = "TWO_FACTOR_TOKEN_EXPIRED")]
     TwoFactorTokenExpired,
+    /// Server-side refusal: the deployment cannot verify a second factor right now.
+    #[serde(rename = "TWO_FACTOR_UNAVAILABLE")]
+    TwoFactorUnavailable,
     #[serde(rename = "TOTP_RATE_LIMIT_EXCEEDED")]
     TotpRateLimitExceeded,
 }
@@ -271,6 +274,11 @@ pub enum AppError {
     #[error("two factor token has expired")]
     TwoFactorTokenExpired,
 
+    /// The deployment cannot verify this factor (no TOTP key, missing challenge storage).
+    /// A server fault, never a statement about the presented code.
+    #[error("two factor authentication is temporarily unavailable")]
+    TwoFactorUnavailable,
+
     #[error("totp rate limit exceeded")]
     TotpRateLimitExceeded,
 
@@ -330,6 +338,7 @@ impl AppError {
             Self::TwoFactorRequired => ErrorCode::TwoFactorRequired,
             Self::TwoFactorTokenInvalid => ErrorCode::TwoFactorTokenInvalid,
             Self::TwoFactorTokenExpired => ErrorCode::TwoFactorTokenExpired,
+            Self::TwoFactorUnavailable => ErrorCode::TwoFactorUnavailable,
             Self::TotpRateLimitExceeded => ErrorCode::TotpRateLimitExceeded,
             // Shares the login wire code, keeps its own 400 mapping.
             Self::TotpEmailNotVerified => ErrorCode::EmailNotVerified,
@@ -378,6 +387,8 @@ impl AppError {
             Self::TwoFactorRequired => StatusCode::OK,
             // 401 — challenge token
             Self::TwoFactorTokenInvalid | Self::TwoFactorTokenExpired => StatusCode::UNAUTHORIZED,
+            // 503 — the deployment cannot verify a factor at all
+            Self::TwoFactorUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             // 409 — already enrolled
             Self::TotpAlreadyEnabled => StatusCode::CONFLICT,
             // 400
@@ -456,6 +467,7 @@ impl AppError {
             Self::TwoFactorRequired => "two factor authentication required",
             Self::TwoFactorTokenInvalid => "two factor token is invalid",
             Self::TwoFactorTokenExpired => "two factor token has expired",
+            Self::TwoFactorUnavailable => "two factor authentication is temporarily unavailable",
             Self::TotpRateLimitExceeded => "totp rate limit exceeded",
             // Same wire code and message as the login gate.
             Self::TotpEmailNotVerified => "Email address has not been verified",
@@ -517,6 +529,7 @@ impl AppError {
             ErrorCode::TwoFactorRequired => Self::TwoFactorRequired,
             ErrorCode::TwoFactorTokenInvalid => Self::TwoFactorTokenInvalid,
             ErrorCode::TwoFactorTokenExpired => Self::TwoFactorTokenExpired,
+            ErrorCode::TwoFactorUnavailable => Self::TwoFactorUnavailable,
             ErrorCode::TotpRateLimitExceeded => Self::TotpRateLimitExceeded,
         }
     }
@@ -594,6 +607,7 @@ impl IntoResponse for AppError {
             Self::TwoFactorTokenInvalid | Self::TwoFactorTokenExpired => {
                 tracing::debug!("two factor token validation failure")
             }
+            Self::TwoFactorUnavailable => tracing::error!("two factor verification unavailable"),
             Self::TotpRateLimitExceeded => tracing::warn!("totp rate limit exceeded"),
             Self::TotpEmailNotVerified => {
                 tracing::debug!("totp enrollment blocked: email not verified")
@@ -699,6 +713,10 @@ mod tests {
             (
                 ErrorCode::TwoFactorTokenExpired,
                 "\"TWO_FACTOR_TOKEN_EXPIRED\"",
+            ),
+            (
+                ErrorCode::TwoFactorUnavailable,
+                "\"TWO_FACTOR_UNAVAILABLE\"",
             ),
             (
                 ErrorCode::TotpRateLimitExceeded,
@@ -1005,6 +1023,12 @@ mod tests {
                 "two factor token has expired",
             ),
             (
+                AppError::TwoFactorUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::TwoFactorUnavailable,
+                "two factor authentication is temporarily unavailable",
+            ),
+            (
                 AppError::TotpRateLimitExceeded,
                 StatusCode::TOO_MANY_REQUESTS,
                 ErrorCode::TotpRateLimitExceeded,
@@ -1215,6 +1239,7 @@ mod tests {
             ErrorCode::TwoFactorRequired,
             ErrorCode::TwoFactorTokenInvalid,
             ErrorCode::TwoFactorTokenExpired,
+            ErrorCode::TwoFactorUnavailable,
             ErrorCode::TotpRateLimitExceeded,
         ];
         for code in codes {

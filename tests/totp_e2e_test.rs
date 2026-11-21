@@ -238,3 +238,107 @@ async fn journey_2_backup_code_login_purges_the_used_hash() {
     );
     assert_eq!(reuse.error_code(), Some(ErrorCode::TotpBackupCodeInvalid));
 }
+
+#[tokio::test]
+async fn journey_3_disable_2fa_then_login_without_a_challenge() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    let ip = dynamic_ip();
+
+    let (email, password, _secret, _backup_codes, session) = enabled_user(&app, &ip).await;
+    let user_id = user_id_for_email(&app.pool, &email).await;
+    let secrets_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM totp_secrets WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("count totp_secrets");
+    assert_eq!(secrets_before, 1, "enrollment must leave one secret row");
+
+    let disable = app
+        .dispatch(session_request(
+            &app,
+            Method::DELETE,
+            "/auth/totp",
+            json!({ "password": password }),
+            &session,
+            &ip,
+        ))
+        .await;
+    assert_eq!(
+        disable.status(),
+        StatusCode::OK,
+        "disable failed: {}",
+        disable.body_str
+    );
+    assert_eq!(
+        disable.json["message"],
+        json!("two-factor authentication disabled")
+    );
+
+    let secrets_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM totp_secrets WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("count totp_secrets");
+    assert_eq!(secrets_after, 0, "disable must drop the secret row");
+
+    // The next login is a full session: no challenge, and a new row for the same user.
+    let sessions_before = count_sessions_for_user(&app.pool, user_id).await;
+    let login_resp = app
+        .post_json(
+            "/auth/login",
+            json!({ "email": email, "password": password }),
+        )
+        .await;
+    assert_eq!(
+        login_resp.status(),
+        StatusCode::OK,
+        "login failed: {}",
+        login_resp.body_str
+    );
+    assert!(
+        login_resp.headers.contains_key(header::SET_COOKIE),
+        "login without 2FA must issue the session cookie"
+    );
+    assert!(
+        login_resp.json.get("two_factor_required").is_none(),
+        "no challenge may remain after disabling 2FA: {}",
+        login_resp.body_str
+    );
+    assert!(login_resp.json.get("challenge_token").is_none());
+    assert_eq!(
+        count_sessions_for_user(&app.pool, user_id).await,
+        sessions_before + 1,
+        "login must issue exactly one session for the same user"
+    );
+
+    let sid = extract_cookie_val(&login_resp.headers, &app.state.config.session.cookie_name)
+        .expect("session cookie");
+    let session_resp = app
+        .dispatch(empty_request_with_headers(
+            Method::GET,
+            "/auth/session",
+            cookie_header(&app, &sid),
+        ))
+        .await;
+    assert_eq!(
+        session_resp.status(),
+        StatusCode::OK,
+        "session lookup failed: {}",
+        session_resp.body_str
+    );
+    let issued_hash = session_resp.json["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    assert!(
+        session_token_hashes(&app.pool, user_id)
+            .await
+            .contains(&issued_hash),
+        "the post-disable session must belong to the same user"
+    );
+}

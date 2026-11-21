@@ -1,10 +1,13 @@
-//! Migration 0008 against a throwaway schema.
+//! Migration 0008 round trip against a throwaway schema.
 //!
-//! The up script must create every Phase 7 table, index, and unique constraint, and must stay
-//! applied on an isolated schema so nothing else in the test database is touched.
+//! 0008 ships its rollback as a commented reference block only
+//! (`migrations/20240101000008_create_totp.sql:44-51`), so there is nothing for sqlx to revert.
+//! The drops below are a literal replay of that block — update both together.
 
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use uuid::Uuid;
+
+const MIGRATION_VERSION: i64 = 20240101000008;
 
 const PHASE7_TABLES: [&str; 3] = ["totp_secrets", "totp_used_codes", "two_factor_tokens"];
 
@@ -21,6 +24,17 @@ const PHASE7_UNIQUE_CONSTRAINTS: [&str; 3] = [
     "uq_two_factor_tokens_hash",
 ];
 
+/// The documented down block, one statement per element.
+const DOWN_STATEMENTS: [&str; 7] = [
+    "DROP INDEX IF EXISTS idx_two_factor_tokens_expires",
+    "DROP INDEX IF EXISTS idx_two_factor_tokens_user_id",
+    "DROP TABLE IF EXISTS two_factor_tokens",
+    "DROP INDEX IF EXISTS idx_totp_used_codes_user_used",
+    "DROP TABLE IF EXISTS totp_used_codes",
+    "DROP INDEX IF EXISTS idx_totp_secrets_user_id",
+    "DROP TABLE IF EXISTS totp_secrets",
+];
+
 #[tokio::test]
 async fn migration_0008_creates_every_phase7_object() {
     in_isolated_schema(|pool, schema| async move {
@@ -28,6 +42,40 @@ async fn migration_0008_creates_every_phase7_object() {
             .run(&pool)
             .await
             .map_err(|e| format!("migrations must apply cleanly: {e}"))?;
+        assert_phase7_present(&pool, &schema).await
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn migration_0008_down_removes_every_phase7_object() {
+    in_isolated_schema(|pool, schema| async move {
+        let migrator = sqlx::migrate!("./migrations");
+        migrator
+            .run(&pool)
+            .await
+            .map_err(|e| format!("migrations must apply cleanly: {e}"))?;
+        assert_phase7_present(&pool, &schema).await?;
+
+        for statement in DOWN_STATEMENTS {
+            sqlx::raw_sql(statement)
+                .execute(&pool)
+                .await
+                .map_err(|e| format!("down statement `{statement}` failed: {e}"))?;
+        }
+        assert_phase7_absent(&pool, &schema).await?;
+
+        // sqlx records 0008 as applied even after the manual drops, so the row must go
+        // before the up script can run again.
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = $1")
+            .bind(MIGRATION_VERSION)
+            .execute(&pool)
+            .await
+            .map_err(|e| format!("clear the 0008 migration record: {e}"))?;
+        migrator
+            .run(&pool)
+            .await
+            .map_err(|e| format!("the 0008 up script must replay after a down: {e}"))?;
         assert_phase7_present(&pool, &schema).await
     })
     .await;
@@ -72,6 +120,47 @@ async fn assert_phase7_present(pool: &PgPool, schema: &str) -> Result<(), String
     if constraints.len() != PHASE7_UNIQUE_CONSTRAINTS.len() {
         return Err(format!(
             "missing phase 7 unique constraints in {schema}: found {constraints:?}"
+        ));
+    }
+
+    Ok(())
+}
+
+async fn assert_phase7_absent(pool: &PgPool, schema: &str) -> Result<(), String> {
+    let tables = object_names(
+        pool,
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = $1 \
+         AND table_name = ANY($2)",
+        schema,
+        &PHASE7_TABLES,
+    )
+    .await?;
+    if !tables.is_empty() {
+        return Err(format!("phase 7 tables survived the down: {tables:?}"));
+    }
+
+    let indexes = object_names(
+        pool,
+        "SELECT indexname FROM pg_indexes WHERE schemaname = $1 AND indexname = ANY($2)",
+        schema,
+        &PHASE7_INDEXES,
+    )
+    .await?;
+    if !indexes.is_empty() {
+        return Err(format!("phase 7 indexes survived the down: {indexes:?}"));
+    }
+
+    let constraints = object_names(
+        pool,
+        "SELECT constraint_name FROM information_schema.table_constraints \
+         WHERE constraint_type = 'UNIQUE' AND table_schema = $1 AND constraint_name = ANY($2)",
+        schema,
+        &PHASE7_UNIQUE_CONSTRAINTS,
+    )
+    .await?;
+    if !constraints.is_empty() {
+        return Err(format!(
+            "phase 7 constraints survived the down: {constraints:?}"
         ));
     }
 

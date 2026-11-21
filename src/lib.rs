@@ -37,9 +37,12 @@ pub mod oauth;
 pub mod ratelimit;
 pub mod session;
 pub mod state;
+pub mod totp;
 
 pub use auth::{Auth, AuthService, AuthServiceImpl, AuthenticatedLogin, UserResponse};
-pub use config::{AppConfig, Config, OAuthConfig, ProviderConfig, RateLimitConfig, SessionConfig};
+pub use config::{
+    AppConfig, Config, OAuthConfig, ProviderConfig, RateLimitConfig, SessionConfig, TotpConfig,
+};
 pub use db::models::{
     EmailOutbox, OAuthAccount, PasswordResetToken, Session, User, VerificationToken,
 };
@@ -48,7 +51,7 @@ pub use email::{
     SharedEmailSender, VerificationEmailPayload,
 };
 pub use error::{AppError, AppResult, ConfigError, ErrorCode, ErrorResponse};
-pub use handler::{auth_routes, oauth_routes, session_routes};
+pub use handler::{auth_routes, oauth_routes, session_routes, totp_routes};
 pub use middleware::{AuthUser, csrf_middleware, require_auth, security_headers_middleware};
 pub use oauth::{
     AppleProvider, GitHubProvider, GoogleProvider, OAUTH_BODY_LIMIT, OAuthCallbackOutcome,
@@ -67,6 +70,7 @@ pub use session::{
     read_session_cookie, set_csrf_cookie, set_session_cookie,
 };
 pub use state::AppState;
+pub use totp::service::{EnrollTotpResponse, FreshAuthProof, TotpService};
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use email::test_utils;

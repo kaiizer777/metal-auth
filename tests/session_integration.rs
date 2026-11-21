@@ -1260,7 +1260,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuffer {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn test_session_hash_not_logged() {
+async fn test_session_hash_logged_only_by_the_authentication_event() {
     let _guard = DB_LOCK.lock().await;
     let Some(app) = setup_test_app().await else {
         return;
@@ -1311,9 +1311,18 @@ async fn test_session_hash_not_logged() {
         !logs.contains(&sid),
         "raw session token must never appear in logs"
     );
+    // Authentication events log the irreversible hash as a session correlator; nothing
+    // else may. Session lifecycle events keep their no-hash rule.
+    let hash_events: Vec<&str> = logs.lines().filter(|line| line.contains(&hash)).collect();
+    assert_eq!(
+        hash_events.len(),
+        1,
+        "the session hash must appear once, on the authentication event: {hash_events:?}"
+    );
     assert!(
-        !logs.contains(&hash),
-        "token hash must never appear in logs"
+        hash_events[0].contains("login_success"),
+        "only the authentication event may log the session hash: {}",
+        hash_events[0]
     );
     assert!(
         !logs.contains(&csrf),

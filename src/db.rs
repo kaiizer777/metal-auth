@@ -140,6 +140,15 @@ pub async fn init_pool_with_options(
     Ok(pool)
 }
 
+/// Serializes the lib tests that dispatch email-outbox rows.
+///
+/// All modules share one schema, and `claim_pending_outbox` claims globally, so per-module
+/// locks let one test's dispatcher deliver another module's fixture rows. Tests that touch
+/// the database without claiming outbox rows — the session expiry tests, for instance — do
+/// not take it.
+#[cfg(test)]
+pub(crate) static DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +189,7 @@ mod tests {
             session: crate::config::SessionConfig::default(),
             rate_limit: crate::config::RateLimitConfig::default(),
             oauth: crate::config::OAuthConfig::default(),
+            totp: crate::config::TotpConfig::default(),
         };
         let opts = DbPoolOptions::from(&cfg);
         assert_eq!(opts.max_connections, 50);

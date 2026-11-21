@@ -682,8 +682,12 @@ impl TotpService {
     /// on the lock and commits after the session, never between the decision and the
     /// insert. Coverage stops at that row — a factor created after this read is not
     /// observed, because `enroll_totp` inserts a new row and an absent row takes no lock.
-    /// Closing that case would require the gate to lock the user row for update, which would
-    /// serialize every login against enrollment and every other user-row writer.
+    /// Closing that case would mean `SELECT … FOR UPDATE` on the user row before this read;
+    /// `create_session_in` takes that same lock later in the same transaction, so the
+    /// acquisition would not add serialization, only move it earlier. It is not taken
+    /// because the boundary is not a bypass: a factor created after this decision did not
+    /// exist when the credentials were validated, and a session minted before activation is
+    /// not revoked — the same position as enabling 2FA after a finished login.
     pub(crate) async fn is_totp_enabled_locked(
         &self,
         connection: &mut PgConnection,

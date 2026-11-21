@@ -140,6 +140,13 @@ pub async fn init_pool_with_options(
     Ok(pool)
 }
 
+/// Serializes every DB-backed lib test in this binary.
+///
+/// All modules share one schema, and `claim_pending_outbox` claims globally, so per-module
+/// locks let one test's dispatcher deliver another module's fixture rows.
+#[cfg(test)]
+pub(crate) static DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;

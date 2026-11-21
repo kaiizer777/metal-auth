@@ -331,6 +331,19 @@ async fn enroll_rejects_already_enabled() {
 // ─── Confirmation ────────────────────────────────────────────────────────────
 
 #[tokio::test]
+async fn confirm_requires_auth() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let resp = app
+        .post_json("/auth/totp/confirm", json!({ "code": "000000" }))
+        .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn confirm_rejects_invalid_code() {
     let _guard = DB_LOCK.lock().await;
     let Some(app) = setup_test_app().await else {
@@ -718,6 +731,24 @@ async fn backup_issues_a_working_session_and_consumes_the_code() {
         .await;
     assert_eq!(reuse.status(), StatusCode::BAD_REQUEST);
     assert_eq!(reuse.error_code(), Some(ErrorCode::TotpBackupCodeInvalid));
+}
+
+#[tokio::test]
+async fn backup_rejects_unknown_challenge_token() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let resp = app
+        .post_json(
+            "/auth/totp/backup",
+            json!({ "challenge_token": "00".repeat(32), "code": "AAAAAAAAAAAAAAAA" }),
+        )
+        .await;
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.error_code(), Some(ErrorCode::TwoFactorTokenInvalid));
 }
 
 #[tokio::test]

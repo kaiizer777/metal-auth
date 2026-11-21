@@ -409,62 +409,86 @@ impl TotpService {
     /// Disable 2FA after a fresh password or live TOTP proof.
     ///
     /// Rejections keep the status of the check that rejected the proof: a wrong password
-    /// is `InvalidCredentials` (401), while a wrong TOTP code is passed through from
-    /// `verify_totp` as `TotpCodeInvalid` (400), matching every other code check. A
-    /// missing or ambiguous body proof is rejected as `ValidationError` (400) before
-    /// this call.
+    /// is `InvalidCredentials` (401), while a wrong TOTP code is passed through from the
+    /// code check as `TotpCodeInvalid` (400), matching every other code check. A missing
+    /// or ambiguous body proof is rejected as `ValidationError` (400) before this call.
     /// Deletes the secret (and its backup codes) plus the user's replay log. Any live
     /// challenge token therefore has no secret left to satisfy.
+    ///
+    /// The code branch is one transaction: the proof's replay row, the secret, and the
+    /// replay log commit together. Rolling back a failed disable therefore leaves the
+    /// still-valid code retryable instead of reporting it as replayed.
     pub async fn disable_totp(
         &self,
         user_id: Uuid,
         fresh_auth: FreshAuthProof,
-        ip: &str,
+        _ip: &str,
     ) -> Result<(), AppError> {
         match fresh_auth {
             FreshAuthProof::Password(password) => {
-                let password_hash: String = sqlx::query_scalar::<_, String>(
-                    "SELECT password_hash FROM users WHERE id = $1",
-                )
+                self.verify_password_proof(user_id, password).await?;
+                self.delete_factor_state(user_id).await
+            }
+            FreshAuthProof::TotpCode(code) => {
+                let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
+                self.verify_and_record_totp(&mut transaction, user_id, &code)
+                    .await?;
+                self.delete_factor_state_in(&mut transaction, user_id)
+                    .await?;
+                transaction.commit().await.map_err(AppError::Database)
+            }
+        }
+    }
+
+    /// Check a password proof on the pool: Argon2id is CPU-bound and must run off the
+    /// executor, and no transaction may be held while it does.
+    async fn verify_password_proof(&self, user_id: Uuid, password: String) -> Result<(), AppError> {
+        let password_hash: String =
+            sqlx::query_scalar::<_, String>("SELECT password_hash FROM users WHERE id = $1")
                 .bind(user_id)
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(AppError::Database)?
                 .ok_or(AppError::InvalidCredentials)?;
 
-                // Argon2id is CPU-bound; never run it on the executor thread.
-                let verified =
-                    tokio::task::spawn_blocking(move || verify_password(&password, &password_hash))
-                        .await
-                        .map_err(|err| {
-                            tracing::error!(error = %err, "password verification task failed");
-                            AppError::Internal
-                        })??;
-                if !verified {
-                    return Err(AppError::InvalidCredentials);
-                }
-            }
-            FreshAuthProof::TotpCode(code) => self.verify_totp(user_id, &code, ip).await?,
+        // Argon2id is CPU-bound; never run it on the executor thread.
+        let verified =
+            tokio::task::spawn_blocking(move || verify_password(&password, &password_hash))
+                .await
+                .map_err(|err| {
+                    tracing::error!(error = %err, "password verification task failed");
+                    AppError::Internal
+                })??;
+        if !verified {
+            return Err(AppError::InvalidCredentials);
         }
+        Ok(())
+    }
 
+    /// Delete the factor and the replay log in their own transaction.
+    async fn delete_factor_state(&self, user_id: Uuid) -> Result<(), AppError> {
         let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
-        let secret_delete = sqlx::query("DELETE FROM totp_secrets WHERE user_id = $1")
+        self.delete_factor_state_in(&mut transaction, user_id)
+            .await?;
+        transaction.commit().await.map_err(AppError::Database)
+    }
+
+    /// Delete the factor and the replay log on the caller's transaction.
+    async fn delete_factor_state_in(
+        &self,
+        connection: &mut PgConnection,
+        user_id: Uuid,
+    ) -> Result<(), AppError> {
+        sqlx::query("DELETE FROM totp_secrets WHERE user_id = $1")
             .bind(user_id)
-            .execute(&mut *transaction)
-            .await;
-        if let Err(error) = secret_delete {
-            let _ = transaction.rollback().await;
-            return Err(AppError::Database(error));
-        }
-        let replay_delete = sqlx::query("DELETE FROM totp_used_codes WHERE user_id = $1")
+            .execute(&mut *connection)
+            .await
+            .map_err(AppError::Database)?;
+        sqlx::query("DELETE FROM totp_used_codes WHERE user_id = $1")
             .bind(user_id)
-            .execute(&mut *transaction)
-            .await;
-        if let Err(error) = replay_delete {
-            let _ = transaction.rollback().await;
-            return Err(AppError::Database(error));
-        }
-        transaction.commit().await.map_err(AppError::Database)?;
+            .execute(&mut *connection)
+            .await
+            .map_err(AppError::Database)?;
 
         tracing::debug!(
             event = "totp_secret_deleted",

@@ -1137,6 +1137,71 @@ async fn disable_with_totp_code() {
     assert!(login_resp.json.get("two_factor_required").is_none());
 }
 
+#[tokio::test]
+async fn failed_disable_keeps_the_totp_proof_retryable() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app_with(|cfg| {
+        cfg.totp.rate_limit_ip_max_attempts = 10;
+        cfg.totp.rate_limit_user_max_attempts = 10;
+    })
+    .await
+    else {
+        return;
+    };
+
+    let (email, _password, secret, _backup_codes, session) =
+        enabled_user(&app, &dynamic_ip()).await;
+    let user_id = user_id_for_email(&app.pool, &email).await;
+    let code = totp_code(&secret);
+
+    reject_factor_deletes_for(&app.pool, user_id).await;
+    let failed = app
+        .dispatch(session_request(
+            &app,
+            Method::DELETE,
+            "/auth/totp",
+            json!({ "totp_code": code }),
+            &session,
+            &dynamic_ip(),
+        ))
+        .await;
+    allow_factor_deletes(&app.pool).await;
+
+    assert_eq!(
+        failed.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "body: {}",
+        failed.body_str
+    );
+    assert!(
+        totp_enabled(&app.pool, user_id).await,
+        "a rolled-back disable must leave the factor enabled"
+    );
+    assert_eq!(
+        used_code_rows(&app.pool, user_id).await,
+        0,
+        "the proof's replay row must roll back with the failed disable"
+    );
+
+    let retry = app
+        .dispatch(session_request(
+            &app,
+            Method::DELETE,
+            "/auth/totp",
+            json!({ "totp_code": code }),
+            &session,
+            &dynamic_ip(),
+        ))
+        .await;
+    assert_eq!(
+        retry.status(),
+        StatusCode::OK,
+        "a rolled-back disable must not report the still-valid code as replayed: {}",
+        retry.body_str
+    );
+    assert!(!totp_enabled(&app.pool, user_id).await);
+}
+
 // ─── Failure injection ───────────────────────────────────────────────────────
 
 /// Make `sessions` inserts fail for one user, so a redemption fails after its factor is
@@ -1171,6 +1236,37 @@ async fn allow_session_inserts(pool: &PgPool) {
         .expect("drop session failure function");
 }
 
+/// Make `totp_secrets` deletes fail for one user, so a disable fails after its proof.
+async fn reject_factor_deletes_for(pool: &PgPool, user_id: Uuid) {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION totp_test_reject_secret_delete() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected factor delete failure'; END $$",
+    )
+    .execute(pool)
+    .await
+    .expect("create delete failure function");
+    // The only interpolated value is a `Uuid`; a trigger predicate cannot take binds.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TRIGGER totp_test_reject_secret_delete BEFORE DELETE ON totp_secrets \
+         FOR EACH ROW WHEN (OLD.user_id = '{user_id}') \
+         EXECUTE FUNCTION totp_test_reject_secret_delete()"
+    )))
+    .execute(pool)
+    .await
+    .expect("create delete failure trigger");
+}
+
+async fn allow_factor_deletes(pool: &PgPool) {
+    sqlx::query("DROP TRIGGER IF EXISTS totp_test_reject_secret_delete ON totp_secrets")
+        .execute(pool)
+        .await
+        .expect("drop delete failure trigger");
+    sqlx::query("DROP FUNCTION IF EXISTS totp_test_reject_secret_delete()")
+        .execute(pool)
+        .await
+        .expect("drop delete failure function");
+}
+
 async fn used_code_rows(pool: &PgPool, user_id: Uuid) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM totp_used_codes WHERE user_id = $1")
         .bind(user_id)
@@ -1187,6 +1283,15 @@ async fn stored_backup_code_count(pool: &PgPool, user_id: Uuid) -> i32 {
     .fetch_one(pool)
     .await
     .expect("count backup codes")
+}
+
+async fn totp_enabled(pool: &PgPool, user_id: Uuid) -> bool {
+    sqlx::query_scalar("SELECT enabled FROM totp_secrets WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .expect("read factor state")
+        .unwrap_or_default()
 }
 
 // ─── Harness invariants ──────────────────────────────────────────────────────

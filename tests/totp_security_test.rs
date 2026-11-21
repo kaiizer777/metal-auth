@@ -1056,10 +1056,13 @@ async fn ip_budget_admits_exactly_ten_attempts_then_returns_429() {
     app.state.rate_limiter.reset(&RateLimiter::totp_ip_key(&ip));
 
     for attempt in 0..10 {
+        // Distinct tokens per attempt: reusing one token could not tell an IP budget from a
+        // per-token budget.
+        let token = format!("{attempt:02x}").repeat(32);
         let resp = app
             .post_json_with_ip(
                 "/auth/totp/verify",
-                json!({ "challenge_token": "00".repeat(32), "code": "000000" }),
+                json!({ "challenge_token": token, "code": "000000" }),
                 &ip,
             )
             .await;
@@ -1075,7 +1078,7 @@ async fn ip_budget_admits_exactly_ten_attempts_then_returns_429() {
     let rejected = app
         .post_json_with_ip(
             "/auth/totp/verify",
-            json!({ "challenge_token": "00".repeat(32), "code": "000000" }),
+            json!({ "challenge_token": "ff".repeat(32), "code": "000000" }),
             &ip,
         )
         .await;

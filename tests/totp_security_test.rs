@@ -1,7 +1,7 @@
 //! Security-regression scenarios for TOTP two-factor authentication.
 //!
-//! Every test here is a negative path from the Phase 7 Tier 4 list, driven through the
-//! real router and PostgreSQL. Positive handler coverage lives in `totp_handler_test.rs`.
+//! Each test drives one Phase 7 Tier 4 case through the real router and PostgreSQL.
+//! Positive handler coverage lives in `totp_handler_test.rs`.
 
 mod common;
 

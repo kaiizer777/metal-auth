@@ -693,8 +693,6 @@ mod tests {
         }
     }
 
-    static DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     struct DbTestContext {
         service: AuthServiceImpl,
         pool: PgPool,
@@ -708,7 +706,7 @@ mod tests {
     }
 
     async fn setup_db_context() -> Option<DbTestContext> {
-        let guard = DB_TEST_LOCK.lock().await;
+        let guard = crate::db::DB_TEST_LOCK.lock().await;
         dotenvy::dotenv().ok();
         let url = db_test_url()?;
         // Runs the embedded migrations, so a bare Postgres (CI service container) is enough.

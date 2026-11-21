@@ -391,8 +391,6 @@ mod tests {
         assert_eq!(custom.lease_duration, Duration::from_secs(45));
     }
 
-    static DB_OUTBOX_TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     async fn test_pool() -> Option<PgPool> {
         dotenvy::dotenv().ok();
         let url = match std::env::var("DATABASE_URL") {
@@ -417,7 +415,7 @@ mod tests {
 
     #[tokio::test]
     async fn deliver_single_message_handles_corrupt_verification_payload() {
-        let _guard = DB_OUTBOX_TEST_MUTEX.lock().await;
+        let _guard = crate::db::DB_TEST_LOCK.lock().await;
         let Some(pool) = test_pool().await else {
             return;
         };
@@ -473,7 +471,7 @@ mod tests {
 
     #[tokio::test]
     async fn deliver_single_message_handles_corrupt_password_reset_payload() {
-        let _guard = DB_OUTBOX_TEST_MUTEX.lock().await;
+        let _guard = crate::db::DB_TEST_LOCK.lock().await;
         let Some(pool) = test_pool().await else {
             return;
         };
@@ -529,7 +527,7 @@ mod tests {
 
     #[tokio::test]
     async fn deliver_single_message_handles_unknown_email_type() {
-        let _guard = DB_OUTBOX_TEST_MUTEX.lock().await;
+        let _guard = crate::db::DB_TEST_LOCK.lock().await;
         let Some(pool) = test_pool().await else {
             return;
         };
@@ -604,7 +602,7 @@ mod tests {
 
     #[tokio::test]
     async fn deliver_single_message_handles_timeout() {
-        let _guard = DB_OUTBOX_TEST_MUTEX.lock().await;
+        let _guard = crate::db::DB_TEST_LOCK.lock().await;
         let Some(pool) = test_pool().await else {
             return;
         };
@@ -669,7 +667,7 @@ mod tests {
 
     #[tokio::test]
     async fn deliver_single_message_lost_lease_logs_warning_and_does_not_panic() {
-        let _guard = DB_OUTBOX_TEST_MUTEX.lock().await;
+        let _guard = crate::db::DB_TEST_LOCK.lock().await;
         let Some(pool) = test_pool().await else {
             return;
         };
@@ -726,7 +724,7 @@ mod tests {
 
     #[tokio::test]
     async fn drain_outbox_batches_loops_until_empty() {
-        let _guard = DB_OUTBOX_TEST_MUTEX.lock().await;
+        let _guard = crate::db::DB_TEST_LOCK.lock().await;
         let Some(pool) = test_pool().await else {
             return;
         };
@@ -812,7 +810,7 @@ mod tests {
 
     #[tokio::test]
     async fn drain_stops_claiming_after_shutdown() {
-        let _guard = DB_OUTBOX_TEST_MUTEX.lock().await;
+        let _guard = crate::db::DB_TEST_LOCK.lock().await;
         let Some(pool) = test_pool().await else {
             return;
         };

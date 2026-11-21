@@ -536,8 +536,6 @@ mod tests {
         http::{HeaderMap, StatusCode, header},
     };
 
-    static TOTP_DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     /// Test-only AES key. Never a production key.
     const TEST_KEY_HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
@@ -550,7 +548,7 @@ mod tests {
     }
 
     async fn setup_db_context() -> Option<DbTestContext> {
-        let guard = TOTP_DB_TEST_LOCK.lock().await;
+        let guard = crate::db::DB_TEST_LOCK.lock().await;
         dotenvy::dotenv().ok();
         let url = db_test_url()?;
         let pool = crate::db::init_pool_with_options(

@@ -1140,6 +1140,7 @@ async fn disable_with_totp_code() {
             json!({ "email": email, "password": password }),
         )
         .await;
+    assert_eq!(login_resp.status(), StatusCode::OK);
     assert!(login_resp.json.get("two_factor_required").is_none());
 }
 

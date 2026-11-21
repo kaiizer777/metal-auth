@@ -59,6 +59,16 @@ async fn pending_challenge_count(pool: &PgPool, user_id: Uuid) -> i64 {
         .expect("count challenge tokens")
 }
 
+async fn stored_backup_hashes(pool: &PgPool, user_id: Uuid) -> Vec<String> {
+    let stored: serde_json::Value =
+        sqlx::query_scalar("SELECT backup_codes FROM totp_secrets WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await
+            .expect("backup code store");
+    serde_json::from_value(stored).expect("backup codes are a JSON string array")
+}
+
 /// Scenario 1: a challenge token past its TTL cannot mint a session.
 #[tokio::test]
 async fn expired_challenge_token_is_rejected() {
@@ -575,6 +585,47 @@ async fn login_with_2fa_returns_only_a_challenge() {
         count_sessions_for_user(&app.pool, user_id).await,
         sessions_before,
         "a 2FA login must not create a session row"
+    );
+}
+
+/// Scenario 10: exactly the consumed hash leaves the JSONB array, and the rest survive.
+#[tokio::test]
+async fn used_backup_code_is_purged_from_storage() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let (email, password, _secret, backup_codes, _session) =
+        enabled_user(&app, &dynamic_ip()).await;
+    let user_id = user_id_for_email(&app.pool, &email).await;
+    let code = backup_codes[2].clone();
+
+    let before = stored_backup_hashes(&app.pool, user_id).await;
+    assert_eq!(before.len(), 10, "enrollment must store ten hashes");
+
+    let token = challenge(&app, &email, &password).await;
+    let used = app
+        .post_json_with_ip(
+            "/auth/totp/backup",
+            json!({ "challenge_token": token, "code": code }),
+            &dynamic_ip(),
+        )
+        .await;
+    assert_eq!(used.status(), StatusCode::OK, "body: {}", used.body_str);
+
+    // Per-code Argon2id salts make the used hash unidentifiable in-test, so the purge is
+    // observable as the count drop plus PHC integrity; reuse rejection is proven in
+    // `reused_backup_code_is_rejected`.
+    let after = stored_backup_hashes(&app.pool, user_id).await;
+    assert_eq!(after.len(), 9, "exactly one hash must be removed");
+    assert!(
+        after.iter().all(|hash| hash.starts_with("$argon2id$")),
+        "the remaining entries must stay Argon2id PHC strings"
+    );
+    assert!(
+        after.iter().all(|hash| !hash.contains(&code)),
+        "no stored hash may contain the raw backup code"
     );
 }
 

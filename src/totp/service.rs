@@ -1442,9 +1442,9 @@ mod tests {
         let live_end = code_window_end(counter).expect("bound");
         let live = format!("{:06}", generate_totp(&raw, counter).expect("generate"));
         ctx.service
-            .verify_totp_at_reference(user_id, &live, live_end - Duration::microseconds(1))
+            .verify_totp_at_reference(user_id, &live, live_end - Duration::seconds(1))
             .await
-            .expect("one microsecond before the bound must still verify");
+            .expect("the last accepted second must still verify");
         assert_eq!(count_used_code(&ctx.pool, user_id, &live).await, 1);
 
         // Two steps older: the reference is still inside the band, the write is past it.
@@ -1453,7 +1453,7 @@ mod tests {
         let stale = format!("{:06}", generate_totp(&raw, stale_step).expect("generate"));
         let write_late = ctx
             .service
-            .verify_totp_at_reference(user_id, &stale, stale_end - Duration::microseconds(1))
+            .verify_totp_at_reference(user_id, &stale, stale_end - Duration::seconds(1))
             .await;
         assert!(
             matches!(write_late, Err(AppError::TotpCodeInvalid)),
@@ -1501,7 +1501,7 @@ mod tests {
         let window_end = code_window_end(step).expect("bound");
         let verdict = ctx
             .service
-            .verify_totp_at_reference(user_id, &code, window_end - Duration::microseconds(1))
+            .verify_totp_at_reference(user_id, &code, window_end - Duration::seconds(1))
             .await;
         assert!(
             matches!(verdict, Err(AppError::TotpCodeInvalid)),

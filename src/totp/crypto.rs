@@ -247,8 +247,10 @@ pub(crate) fn code_window_end(step: u64) -> Option<DateTime<Utc>> {
 /// Replay-tracking hash: `SHA-256(code)` scoped by the row's `user_id`.
 ///
 /// The time step is deliberately excluded: a code is valid at `T-1`, `T`, and `T+1`,
-/// so hashing the step would let one captured code be redeemed three times. The unique
-/// constraint on `(user_id, code_hash)` is the single arbiter.
+/// so hashing the step would let one captured code be redeemed three times. This hash is
+/// the duplicate arbiter: `uq_totp_used_codes` rejects a second row while one survives.
+/// [`code_window_end`] is the window arbiter, refusing a write that lands after the
+/// matched step's acceptance band.
 #[must_use]
 pub fn compute_code_replay_hash(code: &str) -> Vec<u8> {
     let mut hasher = Sha256::new();
@@ -304,12 +306,14 @@ mod tests {
         assert_eq!(code_window_end(0), DateTime::from_timestamp(60, 0));
         assert_eq!(code_window_end(7), DateTime::from_timestamp(270, 0));
 
+        // The counter truncates to whole seconds, so one second is the finest offset this
+        // rule can distinguish: `end - 1s` is the last accepted second, `end` is outside.
         for step in [0_u64, 7] {
             let end = code_window_end(step).expect("bound");
-            let inside = end - chrono::Duration::microseconds(1);
+            let last_accepted = end - chrono::Duration::seconds(1);
             assert!(
-                totp_counter_at(inside).abs_diff(step) <= TOTP_WINDOW_STEPS.unsigned_abs(),
-                "one microsecond before the bound must still be inside the band"
+                totp_counter_at(last_accepted).abs_diff(step) <= TOTP_WINDOW_STEPS.unsigned_abs(),
+                "the last accepted second must still be inside the band"
             );
             assert!(
                 totp_counter_at(end).abs_diff(step) > TOTP_WINDOW_STEPS.unsigned_abs(),

@@ -642,18 +642,21 @@ async fn used_backup_code_is_purged_from_storage() {
         .await;
     assert_eq!(used.status(), StatusCode::OK, "body: {}", used.body_str);
 
-    // Per-code Argon2id salts make the used hash unidentifiable in-test, so the purge is
-    // observable as the count drop plus PHC integrity; reuse rejection is proven in
-    // `reused_backup_code_is_rejected`.
+    // The used hash is identifiable: verification is public and pure, and the JSONB array
+    // delete preserves order.
+    let used_index = metal_auth::totp::backup::verify_backup_code(&code, &before)
+        .expect("the used code must match exactly one stored hash");
+    let mut expected = before;
+    expected.remove(used_index);
+
     let after = stored_backup_hashes(&app.pool, user_id).await;
-    assert_eq!(after.len(), 9, "exactly one hash must be removed");
+    assert_eq!(
+        after, expected,
+        "exactly the hash matching the used code must be removed"
+    );
     assert!(
         after.iter().all(|hash| hash.starts_with("$argon2id$")),
         "the remaining entries must stay Argon2id PHC strings"
-    );
-    assert!(
-        after.iter().all(|hash| !hash.contains(&code)),
-        "no stored hash may contain the raw backup code"
     );
 }
 

@@ -98,6 +98,11 @@ impl AuthServiceImpl {
         })
     }
 
+    /// Borrow the shared pool so sibling services reuse the same connections.
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     // ─── Signup ──────────────────────────────────────────────────────────────
 
     /// Register a new account.

@@ -1377,7 +1377,7 @@ async fn failed_disable_keeps_the_totp_proof_retryable() {
     assert_eq!(
         used_code_rows(&app.pool, user_id).await,
         0,
-        "the proof's replay row must roll back with the failed disable"
+        "disabling must not write a replay row for a proof whose log it deletes"
     );
 
     let retry = app

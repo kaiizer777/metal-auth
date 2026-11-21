@@ -320,14 +320,29 @@ impl TotpService {
         transaction.commit().await.map_err(AppError::Database)
     }
 
-    async fn record_totp_use(
+    /// Verify `code` against the stored secret without recording the use.
+    ///
+    /// Disable is the only caller: its transaction deletes the whole replay log, so a
+    /// recorded use would be deleted before it committed. The spend is the secret delete,
+    /// which rolls back with a failed disable and keeps the code retryable.
+    async fn verify_code_only(
         &self,
         connection: &mut PgConnection,
         user_id: Uuid,
         code: &str,
-        counter: u64,
-        reference: DateTime<Utc>,
-    ) -> Result<u64, AppError> {
+    ) -> Result<(), AppError> {
+        let reference = transaction_now(connection).await?;
+        let secret = self.enabled_secret(connection, user_id).await?;
+        verify_totp_code_at(secret.as_ref(), code, totp_counter_at(reference))?;
+        Ok(())
+    }
+
+    /// Load and decrypt the caller's enabled secret, or report why no code can be checked.
+    async fn enabled_secret(
+        &self,
+        connection: &mut PgConnection,
+        user_id: Uuid,
+    ) -> Result<DecryptedSecret, AppError> {
         let record =
             sqlx::query("SELECT encrypted_secret, enabled FROM totp_secrets WHERE user_id = $1")
                 .bind(user_id)
@@ -345,7 +360,18 @@ impl TotpService {
         let encrypted_secret: Vec<u8> = record
             .try_get("encrypted_secret")
             .map_err(AppError::Database)?;
-        let secret = self.decrypt_totp_secret(&encrypted_secret)?;
+        self.decrypt_totp_secret(&encrypted_secret)
+    }
+
+    async fn record_totp_use(
+        &self,
+        connection: &mut PgConnection,
+        user_id: Uuid,
+        code: &str,
+        counter: u64,
+        reference: DateTime<Utc>,
+    ) -> Result<u64, AppError> {
+        let secret = self.enabled_secret(connection, user_id).await?;
         let step = verify_totp_code_at(secret.as_ref(), code, counter)?;
         let replay_hash = compute_code_replay_hash(code);
 
@@ -493,9 +519,12 @@ impl TotpService {
     /// Deletes the secret (and its backup codes) plus the user's replay log. Any live
     /// challenge token therefore has no secret left to satisfy.
     ///
-    /// The code branch is one transaction: the proof's replay row, the secret, and the
-    /// replay log commit together. Rolling back a failed disable therefore leaves the
-    /// still-valid code retryable instead of reporting it as replayed.
+    /// The code branch is one transaction: the code is verified against the same
+    /// in-transaction clock the verification path uses, then the secret and the replay
+    /// log are deleted together. No replay row is written — the same transaction deletes
+    /// the whole log, so the spend is the delete itself. Rolling back a failed disable
+    /// therefore leaves the still-valid code retryable instead of reporting it as
+    /// replayed.
     pub async fn disable_totp(
         &self,
         user_id: Uuid,
@@ -509,7 +538,7 @@ impl TotpService {
             }
             FreshAuthProof::TotpCode(code) => {
                 let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
-                self.verify_and_record_totp(&mut transaction, user_id, &code)
+                self.verify_code_only(&mut transaction, user_id, &code)
                     .await?;
                 self.delete_factor_state_in(&mut transaction, user_id)
                     .await?;

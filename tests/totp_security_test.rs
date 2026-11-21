@@ -185,3 +185,60 @@ async fn unknown_backup_code_is_rejected_without_state_change() {
         "a rejected backup code must leave the challenge retryable"
     );
 }
+
+/// Scenario 4: a consumed backup code is gone and cannot be replayed.
+#[tokio::test]
+async fn reused_backup_code_is_rejected() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let (email, password, _secret, backup_codes, _session) =
+        enabled_user(&app, &dynamic_ip()).await;
+    let user_id = user_id_for_email(&app.pool, &email).await;
+    let sessions_before = count_sessions_for_user(&app.pool, user_id).await;
+    let code = backup_codes[1].clone();
+
+    let token = challenge(&app, &email, &password).await;
+    let first = app
+        .post_json_with_ip(
+            "/auth/totp/backup",
+            json!({ "challenge_token": token, "code": code }),
+            &dynamic_ip(),
+        )
+        .await;
+    assert_eq!(first.status(), StatusCode::OK, "body: {}", first.body_str);
+    assert_eq!(
+        backup_code_count(&app.pool, user_id).await,
+        9,
+        "a successful use must delete exactly one stored hash"
+    );
+
+    let second_token = challenge(&app, &email, &password).await;
+    let second = app
+        .post_json_with_ip(
+            "/auth/totp/backup",
+            json!({ "challenge_token": second_token, "code": code }),
+            &dynamic_ip(),
+        )
+        .await;
+
+    assert_eq!(
+        second.status(),
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        second.body_str
+    );
+    assert_eq!(second.error_code(), Some(ErrorCode::TotpBackupCodeInvalid));
+    assert_eq!(
+        count_sessions_for_user(&app.pool, user_id).await,
+        sessions_before + 1,
+        "the reuse must not mint a second session"
+    );
+    assert_eq!(
+        backup_code_count(&app.pool, user_id).await,
+        9,
+        "the rejected reuse must not consume another hash"
+    );
+}

@@ -380,7 +380,14 @@ pub async fn login(
             let challenge_token = match state.totp_service.generate_two_factor_token(user_id).await
             {
                 Ok(token) => token,
-                Err(e) => return service_error_response(e),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        user_id = %user_id,
+                        "login refused: second-factor challenge could not be minted"
+                    );
+                    return service_error_response(AppError::TwoFactorUnavailable);
+                }
             };
             tracing::info!(
                 target: "security_event",

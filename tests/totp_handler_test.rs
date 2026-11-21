@@ -1226,6 +1226,45 @@ async fn disable_rejects_wrong_totp_code() {
 }
 
 #[tokio::test]
+async fn login_without_a_mintable_challenge_reports_authentication_unavailable() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let (email, password, _secret, _backup_codes, _session) =
+        enabled_user(&app, &dynamic_ip()).await;
+    let user_id = user_id_for_email(&app.pool, &email).await;
+    let sessions_before = count_sessions_for_user(&app.pool, user_id).await;
+
+    reject_challenge_inserts_for(&app.pool, user_id).await;
+    let refused = app
+        .post_json(
+            "/auth/login",
+            json!({ "email": email, "password": password }),
+        )
+        .await;
+    allow_challenge_inserts(&app.pool).await;
+
+    assert_eq!(
+        refused.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a login that cannot mint a challenge is a server fault: {}",
+        refused.body_str
+    );
+    assert_eq!(refused.error_code(), Some(ErrorCode::TwoFactorUnavailable));
+    assert!(
+        refused.header("set-cookie").is_none(),
+        "a refused challenge must not carry a session cookie"
+    );
+    assert_eq!(
+        count_sessions_for_user(&app.pool, user_id).await,
+        sessions_before,
+        "the refused login must not mint a session"
+    );
+}
+
+#[tokio::test]
 async fn disable_with_password_drops_the_login_challenge() {
     let _guard = DB_LOCK.lock().await;
     let Some(app) = setup_test_app().await else {
@@ -1392,6 +1431,37 @@ async fn allow_session_inserts(pool: &PgPool) {
         .execute(pool)
         .await
         .expect("drop session failure function");
+}
+
+/// Make `two_factor_tokens` inserts fail for one user, so a login cannot mint its challenge.
+async fn reject_challenge_inserts_for(pool: &PgPool, user_id: Uuid) {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION totp_test_reject_challenge() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected challenge insert failure'; END $$",
+    )
+    .execute(pool)
+    .await
+    .expect("create challenge failure function");
+    // The only interpolated value is a `Uuid`; a trigger predicate cannot take binds.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TRIGGER totp_test_reject_challenge BEFORE INSERT ON two_factor_tokens \
+         FOR EACH ROW WHEN (NEW.user_id = '{user_id}') \
+         EXECUTE FUNCTION totp_test_reject_challenge()"
+    )))
+    .execute(pool)
+    .await
+    .expect("create challenge failure trigger");
+}
+
+async fn allow_challenge_inserts(pool: &PgPool) {
+    sqlx::query("DROP TRIGGER IF EXISTS totp_test_reject_challenge ON two_factor_tokens")
+        .execute(pool)
+        .await
+        .expect("drop challenge failure trigger");
+    sqlx::query("DROP FUNCTION IF EXISTS totp_test_reject_challenge()")
+        .execute(pool)
+        .await
+        .expect("drop challenge failure function");
 }
 
 /// Make `totp_secrets` deletes fail for one user, so a disable fails after its proof.

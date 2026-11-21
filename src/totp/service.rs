@@ -71,9 +71,9 @@ impl TotpService {
         let secret_base32 = generate_totp_secret();
         let key = self.encryption_key()?;
         let mut raw_secret = decode_totp_secret(&secret_base32)?;
-        let encrypted_secret = encrypt_secret(&key, &raw_secret);
+        let encrypted = encrypt_secret(&key, &raw_secret);
         crate::crypto::zeroize_bytes(&mut raw_secret);
-        let encrypted_secret = encrypted_secret?;
+        let encrypted_secret = encrypted?;
 
         // 10 Argon2id hashes cost roughly a second of CPU; keep it off the executor.
         let auth_config = Arc::clone(&self.auth_config);
@@ -259,19 +259,18 @@ impl TotpService {
             AppError::Internal
         })?;
 
-        // Both inputs must cross into the blocking closure; every Argon2id verify is CPU-bound.
+        // Owned inputs cross the blocking boundary; the matched PHC string comes back,
+        // so the caller needs neither a clone nor a stale index.
         let candidate = code.to_string();
-        let hashes_for_verification = hashes.clone();
-        let index = tokio::task::spawn_blocking(move || {
-            backup::verify_backup_code(&candidate, &hashes_for_verification)
+        let matched_hash = tokio::task::spawn_blocking(move || {
+            let index = backup::verify_backup_code(&candidate, &hashes)?;
+            hashes.into_iter().nth(index).ok_or(AppError::Internal)
         })
         .await
         .map_err(|err| {
             tracing::error!(error = %err, "backup code verification task failed");
             AppError::Internal
         })??;
-
-        let matched_hash = hashes.get(index).ok_or(AppError::Internal)?;
         let removed = sqlx::query(
             "UPDATE totp_secrets SET backup_codes = backup_codes - $2, \
              updated_at = CURRENT_TIMESTAMP \

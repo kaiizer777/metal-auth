@@ -617,6 +617,58 @@ async fn verify_issues_a_working_session() {
 }
 
 #[tokio::test]
+async fn verify_issues_a_bearer_token_without_cookies() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let (email, password, secret, _backup_codes, _session) =
+        enabled_user(&app, &dynamic_ip()).await;
+    let token = challenge(&app, &email, &password).await;
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-auth-type", "bearer".parse().expect("bearer header"));
+    let req = json_request_with_headers(
+        Method::POST,
+        "/auth/totp/verify",
+        json!({ "challenge_token": token, "code": totp_code(&secret) }),
+        headers,
+    );
+    let resp = app.dispatch(req).await;
+
+    assert_eq!(resp.status(), StatusCode::OK, "body: {}", resp.body_str);
+    assert!(resp.json["user_id"].is_string());
+    assert!(
+        !resp.headers.contains_key(header::SET_COOKIE),
+        "a bearer verify must not set cookies"
+    );
+    let raw_token = resp.json["token"].as_str().expect("bearer token");
+
+    let mut bearer = HeaderMap::new();
+    bearer.insert(
+        header::AUTHORIZATION,
+        format!("Bearer {raw_token}")
+            .parse()
+            .expect("authorization header"),
+    );
+    let session = app
+        .dispatch(empty_request_with_headers(
+            Method::GET,
+            "/auth/session",
+            bearer,
+        ))
+        .await;
+    assert_eq!(
+        session.status(),
+        StatusCode::OK,
+        "body: {}",
+        session.body_str
+    );
+    assert_eq!(session.json["session_type"], json!("bearer"));
+}
+
+#[tokio::test]
 async fn verify_rejects_unknown_challenge_token() {
     let _guard = DB_LOCK.lock().await;
     let Some(app) = setup_test_app().await else {

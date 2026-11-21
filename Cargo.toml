@@ -81,3 +81,11 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wiremock = "0.6"
+
+# Argon2 is the dominant cost of the DB-backed test suites. Optimizing only the
+# hashing crates in the test profile is codegen-only: same m/t/p, same PHC output.
+[profile.test.package.argon2]
+opt-level = 3
+
+[profile.test.package.blake2]
+opt-level = 3

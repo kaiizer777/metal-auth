@@ -117,6 +117,7 @@ impl AppState {
             pool.clone(),
             shared_config,
             Arc::clone(&session_service),
+            Arc::clone(&totp_service),
         )?);
         let rate_limiter = Arc::new(RateLimiter::with_config(config.rate_limit.clone()));
         if config.rate_limit.enabled {

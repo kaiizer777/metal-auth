@@ -85,6 +85,7 @@ async fn setup_oauth_test_app(
         app.pool.clone(),
         cfg_arc,
         session_service.clone(),
+        Arc::clone(&app.state.totp_service),
         providers,
     ));
 

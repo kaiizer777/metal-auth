@@ -88,7 +88,13 @@ fn create_test_oauth_service(
     let cfg_arc = Arc::new(cfg);
     let session_service = Arc::new(SessionService::new(app.pool.clone(), Arc::clone(&cfg_arc)));
 
-    OAuthService::with_providers(app.pool.clone(), cfg_arc, session_service, providers)
+    OAuthService::with_providers(
+        app.pool.clone(),
+        cfg_arc,
+        session_service,
+        Arc::clone(&app.state.totp_service),
+        providers,
+    )
 }
 
 fn extract_state_from_url(url: &str) -> &str {
@@ -380,6 +386,7 @@ async fn test_oauth_auto_provisions_new_verified_user() {
         .expect("handle callback");
     let res = match outcome {
         OAuthCallbackOutcome::Login(r) => r,
+        OAuthCallbackOutcome::TwoFactorRequired { .. } => panic!("expected login"),
         OAuthCallbackOutcome::Linked { .. } => panic!("expected login"),
     };
 
@@ -399,6 +406,110 @@ async fn test_oauth_auto_provisions_new_verified_user() {
     assert_eq!(db_user.0, email);
     assert!(db_user.1);
     assert_eq!(db_user.2, "$unusable$oauth$");
+}
+
+#[tokio::test]
+async fn test_oauth_login_for_totp_user_issues_challenge_and_no_session() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    truncate_tables(&app.pool).await.expect("truncate");
+
+    let google_mock = Arc::new(MockOAuthProvider::new(
+        "google",
+        UserInfo {
+            provider_id: "google".to_string(),
+            provider_user_id: format!("goog_totp_{}", Uuid::new_v4().simple()),
+            email: dynamic_email(),
+            email_verified: true,
+            name: None,
+            avatar_url: None,
+        },
+    ));
+    let svc = create_test_oauth_service(&app, google_mock, None);
+
+    let (auth_url, set_cookie) = svc
+        .get_authorization_url("google", None)
+        .expect("get auth url");
+    let state_token = extract_state_from_url(&auth_url);
+    let first = svc
+        .handle_callback_extended(
+            "google",
+            "valid_code",
+            state_token,
+            Some(&set_cookie),
+            "cookie",
+            Some("127.0.0.1"),
+            Some("test-agent"),
+        )
+        .await
+        .expect("first callback");
+    let user_id = match first {
+        OAuthCallbackOutcome::Login(result) => result.user.id,
+        other => panic!("expected login, got {other:?}"),
+    };
+
+    let enrollment = app
+        .state
+        .totp_service
+        .enroll_totp(user_id)
+        .await
+        .expect("enroll");
+    let code = totp_code(&enrollment.secret_base32);
+    app.state
+        .totp_service
+        .confirm_enrollment(user_id, &code, "127.0.0.1")
+        .await
+        .expect("confirm");
+
+    let sessions_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("count sessions");
+    assert_eq!(sessions_before, 1, "the first login mints one session");
+
+    let (auth_url, set_cookie) = svc
+        .get_authorization_url("google", None)
+        .expect("get auth url");
+    let state_token = extract_state_from_url(&auth_url);
+    let second = svc
+        .handle_callback_extended(
+            "google",
+            "valid_code",
+            state_token,
+            Some(&set_cookie),
+            "cookie",
+            Some("127.0.0.1"),
+            Some("test-agent"),
+        )
+        .await
+        .expect("second callback");
+
+    let OAuthCallbackOutcome::TwoFactorRequired {
+        challenge_token, ..
+    } = second
+    else {
+        panic!("a TOTP-enabled account must not receive a session from OAuth");
+    };
+    assert_eq!(
+        app.state
+            .totp_service
+            .validate_two_factor_token(&challenge_token)
+            .await
+            .expect("challenge token is redeemable"),
+        user_id
+    );
+
+    let sessions_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("count sessions");
+    assert_eq!(sessions_after, sessions_before, "no session may be created");
 }
 
 #[tokio::test]
@@ -618,6 +729,7 @@ async fn test_oauth_email_normalization_on_provisioning() {
         .expect("handle callback");
     let res = match outcome {
         OAuthCallbackOutcome::Login(r) => r,
+        OAuthCallbackOutcome::TwoFactorRequired { .. } => panic!("expected login"),
         OAuthCallbackOutcome::Linked { .. } => panic!("expected login"),
     };
 
@@ -727,6 +839,9 @@ async fn test_oauth_link_intent_in_callback_attaches_identity_without_session() 
             assert!(clear_cookie_header.contains("Max-Age=0"));
         }
         OAuthCallbackOutcome::Login(_) => panic!("expected Linked outcome, got Login"),
+        OAuthCallbackOutcome::TwoFactorRequired { .. } => {
+            panic!("expected Linked outcome, got TwoFactorRequired")
+        }
     }
 
     // 3. Invariant: the callback issued no session beyond the initiating one
@@ -815,6 +930,9 @@ async fn link_callback_succeeds_without_500_after_commit() {
             ..
         } => (user, redirect_url, clear_cookie_header),
         OAuthCallbackOutcome::Login(_) => panic!("expected Linked outcome, got Login"),
+        OAuthCallbackOutcome::TwoFactorRequired { .. } => {
+            panic!("expected Linked outcome, got TwoFactorRequired")
+        }
     };
     assert_eq!(linked_user.id, user_id);
     assert_eq!(redirect_url, "/settings");
@@ -1257,6 +1375,9 @@ async fn link_callback_race_with_revoke_stays_legal() {
             assert_eq!(link_count.0, 1, "committed link must have its row");
         }
         Ok(OAuthCallbackOutcome::Login(_)) => panic!("link intent must not log in"),
+        Ok(OAuthCallbackOutcome::TwoFactorRequired { .. }) => {
+            panic!("link intent must not issue a challenge")
+        }
         Err(AppError::OAuthStateInvalid) => {
             assert_eq!(link_count.0, 0, "rejected link must leave no row");
         }

@@ -16,6 +16,7 @@ use crate::oauth::provider::{
 };
 use crate::oauth::state::{OAuthStateManager, OAuthStatePayload};
 use crate::session::SessionService;
+use crate::totp::service::TotpService;
 
 const SELECT_USER_BY_ID: &str = "SELECT id, email, password_hash, email_verified, created_at, updated_at FROM users WHERE id = $1";
 const SELECT_USER_BY_EMAIL_LOWER: &str = "SELECT id, email, password_hash, email_verified, created_at, updated_at FROM users WHERE LOWER(email) = LOWER($1)";
@@ -64,6 +65,12 @@ impl std::fmt::Debug for OAuthCallbackResult {
 #[derive(Debug, Clone)]
 pub enum OAuthCallbackOutcome {
     Login(OAuthCallbackResult),
+    /// Second factor outstanding: no session was issued. The challenge token is the same
+    /// intermediate token the password path mints and `/auth/totp/*` redeems.
+    TwoFactorRequired {
+        challenge_token: String,
+        clear_cookie_header: String,
+    },
     Linked {
         user: User,
         account: OAuthAccount,
@@ -122,6 +129,7 @@ pub struct OAuthService {
     providers: HashMap<String, Arc<dyn OAuthProvider>>,
     state_mgr: OAuthStateManager,
     session_service: Arc<SessionService>,
+    totp_service: Arc<TotpService>,
     config: Arc<Config>,
 }
 
@@ -151,6 +159,7 @@ impl OAuthService {
         db: PgPool,
         config: Arc<Config>,
         session_service: Arc<SessionService>,
+        totp_service: Arc<TotpService>,
     ) -> Result<Self, AppError> {
         let mut http_client: Option<reqwest::Client> = None;
         let mut providers: HashMap<String, Arc<dyn OAuthProvider>> = HashMap::new();
@@ -179,6 +188,7 @@ impl OAuthService {
             providers,
             state_mgr,
             session_service,
+            totp_service,
             config,
         })
     }
@@ -188,6 +198,7 @@ impl OAuthService {
         db: PgPool,
         config: Arc<Config>,
         session_service: Arc<SessionService>,
+        totp_service: Arc<TotpService>,
         providers: HashMap<String, Arc<dyn OAuthProvider>>,
     ) -> Self {
         let state_mgr = OAuthStateManager::new(&config.oauth, config.session.cookie_secure);
@@ -196,6 +207,7 @@ impl OAuthService {
             providers,
             state_mgr,
             session_service,
+            totp_service,
             config,
         }
     }
@@ -206,6 +218,7 @@ impl OAuthService {
         providers: HashMap<String, Arc<dyn OAuthProvider>>,
         state_mgr: OAuthStateManager,
         session_service: Arc<SessionService>,
+        totp_service: Arc<TotpService>,
         config: Arc<Config>,
     ) -> Self {
         Self {
@@ -213,6 +226,7 @@ impl OAuthService {
             providers,
             state_mgr,
             session_service,
+            totp_service,
             config,
         }
     }
@@ -524,17 +538,6 @@ impl OAuthService {
             .await?;
         let user = link.user;
 
-        let (session, raw_token) = self
-            .session_service
-            .create_session(user.id, ctx.session_type, ctx.ip, ctx.user_agent)
-            .await?;
-
-        tracing::info!(
-            event = "oauth_callback_success",
-            provider = ctx.provider_id,
-            user_id = %user.id,
-            session_id_hash = %session.token_hash,
-        );
         if link.is_linked {
             tracing::info!(
                 event = "oauth_account_linked",
@@ -550,6 +553,35 @@ impl OAuthService {
                 email = %user.email,
             );
         }
+
+        // Second factor gate: an enabled factor blocks session issuance on every login
+        // path, not only the password one. Fail closed — a lookup error aborts the login.
+        if self.totp_service.is_totp_enabled(user.id).await? {
+            let challenge_token = self.totp_service.generate_two_factor_token(user.id).await?;
+            tracing::info!(
+                target: "security_event",
+                event = "two_factor_challenge_issued",
+                provider = ctx.provider_id,
+                user_id = %user.id,
+                ip = ?ctx.ip,
+            );
+            return Ok(OAuthCallbackOutcome::TwoFactorRequired {
+                challenge_token,
+                clear_cookie_header,
+            });
+        }
+
+        let (session, raw_token) = self
+            .session_service
+            .create_session(user.id, ctx.session_type, ctx.ip, ctx.user_agent)
+            .await?;
+
+        tracing::info!(
+            event = "oauth_callback_success",
+            provider = ctx.provider_id,
+            user_id = %user.id,
+            session_id_hash = %session.token_hash,
+        );
 
         let redirect_url = payload.redirect_url.unwrap_or_else(|| "/".to_string());
 
@@ -1208,6 +1240,11 @@ mod tests {
             .connect_lazy(&cfg_arc.database_url)
             .expect("lazy pool");
         let session_service = Arc::new(SessionService::new(pool.clone(), Arc::clone(&cfg_arc)));
+        let totp_service = Arc::new(crate::totp::service::TotpService::new(
+            pool.clone(),
+            Arc::clone(&cfg_arc),
+            Arc::new(crate::config::AppConfig::default()),
+        ));
 
         let mut providers: HashMap<String, Arc<dyn OAuthProvider>> = HashMap::new();
         providers.insert(
@@ -1219,7 +1256,7 @@ mod tests {
             }),
         );
 
-        OAuthService::with_providers(pool, cfg_arc, session_service, providers)
+        OAuthService::with_providers(pool, cfg_arc, session_service, totp_service, providers)
     }
 
     fn alice_user_info() -> UserInfo {

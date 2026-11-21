@@ -7,7 +7,7 @@ mod common;
 
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use common::*;
-use metal_auth::ErrorCode;
+use metal_auth::{ErrorCode, RateLimiter};
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -455,4 +455,133 @@ async fn unverified_email_enrollment_is_rejected() {
         0,
         "a rejected enrollment must not create a secret row"
     );
+}
+
+/// Advertised `Retry-After` must be a positive number of seconds inside the window.
+fn retry_after_secs(resp: &TestResponse, window_secs: u64) -> u64 {
+    let value: u64 = resp
+        .header("retry-after")
+        .expect("a 429 must advertise Retry-After")
+        .parse()
+        .expect("Retry-After is whole seconds");
+    assert!(
+        (1..=window_secs).contains(&value),
+        "Retry-After {value} must be derived from the {window_secs}s window"
+    );
+    value
+}
+
+/// Scenario 8a: the user budget admits exactly its configured attempts, then 429s.
+#[tokio::test]
+async fn user_budget_admits_exactly_three_attempts_then_returns_429() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app_with(|cfg| {
+        cfg.totp.rate_limit_user_max_attempts = 3;
+    })
+    .await
+    else {
+        return;
+    };
+
+    let (email, password, _secret, _backup_codes, _session) =
+        enabled_user(&app, &dynamic_ip()).await;
+    let user_id = user_id_for_email(&app.pool, &email).await;
+    let token = challenge(&app, &email, &password).await;
+
+    // Confirmation already spent one attempt on this user; clear it so the boundary
+    // under test is exactly the configured three, not two.
+    app.state
+        .rate_limiter
+        .reset(&RateLimiter::totp_user_key(user_id));
+
+    for attempt in 0..3 {
+        let resp = app
+            .post_json_with_ip(
+                "/auth/totp/verify",
+                json!({ "challenge_token": token, "code": "000000" }),
+                &dynamic_ip(),
+            )
+            .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "attempt {attempt} must reach the code check: {}",
+            resp.body_str
+        );
+        assert_eq!(resp.error_code(), Some(ErrorCode::TotpCodeInvalid));
+    }
+
+    let rejected = app
+        .post_json_with_ip(
+            "/auth/totp/verify",
+            json!({ "challenge_token": token, "code": "000000" }),
+            &dynamic_ip(),
+        )
+        .await;
+    assert_eq!(
+        rejected.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "body: {}",
+        rejected.body_str
+    );
+    assert_eq!(
+        rejected.error_code(),
+        Some(ErrorCode::TotpRateLimitExceeded)
+    );
+    retry_after_secs(&rejected, app.state.config.totp.rate_limit_window_secs);
+}
+
+/// Scenario 8b: the IP budget is independent of the user budget and trips at 11.
+#[tokio::test]
+async fn ip_budget_admits_exactly_ten_attempts_then_returns_429() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app_with(|cfg| {
+        cfg.totp.rate_limit_ip_max_attempts = 10;
+    })
+    .await
+    else {
+        return;
+    };
+
+    let ip = dynamic_ip();
+    // No enrollment: the token fails validation, so only the IP dimension is charged.
+    app.state
+        .rate_limiter
+        .reset(&RateLimiter::totp_ip_key(&ip));
+
+    for attempt in 0..10 {
+        let resp = app
+            .post_json_with_ip(
+                "/auth/totp/verify",
+                json!({ "challenge_token": "00".repeat(32), "code": "000000" }),
+                &ip,
+            )
+            .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "attempt {attempt} must reach token validation: {}",
+            resp.body_str
+        );
+        assert_eq!(resp.error_code(), Some(ErrorCode::TwoFactorTokenInvalid));
+    }
+
+    let rejected = app
+        .post_json_with_ip(
+            "/auth/totp/verify",
+            json!({ "challenge_token": "00".repeat(32), "code": "000000" }),
+            &ip,
+        )
+        .await;
+    assert_eq!(
+        rejected.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "body: {}",
+        rejected.body_str
+    );
+    assert_eq!(
+        rejected.error_code(),
+        Some(ErrorCode::TotpRateLimitExceeded)
+    );
+    retry_after_secs(&rejected, app.state.config.totp.rate_limit_window_secs);
 }

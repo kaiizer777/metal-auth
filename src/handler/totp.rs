@@ -126,6 +126,65 @@ pub async fn totp_confirm(
     }
 }
 
+/// `POST /auth/totp/backup`
+///
+/// Same lifecycle as [`totp_verify`] with a single-use backup code as the factor.
+pub async fn totp_backup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<TwoFactorChallengeRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(rejection) => return json_rejection_response(rejection),
+    };
+
+    let client_ip = extract_client_ip(&headers);
+
+    if state
+        .rate_limiter
+        .check_totp_ip_limit(&client_ip, &state.config.totp)
+        .is_err()
+    {
+        return totp_rate_limit_exceeded();
+    }
+
+    let user_id = match state
+        .totp_service
+        .validate_two_factor_token(&request.challenge_token)
+        .await
+    {
+        Ok(user_id) => user_id,
+        Err(error) => return service_error_response(error),
+    };
+
+    if state
+        .rate_limiter
+        .check_totp_user_limit(user_id, &state.config.totp)
+        .is_err()
+    {
+        return totp_rate_limit_exceeded();
+    }
+
+    if let Err(error) = state
+        .totp_service
+        .verify_backup_code(user_id, &request.code, &client_ip)
+        .await
+    {
+        return service_error_response(error);
+    }
+
+    if let Err(error) = state
+        .totp_service
+        .consume_two_factor_token(&request.challenge_token)
+        .await
+    {
+        return service_error_response(error);
+    }
+
+    issue_two_factor_session(&state, user_id, &headers, &client_ip).await
+}
+
 /// 429 for either TOTP dimension.
 ///
 /// No `Retry-After`: the limiter rejects with `Exceeded` (sliding window), which has

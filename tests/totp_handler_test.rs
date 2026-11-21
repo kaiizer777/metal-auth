@@ -1335,6 +1335,51 @@ async fn disable_with_totp_code() {
 }
 
 #[tokio::test]
+async fn disable_rejects_a_code_spent_on_the_login_leg() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let (email, password, secret, _backup_codes, session) = enabled_user(&app, &dynamic_ip()).await;
+    let user_id = user_id_for_email(&app.pool, &email).await;
+    let code = totp_code(&secret);
+
+    // A sniffed code buys one login; it must not also remove the second factor.
+    let token = challenge(&app, &email, &password).await;
+    let login = app
+        .post_json(
+            "/auth/totp/verify",
+            json!({ "challenge_token": token, "code": code }),
+        )
+        .await;
+    assert_eq!(login.status(), StatusCode::OK, "body: {}", login.body_str);
+
+    let disable = app
+        .dispatch(session_request(
+            &app,
+            Method::DELETE,
+            "/auth/totp",
+            json!({ "totp_code": code }),
+            &session,
+            &dynamic_ip(),
+        ))
+        .await;
+
+    assert_eq!(
+        disable.status(),
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        disable.body_str
+    );
+    assert_eq!(disable.error_code(), Some(ErrorCode::TotpCodeReplayed));
+    assert!(
+        totp_enabled(&app.pool, user_id).await,
+        "a code already spent at login must not disable the factor"
+    );
+}
+
+#[tokio::test]
 async fn failed_disable_keeps_the_totp_proof_retryable() {
     let _guard = DB_LOCK.lock().await;
     let Some(app) = setup_test_app_with(|cfg| {
@@ -1377,7 +1422,7 @@ async fn failed_disable_keeps_the_totp_proof_retryable() {
     assert_eq!(
         used_code_rows(&app.pool, user_id).await,
         0,
-        "disabling must not write a replay row for a proof whose log it deletes"
+        "the proof's replay row must roll back with the failed disable"
     );
 
     let retry = app

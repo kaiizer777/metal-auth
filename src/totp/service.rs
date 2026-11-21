@@ -320,23 +320,6 @@ impl TotpService {
         transaction.commit().await.map_err(AppError::Database)
     }
 
-    /// Verify `code` against the stored secret without recording the use.
-    ///
-    /// Disable is the only caller: its transaction deletes the whole replay log, so a
-    /// recorded use would be deleted before it committed. The spend is the secret delete,
-    /// which rolls back with a failed disable and keeps the code retryable.
-    async fn verify_code_only(
-        &self,
-        connection: &mut PgConnection,
-        user_id: Uuid,
-        code: &str,
-    ) -> Result<(), AppError> {
-        let reference = transaction_now(connection).await?;
-        let secret = self.enabled_secret(connection, user_id).await?;
-        verify_totp_code_at(secret.as_ref(), code, totp_counter_at(reference))?;
-        Ok(())
-    }
-
     /// Load and decrypt the caller's enabled secret, or report why no code can be checked.
     async fn enabled_secret(
         &self,
@@ -519,12 +502,13 @@ impl TotpService {
     /// Deletes the secret (and its backup codes) plus the user's replay log. Any live
     /// challenge token therefore has no secret left to satisfy.
     ///
-    /// The code branch is one transaction: the code is verified against the same
-    /// in-transaction clock the verification path uses, then the secret and the replay
-    /// log are deleted together. No replay row is written — the same transaction deletes
-    /// the whole log, so the spend is the delete itself. Rolling back a failed disable
-    /// therefore leaves the still-valid code retryable instead of reporting it as
-    /// replayed.
+    /// The code branch is one transaction: the code is verified and its replay row written
+    /// against the same in-transaction clock the verification path uses, then the secret
+    /// and the whole replay log are deleted together. The insert is not redundant: while
+    /// it exists, `uq_totp_used_codes` rejects a code already spent at login or as an
+    /// earlier disable proof, so the delete at the end of this transaction cannot turn a
+    /// spent code into a valid one. Rolling back a failed disable rolls the row back with
+    /// it, leaving the still-valid code retryable instead of reporting it as replayed.
     pub async fn disable_totp(
         &self,
         user_id: Uuid,
@@ -538,7 +522,7 @@ impl TotpService {
             }
             FreshAuthProof::TotpCode(code) => {
                 let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
-                self.verify_code_only(&mut transaction, user_id, &code)
+                self.verify_and_record_totp(&mut transaction, user_id, &code)
                     .await?;
                 self.delete_factor_state_in(&mut transaction, user_id)
                     .await?;
@@ -1508,6 +1492,38 @@ mod tests {
         assert!(!ctx.service.is_totp_enabled(user_id).await.expect("state"));
         assert_eq!(count_rows(&ctx.pool, "totp_secrets", user_id).await, 0);
         assert_eq!(count_rows(&ctx.pool, "totp_used_codes", user_id).await, 0);
+    }
+
+    #[tokio::test]
+    async fn disable_rejects_a_code_already_spent_at_login() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let response = enroll_and_confirm(&ctx, user_id).await;
+        let code = current_code(&response.secret_base32);
+
+        // The login leg records the code, so a sniffed code can buy exactly one session.
+        ctx.service
+            .verify_totp(user_id, &code, "ip")
+            .await
+            .expect("login spends the code");
+
+        assert!(matches!(
+            ctx.service
+                .disable_totp(user_id, FreshAuthProof::TotpCode(code), "ip")
+                .await,
+            Err(AppError::TotpCodeReplayed)
+        ));
+        assert!(
+            ctx.service.is_totp_enabled(user_id).await.expect("state"),
+            "a rejected disable must leave the second factor enabled"
+        );
+        assert_eq!(
+            count_rows(&ctx.pool, "totp_used_codes", user_id).await,
+            1,
+            "the login's replay row must survive the rejected disable"
+        );
     }
 
     #[tokio::test]

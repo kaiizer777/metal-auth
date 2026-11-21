@@ -1653,6 +1653,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_second_disable_with_the_same_code_finds_no_factor() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let response = enroll_and_confirm(&ctx, user_id).await;
+        let code = current_code(&response.secret_base32);
+
+        ctx.service
+            .disable_totp(user_id, FreshAuthProof::TotpCode(code.clone()), "ip")
+            .await
+            .expect("first disable");
+
+        // Disable is destructive, so the repeated proof meets no factor. The rejection is
+        // `TotpNotEnrolled`, before any code check: nothing is left to replay it against.
+        assert!(matches!(
+            ctx.service
+                .disable_totp(user_id, FreshAuthProof::TotpCode(code), "ip")
+                .await,
+            Err(AppError::TotpNotEnrolled)
+        ));
+        assert_eq!(count_rows(&ctx.pool, "totp_secrets", user_id).await, 0);
+    }
+
+    #[tokio::test]
     async fn challenge_token_survives_validation_and_is_single_use() {
         let Some(ctx) = setup_db_context().await else {
             return;

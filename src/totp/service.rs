@@ -17,7 +17,7 @@ use crate::{
     totp::{
         backup,
         crypto::{
-            DecryptedSecret, TOTP_STEP_SECS, build_otpauth_uri, compute_code_replay_hash,
+            DecryptedSecret, build_otpauth_uri, code_window_end, compute_code_replay_hash,
             decode_totp_secret, decrypt_secret, encrypt_secret, generate_totp_secret,
             totp_counter_at, verify_totp_code_at,
         },
@@ -239,8 +239,10 @@ impl TotpService {
 
     /// Verify a live TOTP code and burn it in the same step window.
     ///
-    /// The replay insert is the arbiter: `uq_totp_used_codes` rejects concurrent or
-    /// window-shifted reuse, so there is no read-then-write gap.
+    /// Two arbiters, one statement pair: the guarded insert refuses any write that lands
+    /// after the matched step's acceptance band, so a pruned tombstone cannot be
+    /// re-created, and `uq_totp_used_codes` rejects reuse while a tombstone survives.
+    /// Neither reads before writing, so there is no read-then-write gap.
     ///
     /// `ip` is part of the Part 3 handler contract; rate limiting is handler-owned.
     pub async fn verify_totp(&self, user_id: Uuid, code: &str, _ip: &str) -> Result<(), AppError> {
@@ -794,15 +796,6 @@ async fn transaction_now(connection: &mut PgConnection) -> Result<DateTime<Utc>,
         .map_err(AppError::Database)
 }
 
-/// Exclusive end of the last reference at which a step-`step` code verifies.
-///
-/// A code of step `S` matches any counter in `{S-1, S, S+1}`, so it stays acceptable
-/// while the reference is below `(S+2) * TOTP_STEP_SECS`.
-fn code_window_end(step: u64) -> Option<DateTime<Utc>> {
-    let seconds = step.checked_add(2)?.checked_mul(TOTP_STEP_SECS)?;
-    DateTime::from_timestamp(i64::try_from(seconds).ok()?, 0)
-}
-
 /// Map the replay insert failure: only `uq_totp_used_codes` means a replay.
 ///
 /// Any other `23505` (or any other error) stays a database error instead of being
@@ -1021,6 +1014,13 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("count")
+    }
+
+    async fn database_now(ctx: &DbTestContext) -> DateTime<Utc> {
+        sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&ctx.pool)
+            .await
+            .expect("database clock")
     }
 
     #[tokio::test]
@@ -1396,6 +1396,11 @@ mod tests {
         .execute(&ctx.pool)
         .await
         .expect("seed redemption");
+        assert_eq!(
+            count_used_code(&ctx.pool, user_id, &code).await,
+            1,
+            "the seeded tombstone must land, or the prune half proves nothing"
+        );
 
         // A verify 241s later outlives the minimum 120s prune age and removes the row.
         let fresher = format!("{:06}", generate_totp(&raw, step + 8).expect("generate"));
@@ -1421,6 +1426,88 @@ mod tests {
             "a stalled replay must expire, not be accepted or labelled a replay: {replay:?}"
         );
         assert_eq!(count_used_code(&ctx.pool, user_id, &code).await, 0);
+    }
+
+    #[tokio::test]
+    async fn write_at_the_window_bound_tracks_the_acceptance_band() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let response = enroll_and_confirm(&ctx, user_id).await;
+        let raw = decode_totp_secret(&response.secret_base32).expect("decode");
+        let counter = totp_counter_at(database_now(&ctx).await);
+
+        // The matched step is the current one, so the write is a full step inside the bound.
+        let live_end = code_window_end(counter).expect("bound");
+        let live = format!("{:06}", generate_totp(&raw, counter).expect("generate"));
+        ctx.service
+            .verify_totp_at_reference(user_id, &live, live_end - Duration::microseconds(1))
+            .await
+            .expect("one microsecond before the bound must still verify");
+        assert_eq!(count_used_code(&ctx.pool, user_id, &live).await, 1);
+
+        // Two steps older: the reference is still inside the band, the write is past it.
+        let stale_step = counter - 2;
+        let stale_end = code_window_end(stale_step).expect("bound");
+        let stale = format!("{:06}", generate_totp(&raw, stale_step).expect("generate"));
+        let write_late = ctx
+            .service
+            .verify_totp_at_reference(user_id, &stale, stale_end - Duration::microseconds(1))
+            .await;
+        assert!(
+            matches!(write_late, Err(AppError::TotpCodeInvalid)),
+            "a write past the bound must expire: {write_late:?}"
+        );
+
+        // At the bound the code's own reference is one counter outside the band.
+        let at_bound = ctx
+            .service
+            .verify_totp_at_reference(user_id, &stale, stale_end)
+            .await;
+        assert!(
+            matches!(at_bound, Err(AppError::TotpCodeInvalid)),
+            "the bound is exclusive: {at_bound:?}"
+        );
+        assert_eq!(count_used_code(&ctx.pool, user_id, &stale).await, 0);
+    }
+
+    #[tokio::test]
+    async fn expired_and_already_used_reports_expired() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let response = enroll_and_confirm(&ctx, user_id).await;
+        let raw = decode_totp_secret(&response.secret_base32).expect("decode");
+        let now = database_now(&ctx).await;
+        let counter = totp_counter_at(now);
+
+        // Five steps back, with a tombstone too young for the prune to take.
+        let step = counter - 5;
+        let code = format!("{:06}", generate_totp(&raw, step).expect("generate"));
+        sqlx::query(
+            "INSERT INTO totp_used_codes (user_id, code_hash, used_at) VALUES ($1, $2, $3)",
+        )
+        .bind(user_id)
+        .bind(compute_code_replay_hash(&code))
+        .bind(now - Duration::seconds(60))
+        .execute(&ctx.pool)
+        .await
+        .expect("seed used code");
+        assert_eq!(count_used_code(&ctx.pool, user_id, &code).await, 1);
+
+        // Reference inside the band, write past it: expiry outranks the unique index.
+        let window_end = code_window_end(step).expect("bound");
+        let verdict = ctx
+            .service
+            .verify_totp_at_reference(user_id, &code, window_end - Duration::microseconds(1))
+            .await;
+        assert!(
+            matches!(verdict, Err(AppError::TotpCodeInvalid)),
+            "an expired code must report expiry, not replay: {verdict:?}"
+        );
+        assert_eq!(count_used_code(&ctx.pool, user_id, &code).await, 1);
     }
 
     #[tokio::test]

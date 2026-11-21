@@ -230,6 +230,20 @@ fn parse_totp_code(code: &str) -> Result<u32, AppError> {
     trimmed.parse().map_err(|_| AppError::TotpCodeInvalid)
 }
 
+/// Exclusive upper bound of the references at which a step-`step` code verifies.
+///
+/// [`verify_totp_code_at`] accepts a code of step `S` while the counter is one of
+/// `S-1..=S+1`, and the counter advances one step per [`TOTP_STEP_SECS`]. The bound is
+/// therefore `(S + 1 + TOTP_WINDOW_STEPS) * TOTP_STEP_SECS`, derived from the tolerance
+/// constant so the two cannot drift apart.
+pub(crate) fn code_window_end(step: u64) -> Option<DateTime<Utc>> {
+    let end_step = step
+        .checked_add(1)?
+        .checked_add(u64::try_from(TOTP_WINDOW_STEPS).ok()?)?;
+    let seconds = end_step.checked_mul(TOTP_STEP_SECS)?;
+    DateTime::from_timestamp(i64::try_from(seconds).ok()?, 0)
+}
+
 /// Replay-tracking hash: `SHA-256(code)` scoped by the row's `user_id`.
 ///
 /// The time step is deliberately excluded: a code is valid at `T-1`, `T`, and `T+1`,
@@ -281,6 +295,27 @@ mod tests {
     /// Any valid 32-byte key will do; it carries no secret material.
     fn test_key() -> [u8; AES_KEY_BYTES] {
         Aes256Gcm::generate_key(&mut OsRng).into()
+    }
+
+    #[test]
+    fn code_window_end_is_the_exclusive_end_of_the_acceptance_band() {
+        // One step of drift on each side plus the matched step itself: 2 steps for step 0,
+        // 9 steps for step 7. Pinned absolutely so a tolerance change is loud.
+        assert_eq!(code_window_end(0), DateTime::from_timestamp(60, 0));
+        assert_eq!(code_window_end(7), DateTime::from_timestamp(270, 0));
+
+        for step in [0_u64, 7] {
+            let end = code_window_end(step).expect("bound");
+            let inside = end - chrono::Duration::microseconds(1);
+            assert!(
+                totp_counter_at(inside).abs_diff(step) <= TOTP_WINDOW_STEPS.unsigned_abs(),
+                "one microsecond before the bound must still be inside the band"
+            );
+            assert!(
+                totp_counter_at(end).abs_diff(step) > TOTP_WINDOW_STEPS.unsigned_abs(),
+                "the bound itself must already be outside the band"
+            );
+        }
     }
 
     /// RFC 6238 Appendix B SHA-1 seed. Test vector, never a production secret.

@@ -36,7 +36,9 @@ pub struct TotpService {
 }
 
 impl TotpService {
-    /// Build the service. Never fails on a missing TOTP key: a deployment without 2FA
+    /// Build the service. `config` must already have passed [`Config::validate`].
+    ///
+    /// Never fails on a missing TOTP key: a deployment without 2FA
     /// still boots, and key-dependent operations fail fast when they ask for the key.
     #[must_use]
     pub fn new(pool: PgPool, config: Arc<Config>, auth_config: Arc<AppConfig>) -> Self {

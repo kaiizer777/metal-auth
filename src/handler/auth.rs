@@ -631,9 +631,9 @@ mod tests {
     }
 
     fn create_test_state() -> AuthHandlerState {
-        // The gate is mandatory, so never let its pool default to an unrelated database.
+        // The gate is mandatory, so never let its pool point at an unrelated database.
         let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://localhost/metal_auth_test".into());
+            .expect("DATABASE_URL must be set: the 2FA gate builds a real pool");
         let pool = PgPool::connect_lazy(&database_url).expect("lazy pool");
         let config = Arc::new(AppConfig {
             argon2_m_cost: 19456,
@@ -659,6 +659,17 @@ mod tests {
             config: None,
             totp_service,
         }
+    }
+
+    #[tokio::test]
+    async fn routes_reject_a_config_without_a_totp_key() {
+        let state = create_test_state();
+        let result = routes(state.service, Arc::new(Config::default()));
+
+        assert!(
+            matches!(result, Err(AppError::Config(_))),
+            "a keyless config must fail at startup, not at the first challenge"
+        );
     }
 
     #[tokio::test]

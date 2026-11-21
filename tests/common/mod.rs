@@ -405,7 +405,7 @@ async fn setup_test_app_with_auth_config_and(
     };
 
     let mut cfg = Config {
-        database_url: url.clone(),
+        database_url: url,
         port: 8080,
         allowed_origins: vec!["https://app.example.com".into()],
         allowed_methods: vec!["GET".into(), "POST".into(), "OPTIONS".into()],
@@ -433,8 +433,10 @@ async fn setup_test_app_with_auth_config_and(
 
     customize(&mut cfg);
 
+    // Built from the customized config so `AppState.config` and the pool can never point at
+    // different databases.
     let pool = metal_auth::db::init_pool_with_options(
-        &url,
+        &cfg.database_url,
         metal_auth::db::DbPoolOptions {
             max_connections: cfg.max_connections,
             min_connections: cfg.min_connections,

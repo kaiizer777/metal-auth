@@ -346,11 +346,26 @@ pub fn test_auth_config() -> AppConfig {
 
 /// Initializes a live-DB test app with the Argon2 floor and blocking email dispatcher.
 pub async fn setup_test_app() -> Option<TestApp> {
-    setup_test_app_with_auth_config(Arc::new(test_auth_config())).await
+    setup_test_app_with(|_| {}).await
+}
+
+/// Initializes a live-DB test app after letting the caller adjust its server config.
+///
+/// `AppState` owns its `Config`, so settings a test depends on — TOTP rate-limit budgets in
+/// particular — must be fixed before the state is built.
+pub async fn setup_test_app_with(customize: impl FnOnce(&mut Config)) -> Option<TestApp> {
+    setup_test_app_with_auth_config_and(Arc::new(test_auth_config()), customize).await
 }
 
 /// Initializes a live-DB test app with custom `AppConfig` and blocking email dispatcher.
 pub async fn setup_test_app_with_auth_config(auth_config: Arc<AppConfig>) -> Option<TestApp> {
+    setup_test_app_with_auth_config_and(auth_config, |_| {}).await
+}
+
+async fn setup_test_app_with_auth_config_and(
+    auth_config: Arc<AppConfig>,
+    customize: impl FnOnce(&mut Config),
+) -> Option<TestApp> {
     dotenvy::dotenv().ok();
     let url = match std::env::var("DATABASE_URL") {
         Ok(val) => val,
@@ -365,27 +380,7 @@ pub async fn setup_test_app_with_auth_config(auth_config: Arc<AppConfig>) -> Opt
         Err(e) => panic!("invalid DATABASE_URL environment variable: {e}"),
     };
 
-    let pool = metal_auth::db::init_pool_with_options(
-        &url,
-        metal_auth::db::DbPoolOptions {
-            max_connections: 5,
-            min_connections: 1,
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("DATABASE_URL is set, so the DB-backed test must connect");
-
-    let email_sender = Arc::new(CapturingEmailSender::new());
-    let dispatcher = Arc::new(
-        EmailDispatcher::new_blocking(
-            Some(Arc::clone(&email_sender) as metal_auth::SharedEmailSender),
-            Duration::from_secs(10),
-        )
-        .with_base_url("https://example.com"),
-    );
-
-    let cfg = Config {
+    let mut cfg = Config {
         database_url: url.clone(),
         port: 8080,
         allowed_origins: vec!["https://app.example.com".into()],
@@ -411,6 +406,28 @@ pub async fn setup_test_app_with_auth_config(auth_config: Arc<AppConfig>) -> Opt
             ..metal_auth::TotpConfig::default()
         },
     };
+
+    customize(&mut cfg);
+
+    let pool = metal_auth::db::init_pool_with_options(
+        &url,
+        metal_auth::db::DbPoolOptions {
+            max_connections: 5,
+            min_connections: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("DATABASE_URL is set, so the DB-backed test must connect");
+
+    let email_sender = Arc::new(CapturingEmailSender::new());
+    let dispatcher = Arc::new(
+        EmailDispatcher::new_blocking(
+            Some(Arc::clone(&email_sender) as metal_auth::SharedEmailSender),
+            Duration::from_secs(10),
+        )
+        .with_base_url("https://example.com"),
+    );
 
     let state = AppState::with_dispatcher(pool.clone(), cfg, auth_config, dispatcher)
         .expect("create test app state");

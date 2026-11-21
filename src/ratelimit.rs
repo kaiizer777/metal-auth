@@ -11,7 +11,7 @@ use std::{
 use tokio::time::sleep;
 
 use crate::{
-    config::RateLimitConfig,
+    config::{RateLimitConfig, TotpConfig},
     error::{AppError, ErrorCode},
 };
 
@@ -339,6 +339,53 @@ impl RateLimiter {
             self.config.window(),
             Some(self.config.cooldown()),
         );
+        res
+    }
+
+    /// Check the TOTP IP budget (`totp:ip:<ip>`).
+    ///
+    /// Runs regardless of [`RateLimitConfig::enabled`]: the Phase 5 switch must not
+    /// silently disable second-factor brute-force protection, and these keys are
+    /// disjoint from the `ip:` / `account:` / `reset_account:` dimensions.
+    ///
+    /// Rejects with [`RateLimitRejection::Exceeded`], never `Lockout`: a one-window
+    /// lockout would misstate a sliding window, so no `Retry-After` is claimed.
+    pub fn check_totp_ip_limit(
+        &self,
+        ip: &str,
+        totp: &TotpConfig,
+    ) -> Result<(), RateLimitRejection> {
+        let key = Self::format_account_key("totp:ip", ip);
+        self.check_totp_window(
+            &key,
+            totp.rate_limit_ip_max_attempts,
+            totp.rate_limit_window_secs,
+        )
+    }
+
+    /// Check the TOTP per-user budget (`totp:user:<user_id>`).
+    ///
+    /// Same independence and rejection semantics as [`Self::check_totp_ip_limit`].
+    pub fn check_totp_user_limit(
+        &self,
+        user_id: uuid::Uuid,
+        totp: &TotpConfig,
+    ) -> Result<(), RateLimitRejection> {
+        let key = Self::format_account_key("totp:user", &user_id.to_string());
+        self.check_totp_window(
+            &key,
+            totp.rate_limit_user_max_attempts,
+            totp.rate_limit_window_secs,
+        )
+    }
+
+    fn check_totp_window(
+        &self,
+        key: &str,
+        max: u32,
+        window_secs: u64,
+    ) -> Result<(), RateLimitRejection> {
+        let (_, res) = self.check_internal(key, max, Duration::from_secs(window_secs), None);
         res
     }
 
@@ -999,6 +1046,95 @@ mod tests {
             limiter
                 .check_password_reset(ip, "user4@example.com")
                 .is_err()
+        );
+    }
+
+    fn totp_test_config() -> TotpConfig {
+        TotpConfig {
+            rate_limit_ip_max_attempts: 3,
+            rate_limit_user_max_attempts: 2,
+            rate_limit_window_secs: 60,
+            ..TotpConfig::default()
+        }
+    }
+
+    #[test]
+    fn totp_ip_limit_keys_are_bounded_and_disjoint() {
+        let limiter = RateLimiter::new();
+        let totp = totp_test_config();
+        assert!(limiter.check_totp_ip_limit("198.51.100.7", &totp).is_ok());
+
+        assert!(limiter.windows.contains_key("totp:ip:198.51.100.7"));
+        assert!(!limiter.windows.contains_key("ip:198.51.100.7"));
+        // Phase 5 IP budget untouched by the TOTP dimension.
+        assert!(limiter.check_ip("198.51.100.7").is_ok());
+        assert_eq!(
+            limiter.windows.get("ip:198.51.100.7").unwrap().attempts.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn totp_ip_limit_trips_at_configured_max() {
+        let limiter = RateLimiter::new();
+        let totp = totp_test_config();
+        for _ in 0..3 {
+            assert!(limiter.check_totp_ip_limit("198.51.100.8", &totp).is_ok());
+        }
+        assert_eq!(
+            limiter.check_totp_ip_limit("198.51.100.8", &totp),
+            Err(RateLimitRejection::Exceeded)
+        );
+        // Another IP still has its own budget.
+        assert!(limiter.check_totp_ip_limit("198.51.100.9", &totp).is_ok());
+    }
+
+    #[test]
+    fn totp_user_limit_is_per_user_and_independent_of_ip() {
+        let limiter = RateLimiter::new();
+        let totp = totp_test_config();
+        let user = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+
+        for _ in 0..2 {
+            assert!(limiter.check_totp_user_limit(user, &totp).is_ok());
+        }
+        assert_eq!(
+            limiter.check_totp_user_limit(user, &totp),
+            Err(RateLimitRejection::Exceeded)
+        );
+        assert!(
+            limiter.windows.contains_key(&format!("totp:user:{user}")),
+            "user dimension must use the `totp:user:<user_id>` key"
+        );
+        // A different user is unaffected, and no IP key was consumed by user checks.
+        assert!(limiter.check_totp_user_limit(other, &totp).is_ok());
+        assert_eq!(limiter.entry_count(), 2);
+    }
+
+    #[test]
+    fn totp_limits_ignore_the_phase5_enabled_switch() {
+        let limiter = RateLimiter::with_config(RateLimitConfig {
+            enabled: false,
+            ..RateLimitConfig::default()
+        });
+        let totp = totp_test_config();
+        let user = uuid::Uuid::new_v4();
+
+        for _ in 0..3 {
+            assert!(limiter.check_totp_ip_limit("198.51.100.10", &totp).is_ok());
+        }
+        assert!(
+            limiter.check_totp_ip_limit("198.51.100.10", &totp).is_err(),
+            "TOTP IP limit must hold while Phase 5 limits are disabled"
+        );
+
+        for _ in 0..2 {
+            assert!(limiter.check_totp_user_limit(user, &totp).is_ok());
+        }
+        assert!(
+            limiter.check_totp_user_limit(user, &totp).is_err(),
+            "TOTP user limit must hold while Phase 5 limits are disabled"
         );
     }
 }

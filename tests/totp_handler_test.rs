@@ -4,6 +4,8 @@ use axum::http::{HeaderMap, Method, StatusCode, header};
 use common::*;
 use metal_auth::{AppConfig, ErrorCode};
 use serde_json::json;
+use sqlx::PgPool;
+use uuid::Uuid;
 
 // ─── Enrollment ──────────────────────────────────────────────────────────────
 
@@ -566,6 +568,64 @@ async fn verify_rejects_replayed_code() {
 }
 
 #[tokio::test]
+async fn failed_session_issue_leaves_the_totp_code_unspent() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app_with(|cfg| {
+        cfg.totp.rate_limit_ip_max_attempts = 10;
+        cfg.totp.rate_limit_user_max_attempts = 10;
+    })
+    .await
+    else {
+        return;
+    };
+
+    let (email, password, secret, _backup_codes, _session) =
+        enabled_user(&app, &dynamic_ip()).await;
+    let user_id = user_id_for_email(&app.pool, &email).await;
+    let token = challenge(&app, &email, &password).await;
+    let code = totp_code(&secret);
+
+    reject_session_inserts_for(&app.pool, user_id).await;
+    let failed = app
+        .post_json(
+            "/auth/totp/verify",
+            json!({ "challenge_token": token, "code": code }),
+        )
+        .await;
+    allow_session_inserts(&app.pool).await;
+
+    assert_eq!(
+        failed.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "body: {}",
+        failed.body_str
+    );
+    assert_eq!(
+        used_code_rows(&app.pool, user_id).await,
+        0,
+        "the replay row must roll back with the failed session"
+    );
+    assert_eq!(
+        count_sessions_for_user(&app.pool, user_id).await,
+        1,
+        "the failed redemption must not commit a session"
+    );
+
+    let retry = app
+        .post_json(
+            "/auth/totp/verify",
+            json!({ "challenge_token": token, "code": code }),
+        )
+        .await;
+    assert_eq!(
+        retry.status(),
+        StatusCode::OK,
+        "the code and challenge must stay usable: {}",
+        retry.body_str
+    );
+}
+
+#[tokio::test]
 async fn verify_rate_limits_ip_dimension() {
     let _guard = DB_LOCK.lock().await;
     let Some(app) = setup_test_app().await else {
@@ -825,6 +885,64 @@ async fn backup_rejects_unknown_code() {
     assert_eq!(resp.error_code(), Some(ErrorCode::TotpBackupCodeInvalid));
 }
 
+#[tokio::test]
+async fn failed_session_issue_leaves_the_backup_code_unspent() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app_with(|cfg| {
+        cfg.totp.rate_limit_ip_max_attempts = 10;
+        cfg.totp.rate_limit_user_max_attempts = 10;
+    })
+    .await
+    else {
+        return;
+    };
+
+    let (email, password, _secret, backup_codes, _session) =
+        enabled_user(&app, &dynamic_ip()).await;
+    let user_id = user_id_for_email(&app.pool, &email).await;
+    let code = backup_codes[0].clone();
+    let token = challenge(&app, &email, &password).await;
+
+    reject_session_inserts_for(&app.pool, user_id).await;
+    let failed = app
+        .post_json(
+            "/auth/totp/backup",
+            json!({ "challenge_token": token, "code": code }),
+        )
+        .await;
+    allow_session_inserts(&app.pool).await;
+
+    assert_eq!(
+        failed.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "body: {}",
+        failed.body_str
+    );
+    assert_eq!(
+        stored_backup_code_count(&app.pool, user_id).await,
+        10,
+        "a single-use code must never be spent without a session"
+    );
+    assert_eq!(
+        count_sessions_for_user(&app.pool, user_id).await,
+        1,
+        "the failed redemption must not commit a session"
+    );
+
+    let retry = app
+        .post_json(
+            "/auth/totp/backup",
+            json!({ "challenge_token": token, "code": code }),
+        )
+        .await;
+    assert_eq!(
+        retry.status(),
+        StatusCode::OK,
+        "the backup code and challenge must stay usable: {}",
+        retry.body_str
+    );
+}
+
 // ─── Disable ─────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1017,6 +1135,58 @@ async fn disable_with_totp_code() {
         .await;
     assert_eq!(login_resp.status(), StatusCode::OK);
     assert!(login_resp.json.get("two_factor_required").is_none());
+}
+
+// ─── Failure injection ───────────────────────────────────────────────────────
+
+/// Make `sessions` inserts fail for one user, so a redemption fails after its factor is
+/// verified without any test-only branch in production code.
+async fn reject_session_inserts_for(pool: &PgPool, user_id: Uuid) {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION totp_test_reject_session() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected session insert failure'; END $$",
+    )
+    .execute(pool)
+    .await
+    .expect("create session failure function");
+    // The only interpolated value is a `Uuid`; a trigger predicate cannot take binds.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TRIGGER totp_test_reject_session BEFORE INSERT ON sessions \
+         FOR EACH ROW WHEN (NEW.user_id = '{user_id}') \
+         EXECUTE FUNCTION totp_test_reject_session()"
+    )))
+    .execute(pool)
+    .await
+    .expect("create session failure trigger");
+}
+
+async fn allow_session_inserts(pool: &PgPool) {
+    sqlx::query("DROP TRIGGER IF EXISTS totp_test_reject_session ON sessions")
+        .execute(pool)
+        .await
+        .expect("drop session failure trigger");
+    sqlx::query("DROP FUNCTION IF EXISTS totp_test_reject_session()")
+        .execute(pool)
+        .await
+        .expect("drop session failure function");
+}
+
+async fn used_code_rows(pool: &PgPool, user_id: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM totp_used_codes WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .expect("count used codes")
+}
+
+async fn stored_backup_code_count(pool: &PgPool, user_id: Uuid) -> i32 {
+    sqlx::query_scalar(
+        "SELECT jsonb_array_length(backup_codes) FROM totp_secrets WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .expect("count backup codes")
 }
 
 // ─── Harness invariants ──────────────────────────────────────────────────────

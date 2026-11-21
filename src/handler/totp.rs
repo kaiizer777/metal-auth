@@ -184,7 +184,8 @@ pub async fn totp_confirm(
 
 /// `POST /auth/totp/backup`
 ///
-/// Same lifecycle as [`totp_verify`] with a single-use backup code as the factor.
+/// Same lifecycle as [`totp_verify`] with a single-use backup code as the factor. The
+/// Argon2id match runs before the transaction; only its removal is transactional.
 pub async fn totp_backup(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -196,63 +197,27 @@ pub async fn totp_backup(
     };
 
     let client_ip = extract_client_ip(&headers);
+    let user_id = match challenge_user_id(&state, &client_ip, &request.challenge_token).await {
+        Ok(user_id) => user_id,
+        Err(response) => return response,
+    };
 
-    if state
-        .rate_limiter
-        .check_totp_ip_limit(&client_ip, &state.config.totp)
-        .is_err()
-    {
-        return totp_rate_limit_exceeded(
-            &state,
-            &client_ip,
-            "ip",
-            &RateLimiter::totp_ip_key(&client_ip),
-        );
-    }
-
-    let user_id = match state
+    let matched_hash = match state
         .totp_service
-        .validate_two_factor_token(&request.challenge_token)
+        .match_backup_code(user_id, &request.code)
         .await
     {
-        Ok(user_id) => user_id,
+        Ok(matched_hash) => matched_hash,
         Err(error) => return service_error_response(error),
     };
 
-    if state
-        .rate_limiter
-        .check_totp_user_limit(user_id, &state.config.totp)
-        .is_err()
-    {
-        return totp_rate_limit_exceeded(
-            &state,
-            &client_ip,
-            "user",
-            &RateLimiter::totp_user_key(user_id),
-        );
-    }
-
-    if let Err(error) = state
-        .totp_service
-        .verify_backup_code(user_id, &request.code, &client_ip)
-        .await
-    {
-        return service_error_response(error);
-    }
-
-    if let Err(error) = state
-        .totp_service
-        .consume_two_factor_token(&request.challenge_token)
-        .await
-    {
-        return service_error_response(error);
-    }
-
-    issue_two_factor_session(
+    redeem_challenge(
         &state,
-        user_id,
         &headers,
         &client_ip,
+        user_id,
+        &request.challenge_token,
+        PresentedFactor::BackupCode(matched_hash),
         VerifiedFactor::BackupCode,
     )
     .await
@@ -367,10 +332,57 @@ fn totp_rate_limit_exceeded(
     response
 }
 
+/// Charge the IP budget, resolve the challenge token without consuming it, then charge the
+/// user budget. Token validation sits between the dimensions so an unparsable token costs
+/// the IP budget only.
+async fn challenge_user_id(
+    state: &AppState,
+    client_ip: &str,
+    challenge_token: &str,
+) -> Result<Uuid, Response> {
+    if state
+        .rate_limiter
+        .check_totp_ip_limit(client_ip, &state.config.totp)
+        .is_err()
+    {
+        return Err(totp_rate_limit_exceeded(
+            state,
+            client_ip,
+            "ip",
+            &RateLimiter::totp_ip_key(client_ip),
+        ));
+    }
+
+    let user_id = match state
+        .totp_service
+        .validate_two_factor_token(challenge_token)
+        .await
+    {
+        Ok(user_id) => user_id,
+        Err(error) => return Err(service_error_response(error)),
+    };
+
+    if state
+        .rate_limiter
+        .check_totp_user_limit(user_id, &state.config.totp)
+        .is_err()
+    {
+        return Err(totp_rate_limit_exceeded(
+            state,
+            client_ip,
+            "user",
+            &RateLimiter::totp_user_key(user_id),
+        ));
+    }
+
+    Ok(user_id)
+}
+
 /// `POST /auth/totp/verify`
 ///
 /// Order is load-bearing: IP budget, then non-destructive token validation, then the
-/// user budget, then the code check, then token consumption on success only.
+/// user budget, then the code check. The code check, token consumption, and session insert
+/// commit as one unit — see [`redeem_challenge`].
 pub async fn totp_verify(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -382,93 +394,53 @@ pub async fn totp_verify(
     };
 
     let client_ip = extract_client_ip(&headers);
-
-    if state
-        .rate_limiter
-        .check_totp_ip_limit(&client_ip, &state.config.totp)
-        .is_err()
-    {
-        return totp_rate_limit_exceeded(
-            &state,
-            &client_ip,
-            "ip",
-            &RateLimiter::totp_ip_key(&client_ip),
-        );
-    }
-
-    // Non-destructive: holding the challenge while the code is retyped is the point.
-    let user_id = match state
-        .totp_service
-        .validate_two_factor_token(&request.challenge_token)
-        .await
-    {
+    let user_id = match challenge_user_id(&state, &client_ip, &request.challenge_token).await {
         Ok(user_id) => user_id,
-        Err(error) => return service_error_response(error),
+        Err(response) => return response,
     };
 
-    if state
-        .rate_limiter
-        .check_totp_user_limit(user_id, &state.config.totp)
-        .is_err()
-    {
-        return totp_rate_limit_exceeded(
-            &state,
-            &client_ip,
-            "user",
-            &RateLimiter::totp_user_key(user_id),
-        );
-    }
-
-    if let Err(error) = state
-        .totp_service
-        .verify_totp(user_id, &request.code, &client_ip)
-        .await
-    {
-        return service_error_response(error);
-    }
-
-    if let Err(error) = state
-        .totp_service
-        .consume_two_factor_token(&request.challenge_token)
-        .await
-    {
-        return service_error_response(error);
-    }
-
-    issue_two_factor_session(&state, user_id, &headers, &client_ip, VerifiedFactor::Totp).await
+    redeem_challenge(
+        &state,
+        &headers,
+        &client_ip,
+        user_id,
+        &request.challenge_token,
+        PresentedFactor::TotpCode(&request.code),
+        VerifiedFactor::Totp,
+    )
+    .await
 }
 
-/// Which factor redeemed the challenge, and therefore which audit event fires.
-#[derive(Clone, Copy)]
-enum VerifiedFactor {
-    Totp,
-    BackupCode,
+/// Which factor redeems the challenge.
+enum PresentedFactor<'a> {
+    /// Verified inside the redemption transaction, so its counter derives from the same
+    /// clock reference as the replay-row prune.
+    TotpCode(&'a str),
+    /// Matched against the stored hashes before the transaction: Argon2id must never hold
+    /// a connection. The matched hash is what the transaction removes.
+    BackupCode(String),
 }
 
-impl VerifiedFactor {
-    fn event(self) -> &'static str {
-        match self {
-            Self::Totp => "totp_verified",
-            Self::BackupCode => "backup_code_used",
-        }
-    }
-}
-
-/// Best-effort user agent for audit events, `"unknown"` when absent (login convention).
-fn user_agent(headers: &HeaderMap) -> &str {
-    headers
-        .get(header::USER_AGENT)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("unknown")
-}
-
-/// Issue the post-challenge session using the same wire shape as a password login.
-async fn issue_two_factor_session(
+/// Redeem a challenge as one unit of work.
+///
+/// Ordering, and what commits when:
+/// 1. the factor use — the replay-row insert for a TOTP code, the hash removal for a
+///    backup code. This is the single-use arbiter, so it takes the code's row lock first;
+/// 2. the challenge-token delete — the single-winner check on the challenge;
+/// 3. the session insert — last, because it locks the user row for the credential check.
+///
+/// Committing only after step 3 means a failure anywhere leaves the code unspent and the
+/// challenge intact, so the client can retry the same code, and no session can be minted
+/// from a code that was not spent. The lock order above is the same for every redemption,
+/// so two of them cannot deadlock.
+async fn redeem_challenge(
     state: &AppState,
-    user_id: Uuid,
     headers: &HeaderMap,
     client_ip: &str,
-    factor: VerifiedFactor,
+    user_id: Uuid,
+    challenge_token: &str,
+    factor: PresentedFactor<'_>,
+    verified: VerifiedFactor,
 ) -> Response {
     let user_agent = user_agent(headers);
     let is_bearer = headers
@@ -477,7 +449,7 @@ async fn issue_two_factor_session(
         .is_some_and(|value| value.eq_ignore_ascii_case("bearer"));
     let session_type = if is_bearer { "bearer" } else { "cookie" };
 
-    // `create_session_checked` re-reads this column under the user row lock and rejects a
+    // `create_session_in` re-reads this column under the user row lock and rejects a
     // mismatch, so a reset racing *this request* cannot mint a session. A reset that
     // committed before this read yields the same value at both reads and is not detected:
     // the challenge token carries no credential material. Follow-up: bind the credential
@@ -487,24 +459,75 @@ async fn issue_two_factor_session(
         Err(error) => return service_error_response(error),
     };
 
+    let mut transaction = match state.pool.begin().await {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            tracing::error!(error = %error, "failed to begin challenge redemption");
+            return service_error_response(AppError::Database(error));
+        }
+    };
+
+    let factor_use = match factor {
+        PresentedFactor::TotpCode(code) => {
+            state
+                .totp_service
+                .verify_and_record_totp(&mut transaction, user_id, code)
+                .await
+        }
+        PresentedFactor::BackupCode(matched_hash) => {
+            state
+                .totp_service
+                .consume_backup_code(&mut transaction, user_id, &matched_hash)
+                .await
+        }
+    };
+    if let Err(error) = factor_use {
+        let _ = transaction.rollback().await;
+        return service_error_response(error);
+    }
+
+    if let Err(error) = state
+        .totp_service
+        .consume_two_factor_token_in(&mut transaction, challenge_token)
+        .await
+    {
+        let _ = transaction.rollback().await;
+        return service_error_response(error);
+    }
+
     let (session, raw_id) = match state
         .session_service
-        .create_session_checked(
+        .create_session_in(
+            &mut transaction,
             user_id,
-            &credential_hash,
+            Some(&credential_hash),
             session_type,
-            Some(client_ip),
-            Some(user_agent),
         )
         .await
     {
         Ok(session) => session,
-        Err(error) => return service_error_response(error),
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            return service_error_response(error);
+        }
     };
+
+    if let Err(error) = transaction.commit().await {
+        tracing::error!(error = %error, "failed to commit challenge redemption");
+        return service_error_response(AppError::Database(error));
+    }
 
     tracing::info!(
         target: "security_event",
-        event = factor.event(),
+        event = "session_created",
+        user_id = %user_id,
+        session_type,
+        ip = %client_ip,
+        user_agent = %user_agent,
+    );
+    tracing::info!(
+        target: "security_event",
+        event = verified.event(),
         user_id = %user_id,
         ip = %client_ip,
         user_agent = %user_agent,
@@ -529,6 +552,30 @@ async fn issue_two_factor_session(
             Err(error) => service_error_response(error),
         }
     }
+}
+
+/// Which factor redeemed the challenge, and therefore which audit event fires.
+#[derive(Clone, Copy)]
+enum VerifiedFactor {
+    Totp,
+    BackupCode,
+}
+
+impl VerifiedFactor {
+    fn event(self) -> &'static str {
+        match self {
+            Self::Totp => "totp_verified",
+            Self::BackupCode => "backup_code_used",
+        }
+    }
+}
+
+/// Best-effort user agent for audit events, `"unknown"` when absent (login convention).
+fn user_agent(headers: &HeaderMap) -> &str {
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown")
 }
 
 /// Router for the TOTP endpoints, merged under `/auth` by [`crate::handler::create_router`].

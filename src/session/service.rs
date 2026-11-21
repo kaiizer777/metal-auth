@@ -2,7 +2,7 @@
 
 use chrono::Utc;
 use rand_core::{OsRng, RngCore};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
@@ -112,6 +112,50 @@ impl SessionService {
         ip: Option<&str>,
         user_agent: Option<&str>,
     ) -> Result<(Session, String), AppError> {
+        let mut tx = self.db.begin().await.map_err(|e| {
+            tracing::error!(error = %e, "Failed to begin transaction for create_session");
+            AppError::Database(e)
+        })?;
+
+        let result = self
+            .create_session_in(&mut tx, user_id, expected_credential_hash, session_type)
+            .await;
+        let (session, raw_id) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = tx.rollback().await;
+                return Err(error);
+            }
+        };
+
+        tx.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "Failed to commit session creation transaction");
+            AppError::Database(e)
+        })?;
+
+        tracing::info!(
+            event = "session_created",
+            user_id = %user_id,
+            session_type = session_type,
+            ip = ip.unwrap_or("unknown"),
+            user_agent = user_agent.unwrap_or("unknown"),
+        );
+
+        Ok((session, raw_id))
+    }
+
+    /// Insert the session row on the caller's transaction.
+    ///
+    /// Callers that must atomically couple session issuance with another state change
+    /// (the TOTP redemption path) own the transaction; the standalone paths wrap this in
+    /// [`Self::create_session_inner`].
+    pub(crate) async fn create_session_in(
+        &self,
+        tx: &mut PgConnection,
+        user_id: Uuid,
+        expected_credential_hash: Option<&str>,
+        session_type: &str,
+    ) -> Result<(Session, String), AppError> {
         let raw_id = Self::generate_raw_id();
         let token_hash = Self::hash_raw_id(&raw_id);
 
@@ -130,11 +174,6 @@ impl SessionService {
         } else {
             None
         };
-
-        let mut tx = self.db.begin().await.map_err(|e| {
-            tracing::error!(error = %e, "Failed to begin transaction for create_session");
-            AppError::Database(e)
-        })?;
 
         // Row lock on the user row to serialize concurrent session creations for the user
         sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
@@ -235,19 +274,6 @@ impl SessionService {
             tracing::error!(error = %e, "Failed to insert session");
             AppError::Database(e)
         })?;
-
-        tx.commit().await.map_err(|e| {
-            tracing::error!(error = %e, "Failed to commit session creation transaction");
-            AppError::Database(e)
-        })?;
-
-        tracing::info!(
-            event = "session_created",
-            user_id = %user_id,
-            session_type = session_type,
-            ip = ip.unwrap_or("unknown"),
-            user_agent = user_agent.unwrap_or("unknown"),
-        );
 
         Ok((session, raw_id))
     }

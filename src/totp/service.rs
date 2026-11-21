@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
-use sqlx::{PgPool, Row};
+use sqlx::{PgConnection, PgPool, Row};
 use uuid::Uuid;
 
 use crate::{
@@ -208,22 +208,53 @@ impl TotpService {
     ///
     /// `ip` is part of the Part 3 handler contract; rate limiting is handler-owned.
     pub async fn verify_totp(&self, user_id: Uuid, code: &str, _ip: &str) -> Result<(), AppError> {
-        self.verify_totp_at(user_id, code, current_totp_counter())
-            .await
+        let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
+        self.verify_and_record_totp(&mut transaction, user_id, code)
+            .await?;
+        transaction.commit().await.map_err(AppError::Database)
     }
 
-    /// Verify at an explicit step counter. Production always passes the live counter;
-    /// tests use this to prove a code cannot be replayed at `T-1` or `T+1`.
+    /// Verify `code` and record the use on the caller's transaction.
+    ///
+    /// The caller owns the commit so factor use, challenge deletion, and session issuance
+    /// can share one unit of work.
+    pub(crate) async fn verify_and_record_totp(
+        &self,
+        connection: &mut PgConnection,
+        user_id: Uuid,
+        code: &str,
+    ) -> Result<(), AppError> {
+        self.record_totp_use(connection, user_id, code, current_totp_counter())
+            .await
+            .map(|_step| ())
+    }
+
+    /// Verify at an explicit step counter. Production always passes the live counter; tests
+    /// use this to prove a code cannot be replayed at `T-1` or `T+1`.
+    #[cfg(test)]
     async fn verify_totp_at(
         &self,
         user_id: Uuid,
         code: &str,
         counter: u64,
     ) -> Result<(), AppError> {
+        let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
+        self.record_totp_use(&mut transaction, user_id, code, counter)
+            .await?;
+        transaction.commit().await.map_err(AppError::Database)
+    }
+
+    async fn record_totp_use(
+        &self,
+        connection: &mut PgConnection,
+        user_id: Uuid,
+        code: &str,
+        counter: u64,
+    ) -> Result<u64, AppError> {
         let record =
             sqlx::query("SELECT encrypted_secret, enabled FROM totp_secrets WHERE user_id = $1")
                 .bind(user_id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *connection)
                 .await
                 .map_err(AppError::Database)?
                 .ok_or(AppError::TotpNotEnrolled)?;
@@ -243,17 +274,15 @@ impl TotpService {
 
         // Prune and insert share one unit so no stale row can split them. A 23505 rolls
         // the prune back with the insert; the failed insert is still the replay arbiter.
-        let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
         let pruned = sqlx::query(
             "DELETE FROM totp_used_codes WHERE user_id = $1 \
              AND used_at < CURRENT_TIMESTAMP - make_interval(secs => $2)",
         )
         .bind(user_id)
         .bind(self.config.totp.used_code_prune_age_secs as f64)
-        .execute(&mut *transaction)
+        .execute(&mut *connection)
         .await;
         if let Err(error) = pruned {
-            let _ = transaction.rollback().await;
             return Err(AppError::Database(error));
         }
 
@@ -261,13 +290,11 @@ impl TotpService {
             sqlx::query("INSERT INTO totp_used_codes (user_id, code_hash) VALUES ($1, $2)")
                 .bind(user_id)
                 .bind(&replay_hash[..])
-                .execute(&mut *transaction)
+                .execute(&mut *connection)
                 .await;
         if let Err(error) = inserted {
-            let _ = transaction.rollback().await;
             return Err(classify_used_code_error(error));
         }
-        transaction.commit().await.map_err(AppError::Database)?;
 
         tracing::debug!(
             event = "totp_code_verified",
@@ -275,13 +302,14 @@ impl TotpService {
             step,
             outcome = "accepted",
         );
-        Ok(())
+        Ok(step)
     }
 
     /// Verify a single-use backup code and remove exactly that hash.
     ///
-    /// The removal is one atomic statement keyed on the matched hash, so two concurrent
-    /// submissions cannot both consume a code or delete a neighbouring one.
+    /// Matching runs off the executor and outside any transaction; the removal is one
+    /// atomic statement keyed on the matched hash, so two concurrent submissions cannot
+    /// both consume a code or delete a neighbouring one.
     ///
     /// `ip` is part of the Part 3 handler contract; rate limiting is handler-owned.
     pub async fn verify_backup_code(
@@ -290,6 +318,22 @@ impl TotpService {
         code: &str,
         _ip: &str,
     ) -> Result<(), AppError> {
+        let matched_hash = self.match_backup_code(user_id, code).await?;
+        let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
+        self.consume_backup_code(&mut transaction, user_id, &matched_hash)
+            .await?;
+        transaction.commit().await.map_err(AppError::Database)
+    }
+
+    /// Match `code` against the stored hashes without spending it.
+    ///
+    /// The Argon2id work is CPU-bound and owns no connection: it runs on the blocking pool
+    /// before the caller opens its transaction.
+    pub(crate) async fn match_backup_code(
+        &self,
+        user_id: Uuid,
+        code: &str,
+    ) -> Result<String, AppError> {
         let record =
             sqlx::query("SELECT backup_codes, enabled FROM totp_secrets WHERE user_id = $1")
                 .bind(user_id)
@@ -314,7 +358,7 @@ impl TotpService {
         // Owned inputs cross the blocking boundary; `swap_remove` takes the matched PHC
         // string at the index already found by the traversal, with no clone or re-walk.
         let candidate = code.to_string();
-        let matched_hash = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let mut hashes = hashes;
             let index = backup::verify_backup_code(&candidate, &hashes)?;
             if index >= hashes.len() {
@@ -326,15 +370,27 @@ impl TotpService {
         .map_err(|err| {
             tracing::error!(error = %err, "backup code verification task failed");
             AppError::Internal
-        })??;
+        })?
+    }
+
+    /// Remove exactly the matched hash on the caller's transaction.
+    ///
+    /// Zero rows means another request consumed this hash after our read, which must fail
+    /// the whole unit of work rather than mint a session from a spent code.
+    pub(crate) async fn consume_backup_code(
+        &self,
+        connection: &mut PgConnection,
+        user_id: Uuid,
+        matched_hash: &str,
+    ) -> Result<(), AppError> {
         let removed = sqlx::query(
             "UPDATE totp_secrets SET backup_codes = backup_codes - $2, \
              updated_at = CURRENT_TIMESTAMP \
              WHERE user_id = $1 AND backup_codes ? $2",
         )
         .bind(user_id)
-        .bind(matched_hash.as_str())
-        .execute(&self.pool)
+        .bind(matched_hash)
+        .execute(&mut *connection)
         .await
         .map_err(AppError::Database)?;
         if removed.rows_affected() == 0 {
@@ -462,10 +518,22 @@ impl TotpService {
     /// Reports whether a row was actually deleted, so a double consume cannot mint a
     /// second session from the same token.
     pub async fn consume_two_factor_token(&self, token: &str) -> Result<(), AppError> {
+        let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
+        self.consume_two_factor_token_in(&mut transaction, token)
+            .await?;
+        transaction.commit().await.map_err(AppError::Database)
+    }
+
+    /// Delete the challenge token on the caller's transaction.
+    pub(crate) async fn consume_two_factor_token_in(
+        &self,
+        connection: &mut PgConnection,
+        token: &str,
+    ) -> Result<(), AppError> {
         let token_hash = hash_token(token).map_err(|_| AppError::TwoFactorTokenInvalid)?;
         let deleted = sqlx::query("DELETE FROM two_factor_tokens WHERE token_hash = $1")
             .bind(&token_hash[..])
-            .execute(&self.pool)
+            .execute(&mut *connection)
             .await
             .map_err(AppError::Database)?;
         if deleted.rows_affected() == 0 {

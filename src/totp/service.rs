@@ -883,7 +883,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
     async fn concurrent_verification_admits_exactly_one_request() {
         let Some(ctx) = setup_db_context().await else {
             return;
@@ -892,11 +892,14 @@ mod tests {
         let response = enroll_and_confirm(&ctx, user_id).await;
         let code = current_code(&response.secret_base32);
 
+        let barrier = Arc::new(tokio::sync::Barrier::new(5));
         let mut handles = Vec::new();
         for _ in 0..5 {
             let service = ctx.service.clone();
             let attempt = code.clone();
+            let barrier = Arc::clone(&barrier);
             handles.push(tokio::spawn(async move {
+                barrier.wait().await;
                 service.verify_totp(user_id, &attempt, "ip").await
             }));
         }

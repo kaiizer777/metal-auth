@@ -265,12 +265,16 @@ impl TotpService {
             AppError::Internal
         })?;
 
-        // Owned inputs cross the blocking boundary; the matched PHC string comes back,
-        // so the caller needs neither a clone nor a stale index.
+        // Owned inputs cross the blocking boundary; `swap_remove` takes the matched PHC
+        // string at the index already found by the traversal, with no clone or re-walk.
         let candidate = code.to_string();
         let matched_hash = tokio::task::spawn_blocking(move || {
+            let mut hashes = hashes;
             let index = backup::verify_backup_code(&candidate, &hashes)?;
-            hashes.into_iter().nth(index).ok_or(AppError::Internal)
+            if index >= hashes.len() {
+                return Err(AppError::Internal);
+            }
+            Ok(hashes.swap_remove(index))
         })
         .await
         .map_err(|err| {

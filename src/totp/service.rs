@@ -93,21 +93,8 @@ impl TotpService {
                 .collect(),
         );
 
-        sqlx::query(
-            "INSERT INTO totp_secrets (user_id, encrypted_secret, backup_codes, enabled) \
-             VALUES ($1, $2, $3, FALSE) \
-             ON CONFLICT (user_id) DO UPDATE SET \
-                encrypted_secret = EXCLUDED.encrypted_secret, \
-                backup_codes = EXCLUDED.backup_codes, \
-                enabled = FALSE, \
-                updated_at = CURRENT_TIMESTAMP",
-        )
-        .bind(user_id)
-        .bind(&encrypted_secret[..])
-        .bind(&backup_hashes)
-        .execute(&self.pool)
-        .await
-        .map_err(AppError::Database)?;
+        self.store_pending_secret(user_id, &encrypted_secret, &backup_hashes)
+            .await?;
 
         let otpauth_uri = build_otpauth_uri(&secret_base32, &email, &self.config.totp.issuer);
         Ok(EnrollTotpResponse {
@@ -115,6 +102,39 @@ impl TotpService {
             otpauth_uri,
             backup_codes,
         })
+    }
+
+    /// Store or rotate a pending secret.
+    ///
+    /// The conflict update is fenced on `enabled = FALSE`: a confirmation that commits
+    /// while the backup codes are hashing must win, otherwise enrollment downgrades a
+    /// live factor. A zero-row result is that race, reported as `TotpAlreadyEnabled`.
+    async fn store_pending_secret(
+        &self,
+        user_id: Uuid,
+        encrypted_secret: &[u8],
+        backup_hashes: &serde_json::Value,
+    ) -> Result<(), AppError> {
+        let stored = sqlx::query(
+            "INSERT INTO totp_secrets (user_id, encrypted_secret, backup_codes, enabled) \
+             VALUES ($1, $2, $3, FALSE) \
+             ON CONFLICT (user_id) DO UPDATE SET \
+                encrypted_secret = EXCLUDED.encrypted_secret, \
+                backup_codes = EXCLUDED.backup_codes, \
+                enabled = FALSE, \
+                updated_at = CURRENT_TIMESTAMP \
+             WHERE totp_secrets.enabled = FALSE",
+        )
+        .bind(user_id)
+        .bind(encrypted_secret)
+        .bind(backup_hashes)
+        .execute(&self.pool)
+        .await
+        .map_err(AppError::Database)?;
+        if stored.rows_affected() == 0 {
+            return Err(AppError::TotpAlreadyEnabled);
+        }
+        Ok(())
     }
 
     /// Step 2 of enrollment: verify the first code against the pending secret and enable.
@@ -726,6 +746,38 @@ mod tests {
             ctx.service.enroll_totp(user_id).await,
             Err(AppError::TotpAlreadyEnabled)
         ));
+    }
+
+    #[tokio::test]
+    async fn enrollment_upsert_cannot_downgrade_a_confirmed_factor() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        enroll_and_confirm(&ctx, user_id).await;
+        let before: (Vec<u8>, bool) =
+            sqlx::query_as("SELECT encrypted_secret, enabled FROM totp_secrets WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(&ctx.pool)
+                .await
+                .expect("confirmed secret");
+
+        // The enroll request passed the pre-hash gate, then the confirmation landed.
+        let replacement = serde_json::Value::Array(Vec::new());
+        assert!(matches!(
+            ctx.service
+                .store_pending_secret(user_id, &[7u8; 40], &replacement)
+                .await,
+            Err(AppError::TotpAlreadyEnabled)
+        ));
+
+        let after: (Vec<u8>, bool) =
+            sqlx::query_as("SELECT encrypted_secret, enabled FROM totp_secrets WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(&ctx.pool)
+                .await
+                .expect("confirmed secret");
+        assert_eq!(before, after, "a losing enrollment must not touch the row");
     }
 
     #[tokio::test]

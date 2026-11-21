@@ -136,10 +136,10 @@ async fn replayed_totp_code_is_rejected() {
     let second_token = challenge(&app, &email, &password).await;
     // One step ahead keeps the code inside the ±1 acceptance window across both requests
     // and off the 30-second boundary that would move it out of range.
-    let code = code_at(
-        &secret,
-        metal_auth::totp::crypto::current_totp_counter() + 1,
-    );
+    let counter = metal_auth::totp::crypto::current_totp_counter();
+    let code = code_at(&secret, counter + 1);
+    // Never presented: a rejection of this code can only be the consumed token.
+    let fresh_code = code_at(&secret, counter);
 
     let first = app
         .post_json_with_ip(
@@ -153,6 +153,30 @@ async fn replayed_totp_code_is_rejected() {
         count_sessions_for_user(&app.pool, user_id).await,
         sessions_before + 1,
         "the first presentation must issue one session"
+    );
+
+    // The verify above consumed `first_token`, so re-presenting it must fail on the token.
+    let consumed = app
+        .post_json_with_ip(
+            "/auth/totp/verify",
+            json!({ "challenge_token": first_token, "code": fresh_code }),
+            &dynamic_ip(),
+        )
+        .await;
+    assert_eq!(
+        consumed.status(),
+        StatusCode::UNAUTHORIZED,
+        "a consumed challenge token must be refused: {}",
+        consumed.body_str
+    );
+    assert_eq!(
+        consumed.error_code(),
+        Some(ErrorCode::TwoFactorTokenInvalid)
+    );
+    assert_eq!(
+        count_sessions_for_user(&app.pool, user_id).await,
+        sessions_before + 1,
+        "a consumed challenge token must not mint a second session"
     );
 
     let second = app

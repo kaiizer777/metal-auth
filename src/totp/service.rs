@@ -1230,7 +1230,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stalled_request_cannot_prune_the_row_that_blocks_its_replay() {
+    async fn stalled_request_counter_and_prune_cutoff_share_one_clock() {
         let Some(ctx) = setup_db_context().await else {
             return;
         };
@@ -1244,18 +1244,18 @@ mod tests {
             .expect("first use");
 
         // A stalled request: its counter and its prune cutoff are one instant, 121s past
-        // the row's write. Deriving the counter from a wall-clock pre-read instead would
-        // accept the code while the cutoff deletes the very row that blocks the replay.
+        // the code's step, which is beyond the default 120s prune age. The code is
+        // therefore outside the ±1 step window by the same reference that sets the cutoff.
+        // A wall-clock counter with this cutoff would prune the blocking row and accept
+        // the code instead.
         let replay = ctx
             .service
             .verify_totp_at_reference(user_id, &code, Utc::now() + Duration::seconds(121))
             .await;
 
-        assert!(replay.is_err(), "a code must never be accepted twice");
-        assert_eq!(
-            count_rows(&ctx.pool, "totp_used_codes", user_id).await,
-            1,
-            "the row that blocks the replay must not be pruned by a later clock reference"
+        assert!(
+            matches!(replay, Err(AppError::TotpCodeInvalid)),
+            "a stalled request must reject the code as out of window, not as a replay: {replay:?}"
         );
     }
 

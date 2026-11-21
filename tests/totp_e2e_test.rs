@@ -7,17 +7,40 @@ mod common;
 
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use common::*;
+use metal_auth::ErrorCode;
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// Token hashes of every session the user currently owns.
+async fn session_token_hashes(pool: &PgPool, user_id: Uuid) -> Vec<String> {
+    sqlx::query_scalar("SELECT token_hash FROM sessions WHERE user_id = $1 ORDER BY created_at")
+        .bind(user_id)
+        .fetch_all(pool)
+        .await
+        .expect("list the journey user's sessions")
+}
+
 /// Token hash of the journey user's only session, for tying an HTTP response to a user row.
 async fn only_session_token_hash(pool: &PgPool, user_id: Uuid) -> String {
-    sqlx::query_scalar("SELECT token_hash FROM sessions WHERE user_id = $1")
-        .bind(user_id)
-        .fetch_one(pool)
-        .await
-        .expect("exactly one session for the journey user")
+    let mut hashes = session_token_hashes(pool, user_id).await;
+    assert_eq!(
+        hashes.len(),
+        1,
+        "expected exactly one session for the journey user"
+    );
+    hashes.pop().expect("one session")
+}
+
+/// Stored Argon2id PHC strings behind the enroll response's backup codes.
+async fn stored_backup_hashes(pool: &PgPool, user_id: Uuid) -> Vec<String> {
+    let value: serde_json::Value =
+        sqlx::query_scalar("SELECT backup_codes FROM totp_secrets WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await
+            .expect("totp_secrets row for the journey user");
+    serde_json::from_value(value).expect("backup_codes is a JSON array of strings")
 }
 
 fn cookie_header(app: &TestApp, sid: &str) -> HeaderMap {
@@ -128,4 +151,90 @@ async fn journey_1_enroll_then_verify_2fa_and_reach_a_protected_route() {
         json!(only_session_token_hash(&app.pool, user_id).await),
         "the authenticated session must belong to the signed-up user"
     );
+}
+
+#[tokio::test]
+async fn journey_2_backup_code_login_purges_the_used_hash() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    let ip = dynamic_ip();
+
+    let (email, password, _secret, backup_codes, _enroll_session) = enabled_user(&app, &ip).await;
+    let user_id = user_id_for_email(&app.pool, &email).await;
+    assert_eq!(backup_codes.len(), 10);
+    let used_code = backup_codes[0].clone();
+    assert_eq!(stored_backup_hashes(&app.pool, user_id).await.len(), 10);
+
+    let sessions_before = count_sessions_for_user(&app.pool, user_id).await;
+    let challenge_token = challenge(&app, &email, &password).await;
+    let resp = app
+        .post_json(
+            "/auth/totp/backup",
+            json!({ "challenge_token": challenge_token, "code": used_code.clone() }),
+        )
+        .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "backup login failed: {}",
+        resp.body_str
+    );
+    let sid = extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name)
+        .expect("backup login must set the session cookie");
+    assert_eq!(
+        count_sessions_for_user(&app.pool, user_id).await,
+        sessions_before + 1,
+        "backup login must issue exactly one session"
+    );
+
+    let session_resp = app
+        .dispatch(empty_request_with_headers(
+            Method::GET,
+            "/auth/session",
+            cookie_header(&app, &sid),
+        ))
+        .await;
+    assert_eq!(
+        session_resp.status(),
+        StatusCode::OK,
+        "session lookup failed: {}",
+        session_resp.body_str
+    );
+    let issued_hash = session_resp.json["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    assert!(
+        session_token_hashes(&app.pool, user_id)
+            .await
+            .contains(&issued_hash),
+        "the backup-issued session must belong to the same user"
+    );
+
+    // The stored values are Argon2id PHC strings with per-code salts, so the consumed hash
+    // cannot be named from outside: the array must shrink by exactly one intact hash.
+    let remaining = stored_backup_hashes(&app.pool, user_id).await;
+    assert_eq!(remaining.len(), 9, "one backup code must be purged");
+    assert!(
+        remaining.iter().all(|hash| hash.starts_with("$argon2id$")),
+        "the remaining nine hashes must stay intact: {remaining:?}"
+    );
+
+    // Functional proof that the consumed hash is gone: the same code cannot log in again.
+    let challenge_token = challenge(&app, &email, &password).await;
+    let reuse = app
+        .post_json(
+            "/auth/totp/backup",
+            json!({ "challenge_token": challenge_token, "code": used_code }),
+        )
+        .await;
+    assert_eq!(
+        reuse.status(),
+        StatusCode::BAD_REQUEST,
+        "reusing a consumed backup code must fail: {}",
+        reuse.body_str
+    );
+    assert_eq!(reuse.error_code(), Some(ErrorCode::TotpBackupCodeInvalid));
 }

@@ -331,9 +331,22 @@ pub async fn get_outbox_rows_for_recipient(
     .await
 }
 
-/// Initializes a live-DB test app with default `AppConfig` and blocking email dispatcher.
+/// Test-only Argon2id cost floor: the cheapest parameters `AppConfig::validate` accepts.
+///
+/// Production defaults (65536/3/4) stay untouched; integration tests would otherwise need
+/// ~87 minutes because every signup, dummy hash, and TOTP enrollment pays full cost.
+pub fn test_auth_config() -> AppConfig {
+    AppConfig {
+        argon2_m_cost: 19456,
+        argon2_t_cost: 2,
+        argon2_p_cost: 1,
+        ..AppConfig::default()
+    }
+}
+
+/// Initializes a live-DB test app with the Argon2 floor and blocking email dispatcher.
 pub async fn setup_test_app() -> Option<TestApp> {
-    setup_test_app_with_auth_config(Arc::new(AppConfig::default())).await
+    setup_test_app_with_auth_config(Arc::new(test_auth_config())).await
 }
 
 /// Initializes a live-DB test app with custom `AppConfig` and blocking email dispatcher.
@@ -392,7 +405,11 @@ pub async fn setup_test_app_with_auth_config(auth_config: Arc<AppConfig>) -> Opt
         session: metal_auth::SessionConfig::default(),
         rate_limit: metal_auth::RateLimitConfig::default(),
         oauth: metal_auth::OAuthConfig::default(),
-        totp: metal_auth::TotpConfig::default(),
+        totp: metal_auth::TotpConfig {
+            // TOTP handlers resolve the key per operation; without it every call is a 500.
+            encryption_key: Some("00".repeat(32)),
+            ..metal_auth::TotpConfig::default()
+        },
     };
 
     let state = AppState::with_dispatcher(pool.clone(), cfg, auth_config, dispatcher)

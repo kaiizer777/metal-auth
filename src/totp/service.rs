@@ -504,10 +504,19 @@ impl std::fmt::Debug for EnrollTotpResponse {
 mod tests {
     use super::*;
     use crate::{
+        auth::{models::LoginRequest, service::AuthServiceImpl},
         config::TotpConfig,
         crypto::hash_password,
         db::DbPoolOptions,
+        email::EmailDispatcher,
+        handler::auth::{AuthHandlerState, login},
         totp::crypto::{current_totp_counter, generate_totp},
+    };
+    use axum::{
+        Json,
+        body::to_bytes,
+        extract::State,
+        http::{HeaderMap, StatusCode, header},
     };
 
     static TOTP_DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -518,6 +527,7 @@ mod tests {
     struct DbTestContext {
         service: TotpService,
         pool: PgPool,
+        config: Arc<Config>,
         auth_config: Arc<AppConfig>,
         _guard: tokio::sync::MutexGuard<'static, ()>,
     }
@@ -550,10 +560,11 @@ mod tests {
             },
             ..Config::default()
         });
-        let service = TotpService::new(pool.clone(), config, Arc::clone(&auth_config));
+        let service = TotpService::new(pool.clone(), Arc::clone(&config), Arc::clone(&auth_config));
         Some(DbTestContext {
             service,
             pool,
+            config,
             auth_config,
             _guard: guard,
         })
@@ -580,19 +591,28 @@ mod tests {
         format!("Fixture-{}-Aa1!", Uuid::new_v4().simple())
     }
 
-    async fn create_user(ctx: &DbTestContext, verified: bool, password: &str) -> Uuid {
+    async fn create_user_with_email(
+        ctx: &DbTestContext,
+        verified: bool,
+        password: &str,
+    ) -> (Uuid, String) {
         let email = format!("totp-{}@example.com", Uuid::new_v4().simple());
         let password_hash = hash_password(password, &ctx.auth_config).expect("hash");
-        sqlx::query_scalar(
+        let user_id = sqlx::query_scalar(
             "INSERT INTO users (email, password_hash, email_verified) \
              VALUES ($1, $2, $3) RETURNING id",
         )
-        .bind(email)
+        .bind(&email)
         .bind(password_hash)
         .bind(verified)
         .fetch_one(&ctx.pool)
         .await
-        .expect("insert user")
+        .expect("insert user");
+        (user_id, email)
+    }
+
+    async fn create_user(ctx: &DbTestContext, verified: bool, password: &str) -> Uuid {
+        create_user_with_email(ctx, verified, password).await.0
     }
 
     fn current_code(secret_base32: &str) -> String {
@@ -1059,5 +1079,87 @@ mod tests {
         };
         let user_id = create_user(&ctx, true, &fixture_password()).await;
         assert!(!ctx.service.is_totp_enabled(user_id).await.expect("state"));
+    }
+
+    fn handler_state(ctx: &DbTestContext) -> AuthHandlerState {
+        // AuthServiceImpl validates the production Argon2 floor; the TOTP hash fixtures
+        // use cheaper parameters because verification reads the PHC header.
+        let auth_config = Arc::new(AppConfig {
+            argon2_m_cost: 19456,
+            argon2_t_cost: 2,
+            argon2_p_cost: 1,
+            ..Default::default()
+        });
+        let auth_service = Arc::new(
+            AuthServiceImpl::new(
+                ctx.pool.clone(),
+                auth_config,
+                Arc::new(EmailDispatcher::new(
+                    None,
+                    std::time::Duration::from_secs(10),
+                )),
+            )
+            .expect("auth service"),
+        );
+        AuthHandlerState {
+            service: auth_service,
+            session_service: None,
+            rate_limiter: None,
+            config: Some(Arc::clone(&ctx.config)),
+            totp_service: Arc::new(ctx.service.clone()),
+        }
+    }
+
+    #[tokio::test]
+    async fn login_gate_issues_a_challenge_without_a_session() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let password = fixture_password();
+        let (user_id, email) = create_user_with_email(&ctx, true, &password).await;
+        enroll_and_confirm(&ctx, user_id).await;
+
+        let response = login(
+            State(handler_state(&ctx)),
+            HeaderMap::new(),
+            Ok(Json(LoginRequest { email, password })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers().get(header::SET_COOKIE).is_none(),
+            "2fa challenge must not issue a session cookie"
+        );
+        let body = to_bytes(response.into_body(), 4096).await.expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(body["two_factor_required"], true);
+        assert!(body.get("user_id").is_none());
+        assert!(body.get("expires_at").is_none());
+        let token = body["challenge_token"].as_str().expect("challenge token");
+        assert_eq!(token.len(), 64);
+        assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[tokio::test]
+    async fn login_without_totp_keeps_the_session_body() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let password = fixture_password();
+        let (user_id, email) = create_user_with_email(&ctx, true, &password).await;
+
+        let response = login(
+            State(handler_state(&ctx)),
+            HeaderMap::new(),
+            Ok(Json(LoginRequest { email, password })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(body["user_id"], user_id.to_string());
+        assert!(body.get("two_factor_required").is_none());
     }
 }

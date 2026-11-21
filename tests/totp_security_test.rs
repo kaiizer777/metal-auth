@@ -311,6 +311,61 @@ async fn reused_backup_code_is_rejected() {
     );
 }
 
+/// Scenario 4b: a challenge token consumed by a backup login cannot be redeemed again.
+#[tokio::test]
+async fn consumed_challenge_token_is_rejected_by_backup_path() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let (email, password, _secret, backup_codes, _session) =
+        enabled_user(&app, &dynamic_ip()).await;
+    let user_id = user_id_for_email(&app.pool, &email).await;
+    let sessions_before = count_sessions_for_user(&app.pool, user_id).await;
+    let token = challenge(&app, &email, &password).await;
+
+    let first = app
+        .post_json_with_ip(
+            "/auth/totp/backup",
+            json!({ "challenge_token": token, "code": backup_codes[0] }),
+            &dynamic_ip(),
+        )
+        .await;
+    assert_eq!(first.status(), StatusCode::OK, "body: {}", first.body_str);
+    assert_eq!(
+        count_sessions_for_user(&app.pool, user_id).await,
+        sessions_before + 1,
+        "a backup login must issue exactly one session"
+    );
+
+    // A second, still-unused code: only the consumed token can reject this request.
+    let reused = app
+        .post_json_with_ip(
+            "/auth/totp/backup",
+            json!({ "challenge_token": token, "code": backup_codes[1] }),
+            &dynamic_ip(),
+        )
+        .await;
+    assert_eq!(
+        reused.status(),
+        StatusCode::UNAUTHORIZED,
+        "a consumed challenge token must be refused: {}",
+        reused.body_str
+    );
+    assert_eq!(reused.error_code(), Some(ErrorCode::TwoFactorTokenInvalid));
+    assert_eq!(
+        count_sessions_for_user(&app.pool, user_id).await,
+        sessions_before + 1,
+        "a consumed challenge token must not mint a second session"
+    );
+    assert_eq!(
+        backup_code_count(&app.pool, user_id).await,
+        9,
+        "a consumed challenge token must not consume another backup code"
+    );
+}
+
 /// Scenario 5: a real challenge for a user whose secret row is gone cannot verify.
 #[tokio::test]
 async fn unenrolled_user_verify_is_rejected() {

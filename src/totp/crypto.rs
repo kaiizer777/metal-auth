@@ -225,13 +225,15 @@ fn parse_totp_code(code: &str) -> Result<u32, AppError> {
     trimmed.parse().map_err(|_| AppError::TotpCodeInvalid)
 }
 
-/// Replay-tracking hash: `SHA-256(code || "::" || step)`.
+/// Replay-tracking hash: `SHA-256(code)` scoped by the row's `user_id`.
+///
+/// The time step is deliberately excluded: a code is valid at `T-1`, `T`, and `T+1`,
+/// so hashing the step would let one captured code be redeemed three times. The unique
+/// constraint on `(user_id, code_hash)` is the single arbiter.
 #[must_use]
-pub fn compute_code_replay_hash(code: &str, step: u64) -> Vec<u8> {
+pub fn compute_code_replay_hash(code: &str) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(code.trim().as_bytes());
-    hasher.update(b"::");
-    hasher.update(step.to_string().as_bytes());
     hasher.finalize().to_vec()
 }
 
@@ -431,15 +433,14 @@ mod tests {
     }
 
     #[test]
-    fn replay_hash_binds_code_and_step() {
-        let hash = compute_code_replay_hash("012345", 100);
+    fn replay_hash_is_code_only() {
+        let hash = compute_code_replay_hash("012345");
         assert_eq!(hash.len(), 32);
-        assert_eq!(hash, compute_code_replay_hash("012345", 100));
-        assert_ne!(hash, compute_code_replay_hash("012345", 101));
-        assert_ne!(hash, compute_code_replay_hash("012346", 100));
+        assert_eq!(hash, compute_code_replay_hash("012345"));
+        assert_ne!(hash, compute_code_replay_hash("012346"));
         assert_eq!(
             hash,
-            compute_code_replay_hash(" 012345 ", 100),
+            compute_code_replay_hash(" 012345 "),
             "surrounding whitespace must not fork the hash"
         );
     }

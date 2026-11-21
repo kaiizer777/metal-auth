@@ -176,7 +176,7 @@ impl TotpService {
             .map_err(AppError::Database)?;
         let secret = self.decrypt_totp_secret(&encrypted_secret)?;
         let step = verify_totp_code(secret.as_ref(), code)?;
-        let replay_hash = compute_code_replay_hash(code, step);
+        let replay_hash = compute_code_replay_hash(code);
 
         sqlx::query("INSERT INTO totp_used_codes (user_id, code_hash) VALUES ($1, $2)")
             .bind(user_id)

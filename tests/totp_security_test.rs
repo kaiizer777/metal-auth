@@ -960,6 +960,7 @@ struct TestLogScope {
 
 impl TestLogScope {
     fn new() -> Self {
+        install_global_log_sink();
         let buf = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::DEBUG)
@@ -967,6 +968,8 @@ impl TestLogScope {
             .with_ansi(false)
             .finish();
         let guard = tracing::subscriber::set_default(subscriber);
+        // Repairs callsites cached as `never` before the global sink existed.
+        tracing::callsite::rebuild_interest_cache();
         Self { buf, _guard: guard }
     }
 

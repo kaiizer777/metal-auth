@@ -1,3 +1,5 @@
+mod common;
+
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -1539,6 +1541,7 @@ struct TestLogScope {
 
 impl TestLogScope {
     fn new() -> Self {
+        common::install_global_log_sink();
         let buf = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::DEBUG)
@@ -1546,6 +1549,9 @@ impl TestLogScope {
             .with_ansi(false)
             .finish();
         let guard = tracing::subscriber::set_default(subscriber);
+        // Repairs callsites cached as `never` before the global sink existed. With `JustOne`
+        // this rebuilds against this capture, so it can only enable what the capture accepts.
+        tracing::callsite::rebuild_interest_cache();
         Self { buf, _guard: guard }
     }
 

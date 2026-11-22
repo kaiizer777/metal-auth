@@ -1267,12 +1267,15 @@ async fn test_session_hash_logged_only_by_the_authentication_event() {
     };
 
     let log_buf = SharedBuffer::default();
+    install_global_log_sink();
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_writer(log_buf.clone())
         .with_ansi(false)
         .finish();
     let _log_guard = tracing::subscriber::set_default(subscriber);
+    // Repairs callsites cached as `never` before the global sink existed.
+    tracing::callsite::rebuild_interest_cache();
 
     let (email, password) = create_and_verify_user(&app).await;
 

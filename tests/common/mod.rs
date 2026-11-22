@@ -40,6 +40,69 @@ pub fn block_on_concurrent<F: Future>(body: F) -> F::Output {
         .block_on(body)
 }
 
+// ─── Tracing capture support ─────────────────────────────────────────────────
+
+/// Discarding global subscriber that reports maximum interest.
+struct DiscardSubscriber;
+
+impl tracing::Subscriber for DiscardSubscriber {
+    // Levels above DEBUG stay uninteresting: the capturing subscribers are DEBUG too, so this
+    // sink never widens what a capture records.
+    fn register_callsite(
+        &self,
+        metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        if metadata.level() <= &tracing::Level::DEBUG {
+            tracing::subscriber::Interest::always()
+        } else {
+            tracing::subscriber::Interest::never()
+        }
+    }
+
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.level() <= &tracing::Level::DEBUG
+    }
+
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::DEBUG)
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(0xDEAD)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, _event: &tracing::Event<'_>) {}
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// Installs the permissive global tracing subscriber once per test binary, and repairs the
+/// callsite interest cache. Call this before creating a scoped capture subscriber.
+///
+/// `tracing`'s interest cache is process-global while `set_default` is thread-local: a callsite
+/// whose first hit lands on a thread with no subscriber is cached as `Interest::never()` and is
+/// then dropped inside the `event!` macro on every thread, so a capture never sees it. With a
+/// permissive global default that registration path resolves to `Interest::always()` instead, and
+/// the captures — which still point at their own per-test buffers — cannot be disabled by a
+/// concurrent test. Nothing is captured by this sink: it discards every event.
+pub fn install_global_log_sink() {
+    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        // A second install cannot succeed; a host process that already set a global default is
+        // equally fine, since the point is only that `get_global` is never `NoSubscriber`.
+        let _ = tracing::subscriber::set_global_default(DiscardSubscriber);
+        // `set_global_default` does not rebuild the cache, so callsites already disabled by an
+        // earlier subscriber-less registration would otherwise stay off for the whole process.
+        tracing::callsite::rebuild_interest_cache();
+    });
+}
+
 /// Truncates all authentication and session domain tables with CASCADE.
 pub async fn truncate_tables(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query(

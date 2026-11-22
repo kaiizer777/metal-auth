@@ -1494,7 +1494,9 @@ pub struct TotpConfig {
     /// 64-character hex AES-256 key for encrypting TOTP secrets at rest.
     ///
     /// `None` means no key was configured; TOTP operations fail fast when they ask for the
-    /// key bytes. Kept optional so a deployment without 2FA still boots.
+    /// key bytes. Still optional here so config parsing and non-router consumers work, but
+    /// building a router ([`crate::handler::create_router`],
+    /// [`crate::handler::auth::routes_with_app_state`]) requires it.
     pub encryption_key: Option<String>,
     /// Issuer label shown in authenticator apps.
     pub issuer: String,

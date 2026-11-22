@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 use sqlx::{PgConnection, PgPool, Row};
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::{
@@ -540,9 +541,14 @@ impl TotpService {
     /// same code: the second waits here and, once the first commits its delete, finds no
     /// row and fails `TotpNotEnrolled` rather than reporting a second success. It covers
     /// only that row and only for the life of this transaction — an enrollment committing a
-    /// new factor afterwards is not observed (an absent row takes no lock), and the password
-    /// branch takes no lock at all, because two password proofs present no code and
-    /// converge on the same end state.
+    /// new factor afterwards is not observed (an absent row takes no lock).
+    ///
+    /// The password branch takes no factor row lock: two password proofs present no code and
+    /// converge on the same end state. It re-reads `users.password_hash` under `FOR UPDATE`
+    /// and constant-time compares it with the hash Argon2 verified, so a reset committing
+    /// between the proof and the delete rejects the disable rather than stripping the factor
+    /// for a superseded credential. The users row is taken last, the order
+    /// `create_session_in` uses.
     ///
     /// The replay row is then written against the same in-transaction clock the verification
     /// path uses, and while it exists `uq_totp_used_codes` rejects a code already spent at
@@ -559,8 +565,9 @@ impl TotpService {
     ) -> Result<(), AppError> {
         match fresh_auth {
             FreshAuthProof::Password(password) => {
-                self.verify_password_proof(user_id, password).await?;
-                self.delete_factor_state(user_id).await
+                let verified_hash = self.verify_password_proof(user_id, password).await?;
+                self.disable_with_verified_password(user_id, &verified_hash)
+                    .await
             }
             FreshAuthProof::TotpCode(code) => {
                 let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
@@ -603,7 +610,14 @@ impl TotpService {
 
     /// Check a password proof on the pool: Argon2id is CPU-bound and must run off the
     /// executor, and no transaction may be held while it does.
-    async fn verify_password_proof(&self, user_id: Uuid, password: String) -> Result<(), AppError> {
+    ///
+    /// Returns the PHC string that was verified, so the caller can re-check it against the
+    /// row it mutates.
+    async fn verify_password_proof(
+        &self,
+        user_id: Uuid,
+        password: String,
+    ) -> Result<String, AppError> {
         let password_hash: String =
             sqlx::query_scalar::<_, String>("SELECT password_hash FROM users WHERE id = $1")
                 .bind(user_id)
@@ -613,22 +627,49 @@ impl TotpService {
                 .ok_or(AppError::InvalidCredentials)?;
 
         // Argon2id is CPU-bound; never run it on the executor thread.
-        let verified =
-            tokio::task::spawn_blocking(move || verify_password(&password, &password_hash))
-                .await
-                .map_err(|err| {
-                    tracing::error!(error = %err, "password verification task failed");
-                    AppError::Internal
-                })??;
+        let (verified, verified_hash) = tokio::task::spawn_blocking(move || {
+            verify_password(&password, &password_hash).map(|verified| (verified, password_hash))
+        })
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "password verification task failed");
+            AppError::Internal
+        })??;
         if !verified {
             return Err(AppError::InvalidCredentials);
         }
-        Ok(())
+        Ok(verified_hash)
     }
 
-    /// Delete the factor and the replay log in their own transaction.
-    async fn delete_factor_state(&self, user_id: Uuid) -> Result<(), AppError> {
+    /// Commit a password-authorized disable, rejecting a proof whose credential was
+    /// superseded after verification.
+    ///
+    /// The users row lock serializes with `reset_password`'s `UPDATE users`, and the
+    /// constant-time compare keeps the stored PHC string out of timing reach. A reset that
+    /// committed before the proof was verified still disables: the snapshot matches, the
+    /// same boundary `create_session_in` draws.
+    async fn disable_with_verified_password(
+        &self,
+        user_id: Uuid,
+        verified_hash: &str,
+    ) -> Result<(), AppError> {
         let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1 FOR UPDATE")
+                .bind(user_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(AppError::Database)?;
+        let fresh = match current {
+            Some(ref stored) if stored.len() == verified_hash.len() => {
+                stored.as_bytes().ct_eq(verified_hash.as_bytes()).into()
+            }
+            _ => false,
+        };
+        if !fresh {
+            return Err(AppError::InvalidCredentials);
+        }
+
         self.delete_factor_state_in(&mut transaction, user_id)
             .await?;
         transaction.commit().await.map_err(AppError::Database)
@@ -1935,6 +1976,44 @@ mod tests {
         assert!(!ctx.service.is_totp_enabled(user_id).await.expect("state"));
         assert_eq!(count_rows(&ctx.pool, "totp_secrets", user_id).await, 0);
         assert_eq!(count_rows(&ctx.pool, "totp_used_codes", user_id).await, 0);
+    }
+
+    #[tokio::test]
+    async fn disable_rejects_a_password_superseded_after_verification() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let password = fixture_password();
+        let user_id = create_user(&ctx, true, &password).await;
+        enroll_and_confirm(&ctx, user_id).await;
+
+        // The proof path reads the credential before Argon2 runs; a reset committing in
+        // that window must not let the disable land.
+        let verified_hash: String =
+            sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(&ctx.pool)
+                .await
+                .expect("read credential");
+        let rotated = hash_password(&fixture_password(), &ctx.auth_config).expect("hash");
+        sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
+            .bind(user_id)
+            .bind(&rotated)
+            .execute(&ctx.pool)
+            .await
+            .expect("rotate password");
+
+        assert!(matches!(
+            ctx.service
+                .disable_with_verified_password(user_id, &verified_hash)
+                .await,
+            Err(AppError::InvalidCredentials)
+        ));
+        assert_eq!(
+            count_rows(&ctx.pool, "totp_secrets", user_id).await,
+            1,
+            "a superseded credential must not strip the second factor"
+        );
     }
 
     #[tokio::test]

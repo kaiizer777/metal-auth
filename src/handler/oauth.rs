@@ -23,6 +23,12 @@ use crate::{
 /// re-emitted as `Location`, so an unbounded value blows past header limits.
 const MAX_REDIRECT_URL_LEN: usize = 2048;
 
+/// Fragment key handing a pending second-factor challenge to the destination app.
+///
+/// A fragment is never sent to a server, so the half-authenticated token stays out of
+/// `Referer`, proxy logs, and this service's own request logging.
+const TOTP_CHALLENGE_FRAGMENT_KEY: &str = "totp_challenge";
+
 #[derive(Debug, Deserialize)]
 pub struct InitiateQuery {
     pub redirect_url: Option<String>,
@@ -86,6 +92,17 @@ pub fn safe_oauth_redirect(target: &str) -> &str {
         return "/";
     }
     target
+}
+
+/// Builds the browser handoff for a pending second factor.
+///
+/// The destination is sanitized here rather than trusted from the service, exactly like the
+/// `Login` and `Linked` arms. A destination that already carries a fragment cannot also carry
+/// the challenge, so that fragment is dropped instead of emitting two `#`.
+fn totp_challenge_location(destination: &str, challenge_token: &str) -> String {
+    let destination = safe_oauth_redirect(destination);
+    let destination = destination.split('#').next().unwrap_or("/");
+    format!("{destination}#{TOTP_CHALLENGE_FRAGMENT_KEY}={challenge_token}")
 }
 
 /// Attaches a `Set-Cookie` header clearing the provider-scoped OAuth state cookie.
@@ -418,14 +435,24 @@ async fn handle_callback_internal(
         }
         OAuthCallbackOutcome::TwoFactorRequired {
             challenge_token,
-            redirect_url: _,
+            redirect_url,
             clear_cookie_header,
         } => {
-            let mut resp = (
-                StatusCode::OK,
-                Json(LoginResponse::two_factor_required(challenge_token)),
-            )
-                .into_response();
+            let mut resp = if wants_json {
+                (
+                    StatusCode::OK,
+                    Json(LoginResponse::two_factor_required(challenge_token)),
+                )
+                    .into_response()
+            } else {
+                let location = totp_challenge_location(&redirect_url, &challenge_token);
+                match header::HeaderValue::from_str(&location) {
+                    Ok(value) => (StatusCode::FOUND, [(header::LOCATION, value)]).into_response(),
+                    // Unreachable: `safe_oauth_redirect` rejects control characters and the
+                    // minted challenge is hex. Fail loudly rather than emit a broken header.
+                    Err(_) => return oauth_error_response(state, provider, AppError::Internal),
+                }
+            };
             append_set_cookie(&mut resp, &clear_cookie_header);
             resp
         }
@@ -595,6 +622,31 @@ mod tests {
                 safe_oauth_redirect(&target),
                 "/",
                 "C0 control {control:#04x} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_totp_challenge_location_appends_fragment_to_a_sanitized_destination() {
+        let token = "a".repeat(64);
+        assert_eq!(
+            totp_challenge_location("/app/settings", &token),
+            format!("/app/settings#totp_challenge={token}")
+        );
+        // An existing query survives: the fragment separator is not a query separator.
+        assert_eq!(
+            totp_challenge_location("/app/home?tab=1", &token),
+            format!("/app/home?tab=1#totp_challenge={token}")
+        );
+        // A destination that already carries a fragment cannot carry the challenge too.
+        assert_eq!(
+            totp_challenge_location("/app/home#section", &token),
+            format!("/app/home#totp_challenge={token}")
+        );
+        for rejected in ["https://evil.com", "//evil.com", "/with\rnewline", ""] {
+            assert_eq!(
+                totp_challenge_location(rejected, &token),
+                format!("/#totp_challenge={token}")
             );
         }
     }

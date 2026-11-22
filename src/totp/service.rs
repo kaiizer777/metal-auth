@@ -239,10 +239,12 @@ impl TotpService {
 
     /// Verify a live TOTP code and burn it in the same step window.
     ///
-    /// Two arbiters, one statement pair: the guarded insert refuses any write that lands
-    /// after the matched step's acceptance band, so a pruned tombstone cannot be
-    /// re-created, and `uq_totp_used_codes` rejects reuse while a tombstone survives.
-    /// Neither reads before writing, so there is no read-then-write gap.
+    /// Three arbiters: the per-user advisory lock serializes verification through commit,
+    /// so no verifier can pass the window guard, stall, and let a prune commit before its
+    /// own insert; the guarded insert refuses any write that lands after the matched step's
+    /// acceptance band, so a pruned tombstone cannot be re-created; and
+    /// `uq_totp_used_codes` rejects reuse while a tombstone survives. The lock is
+    /// transaction-scoped and released by commit or rollback.
     ///
     /// `ip` is part of the Part 3 handler contract; rate limiting is handler-owned.
     pub async fn verify_totp(&self, user_id: Uuid, code: &str, _ip: &str) -> Result<(), AppError> {
@@ -254,16 +256,18 @@ impl TotpService {
 
     /// Verify `code` and record the use on the caller's transaction.
     ///
-    /// The counter and the prune cutoff both derive from one database timestamp read on
-    /// this transaction. Two independent references — a wall-clock pre-read for the
-    /// counter, the transaction time for the cutoff — let a stalled request prune the row
-    /// that blocks its own replay, because the cutoff outruns the counter.
+    /// The user lock is taken first, then one database timestamp read on this transaction.
+    /// Two independent references — a wall-clock pre-read for the counter, the transaction
+    /// time for the cutoff — let a stalled request prune the row that blocks its own replay,
+    /// because the cutoff outruns the counter. Reading it after the lock keeps the check and
+    /// the record inside one serialized section.
     pub(crate) async fn verify_and_record_totp(
         &self,
         connection: &mut PgConnection,
         user_id: Uuid,
         code: &str,
     ) -> Result<(), AppError> {
+        lock_totp_user(connection, user_id).await?;
         let reference = transaction_now(connection).await?;
         self.verify_totp_within(connection, user_id, code, reference)
             .await
@@ -302,6 +306,7 @@ impl TotpService {
         counter: u64,
     ) -> Result<(), AppError> {
         let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
+        lock_totp_user(&mut transaction, user_id).await?;
         let reference = transaction_now(&mut transaction).await?;
         self.record_totp_use(&mut transaction, user_id, code, counter, reference)
             .await?;
@@ -320,6 +325,7 @@ impl TotpService {
         reference: DateTime<Utc>,
     ) -> Result<(), AppError> {
         let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
+        lock_totp_user(&mut transaction, user_id).await?;
         self.verify_totp_within(&mut transaction, user_id, code, reference)
             .await?;
         transaction.commit().await.map_err(AppError::Database)
@@ -486,14 +492,17 @@ impl TotpService {
 
     /// Remove exactly the matched hash on the caller's transaction.
     ///
-    /// Zero rows means another request consumed this hash after our read, which must fail
-    /// the whole unit of work rather than mint a session from a spent code.
+    /// Takes the same per-user lock as a TOTP-code verification, so a backup code and a live
+    /// code are never consumed concurrently for one user. Zero rows means another request
+    /// consumed this hash after our read, which must fail the whole unit of work rather than
+    /// mint a session from a spent code.
     pub(crate) async fn consume_backup_code(
         &self,
         connection: &mut PgConnection,
         user_id: Uuid,
         matched_hash: &str,
     ) -> Result<(), AppError> {
+        lock_totp_user(connection, user_id).await?;
         let removed = sqlx::query(
             "UPDATE totp_secrets SET backup_codes = backup_codes - $2, \
              updated_at = CURRENT_TIMESTAMP \
@@ -555,6 +564,9 @@ impl TotpService {
             }
             FreshAuthProof::TotpCode(code) => {
                 let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
+                // Before the factor row lock: the advisory key is always acquired first so
+                // a disable and a login presenting the same code cannot cross orders.
+                lock_totp_user(&mut transaction, user_id).await?;
                 self.lock_factor_for_disable(&mut transaction, user_id)
                     .await?;
                 self.verify_and_record_totp(&mut transaction, user_id, &code)
@@ -568,10 +580,10 @@ impl TotpService {
 
     /// Lock the caller's factor row until this transaction ends, or report it unusable.
     ///
-    /// Taken before the disable proof is read so a second disable presenting the same code
-    /// blocks here instead of racing the replay insert. The absent row takes no lock: an
-    /// enrollment committed after this point is not excluded, the same boundary as
-    /// [`Self::is_totp_enabled_locked`].
+    /// Taken before the disable proof is read. The per-user advisory lock already serializes
+    /// a second disable presenting the same code; this row lock additionally pins the row the
+    /// delete below removes. The absent row takes no lock: an enrollment committed after this
+    /// point is not excluded, the same boundary as [`Self::is_totp_enabled_locked`].
     async fn lock_factor_for_disable(
         &self,
         connection: &mut PgConnection,
@@ -780,6 +792,22 @@ impl TotpService {
             AppError::TotpCodeInvalid
         })
     }
+}
+
+/// Serialize every check that consumes a code for one user, for the life of the transaction.
+///
+/// Transaction-scoped: commit or rollback releases it, no manual unlock. Taken before the
+/// reference timestamp and before any row lock, so a verifier cannot pass the window guard,
+/// stall, and let a prune commit before its own insert; the next verifier for the same user
+/// waits here. The key is a deterministic hash of the user id, so every path that consumes a
+/// code for that user contends on the same key.
+async fn lock_totp_user(connection: &mut PgConnection, user_id: Uuid) -> Result<(), AppError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended(($1::uuid)::text, 0))")
+        .bind(user_id)
+        .execute(&mut *connection)
+        .await
+        .map(|_| ())
+        .map_err(AppError::Database)
 }
 
 /// Single clock reference for one verification transaction.
@@ -1426,6 +1454,106 @@ mod tests {
             "a stalled replay must expire, not be accepted or labelled a replay: {replay:?}"
         );
         assert_eq!(count_used_code(&ctx.pool, user_id, &code).await, 0);
+    }
+
+    /// The window guard alone leaves a gap: a verifier can pass it, stall, and let a prune
+    /// commit before its own insert. T1 here holds the exact statement order through the
+    /// guard and pauses; T2 must wait for the user lock instead of recording the same code.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stalled_verifier_blocks_the_second_verifier_until_commit() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let response = enroll_and_confirm(&ctx, user_id).await;
+        let raw = decode_totp_secret(&response.secret_base32).expect("decode");
+        let code = current_code(&response.secret_base32);
+        let replay_hash = compute_code_replay_hash(&code);
+
+        // T1: lock, then reference, then the acceptance check — and stop before the insert.
+        let mut stalled = ctx.pool.begin().await.expect("T1 begin");
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended(($1::uuid)::text, 0))")
+            .bind(user_id)
+            .execute(&mut *stalled)
+            .await
+            .expect("T1 lock");
+        let reference: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *stalled)
+            .await
+            .expect("T1 reference");
+        let step = verify_totp_code_at(&raw, &code, totp_counter_at(reference))
+            .expect("T1 passes the acceptance check");
+        let window_end = code_window_end(step).expect("window end");
+        assert!(
+            reference < window_end,
+            "T1 must pause inside the code's window"
+        );
+
+        // T2: the production path, attempted while T1 is paused.
+        let service = ctx.service.clone();
+        let attempt = code.clone();
+        let second =
+            tokio::spawn(async move { service.verify_totp(user_id, &attempt, "ip").await });
+
+        // Wait for a provable state, not a fixed delay: T2 either waits on the user lock or,
+        // with no serialization, finishes and records the code itself.
+        let mut waited = false;
+        for _ in 0..300 {
+            if second.is_finished() {
+                break;
+            }
+            waited = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks \
+                 WHERE locktype = 'advisory' AND NOT granted)",
+            )
+            .fetch_one(&ctx.pool)
+            .await
+            .expect("inspect pg_locks");
+            if waited {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        if !waited {
+            let raced = second.await.expect("join");
+            panic!("second verifier ran past the paused one instead of waiting: {raced:?}");
+        }
+
+        // T1 resumes: prune, guarded insert, commit — the paused half of `record_totp_use`.
+        sqlx::query(
+            "DELETE FROM totp_used_codes WHERE user_id = $1 \
+             AND used_at < $2 - make_interval(secs => $3)",
+        )
+        .bind(user_id)
+        .bind(reference)
+        .bind(ctx.config.totp.used_code_prune_age_secs as f64)
+        .execute(&mut *stalled)
+        .await
+        .expect("T1 prune");
+        let inserted = sqlx::query(
+            "INSERT INTO totp_used_codes (user_id, code_hash, used_at) \
+             SELECT $1, $2, $3 WHERE clock_timestamp() < $4",
+        )
+        .bind(user_id)
+        .bind(&replay_hash[..])
+        .bind(reference)
+        .bind(window_end)
+        .execute(&mut *stalled)
+        .await
+        .expect("T1 insert");
+        assert_eq!(
+            inserted.rows_affected(),
+            1,
+            "the stalled verifier's write must land inside its window"
+        );
+        stalled.commit().await.expect("T1 commit");
+
+        // T2 unblocks against the committed tombstone: the code was spent under it.
+        assert!(matches!(
+            second.await.expect("join"),
+            Err(AppError::TotpCodeReplayed)
+        ));
+        assert_eq!(count_used_code(&ctx.pool, user_id, &code).await, 1);
     }
 
     #[tokio::test]

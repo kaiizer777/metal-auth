@@ -1280,6 +1280,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use sqlx::postgres::PgPoolOptions;
+    use sqlx::{Connection, PgConnection};
 
     #[derive(Debug)]
     struct MockProvider {
@@ -1746,6 +1747,7 @@ mod tests {
     struct RejectedChallengeInsert {
         pool: PgPool,
         trigger: String,
+        armed: bool,
     }
 
     impl RejectedChallengeInsert {
@@ -1772,21 +1774,91 @@ mod tests {
             Self {
                 pool: pool.clone(),
                 trigger,
+                armed: true,
             }
         }
 
-        async fn disarm(self) {
-            for statement in [
+        /// Remove the injection now. The guard stays armed until both drops commit, so a
+        /// failing or cancelled drop leaves `Drop` to retry.
+        async fn disarm(mut self) {
+            let mut connection = self.pool.acquire().await.expect("cleanup connection");
+            drop_injection(&mut connection, self.drop_statements())
+                .await
+                .expect("drop challenge-insert rejection");
+            self.armed = false;
+        }
+
+        fn drop_statements(&self) -> [String; 2] {
+            [
                 format!(
                     "DROP TRIGGER IF EXISTS {} ON two_factor_tokens",
                     self.trigger
                 ),
                 format!("DROP FUNCTION IF EXISTS {}()", self.trigger),
-            ] {
-                sqlx::query(sqlx::AssertSqlSafe(statement))
-                    .execute(&self.pool)
-                    .await
-                    .expect("drop challenge-insert rejection");
+            ]
+        }
+    }
+
+    /// Bound on the cleanup drops: `DROP TRIGGER` takes `ACCESS EXCLUSIVE`, so another
+    /// backend holding the table would otherwise hang the test binary.
+    const CLEANUP_TIMEOUT: &str = "5s";
+
+    /// Drop the trigger and its function in one bounded transaction.
+    ///
+    /// `IF EXISTS` makes a retry after a timeout safe.
+    async fn drop_injection(
+        connection: &mut PgConnection,
+        statements: [String; 2],
+    ) -> Result<(), sqlx::Error> {
+        let mut transaction = connection.begin().await?;
+        for timeout in [
+            format!("SET LOCAL lock_timeout = '{CLEANUP_TIMEOUT}'"),
+            format!("SET LOCAL statement_timeout = '{CLEANUP_TIMEOUT}'"),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(timeout))
+                .execute(&mut *transaction)
+                .await?;
+        }
+        for statement in statements {
+            sqlx::query(sqlx::AssertSqlSafe(statement))
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await
+    }
+
+    impl Drop for RejectedChallengeInsert {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            let options = self.pool.connect_options();
+            let statements = self.drop_statements();
+            // A panicking assertion cannot await: finish the drops on a scratch thread with
+            // its own runtime so the trigger cannot leak into another test binary.
+            let cleanup = std::thread::spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        eprintln!("oauth injection cleanup skipped: {error}");
+                        return;
+                    }
+                };
+                let dropped = runtime.block_on(async move {
+                    let mut connection = PgConnection::connect_with(&options).await?;
+                    drop_injection(&mut connection, statements).await
+                });
+                if let Err(error) = dropped {
+                    eprintln!(
+                        "oauth injection cleanup failed ({CLEANUP_TIMEOUT} lock timeout): {error}"
+                    );
+                }
+            });
+            if cleanup.join().is_err() {
+                eprintln!("oauth injection cleanup thread panicked");
             }
         }
     }

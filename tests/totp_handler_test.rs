@@ -1658,14 +1658,17 @@ impl FailureInjection {
     }
 
     /// Remove the injection now, on a path that is about to assert.
+    ///
+    /// The guard stays armed until both drops complete, so a failing or cancelled drop
+    /// leaves `Drop` to retry on its scratch connection instead of leaking the trigger.
     async fn disarm(mut self) {
-        self.armed = false;
         for statement in self.drop_statements() {
             sqlx::query(sqlx::AssertSqlSafe(statement))
                 .execute(&self.pool)
                 .await
                 .expect("drop failure injection");
         }
+        self.armed = false;
     }
 
     fn drop_statements(&self) -> [String; 2] {

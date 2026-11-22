@@ -2376,6 +2376,52 @@ mod tests {
         assert_eq!(count_rows(&ctx.pool, "sessions", user_id).await, 0);
     }
 
+    /// The backup-code leg must stay key-independent: that is what makes the startup gate a
+    /// guard on the TOTP secret, not on account recovery.
+    #[tokio::test]
+    async fn keyless_service_still_verifies_and_consumes_backup_codes() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        // Enrollment needs the key, so it runs on the keyed service.
+        let response = enroll_and_confirm(&ctx, user_id).await;
+        let code = response.backup_codes[0].clone();
+
+        let keyless_config = Arc::new(Config {
+            totp: TotpConfig {
+                encryption_key: None,
+                ..TotpConfig::default()
+            },
+            ..Config::default()
+        });
+        let service = TotpService::new(
+            ctx.pool.clone(),
+            keyless_config,
+            Arc::clone(&ctx.auth_config),
+        );
+
+        service
+            .verify_backup_code(user_id, &code, "ip")
+            .await
+            .expect("backup codes never touch the encryption key");
+        assert!(
+            matches!(
+                service.verify_backup_code(user_id, &code, "ip").await,
+                Err(AppError::TotpBackupCodeInvalid)
+            ),
+            "the keyless path must still consume the code it verified"
+        );
+
+        let stored: serde_json::Value =
+            sqlx::query_scalar("SELECT backup_codes FROM totp_secrets WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(&ctx.pool)
+                .await
+                .expect("backup codes");
+        assert_eq!(stored.as_array().expect("array").len(), 9);
+    }
+
     #[tokio::test]
     async fn login_gate_issues_a_challenge_without_a_session() {
         let Some(ctx) = setup_db_context().await else {
@@ -2427,7 +2473,7 @@ mod tests {
         // Exactly what `routes()` builds: no session service, and no `/totp/*` route.
         let mut handler = handler_state(&ctx);
         handler.session_service = None;
-        let app = routes_with_state(handler);
+        let app = routes_with_state(handler).expect("keyed test config builds the router");
 
         let request = Request::builder()
             .method("POST")

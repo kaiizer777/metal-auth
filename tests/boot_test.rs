@@ -35,8 +35,54 @@ fn test_config() -> Config {
         session: metal_auth::SessionConfig::default(),
         rate_limit: metal_auth::RateLimitConfig::default(),
         oauth: metal_auth::OAuthConfig::default(),
-        totp: metal_auth::TotpConfig::default(),
+        totp: metal_auth::TotpConfig {
+            encryption_key: Some("00".repeat(32)),
+            ..metal_auth::TotpConfig::default()
+        },
     }
+}
+
+#[tokio::test]
+async fn test_auth_facade_rejects_keyless_totp_config() {
+    let mut cfg = test_config();
+    cfg.totp.encryption_key = None;
+
+    let pool = PgPool::connect_lazy(&cfg.database_url).expect("lazy pool creation");
+    // The gate belongs to router construction, so the state itself is still valid.
+    let state = AppState::new(pool, cfg).expect("keyless config is a valid AppState");
+
+    let result = Auth::from_state(state);
+    assert!(
+        matches!(
+            result,
+            Err(AppError::Config(ConfigError::InvalidValue { field, .. }))
+                if field == "totp.encryption_key"
+        ),
+        "a keyless TOTP config must not build the app"
+    );
+}
+
+#[tokio::test]
+async fn test_keyed_config_serves_the_totp_verification_route() {
+    let cfg = test_config();
+
+    let pool = PgPool::connect_lazy(&cfg.database_url).expect("lazy pool creation");
+    let state = AppState::new(pool, cfg).expect("keyed config is a valid AppState");
+    let mut auth = Auth::from_state(state).expect("keyed config builds the app");
+
+    let req = Request::builder()
+        .uri("/auth/totp/verify")
+        .method(Method::POST)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = auth.router.call(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    let err_envelope: ErrorResponse = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(err_envelope.code, ErrorCode::ValidationError);
 }
 
 #[tokio::test]

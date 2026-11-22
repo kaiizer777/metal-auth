@@ -1,7 +1,12 @@
 use axum::{Router, http::HeaderMap};
 use tower_http::trace::TraceLayer;
 
-use crate::{error::AppError, middleware::security_headers_middleware, state::AppState};
+use crate::{
+    config::Config,
+    error::{AppError, ConfigError},
+    middleware::security_headers_middleware,
+    state::AppState,
+};
 
 pub mod auth;
 pub mod cors;
@@ -34,16 +39,34 @@ pub(crate) fn untrusted_client_ip(headers: &HeaderMap) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+/// Refuse a config whose TOTP encryption key is absent or unusable.
+///
+/// Minting a challenge needs no key, but verifying one decrypts the stored secret, so a
+/// keyless router issues challenges it can never redeem. `None` (no config at all) can be
+/// proved just as little, so it is refused the same way. Fail at construction instead.
+pub(crate) fn require_totp_key(config: Option<&Config>) -> Result<(), AppError> {
+    let config = config.ok_or(ConfigError::InvalidValue {
+        field: "totp.encryption_key",
+        reason: "must be set to enable totp",
+    })?;
+    config
+        .totp
+        .encryption_key_bytes()
+        .map(|_| ())
+        .map_err(AppError::Config)
+}
+
 pub fn create_router(state: AppState) -> Result<Router, AppError> {
     // `AppState` fields are public, so validate here too: no router is served from a
     // config that failed validation.
     state.config.validate().map_err(AppError::Config)?;
+    require_totp_key(Some(&state.config))?;
     let cors = cors_layer(&state.config)?;
 
     let oauth_router = oauth::routes(state.clone());
-    let auth_router = auth::routes_with_app_state(state.clone())
+    let auth_router = auth::routes_with_app_state(state.clone())?
         .merge(session::routes(state.clone()))
-        .merge(totp::routes(state.clone()))
+        .merge(totp::routes(state.clone())?)
         .merge(oauth_router.clone());
 
     Ok(Router::new()
@@ -68,6 +91,7 @@ pub fn create_router(state: AppState) -> Result<Router, AppError> {
 mod tests {
     use super::*;
     use crate::config::{AppConfig, Config};
+    use crate::error::ConfigError;
     use axum::{
         body::Body,
         http::{Method, Request, StatusCode},
@@ -105,7 +129,28 @@ mod tests {
             session: crate::config::SessionConfig::default(),
             rate_limit: crate::config::RateLimitConfig::default(),
             oauth: crate::config::OAuthConfig::default(),
-            totp: crate::config::TotpConfig::default(),
+            totp: crate::config::TotpConfig {
+                encryption_key: Some("00".repeat(crate::config::TOTP_ENCRYPTION_KEY_BYTES)),
+                ..crate::config::TotpConfig::default()
+            },
+        }
+    }
+
+    fn state_with_config(cfg: Config) -> AppState {
+        let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
+        AppState::with_configs_and_dispatcher(pool, cfg, Arc::new(AppConfig::default()), None)
+            .expect("valid test AppState")
+    }
+
+    /// Returns the reported `reason`, asserting the failure names the TOTP key setting.
+    fn totp_key_error_reason<T>(result: Result<T, AppError>) -> &'static str {
+        match result {
+            Ok(_) => panic!("a config without a usable TOTP key must not build a router"),
+            Err(AppError::Config(ConfigError::InvalidValue { field, reason })) => {
+                assert_eq!(field, "totp.encryption_key");
+                reason
+            }
+            Err(other) => panic!("expected a totp.encryption_key config error, got {other:?}"),
         }
     }
 
@@ -118,6 +163,131 @@ mod tests {
             AppState::with_configs_and_dispatcher(pool, cfg, Arc::new(AppConfig::default()), None)
                 .unwrap();
         let _router: Router = create_router(state).unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_router_rejects_absent_totp_encryption_key() {
+        let cfg = Config {
+            totp: crate::config::TotpConfig::default(),
+            ..valid_config()
+        };
+
+        assert_eq!(
+            totp_key_error_reason(create_router(state_with_config(cfg))),
+            "must be set to enable totp"
+        );
+    }
+
+    #[test]
+    fn require_totp_key_rejects_blank_key() {
+        let cfg = Config {
+            totp: crate::config::TotpConfig {
+                encryption_key: Some(String::new()),
+                ..crate::config::TotpConfig::default()
+            },
+            ..valid_config()
+        };
+
+        assert_eq!(
+            totp_key_error_reason(require_totp_key(Some(&cfg))),
+            "must be exactly 64 hexadecimal characters"
+        );
+    }
+
+    #[tokio::test]
+    async fn routes_with_app_state_rejects_absent_totp_encryption_key() {
+        let cfg = Config {
+            totp: crate::config::TotpConfig::default(),
+            ..valid_config()
+        };
+
+        assert_eq!(
+            totp_key_error_reason(crate::handler::auth::routes_with_app_state(
+                state_with_config(cfg)
+            )),
+            "must be set to enable totp"
+        );
+    }
+
+    fn handler_state_with_config(cfg: Config) -> crate::handler::auth::AuthHandlerState {
+        let state = state_with_config(cfg);
+        crate::handler::auth::AuthHandlerState {
+            service: Arc::clone(&state.auth_service),
+            session_service: Some(Arc::clone(&state.session_service)),
+            rate_limiter: Some(Arc::clone(&state.rate_limiter)),
+            config: Some(Arc::new(state.config.clone())),
+            totp_service: Arc::clone(&state.totp_service),
+        }
+    }
+
+    #[tokio::test]
+    async fn routes_with_state_rejects_absent_totp_encryption_key() {
+        let cfg = Config {
+            totp: crate::config::TotpConfig::default(),
+            ..valid_config()
+        };
+
+        assert_eq!(
+            totp_key_error_reason(crate::handler::auth::routes_with_state(
+                handler_state_with_config(cfg)
+            )),
+            "must be set to enable totp"
+        );
+    }
+
+    #[tokio::test]
+    async fn routes_with_state_rejects_a_handler_state_without_config() {
+        let mut handler = handler_state_with_config(valid_config());
+        handler.config = None;
+
+        assert_eq!(
+            totp_key_error_reason(crate::handler::auth::routes_with_state(handler)),
+            "must be set to enable totp"
+        );
+    }
+
+    #[tokio::test]
+    async fn routes_with_state_serves_a_keyed_config() {
+        let mut router =
+            crate::handler::auth::routes_with_state(handler_state_with_config(valid_config()))
+                .expect("keyed config builds the auth router");
+
+        let req = Request::builder()
+            .uri("/login")
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn totp_routes_rejects_absent_totp_encryption_key() {
+        let cfg = Config {
+            totp: crate::config::TotpConfig::default(),
+            ..valid_config()
+        };
+
+        assert_eq!(
+            totp_key_error_reason(crate::handler::totp::routes(state_with_config(cfg))),
+            "must be set to enable totp"
+        );
+    }
+
+    #[tokio::test]
+    async fn totp_routes_serves_a_keyed_config() {
+        let mut router = crate::handler::totp::routes(state_with_config(valid_config()))
+            .expect("keyed config builds the totp router");
+
+        let req = Request::builder()
+            .uri("/totp/verify")
+            .method(Method::POST)
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

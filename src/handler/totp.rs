@@ -602,13 +602,18 @@ fn user_agent(headers: &HeaderMap) -> &str {
 
 /// Router for the TOTP endpoints, merged under `/auth` by [`crate::handler::create_router`].
 ///
+/// Fails at startup when the TOTP encryption key is absent or unusable: verification decrypts
+/// the stored secret, so a keyless config would answer every challenge with a 503.
+///
 /// CSRF split is deliberate. `enroll`, `confirm`, and `DELETE /totp` mutate state on an
 /// ambient session cookie and sit behind `require_auth` + CSRF (guard outermost, so an
 /// anonymous request gets 401 before CSRF can answer 403). `verify` and `backup`
 /// authenticate with a body-borne `challenge_token` and carry no ambient authority;
 /// inside the CSRF layer a browser holding any unrelated `sid` cookie would be rejected
 /// before the challenge is read, while cookie-less clients would still pass.
-pub fn routes(state: AppState) -> Router {
+pub fn routes(state: AppState) -> Result<Router, AppError> {
+    super::require_totp_key(Some(&state.config))?;
+
     let protected = Router::new()
         .route(
             "/totp/enroll",
@@ -642,5 +647,5 @@ pub fn routes(state: AppState) -> Router {
         )
         .with_state(state);
 
-    protected.merge(public)
+    Ok(protected.merge(public))
 }

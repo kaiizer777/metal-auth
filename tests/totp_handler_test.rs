@@ -1032,66 +1032,6 @@ async fn backup_issues_a_working_session_and_consumes_the_code() {
 }
 
 #[tokio::test]
-async fn keyless_deployment_serves_backup_codes_and_fails_the_totp_leg_closed() {
-    let _guard = DB_LOCK.lock().await;
-    // Enrollment needs the key, so it runs on a keyed app; redemption runs on a keyless one
-    // against the same database.
-    let Some(keyed) = setup_test_app().await else {
-        return;
-    };
-    let (email, password, secret, backup_codes, _session) =
-        enabled_user(&keyed, &dynamic_ip()).await;
-
-    let Some(keyless) = setup_test_app_with(|cfg| cfg.totp.encryption_key = None).await else {
-        return;
-    };
-    let user_id = user_id_for_email(&keyless.pool, &email).await;
-    let sessions_before: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = $1")
-            .bind(user_id)
-            .fetch_one(&keyless.pool)
-            .await
-            .expect("count sessions");
-    let token = challenge(&keyless, &email, &password).await;
-
-    // TOTP-code leg: the stored secret cannot be decrypted, so it fails closed without
-    // revealing anything about the presented code and without a session.
-    let resp = keyless
-        .post_json(
-            "/auth/totp/verify",
-            json!({ "challenge_token": token, "code": totp_code(&secret) }),
-        )
-        .await;
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(resp.error_code(), Some(ErrorCode::TwoFactorUnavailable));
-    let sessions_after_rejection: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = $1")
-            .bind(user_id)
-            .fetch_one(&keyless.pool)
-            .await
-            .expect("count sessions");
-    assert_eq!(
-        sessions_after_rejection, sessions_before,
-        "the failed TOTP leg must not mint a session"
-    );
-
-    // Backup-code leg: Argon2id matching never touches the encryption key, so recovery still
-    // works and the challenge token is intact.
-    let resp = keyless
-        .post_json(
-            "/auth/totp/backup",
-            json!({ "challenge_token": token, "code": backup_codes[0].clone() }),
-        )
-        .await;
-    assert_eq!(resp.status(), StatusCode::OK, "body: {}", resp.body_str);
-    let cookie_name = keyless.state.config.session.cookie_name.clone();
-    assert!(
-        extract_cookie_val(&resp.headers, &cookie_name).is_some(),
-        "backup-code recovery must still mint a session without the key"
-    );
-}
-
-#[tokio::test]
 async fn backup_rejects_unknown_challenge_token() {
     let _guard = DB_LOCK.lock().await;
     let Some(app) = setup_test_app().await else {

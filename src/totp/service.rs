@@ -1560,9 +1560,15 @@ mod tests {
                 break;
             }
             waited = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS (SELECT 1 FROM pg_locks \
-                 WHERE locktype = 'advisory' AND NOT granted)",
+                "SELECT EXISTS ( \
+                     SELECT 1 FROM pg_locks \
+                     WHERE locktype = 'advisory' AND NOT granted \
+                       AND database = (SELECT oid FROM pg_database \
+                                       WHERE datname = current_database()) \
+                       AND ((classid::bigint << 32) | objid::bigint) \
+                           = hashtextextended(($1::uuid)::text, 0))",
             )
+            .bind(user_id)
             .fetch_one(&ctx.pool)
             .await
             .expect("inspect pg_locks");

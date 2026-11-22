@@ -2427,7 +2427,7 @@ mod tests {
         // Exactly what `routes()` builds: no session service, and no `/totp/*` route.
         let mut handler = handler_state(&ctx);
         handler.session_service = None;
-        let app = routes_with_state(handler);
+        let app = routes_with_state(handler).expect("keyed test config builds the router");
 
         let request = Request::builder()
             .method("POST")

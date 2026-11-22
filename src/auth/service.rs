@@ -9,7 +9,7 @@
 //! - signup returns Ok(()) on duplicate email (anti-enumeration)
 //! - request_password_reset always queries DB; always returns Ok(())
 //! - token tables are DELETE-on-consume within a transaction (no TOCTOU)
-//! - reset_password deletes ALL reset tokens for user on success
+//! - reset_password deletes ALL reset tokens and pending 2FA challenges for the user
 //! - email dispatch is detached from the response path (mailer latency is never observable)
 
 use std::sync::Arc;
@@ -458,7 +458,7 @@ impl AuthServiceImpl {
     /// Performance & Security:
     /// Atomically consumes token via DELETE RETURNING before computing Argon2id hash
     /// with zero open DB connection, eliminating pool starvation and CPU exhaustion DoS.
-    /// Revokes ALL remaining reset tokens for the user upon success.
+    /// Revokes ALL remaining reset tokens and pending 2FA challenges for the user on success.
     pub async fn reset_password(&self, token: &str, new_password: &str) -> AppResult<()> {
         validate_password(new_password, &self.config)?;
         let token_hash = hash_token(token)?;
@@ -491,6 +491,15 @@ impl AuthServiceImpl {
             .map_err(|_| AppError::Internal)??;
 
         let mut tx = self.pool.begin().await.map_err(AppError::Database)?;
+
+        // Before the `users` lock: redemption takes the challenge row first and the
+        // `users` row second, so this order keeps reset and an in-flight verify from
+        // deadlocking on the same two resources.
+        sqlx::query("DELETE FROM two_factor_tokens WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::Database)?;
 
         // Serialize concurrent resets for this user: the lock orders two
         // simultaneously consumed tokens deterministically instead of racing

@@ -140,12 +140,12 @@ pub async fn init_pool_with_options(
     Ok(pool)
 }
 
-/// Serializes the lib tests that dispatch email-outbox rows.
+/// Serializes every lib test that can write `email_outbox`.
 ///
-/// All modules share one schema, and `claim_pending_outbox` claims globally, so per-module
-/// locks let one test's dispatcher deliver another module's fixture rows. Tests that touch
-/// the database without claiming outbox rows — the session expiry tests, for instance — do
-/// not take it.
+/// The claim is global, so any test that inserts, claims, resets, or purges rows must hold
+/// it — including through a background writer it starts indirectly: a spawned outbox worker
+/// runs `recover_stale_processing` and `cleanup_sent_outbox` against the shared schema. Tests
+/// that never reach `email_outbox`, such as the session expiry tests, do not take it.
 #[cfg(test)]
 pub(crate) static DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 

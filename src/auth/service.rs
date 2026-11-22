@@ -592,7 +592,9 @@ mod tests {
             argon2_p_cost: 1,
             ..Default::default()
         });
-        let dispatcher = Arc::new(EmailDispatcher::new(
+        // Worker-free: these tests never deliver, and a detached dispatcher would spawn the
+        // production worker against whatever `postgres://localhost/test` resolves to.
+        let dispatcher = Arc::new(EmailDispatcher::new_blocking(
             None,
             std::time::Duration::from_secs(10),
         ));

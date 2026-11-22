@@ -775,7 +775,11 @@ mod tests {
             password_max_len: 128,
             ..Default::default()
         });
-        let dispatcher = Arc::new(EmailDispatcher::new(
+        // Blocking mode is worker-free. A detached dispatcher would spawn the production
+        // worker on the real schema, and that worker rewrites `email_outbox` every poll
+        // tick without holding `crate::db::DB_TEST_LOCK`. These tests assert HTTP shapes
+        // and never deliver, so inline mode costs nothing and removes the writer.
+        let dispatcher = Arc::new(EmailDispatcher::new_blocking(
             None,
             std::time::Duration::from_secs(10),
         ));
@@ -1263,5 +1267,99 @@ mod tests {
         let resp = request_password_reset(State(state), HeaderMap::new(), Ok(Json(payload))).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(limiter.entry_count(), 0);
+    }
+
+    /// Returns a real pool on the shared test schema, or skips loudly outside CI.
+    async fn db_test_pool() -> Option<PgPool> {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) => {
+                assert!(
+                    std::env::var_os("CI").is_none(),
+                    "DATABASE_URL must be set in CI: DB-backed tests must never skip silently"
+                );
+                eprintln!("SKIP: DB-backed handler tests need DATABASE_URL");
+                return None;
+            }
+        };
+        Some(
+            crate::db::init_pool_with_options(
+                &url,
+                crate::db::DbPoolOptions {
+                    max_connections: 2,
+                    min_connections: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("DATABASE_URL is set, so the DB-backed test must connect"),
+        )
+    }
+
+    /// A state built for handler tests must not run the production outbox worker: that worker
+    /// rewrites `email_outbox` on startup and on every poll tick, off-lock, so it can reset or
+    /// delete a row the owning test is asserting on.
+    #[tokio::test]
+    async fn test_state_runs_no_outbox_worker() {
+        let _guard = crate::db::DB_TEST_LOCK.lock().await;
+        let Some(pool) = db_test_pool().await else {
+            return;
+        };
+
+        let stale_id = uuid::Uuid::new_v4();
+        let expired_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO email_outbox (id, recipient, email_type, payload, status, retry_count, next_retry_at)
+            VALUES ($1, $2, 'verification', '{}'::jsonb, $3, 0, NOW() - INTERVAL '10 seconds')
+            "#,
+        )
+        .bind(stale_id)
+        .bind(format!("handler_stale_{stale_id}@example.com"))
+        .bind(crate::db::models::OUTBOX_STATUS_PROCESSING)
+        .execute(&pool)
+        .await
+        .expect("insert expired processing row");
+        sqlx::query(
+            r#"
+            INSERT INTO email_outbox (id, recipient, email_type, payload, status, retry_count, next_retry_at, sent_at)
+            VALUES ($1, $2, 'verification', '{}'::jsonb, $3, 0, NOW(), NOW() - INTERVAL '10 days')
+            "#,
+        )
+        .bind(expired_id)
+        .bind(format!("handler_expired_{expired_id}@example.com"))
+        .bind(crate::db::models::OUTBOX_STATUS_SENT)
+        .execute(&pool)
+        .await
+        .expect("insert retainable sent row");
+
+        let _state = create_test_state();
+
+        // The worker recovers stale leases and purges expired `sent` rows immediately on
+        // spawn, so two poll intervals leave no room for a lucky-timing pass.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        let stale = crate::db::outbox::get_outbox_by_id(&pool, stale_id)
+            .await
+            .expect("fetch expired processing row")
+            .expect("row exists");
+        assert_eq!(
+            stale.status,
+            crate::db::models::OUTBOX_STATUS_PROCESSING,
+            "building a handler test state must not run recover_stale_processing"
+        );
+        assert!(
+            crate::db::outbox::get_outbox_by_id(&pool, expired_id)
+                .await
+                .expect("fetch sent row")
+                .is_some(),
+            "building a handler test state must not run cleanup_sent_outbox"
+        );
+
+        let _ = sqlx::query("DELETE FROM email_outbox WHERE id IN ($1, $2)")
+            .bind(stale_id)
+            .bind(expired_id)
+            .execute(&pool)
+            .await;
     }
 }

@@ -418,6 +418,7 @@ async fn handle_callback_internal(
         }
         OAuthCallbackOutcome::TwoFactorRequired {
             challenge_token,
+            redirect_url: _,
             clear_cookie_header,
         } => {
             let mut resp = (

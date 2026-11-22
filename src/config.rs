@@ -1607,7 +1607,10 @@ impl TotpConfig {
         if self.used_code_prune_age_secs > MAX_TOTP_USED_CODE_PRUNE_AGE_SECS {
             return Err(ConfigError::InvalidValue {
                 field: "totp.used_code_prune_age_secs",
-                reason: "must stay inside PostgreSQL's interval range",
+                // `reason` is `&'static str`, so the bound is spelled out here; the test
+                // `totp_validate_rejects_prune_age_beyond_postgres_interval` derives the
+                // digits from the constant and fails if the two drift apart.
+                reason: "must be at most 31536000 seconds (365 days)",
             });
         }
         Ok(())
@@ -3618,7 +3621,15 @@ mod tests {
                 used_code_prune_age_secs: rejected,
                 ..TotpConfig::default()
             };
-            assert!(over.validate().is_err(), "accepted {rejected}");
+            let error = over.validate().expect_err("above the bound");
+            let ConfigError::InvalidValue { field, reason } = error else {
+                panic!("expected InvalidValue, got {error:?}");
+            };
+            assert_eq!(field, "totp.used_code_prune_age_secs");
+            assert!(
+                reason.contains(&MAX_TOTP_USED_CODE_PRUNE_AGE_SECS.to_string()),
+                "the message must name the {MAX_TOTP_USED_CODE_PRUNE_AGE_SECS}s bound: {reason}"
+            );
         }
     }
 

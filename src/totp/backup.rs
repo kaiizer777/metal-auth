@@ -88,6 +88,56 @@ fn is_valid_backup_code_format(code: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Discarding global subscriber that reports maximum interest.
+    struct DiscardSubscriber;
+
+    impl tracing::Subscriber for DiscardSubscriber {
+        fn register_callsite(
+            &self,
+            metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            if metadata.level() <= &tracing::Level::DEBUG {
+                tracing::subscriber::Interest::always()
+            } else {
+                tracing::subscriber::Interest::never()
+            }
+        }
+
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.level() <= &tracing::Level::DEBUG
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::DEBUG)
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(0xDEAD)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, _event: &tracing::Event<'_>) {}
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Keeps `get_global` from being `NoSubscriber`, so a callsite first reached on a
+    /// subscriber-less thread is not cached as `Interest::never()` for the whole process.
+    ///
+    /// Mirrors `tests/common/mod.rs::install_global_log_sink`, which this test target cannot import.
+    fn install_global_log_sink() {
+        static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            let _ = tracing::subscriber::set_global_default(DiscardSubscriber);
+            tracing::callsite::rebuild_interest_cache();
+        });
+    }
+
     /// Minimal Argon2id cost accepted by `Params` (8 KiB, one lane) so the suite stays fast
     /// in unoptimised builds; hashing behaviour and PHC round-tripping are unchanged.
     fn test_config() -> AppConfig {
@@ -202,6 +252,8 @@ mod tests {
         use std::io;
         use std::sync::{Arc, Mutex};
 
+        install_global_log_sink();
+
         struct Capture(Arc<Mutex<Vec<u8>>>);
         impl io::Write for Capture {
             fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -225,7 +277,11 @@ mod tests {
             })
             .finish();
 
-        tracing::dispatcher::with_default(&tracing::dispatcher::Dispatch::new(subscriber), body);
+        tracing::dispatcher::with_default(&tracing::dispatcher::Dispatch::new(subscriber), || {
+            // Repairs callsites cached as `never` before the global sink existed.
+            tracing::callsite::rebuild_interest_cache();
+            body()
+        });
 
         String::from_utf8(buffer.lock().expect("log buffer poisoned").clone())
             .expect("logs are UTF-8")

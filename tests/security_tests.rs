@@ -1712,6 +1712,36 @@ async fn test_no_secrets_in_tracing_logs() {
     );
 }
 
+/// One callsite, reached from whichever thread calls this.
+fn emit_interest_cache_probe() {
+    tracing::info!(
+        target: "interest_cache_probe",
+        "probe event after bare-thread registration"
+    );
+}
+
+/// `set_default` is thread-scoped but the callsite interest cache is process-global: a callsite
+/// first reached on a thread with no subscriber is cached as `Interest::never()` and the `event!`
+/// macro then drops it everywhere, including on the capturing thread.
+#[test]
+fn test_capture_survives_a_callsite_registered_on_a_bare_thread() {
+    let log_scope = TestLogScope::new();
+
+    // First hit lands on a thread with no subscriber, after the capture is installed — the
+    // registration path the concurrent tests in this binary take.
+    std::thread::spawn(emit_interest_cache_probe)
+        .join()
+        .expect("bare probe thread");
+
+    emit_interest_cache_probe();
+
+    let logs = log_scope.text();
+    assert!(
+        logs.contains("probe event after bare-thread registration"),
+        "capture lost a callsite that was registered on a subscriber-less thread: {logs}"
+    );
+}
+
 #[tokio::test]
 async fn test_db_error_does_not_leak_sql_text() {
     let router = create_failing_db_router();

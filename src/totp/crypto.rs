@@ -190,7 +190,8 @@ pub fn current_totp_counter() -> u64 {
 /// display or comparison as `format!("{code:06}")`, never with `{}`, or roughly 10% of
 /// codes lose a digit.
 pub fn generate_totp(secret: &[u8], counter: u64) -> Result<u32, AppError> {
-    let mut mac = <HmacSha1 as Mac>::new_from_slice(secret).map_err(|_| AppError::Internal)?;
+    let mut mac =
+        <HmacSha1 as hmac::KeyInit>::new_from_slice(secret).map_err(|_| AppError::Internal)?;
     mac.update(&counter.to_be_bytes());
     let digest = mac.finalize().into_bytes();
 
@@ -519,7 +520,7 @@ mod tests {
 
     /// RFC 6238 Appendix B eight-digit SHA-1 vector, for the decoder proof.
     fn rfc6238_eight_digit(secret: &[u8], counter: u64) -> u32 {
-        let mut mac = <HmacSha1 as Mac>::new_from_slice(secret).expect("hmac key");
+        let mut mac = <HmacSha1 as hmac::KeyInit>::new_from_slice(secret).expect("hmac key");
         mac.update(&counter.to_be_bytes());
         let digest = mac.finalize().into_bytes();
         let offset = usize::from(digest[19] & 0x0f);

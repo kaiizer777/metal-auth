@@ -471,7 +471,7 @@ async fn test_oauth_login_for_totp_user_issues_challenge_and_no_session() {
     assert_eq!(sessions_before, 1, "the first login mints one session");
 
     let (auth_url, set_cookie) = svc
-        .get_authorization_url("google", None)
+        .get_authorization_url("google", Some("/app/settings".to_string()))
         .expect("get auth url");
     let state_token = extract_state_from_url(&auth_url);
     let second = svc
@@ -488,11 +488,17 @@ async fn test_oauth_login_for_totp_user_issues_challenge_and_no_session() {
         .expect("second callback");
 
     let OAuthCallbackOutcome::TwoFactorRequired {
-        challenge_token, ..
+        challenge_token,
+        redirect_url,
+        ..
     } = second
     else {
         panic!("a TOTP-enabled account must not receive a session from OAuth");
     };
+    assert_eq!(
+        redirect_url, "/app/settings",
+        "the challenge outcome must carry the saved destination"
+    );
     assert_eq!(
         app.state
             .totp_service

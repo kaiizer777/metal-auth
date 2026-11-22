@@ -228,6 +228,243 @@ async fn test_oauth_google_end_to_end_flow() {
     assert_eq!(accounts[0]["provider_user_id"], test_sub);
 }
 
+const TOTP_GOOGLE_ACCESS_TOKEN: &str = "goog-2fa-at";
+
+/// Google-provider app whose callback resolves `email`, with that account TOTP-enabled.
+async fn setup_totp_oauth_app(server: &MockServer, email: &str) -> Option<(TestApp, Uuid)> {
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": TOTP_GOOGLE_ACCESS_TOKEN,
+            "token_type": "Bearer",
+            "expires_in": 3600
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/userinfo"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "sub": format!("google-2fa-{}", Uuid::new_v4().simple()),
+            "email": email,
+            "email_verified": true,
+            "name": "Two Factor Google User"
+        })))
+        .mount(server)
+        .await;
+
+    let google_cfg = ProviderConfig {
+        client_id: "google-id".to_string(),
+        client_secret: "google-secret".to_string(),
+        redirect_uri: "https://example.com/auth/oauth/google/callback".to_string(),
+        scopes: vec![],
+        enabled: true,
+        team_id: None,
+        key_id: None,
+        private_key: None,
+    };
+    let google = GoogleProvider::with_endpoints(
+        &google_cfg,
+        reqwest::Client::new(),
+        format!("{}/auth", server.uri()),
+        format!("{}/token", server.uri()),
+        format!("{}/userinfo", server.uri()),
+    )
+    .unwrap();
+
+    let mut providers: HashMap<String, Arc<dyn OAuthProvider>> = HashMap::new();
+    providers.insert("google".to_string(), Arc::new(google));
+
+    let app = setup_oauth_test_app(providers).await?;
+
+    let user_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, TRUE)",
+    )
+    .bind(user_id)
+    .bind(email)
+    .bind("$unusable$oauth$test")
+    .execute(&app.pool)
+    .await
+    .expect("insert TOTP-enabled local user");
+
+    let enrollment = app
+        .state
+        .totp_service
+        .enroll_totp(user_id)
+        .await
+        .expect("enroll");
+    let code = totp_code(&enrollment.secret_base32);
+    app.state
+        .totp_service
+        .confirm_enrollment(user_id, &code, "127.0.0.1")
+        .await
+        .expect("confirm");
+
+    Some((app, user_id))
+}
+
+/// Starts the flow and returns the signed state token plus the `oauth_state` cookie.
+async fn initiate_google(app: &TestApp, redirect_url: Option<&str>) -> (String, String) {
+    let uri = match redirect_url {
+        Some(url) => format!("/auth/oauth/google?redirect_url={url}"),
+        None => "/auth/oauth/google".to_string(),
+    };
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(&uri)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.dispatch(req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FOUND,
+        "initiate must redirect to the provider"
+    );
+
+    (
+        extract_state_from_location(&resp.headers),
+        extract_cookie_value(&resp.headers, "oauth_state").expect("oauth_state cookie set"),
+    )
+}
+
+#[tokio::test]
+async fn oauth_callback_2fa_browser_redirects_with_fragment_challenge() {
+    let _guard = DB_LOCK.lock().await;
+    let server = MockServer::start().await;
+    let test_email = dynamic_email();
+
+    let Some((app, user_id)) = setup_totp_oauth_app(&server, &test_email).await else {
+        return;
+    };
+
+    let (state_token, state_cookie) = initiate_google(&app, Some("/app/settings")).await;
+    let callback_uri = format!("/auth/oauth/google/callback?code=good_code&state={state_token}");
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(&callback_uri)
+        .header(header::COOKIE, format!("oauth_state={state_cookie}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.dispatch(req).await;
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::FOUND,
+        "browser must be redirected"
+    );
+    let location = resp
+        .header(header::LOCATION.as_str())
+        .expect("Location header");
+    assert!(
+        !location.contains('?'),
+        "the challenge must never travel in a query: {location}"
+    );
+
+    let (destination, fragment) = location
+        .split_once('#')
+        .expect("challenge fragment present");
+    assert_eq!(destination, "/app/settings");
+    let challenge = fragment
+        .strip_prefix("totp_challenge=")
+        .expect("fragment carries the totp_challenge key");
+    assert_eq!(challenge.len(), 64);
+    assert!(challenge.bytes().all(|b| b.is_ascii_hexdigit()));
+
+    assert!(
+        extract_cookie_value(&resp.headers, &app.state.config.session.cookie_name).is_none(),
+        "a pending challenge must not issue a session"
+    );
+    assert!(
+        extract_cookie_value(&resp.headers, "csrf_token").is_none(),
+        "a pending challenge must not issue a CSRF cookie"
+    );
+    assert_eq!(
+        extract_cookie_value(&resp.headers, "oauth_state"),
+        Some(String::new()),
+        "the state cookie is single-use and must be cleared"
+    );
+    assert!(
+        !resp.body_str.contains(challenge),
+        "the challenge must not reach the response body"
+    );
+
+    assert_eq!(
+        app.state
+            .totp_service
+            .validate_two_factor_token(challenge)
+            .await
+            .expect("delivered challenge is redeemable"),
+        user_id
+    );
+    assert_eq!(
+        count_sessions_for_user(&app.pool, user_id).await,
+        0,
+        "no session may exist before the second factor is verified"
+    );
+}
+
+#[tokio::test]
+async fn oauth_callback_2fa_non_browser_response_is_unchanged() {
+    let _guard = DB_LOCK.lock().await;
+    let server = MockServer::start().await;
+    let test_email = dynamic_email();
+
+    let Some((app, user_id)) = setup_totp_oauth_app(&server, &test_email).await else {
+        return;
+    };
+
+    for extra_header in [
+        Some(("x-auth-type", "bearer")),
+        Some(("accept", "application/json")),
+    ] {
+        let (state_token, state_cookie) = initiate_google(&app, Some("/app/settings")).await;
+        let callback_uri =
+            format!("/auth/oauth/google/callback?code=good_code&state={state_token}");
+        let mut builder = Request::builder()
+            .method(Method::GET)
+            .uri(&callback_uri)
+            .header(header::COOKIE, format!("oauth_state={state_cookie}"));
+        if let Some((name, value)) = extra_header {
+            builder = builder.header(name, value);
+        }
+        let resp = app.dispatch(builder.body(Body::empty()).unwrap()).await;
+
+        assert_eq!(resp.status(), StatusCode::OK, "{extra_header:?}");
+        assert_eq!(
+            resp.header(header::CONTENT_TYPE.as_str()),
+            Some("application/json"),
+            "{extra_header:?}"
+        );
+        assert!(
+            resp.header(header::LOCATION.as_str()).is_none(),
+            "non-browser callers must not be redirected: {extra_header:?}"
+        );
+
+        let challenge = resp.json()["challenge_token"]
+            .as_str()
+            .expect("challenge token in body")
+            .to_string();
+        assert_eq!(resp.json()["two_factor_required"], serde_json::json!(true));
+        assert_eq!(
+            resp.body_str,
+            format!(r#"{{"two_factor_required":true,"challenge_token":"{challenge}"}}"#),
+            "the JSON body must stay byte-identical: {extra_header:?}"
+        );
+        assert_eq!(
+            extract_cookie_value(&resp.headers, "oauth_state"),
+            Some(String::new()),
+            "the state cookie is cleared on every path: {extra_header:?}"
+        );
+    }
+
+    assert_eq!(
+        count_sessions_for_user(&app.pool, user_id).await,
+        0,
+        "no session may exist before the second factor is verified"
+    );
+}
+
 #[tokio::test]
 async fn test_oauth_bearer_flow_transport() {
     let _guard = DB_LOCK.lock().await;

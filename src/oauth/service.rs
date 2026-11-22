@@ -73,6 +73,7 @@ pub enum OAuthCallbackOutcome {
     /// intermediate token the password path mints and `/auth/totp/*` redeems.
     TwoFactorRequired {
         challenge_token: String,
+        redirect_url: String,
         clear_cookie_header: String,
     },
     Linked {
@@ -90,11 +91,13 @@ impl std::fmt::Debug for OAuthCallbackOutcome {
         match self {
             Self::Login(result) => f.debug_tuple("Login").field(result).finish(),
             Self::TwoFactorRequired {
+                redirect_url,
                 clear_cookie_header,
                 ..
             } => f
                 .debug_struct("TwoFactorRequired")
                 .field("challenge_token", &"[REDACTED]")
+                .field("redirect_url", redirect_url)
                 .field("clear_cookie_header", clear_cookie_header)
                 .finish(),
             Self::Linked {
@@ -597,6 +600,10 @@ impl OAuthService {
             );
         }
 
+        // Read the destination once, above the second-factor gate: the challenge outcome has
+        // to carry it too, otherwise the browser has nowhere to land.
+        let redirect_url = payload.redirect_url.unwrap_or_else(|| "/".to_string());
+
         // Second factor gate: an enabled factor blocks session issuance on every login
         // path, not only the password one. The gate read and the session insert share one
         // transaction, so an activation that lands after the read waits for this commit
@@ -642,6 +649,7 @@ impl OAuthService {
             );
             return Ok(OAuthCallbackOutcome::TwoFactorRequired {
                 challenge_token,
+                redirect_url,
                 clear_cookie_header,
             });
         }
@@ -677,8 +685,6 @@ impl OAuthService {
             user_id = %user.id,
             session_id_hash = %session.token_hash,
         );
-
-        let redirect_url = payload.redirect_url.unwrap_or_else(|| "/".to_string());
 
         Ok(OAuthCallbackOutcome::Login(OAuthCallbackResult {
             session,
@@ -1573,6 +1579,7 @@ mod tests {
     fn callback_outcome_debug_redacts_the_challenge_token() {
         let outcome = OAuthCallbackOutcome::TwoFactorRequired {
             challenge_token: "live-challenge-token".to_string(),
+            redirect_url: "/app/settings".to_string(),
             clear_cookie_header: "oauth_state=; Max-Age=0".to_string(),
         };
 
@@ -1581,6 +1588,7 @@ mod tests {
         assert!(debug.contains("[REDACTED]"));
         // Not secret: the same header is printed for a completed login.
         assert!(debug.contains("oauth_state=; Max-Age=0"));
+        assert!(debug.contains("/app/settings"));
     }
 
     /// A failed challenge mint is infrastructure, not user input: it must surface as

@@ -16,6 +16,7 @@ use crate::oauth::provider::{
 };
 use crate::oauth::state::{OAuthStateManager, OAuthStatePayload};
 use crate::session::SessionService;
+use crate::totp::service::TotpService;
 
 const SELECT_USER_BY_ID: &str = "SELECT id, email, password_hash, email_verified, created_at, updated_at FROM users WHERE id = $1";
 const SELECT_USER_BY_EMAIL_LOWER: &str = "SELECT id, email, password_hash, email_verified, created_at, updated_at FROM users WHERE LOWER(email) = LOWER($1)";
@@ -61,15 +62,55 @@ impl std::fmt::Debug for OAuthCallbackResult {
 }
 
 /// Outcome of processing an OAuth callback, distinguishing between standard login and account linking.
-#[derive(Debug, Clone)]
+///
+/// Non-exhaustive: embedders consume this from their own HTTP layer, so a new outcome
+/// (the second-factor challenge, for one) must not break an exhaustive `match`.
+#[non_exhaustive]
+#[derive(Clone)]
 pub enum OAuthCallbackOutcome {
     Login(OAuthCallbackResult),
+    /// Second factor outstanding: no session was issued. The challenge token is the same
+    /// intermediate token the password path mints and `/auth/totp/*` redeems.
+    TwoFactorRequired {
+        challenge_token: String,
+        clear_cookie_header: String,
+    },
     Linked {
         user: User,
         account: OAuthAccount,
         redirect_url: String,
         clear_cookie_header: String,
     },
+}
+
+// Manual `Debug`: `challenge_token` is a live half-authenticated credential that a session
+// can be minted from, so it must never reach a log line or a panic message.
+impl std::fmt::Debug for OAuthCallbackOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Login(result) => f.debug_tuple("Login").field(result).finish(),
+            Self::TwoFactorRequired {
+                clear_cookie_header,
+                ..
+            } => f
+                .debug_struct("TwoFactorRequired")
+                .field("challenge_token", &"[REDACTED]")
+                .field("clear_cookie_header", clear_cookie_header)
+                .finish(),
+            Self::Linked {
+                user,
+                account,
+                redirect_url,
+                clear_cookie_header,
+            } => f
+                .debug_struct("Linked")
+                .field("user", user)
+                .field("account", account)
+                .field("redirect_url", redirect_url)
+                .field("clear_cookie_header", clear_cookie_header)
+                .finish(),
+        }
+    }
 }
 
 /// Per-request transport metadata for a callback.
@@ -122,6 +163,7 @@ pub struct OAuthService {
     providers: HashMap<String, Arc<dyn OAuthProvider>>,
     state_mgr: OAuthStateManager,
     session_service: Arc<SessionService>,
+    totp_service: Arc<TotpService>,
     config: Arc<Config>,
 }
 
@@ -147,10 +189,16 @@ impl std::fmt::Debug for OAuthService {
 impl OAuthService {
     /// Constructs a new OAuth service instance with active providers instantiated
     /// from application configuration.
+    ///
+    /// `totp_service` is required: the login path gates session issuance on an enabled
+    /// second factor, so a service built without it could not enforce that gate.
+    /// Callers upgrading from a three-argument form must pass one built from the same
+    /// pool and [`Config`].
     pub fn new(
         db: PgPool,
         config: Arc<Config>,
         session_service: Arc<SessionService>,
+        totp_service: Arc<TotpService>,
     ) -> Result<Self, AppError> {
         let mut http_client: Option<reqwest::Client> = None;
         let mut providers: HashMap<String, Arc<dyn OAuthProvider>> = HashMap::new();
@@ -179,15 +227,19 @@ impl OAuthService {
             providers,
             state_mgr,
             session_service,
+            totp_service,
             config,
         })
     }
 
     /// Constructs a service with custom/mock providers for testing.
+    ///
+    /// Takes the same required `totp_service` as [`Self::new`].
     pub fn with_providers(
         db: PgPool,
         config: Arc<Config>,
         session_service: Arc<SessionService>,
+        totp_service: Arc<TotpService>,
         providers: HashMap<String, Arc<dyn OAuthProvider>>,
     ) -> Self {
         let state_mgr = OAuthStateManager::new(&config.oauth, config.session.cookie_secure);
@@ -196,16 +248,20 @@ impl OAuthService {
             providers,
             state_mgr,
             session_service,
+            totp_service,
             config,
         }
     }
 
     /// Constructs a service with explicit state manager.
+    ///
+    /// Takes the same required `totp_service` as [`Self::new`].
     pub fn new_with_manager(
         db: PgPool,
         providers: HashMap<String, Arc<dyn OAuthProvider>>,
         state_mgr: OAuthStateManager,
         session_service: Arc<SessionService>,
+        totp_service: Arc<TotpService>,
         config: Arc<Config>,
     ) -> Self {
         Self {
@@ -213,6 +269,7 @@ impl OAuthService {
             providers,
             state_mgr,
             session_service,
+            totp_service,
             config,
         }
     }
@@ -524,17 +581,6 @@ impl OAuthService {
             .await?;
         let user = link.user;
 
-        let (session, raw_token) = self
-            .session_service
-            .create_session(user.id, ctx.session_type, ctx.ip, ctx.user_agent)
-            .await?;
-
-        tracing::info!(
-            event = "oauth_callback_success",
-            provider = ctx.provider_id,
-            user_id = %user.id,
-            session_id_hash = %session.token_hash,
-        );
         if link.is_linked {
             tracing::info!(
                 event = "oauth_account_linked",
@@ -550,6 +596,87 @@ impl OAuthService {
                 email = %user.email,
             );
         }
+
+        // Second factor gate: an enabled factor blocks session issuance on every login
+        // path, not only the password one. The gate read and the session insert share one
+        // transaction, so an activation that lands after the read waits for this commit
+        // instead of slipping between the decision and the insert. This is the same shape
+        // as `handler::auth::issue_session_after_gate`. Fail closed — a gate read error
+        // aborts the login.
+        let mut transaction = self.db.begin().await.map_err(AppError::Database)?;
+        let enabled = match self
+            .totp_service
+            .is_totp_enabled_locked(&mut transaction, user.id)
+            .await
+        {
+            Ok(enabled) => enabled,
+            Err(error) => {
+                rollback_quietly(transaction).await;
+                return Err(error);
+            }
+        };
+
+        if enabled {
+            rollback_quietly(transaction).await;
+            // Minting can only fail on infrastructure (its INSERT), never on user input.
+            // Report it as unavailable — the class `handler::auth` uses for the same
+            // failure — instead of letting a `Database` error surface as a 500.
+            let challenge_token = match self.totp_service.generate_two_factor_token(user.id).await {
+                Ok(token) => token,
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        user_id = %user.id,
+                        provider = ctx.provider_id,
+                        "oauth callback refused: second-factor challenge could not be minted"
+                    );
+                    return Err(AppError::TwoFactorUnavailable);
+                }
+            };
+            tracing::info!(
+                target: "security_event",
+                event = "two_factor_challenge_issued",
+                provider = ctx.provider_id,
+                user_id = %user.id,
+                ip = ?ctx.ip,
+            );
+            return Ok(OAuthCallbackOutcome::TwoFactorRequired {
+                challenge_token,
+                clear_cookie_header,
+            });
+        }
+
+        let (session, raw_token) = match self
+            .session_service
+            .create_session_in(&mut transaction, user.id, None, ctx.session_type)
+            .await
+        {
+            Ok(created) => created,
+            Err(error) => {
+                rollback_quietly(transaction).await;
+                return Err(error);
+            }
+        };
+        transaction.commit().await.map_err(AppError::Database)?;
+
+        // `create_session_in` leaves logging to its caller; keep the standalone path's
+        // `session_created` event on this one.
+        tracing::info!(
+            event = "session_created",
+            user_id = %user.id,
+            session_type = ctx.session_type,
+            ip = ctx.ip.unwrap_or("unknown"),
+            user_agent = ctx.user_agent.unwrap_or("unknown"),
+        );
+
+        // `session_id_hash` is a SHA-256 of a 256-bit token, never the token: a correlator,
+        // not a credential. Every authentication event carries it; lifecycle events do not.
+        tracing::info!(
+            event = "oauth_callback_success",
+            provider = ctx.provider_id,
+            user_id = %user.id,
+            session_id_hash = %session.token_hash,
+        );
 
         let redirect_url = payload.redirect_url.unwrap_or_else(|| "/".to_string());
 
@@ -1153,6 +1280,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use sqlx::postgres::PgPoolOptions;
+    use sqlx::{Connection, PgConnection};
 
     #[derive(Debug)]
     struct MockProvider {
@@ -1208,6 +1336,11 @@ mod tests {
             .connect_lazy(&cfg_arc.database_url)
             .expect("lazy pool");
         let session_service = Arc::new(SessionService::new(pool.clone(), Arc::clone(&cfg_arc)));
+        let totp_service = Arc::new(crate::totp::service::TotpService::new(
+            pool.clone(),
+            Arc::clone(&cfg_arc),
+            Arc::new(crate::config::AppConfig::default()),
+        ));
 
         let mut providers: HashMap<String, Arc<dyn OAuthProvider>> = HashMap::new();
         providers.insert(
@@ -1219,7 +1352,7 @@ mod tests {
             }),
         );
 
-        OAuthService::with_providers(pool, cfg_arc, session_service, providers)
+        OAuthService::with_providers(pool, cfg_arc, session_service, totp_service, providers)
     }
 
     fn alice_user_info() -> UserInfo {
@@ -1434,5 +1567,303 @@ mod tests {
         let debug = format!("{result:?}");
         assert!(!debug.contains("live-bearer-token"));
         assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn callback_outcome_debug_redacts_the_challenge_token() {
+        let outcome = OAuthCallbackOutcome::TwoFactorRequired {
+            challenge_token: "live-challenge-token".to_string(),
+            clear_cookie_header: "oauth_state=; Max-Age=0".to_string(),
+        };
+
+        let debug = format!("{outcome:?}");
+        assert!(!debug.contains("live-challenge-token"));
+        assert!(debug.contains("[REDACTED]"));
+        // Not secret: the same header is printed for a completed login.
+        assert!(debug.contains("oauth_state=; Max-Age=0"));
+    }
+
+    /// A failed challenge mint is infrastructure, not user input: it must surface as
+    /// `TwoFactorUnavailable` (503) rather than a `Database` error (500).
+    #[tokio::test]
+    async fn challenge_mint_failure_maps_to_two_factor_unavailable() {
+        let Some(ctx) = setup_oauth_db_context().await else {
+            return;
+        };
+        let email = format!("totp-oauth-{}@example.com", Uuid::new_v4().simple());
+        let user_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO users (email, password_hash, email_verified) \
+             VALUES ($1, $2, TRUE) RETURNING id",
+        )
+        .bind(&email)
+        .bind(OAUTH_UNUSABLE_PASSWORD_HASH)
+        .fetch_one(&ctx.pool)
+        .await
+        .expect("seed user");
+        // The gate only reads `enabled`; the blob's shape is irrelevant here.
+        sqlx::query(
+            "INSERT INTO totp_secrets (user_id, encrypted_secret, enabled) \
+             VALUES ($1, $2, TRUE)",
+        )
+        .bind(user_id)
+        .bind(vec![0u8; 44])
+        .execute(&ctx.pool)
+        .await
+        .expect("seed enabled factor");
+
+        let svc = oauth_service_over_pool(
+            &ctx.pool,
+            Arc::clone(&ctx.config),
+            UserInfo {
+                provider_id: "google".to_string(),
+                provider_user_id: format!("goog_{}", Uuid::new_v4().simple()),
+                email: email.clone(),
+                email_verified: true,
+                name: None,
+                avatar_url: None,
+            },
+        );
+
+        let injection = reject_challenge_inserts_for(&ctx.pool, user_id).await;
+        let (auth_url, set_cookie) = svc
+            .get_authorization_url("google", None)
+            .expect("init flow");
+        let state_token = extract_state_token(&auth_url);
+        let result = svc
+            .handle_callback_extended(
+                "google",
+                "valid_code",
+                &state_token,
+                Some(&set_cookie),
+                "cookie",
+                Some("127.0.0.1"),
+                Some("test-agent"),
+            )
+            .await;
+        // Disarm before asserting: a panicking assertion must not leave the trigger behind.
+        injection.disarm().await;
+
+        let error = result.expect_err("the challenge insert is injected to fail");
+        assert!(
+            matches!(error, AppError::TwoFactorUnavailable),
+            "a mint failure must not surface as a database error, got {error:?}"
+        );
+
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&ctx.pool)
+            .await
+            .expect("count sessions");
+        assert_eq!(sessions, 0, "the failure must not issue a session");
+    }
+
+    struct OAuthDbContext {
+        pool: PgPool,
+        config: Arc<Config>,
+        _guard: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    async fn setup_oauth_db_context() -> Option<OAuthDbContext> {
+        let guard = crate::db::DB_TEST_LOCK.lock().await;
+        dotenvy::dotenv().ok();
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) => {
+                assert!(
+                    std::env::var_os("CI").is_none(),
+                    "DATABASE_URL must be set in CI: DB-backed tests must never skip silently"
+                );
+                eprintln!("SKIP: DB-backed oauth tests need DATABASE_URL");
+                return None;
+            }
+        };
+        let pool = crate::db::init_pool_with_options(
+            &url,
+            crate::db::DbPoolOptions {
+                max_connections: 5,
+                min_connections: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("DATABASE_URL is set, so the DB-backed test must connect");
+
+        let mut config = Config {
+            database_url: url,
+            ..Default::default()
+        };
+        config.oauth.state_secret = "01234567890123456789012345678901".to_string();
+        Some(OAuthDbContext {
+            pool,
+            config: Arc::new(config),
+            _guard: guard,
+        })
+    }
+
+    fn oauth_service_over_pool(
+        pool: &PgPool,
+        config: Arc<Config>,
+        user_info: UserInfo,
+    ) -> OAuthService {
+        let session_service = Arc::new(SessionService::new(pool.clone(), Arc::clone(&config)));
+        let totp_service = Arc::new(crate::totp::service::TotpService::new(
+            pool.clone(),
+            Arc::clone(&config),
+            Arc::new(crate::config::AppConfig::default()),
+        ));
+        let mut providers: HashMap<String, Arc<dyn OAuthProvider>> = HashMap::new();
+        providers.insert(
+            "google".to_string(),
+            Arc::new(MockProvider {
+                id: "google",
+                user_info,
+                exchange_fail: false,
+            }),
+        );
+        OAuthService::with_providers(
+            pool.clone(),
+            config,
+            session_service,
+            totp_service,
+            providers,
+        )
+    }
+
+    fn extract_state_token(auth_url: &str) -> String {
+        auth_url
+            .split("state=")
+            .nth(1)
+            .expect("auth url carries a state")
+            .split('&')
+            .next()
+            .expect("state value")
+            .to_string()
+    }
+
+    /// Rejects `two_factor_tokens` inserts for one user, so the mint fails on infrastructure.
+    ///
+    /// The trigger name is unique per run, so residue from a crashed run cannot block a
+    /// later one, and the predicate is scoped to one freshly created user.
+    struct RejectedChallengeInsert {
+        pool: PgPool,
+        trigger: String,
+        armed: bool,
+    }
+
+    impl RejectedChallengeInsert {
+        async fn install(pool: &PgPool, user_id: Uuid) -> Self {
+            let trigger = format!("oauth_test_reject_challenge_{}", Uuid::new_v4().simple());
+            // Only a generated identifier and a `Uuid` are interpolated; a trigger
+            // predicate cannot take binds.
+            let statements = [
+                format!(
+                    "CREATE FUNCTION {trigger}() RETURNS trigger LANGUAGE plpgsql \
+                     AS $$ BEGIN RAISE EXCEPTION 'injected challenge insert failure'; END $$"
+                ),
+                format!(
+                    "CREATE TRIGGER {trigger} BEFORE INSERT ON two_factor_tokens FOR EACH ROW \
+                     WHEN (NEW.user_id = '{user_id}') EXECUTE FUNCTION {trigger}()"
+                ),
+            ];
+            for statement in statements {
+                sqlx::query(sqlx::AssertSqlSafe(statement))
+                    .execute(pool)
+                    .await
+                    .expect("install challenge-insert rejection");
+            }
+            Self {
+                pool: pool.clone(),
+                trigger,
+                armed: true,
+            }
+        }
+
+        /// Remove the injection now. The guard stays armed until both drops commit, so a
+        /// failing or cancelled drop leaves `Drop` to retry.
+        async fn disarm(mut self) {
+            let mut connection = self.pool.acquire().await.expect("cleanup connection");
+            drop_injection(&mut connection, self.drop_statements())
+                .await
+                .expect("drop challenge-insert rejection");
+            self.armed = false;
+        }
+
+        fn drop_statements(&self) -> [String; 2] {
+            [
+                format!(
+                    "DROP TRIGGER IF EXISTS {} ON two_factor_tokens",
+                    self.trigger
+                ),
+                format!("DROP FUNCTION IF EXISTS {}()", self.trigger),
+            ]
+        }
+    }
+
+    /// Bound on the cleanup drops: `DROP TRIGGER` takes `ACCESS EXCLUSIVE`, so another
+    /// backend holding the table would otherwise hang the test binary.
+    const CLEANUP_TIMEOUT: &str = "5s";
+
+    /// Drop the trigger and its function in one bounded transaction.
+    ///
+    /// `IF EXISTS` makes a retry after a timeout safe.
+    async fn drop_injection(
+        connection: &mut PgConnection,
+        statements: [String; 2],
+    ) -> Result<(), sqlx::Error> {
+        let mut transaction = connection.begin().await?;
+        for timeout in [
+            format!("SET LOCAL lock_timeout = '{CLEANUP_TIMEOUT}'"),
+            format!("SET LOCAL statement_timeout = '{CLEANUP_TIMEOUT}'"),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(timeout))
+                .execute(&mut *transaction)
+                .await?;
+        }
+        for statement in statements {
+            sqlx::query(sqlx::AssertSqlSafe(statement))
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await
+    }
+
+    impl Drop for RejectedChallengeInsert {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            let options = self.pool.connect_options();
+            let statements = self.drop_statements();
+            // A panicking assertion cannot await: finish the drops on a scratch thread with
+            // its own runtime so the trigger cannot leak into another test binary.
+            let cleanup = std::thread::spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        eprintln!("oauth injection cleanup skipped: {error}");
+                        return;
+                    }
+                };
+                let dropped = runtime.block_on(async move {
+                    let mut connection = PgConnection::connect_with(&options).await?;
+                    drop_injection(&mut connection, statements).await
+                });
+                if let Err(error) = dropped {
+                    eprintln!(
+                        "oauth injection cleanup failed ({CLEANUP_TIMEOUT} lock timeout): {error}"
+                    );
+                }
+            });
+            if cleanup.join().is_err() {
+                eprintln!("oauth injection cleanup thread panicked");
+            }
+        }
+    }
+
+    async fn reject_challenge_inserts_for(pool: &PgPool, user_id: Uuid) -> RejectedChallengeInsert {
+        RejectedChallengeInsert::install(pool, user_id).await
     }
 }

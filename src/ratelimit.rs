@@ -11,7 +11,7 @@ use std::{
 use tokio::time::sleep;
 
 use crate::{
-    config::RateLimitConfig,
+    config::{RateLimitConfig, TotpConfig},
     error::{AppError, ErrorCode},
 };
 
@@ -38,12 +38,17 @@ pub enum KeyAdmission {
 }
 
 /// Detailed reason for a rate limit rejection.
+///
+/// Non-exhaustive: [`RateLimitRejection::Exceeded`] gained its window payload in `0.1.0`,
+/// and further rejection detail must land without breaking callers. Match with a wildcard.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RateLimitRejection {
     /// Active lockout duration in whole seconds (minimum 1s, ceiling rounded).
     Lockout(u64),
-    /// Attempt limit exceeded for the sliding window without cooldown.
-    Exceeded,
+    /// Attempt limit exceeded for the sliding window; carries the whole seconds until the
+    /// oldest admitted attempt leaves the window (minimum 1s, ceiling rounded).
+    Exceeded(u64),
     /// Maximum capacity of rate limiter entries exceeded.
     CapacityExhausted,
 }
@@ -51,12 +56,13 @@ pub enum RateLimitRejection {
 impl RateLimitRejection {
     /// Return the `Retry-After` header value in seconds, if applicable.
     ///
-    /// Omitted for [`RateLimitRejection::CapacityExhausted`] or [`RateLimitRejection::Exceeded`].
+    /// `None` only for [`RateLimitRejection::CapacityExhausted`]: that rejection admitted no
+    /// attempt, so it has no window to advertise.
     #[must_use]
     pub fn retry_after(&self) -> Option<u64> {
         match self {
-            Self::Lockout(secs) => Some(*secs),
-            Self::Exceeded | Self::CapacityExhausted => None,
+            Self::Lockout(secs) | Self::Exceeded(secs) => Some(*secs),
+            Self::CapacityExhausted => None,
         }
     }
 
@@ -77,7 +83,7 @@ impl std::fmt::Display for RateLimitRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Lockout(secs) => write!(f, "rate limit lockout: retry after {secs}s"),
-            Self::Exceeded => write!(f, "rate limit exceeded"),
+            Self::Exceeded(secs) => write!(f, "rate limit exceeded: retry after {secs}s"),
             Self::CapacityExhausted => write!(f, "rate limiter capacity exhausted"),
         }
     }
@@ -146,6 +152,55 @@ impl RateLimiter {
         format!("{prefix}:{bounded}")
     }
 
+    /// Format the `totp:ip:<ip>` budget key.
+    #[must_use]
+    pub fn totp_ip_key(ip: &str) -> String {
+        Self::format_account_key("totp:ip", ip)
+    }
+
+    /// Format the `totp:user:<user_id>` budget key.
+    #[must_use]
+    pub fn totp_user_key(user_id: uuid::Uuid) -> String {
+        Self::format_account_key("totp:user", &user_id.to_string())
+    }
+
+    /// Format the `totp:enroll:ip:<ip>` budget key.
+    #[must_use]
+    pub fn totp_enroll_ip_key(ip: &str) -> String {
+        Self::format_account_key("totp:enroll:ip", ip)
+    }
+
+    /// Format the `totp:enroll:user:<user_id>` budget key.
+    #[must_use]
+    pub fn totp_enroll_user_key(user_id: uuid::Uuid) -> String {
+        Self::format_account_key("totp:enroll:user", &user_id.to_string())
+    }
+
+    /// Format the `totp:confirm:ip:<ip>` budget key.
+    #[must_use]
+    pub fn totp_confirm_ip_key(ip: &str) -> String {
+        Self::format_account_key("totp:confirm:ip", ip)
+    }
+
+    /// Format the `totp:confirm:user:<user_id>` budget key.
+    #[must_use]
+    pub fn totp_confirm_user_key(user_id: uuid::Uuid) -> String {
+        Self::format_account_key("totp:confirm:user", &user_id.to_string())
+    }
+
+    /// Seconds until the oldest admitted attempt leaves `key`'s sliding window.
+    ///
+    /// `None` when the key is unknown or holds no recorded attempt. A caller that
+    /// reopens the budget at that point admits the next request, so the value is the
+    /// exact `Retry-After` for a sliding-window rejection.
+    #[must_use]
+    pub fn remaining_window(&self, key: &str) -> Option<u64> {
+        let entry = self.windows.get(key)?;
+        let oldest = entry.attempts.iter().min()?;
+        let remaining = entry.window.saturating_sub(oldest.elapsed());
+        Some((remaining.as_secs_f64().ceil() as u64).max(1))
+    }
+
     /// Evaluate an entry's sliding window and lockout state.
     fn evaluate_entry(
         entry: &mut WindowEntry,
@@ -173,7 +228,12 @@ impl RateLimiter {
                 let secs = (cd.as_secs_f64().ceil() as u64).max(1);
                 return Err(RateLimitRejection::Lockout(secs));
             }
-            return Err(RateLimitRejection::Exceeded);
+            // The window reopens when its oldest attempt expires; the rejection carries
+            // that instant so the caller never has to re-read the key for `Retry-After`.
+            let oldest = entry.attempts.iter().min().copied().unwrap_or(now);
+            let remaining = window.saturating_sub(now.duration_since(oldest));
+            let secs = (remaining.as_secs_f64().ceil() as u64).max(1);
+            return Err(RateLimitRejection::Exceeded(secs));
         }
 
         entry.attempts.push(now);
@@ -340,6 +400,122 @@ impl RateLimiter {
             Some(self.config.cooldown()),
         );
         res
+    }
+
+    /// Check the TOTP IP budget (`totp:ip:<ip>`).
+    ///
+    /// Runs regardless of [`RateLimitConfig::enabled`]: the Phase 5 switch must not
+    /// silently disable second-factor brute-force protection, and these keys are
+    /// disjoint from the `ip:` / `account:` / `reset_account:` dimensions.
+    ///
+    /// Rejects with [`RateLimitRejection::Exceeded`], never `Lockout`: the rejection is a
+    /// sliding-window exhaustion, and it carries the exact reopening instant for the
+    /// handler's `Retry-After` instead of a synthetic lockout duration.
+    pub fn check_totp_ip_limit(
+        &self,
+        ip: &str,
+        totp: &TotpConfig,
+    ) -> Result<(), RateLimitRejection> {
+        let key = Self::totp_ip_key(ip);
+        self.check_totp_window(
+            &key,
+            totp.rate_limit_ip_max_attempts,
+            totp.rate_limit_window_secs,
+        )
+    }
+
+    /// Check the TOTP per-user budget (`totp:user:<user_id>`).
+    ///
+    /// Same independence and rejection semantics as [`Self::check_totp_ip_limit`].
+    pub fn check_totp_user_limit(
+        &self,
+        user_id: uuid::Uuid,
+        totp: &TotpConfig,
+    ) -> Result<(), RateLimitRejection> {
+        let key = Self::totp_user_key(user_id);
+        self.check_totp_window(
+            &key,
+            totp.rate_limit_user_max_attempts,
+            totp.rate_limit_window_secs,
+        )
+    }
+
+    fn check_totp_window(
+        &self,
+        key: &str,
+        max: u32,
+        window_secs: u64,
+    ) -> Result<(), RateLimitRejection> {
+        let (_, res) = self.check_internal(key, max, Duration::from_secs(window_secs), None);
+        res
+    }
+
+    /// Check the enrollment IP budget (`totp:enroll:ip:<ip>`).
+    ///
+    /// Enrollment rotates a secret and hashes ten Argon2id codes per call, so it needs its own
+    /// throttle. Separate keys keep a reroll loop from spending the attempts `/auth/totp/verify`
+    /// and `/auth/totp/backup` need after login.
+    pub fn check_totp_enroll_ip_limit(
+        &self,
+        ip: &str,
+        totp: &TotpConfig,
+    ) -> Result<(), RateLimitRejection> {
+        let key = Self::totp_enroll_ip_key(ip);
+        self.check_totp_window(
+            &key,
+            totp.rate_limit_ip_max_attempts,
+            totp.rate_limit_window_secs,
+        )
+    }
+
+    /// Check the enrollment per-user budget (`totp:enroll:user:<user_id>`).
+    ///
+    /// Same independence and rejection semantics as [`Self::check_totp_enroll_ip_limit`].
+    pub fn check_totp_enroll_user_limit(
+        &self,
+        user_id: uuid::Uuid,
+        totp: &TotpConfig,
+    ) -> Result<(), RateLimitRejection> {
+        let key = Self::totp_enroll_user_key(user_id);
+        self.check_totp_window(
+            &key,
+            totp.rate_limit_user_max_attempts,
+            totp.rate_limit_window_secs,
+        )
+    }
+
+    /// Check the confirmation IP budget (`totp:confirm:ip:<ip>`).
+    ///
+    /// Confirmation checks one code, not the ten Argon2id hashes enrollment pays for, so it
+    /// keeps its own budget: a reroll loop cannot lock a user out of finishing enrollment, and
+    /// repeated bad confirmations cannot block a fresh enrollment.
+    pub fn check_totp_confirm_ip_limit(
+        &self,
+        ip: &str,
+        totp: &TotpConfig,
+    ) -> Result<(), RateLimitRejection> {
+        let key = Self::totp_confirm_ip_key(ip);
+        self.check_totp_window(
+            &key,
+            totp.rate_limit_ip_max_attempts,
+            totp.rate_limit_window_secs,
+        )
+    }
+
+    /// Check the confirmation per-user budget (`totp:confirm:user:<user_id>`).
+    ///
+    /// Same independence and rejection semantics as [`Self::check_totp_confirm_ip_limit`].
+    pub fn check_totp_confirm_user_limit(
+        &self,
+        user_id: uuid::Uuid,
+        totp: &TotpConfig,
+    ) -> Result<(), RateLimitRejection> {
+        let key = Self::totp_confirm_user_key(user_id);
+        self.check_totp_window(
+            &key,
+            totp.rate_limit_user_max_attempts,
+            totp.rate_limit_window_secs,
+        )
     }
 
     /// Check rate limit for password reset requests.
@@ -999,6 +1175,257 @@ mod tests {
             limiter
                 .check_password_reset(ip, "user4@example.com")
                 .is_err()
+        );
+    }
+
+    fn totp_test_config() -> TotpConfig {
+        TotpConfig {
+            rate_limit_ip_max_attempts: 3,
+            rate_limit_user_max_attempts: 2,
+            rate_limit_window_secs: 60,
+            ..TotpConfig::default()
+        }
+    }
+
+    #[test]
+    fn totp_ip_limit_keys_are_bounded_and_disjoint() {
+        let limiter = RateLimiter::new();
+        let totp = totp_test_config();
+        assert!(limiter.check_totp_ip_limit("198.51.100.7", &totp).is_ok());
+
+        assert!(limiter.windows.contains_key("totp:ip:198.51.100.7"));
+        assert!(!limiter.windows.contains_key("ip:198.51.100.7"));
+        // Phase 5 IP budget untouched by the TOTP dimension.
+        assert!(limiter.check_ip("198.51.100.7").is_ok());
+        assert_eq!(
+            limiter
+                .windows
+                .get("ip:198.51.100.7")
+                .unwrap()
+                .attempts
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn totp_ip_limit_trips_at_configured_max() {
+        let limiter = RateLimiter::new();
+        let totp = totp_test_config();
+        for _ in 0..3 {
+            assert!(limiter.check_totp_ip_limit("198.51.100.8", &totp).is_ok());
+        }
+        let rejection = limiter
+            .check_totp_ip_limit("198.51.100.8", &totp)
+            .expect_err("the IP budget must trip");
+        assert!(matches!(rejection, RateLimitRejection::Exceeded(_)));
+        // Another IP still has its own budget.
+        assert!(limiter.check_totp_ip_limit("198.51.100.9", &totp).is_ok());
+    }
+
+    #[test]
+    fn totp_user_limit_is_per_user_and_independent_of_ip() {
+        let limiter = RateLimiter::new();
+        let totp = totp_test_config();
+        let user = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+
+        for _ in 0..2 {
+            assert!(limiter.check_totp_user_limit(user, &totp).is_ok());
+        }
+        let rejection = limiter
+            .check_totp_user_limit(user, &totp)
+            .expect_err("the user budget must trip");
+        assert!(matches!(rejection, RateLimitRejection::Exceeded(_)));
+        assert!(
+            limiter.windows.contains_key(&format!("totp:user:{user}")),
+            "user dimension must use the `totp:user:<user_id>` key"
+        );
+        // A different user is unaffected, and no IP key was consumed by user checks.
+        assert!(limiter.check_totp_user_limit(other, &totp).is_ok());
+        assert_eq!(limiter.entry_count(), 2);
+    }
+
+    #[test]
+    fn remaining_window_tracks_the_oldest_attempt() {
+        let limiter = RateLimiter::new();
+        let totp = totp_test_config();
+        for _ in 0..3 {
+            assert!(limiter.check_totp_ip_limit("198.51.100.11", &totp).is_ok());
+        }
+        assert!(limiter.check_totp_ip_limit("198.51.100.11", &totp).is_err());
+
+        let key = RateLimiter::totp_ip_key("198.51.100.11");
+        let secs = limiter.remaining_window(&key).expect("window entry");
+        assert!((59..=60).contains(&secs));
+        assert!(limiter.remaining_window("totp:ip:unknown").is_none());
+    }
+
+    #[test]
+    fn window_rejection_reports_its_own_remaining_time_after_the_key_is_reclaimed() {
+        let limiter = RateLimiter::new();
+        let totp = totp_test_config();
+        let ip = "198.51.100.13";
+        for _ in 0..3 {
+            assert!(limiter.check_totp_ip_limit(ip, &totp).is_ok());
+        }
+        let rejection = limiter
+            .check_totp_ip_limit(ip, &totp)
+            .expect_err("the IP budget must trip");
+        let advertised = rejection
+            .retry_after()
+            .expect("a window rejection advertises its reopening instant");
+        assert!((59..=60).contains(&advertised));
+
+        // Reclaim the slot and let a different request claim the same key with a shorter
+        // window: a re-read of the key would now advertise that request's value.
+        limiter.reset(&RateLimiter::totp_ip_key(ip));
+        assert!(limiter.allow(&RateLimiter::totp_ip_key(ip), 5, Duration::from_secs(5)));
+        let reread = limiter
+            .remaining_window(&RateLimiter::totp_ip_key(ip))
+            .expect("the replacement request registered the key");
+        assert!(reread <= 5);
+        assert_eq!(rejection.retry_after(), Some(advertised));
+    }
+
+    #[test]
+    fn capacity_rejection_has_no_retry_after() {
+        let config = RateLimitConfig {
+            enabled: true,
+            max_attempts: 5,
+            window_secs: 60,
+            login_cooldown_secs: 60,
+        };
+        let limiter = RateLimiter::with_config_and_capacity(config, 1);
+        assert!(limiter.check_ip("192.0.2.10").is_ok());
+
+        let rejection = limiter
+            .check_totp_ip_limit("192.0.2.11", &totp_test_config())
+            .expect_err("capacity must reject a key that was never admitted");
+        assert_eq!(rejection, RateLimitRejection::CapacityExhausted);
+        assert_eq!(rejection.retry_after(), None);
+        assert!(
+            limiter
+                .remaining_window(&RateLimiter::totp_ip_key("192.0.2.11"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn totp_dimensions_do_not_consume_each_other() {
+        let limiter = RateLimiter::new();
+        let totp = totp_test_config();
+        let user = uuid::Uuid::new_v4();
+
+        for _ in 0..3 {
+            assert!(limiter.check_totp_ip_limit("198.51.100.12", &totp).is_ok());
+        }
+        assert!(limiter.check_totp_ip_limit("198.51.100.12", &totp).is_err());
+
+        // The IP trip must leave the user dimension's full budget intact.
+        for _ in 0..2 {
+            assert!(limiter.check_totp_user_limit(user, &totp).is_ok());
+        }
+        assert!(limiter.check_totp_user_limit(user, &totp).is_err());
+    }
+
+    #[test]
+    fn enrollment_limits_key_separately_from_verification() {
+        let limiter = RateLimiter::new();
+        let totp = totp_test_config();
+        let user = uuid::Uuid::new_v4();
+        let ip = "198.51.100.20";
+
+        for _ in 0..3 {
+            assert!(limiter.check_totp_enroll_ip_limit(ip, &totp).is_ok());
+        }
+        assert!(limiter.check_totp_enroll_ip_limit(ip, &totp).is_err());
+        assert!(
+            limiter
+                .windows
+                .contains_key(&RateLimiter::totp_enroll_ip_key(ip))
+        );
+        assert!(
+            !limiter.windows.contains_key(&RateLimiter::totp_ip_key(ip)),
+            "enrollment must not spend the verification IP budget"
+        );
+
+        for _ in 0..2 {
+            assert!(limiter.check_totp_enroll_user_limit(user, &totp).is_ok());
+        }
+        assert!(limiter.check_totp_enroll_user_limit(user, &totp).is_err());
+
+        // Both verification dimensions keep their full budget after enrollment trips.
+        for _ in 0..3 {
+            assert!(limiter.check_totp_ip_limit(ip, &totp).is_ok());
+        }
+        for _ in 0..2 {
+            assert!(limiter.check_totp_user_limit(user, &totp).is_ok());
+        }
+    }
+
+    #[test]
+    fn confirmation_limits_key_separately_from_enrollment() {
+        let limiter = RateLimiter::new();
+        let totp = totp_test_config();
+        let user = uuid::Uuid::new_v4();
+        let ip = "198.51.100.21";
+
+        for _ in 0..3 {
+            assert!(limiter.check_totp_confirm_ip_limit(ip, &totp).is_ok());
+        }
+        assert!(limiter.check_totp_confirm_ip_limit(ip, &totp).is_err());
+        assert!(
+            limiter
+                .windows
+                .contains_key(&RateLimiter::totp_confirm_ip_key(ip))
+        );
+        assert!(
+            !limiter
+                .windows
+                .contains_key(&RateLimiter::totp_enroll_ip_key(ip)),
+            "confirmation must not spend the enrollment IP budget"
+        );
+
+        for _ in 0..2 {
+            assert!(limiter.check_totp_confirm_user_limit(user, &totp).is_ok());
+        }
+        assert!(limiter.check_totp_confirm_user_limit(user, &totp).is_err());
+
+        // Both enrollment and verification keep their full budget after confirmation trips.
+        for _ in 0..3 {
+            assert!(limiter.check_totp_enroll_ip_limit(ip, &totp).is_ok());
+            assert!(limiter.check_totp_ip_limit(ip, &totp).is_ok());
+        }
+        for _ in 0..2 {
+            assert!(limiter.check_totp_enroll_user_limit(user, &totp).is_ok());
+            assert!(limiter.check_totp_user_limit(user, &totp).is_ok());
+        }
+    }
+
+    #[test]
+    fn totp_limits_ignore_the_phase5_enabled_switch() {
+        let limiter = RateLimiter::with_config(RateLimitConfig {
+            enabled: false,
+            ..RateLimitConfig::default()
+        });
+        let totp = totp_test_config();
+        let user = uuid::Uuid::new_v4();
+
+        for _ in 0..3 {
+            assert!(limiter.check_totp_ip_limit("198.51.100.10", &totp).is_ok());
+        }
+        assert!(
+            limiter.check_totp_ip_limit("198.51.100.10", &totp).is_err(),
+            "TOTP IP limit must hold while Phase 5 limits are disabled"
+        );
+
+        for _ in 0..2 {
+            assert!(limiter.check_totp_user_limit(user, &totp).is_ok());
+        }
+        assert!(
+            limiter.check_totp_user_limit(user, &totp).is_err(),
+            "TOTP user limit must hold while Phase 5 limits are disabled"
         );
     }
 }

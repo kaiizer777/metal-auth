@@ -88,7 +88,13 @@ fn create_test_oauth_service(
     let cfg_arc = Arc::new(cfg);
     let session_service = Arc::new(SessionService::new(app.pool.clone(), Arc::clone(&cfg_arc)));
 
-    OAuthService::with_providers(app.pool.clone(), cfg_arc, session_service, providers)
+    OAuthService::with_providers(
+        app.pool.clone(),
+        cfg_arc,
+        session_service,
+        Arc::clone(&app.state.totp_service),
+        providers,
+    )
 }
 
 fn extract_state_from_url(url: &str) -> &str {
@@ -380,7 +386,7 @@ async fn test_oauth_auto_provisions_new_verified_user() {
         .expect("handle callback");
     let res = match outcome {
         OAuthCallbackOutcome::Login(r) => r,
-        OAuthCallbackOutcome::Linked { .. } => panic!("expected login"),
+        other => panic!("expected login, got {other:?}"),
     };
 
     assert!(res.is_created);
@@ -399,6 +405,221 @@ async fn test_oauth_auto_provisions_new_verified_user() {
     assert_eq!(db_user.0, email);
     assert!(db_user.1);
     assert_eq!(db_user.2, "$unusable$oauth$");
+}
+
+#[tokio::test]
+async fn test_oauth_login_for_totp_user_issues_challenge_and_no_session() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    truncate_tables(&app.pool).await.expect("truncate");
+
+    let google_mock = Arc::new(MockOAuthProvider::new(
+        "google",
+        UserInfo {
+            provider_id: "google".to_string(),
+            provider_user_id: format!("goog_totp_{}", Uuid::new_v4().simple()),
+            email: dynamic_email(),
+            email_verified: true,
+            name: None,
+            avatar_url: None,
+        },
+    ));
+    let svc = create_test_oauth_service(&app, google_mock, None);
+
+    let (auth_url, set_cookie) = svc
+        .get_authorization_url("google", None)
+        .expect("get auth url");
+    let state_token = extract_state_from_url(&auth_url);
+    let first = svc
+        .handle_callback_extended(
+            "google",
+            "valid_code",
+            state_token,
+            Some(&set_cookie),
+            "cookie",
+            Some("127.0.0.1"),
+            Some("test-agent"),
+        )
+        .await
+        .expect("first callback");
+    let user_id = match first {
+        OAuthCallbackOutcome::Login(result) => result.user.id,
+        other => panic!("expected login, got {other:?}"),
+    };
+
+    let enrollment = app
+        .state
+        .totp_service
+        .enroll_totp(user_id)
+        .await
+        .expect("enroll");
+    let code = totp_code(&enrollment.secret_base32);
+    app.state
+        .totp_service
+        .confirm_enrollment(user_id, &code, "127.0.0.1")
+        .await
+        .expect("confirm");
+
+    let sessions_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("count sessions");
+    assert_eq!(sessions_before, 1, "the first login mints one session");
+
+    let (auth_url, set_cookie) = svc
+        .get_authorization_url("google", None)
+        .expect("get auth url");
+    let state_token = extract_state_from_url(&auth_url);
+    let second = svc
+        .handle_callback_extended(
+            "google",
+            "valid_code",
+            state_token,
+            Some(&set_cookie),
+            "cookie",
+            Some("127.0.0.1"),
+            Some("test-agent"),
+        )
+        .await
+        .expect("second callback");
+
+    let OAuthCallbackOutcome::TwoFactorRequired {
+        challenge_token, ..
+    } = second
+    else {
+        panic!("a TOTP-enabled account must not receive a session from OAuth");
+    };
+    assert_eq!(
+        app.state
+            .totp_service
+            .validate_two_factor_token(&challenge_token)
+            .await
+            .expect("challenge token is redeemable"),
+        user_id
+    );
+
+    let sessions_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("count sessions");
+    assert_eq!(sessions_after, sessions_before, "no session may be created");
+}
+
+#[tokio::test]
+async fn oauth_login_cannot_issue_a_session_while_an_activation_is_in_flight() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    truncate_tables(&app.pool).await.expect("truncate");
+
+    let google_mock = Arc::new(MockOAuthProvider::new(
+        "google",
+        UserInfo {
+            provider_id: "google".to_string(),
+            provider_user_id: format!("goog_race_{}", Uuid::new_v4().simple()),
+            email: dynamic_email(),
+            email_verified: true,
+            name: None,
+            avatar_url: None,
+        },
+    ));
+    let svc = create_test_oauth_service(&app, google_mock, None);
+
+    let (auth_url, set_cookie) = svc
+        .get_authorization_url("google", None)
+        .expect("get auth url");
+    let state_token = extract_state_from_url(&auth_url).to_string();
+    let first = svc
+        .handle_callback_extended(
+            "google",
+            "valid_code",
+            &state_token,
+            Some(&set_cookie),
+            "cookie",
+            Some("127.0.0.1"),
+            Some("test-agent"),
+        )
+        .await
+        .expect("first callback");
+    let user_id = match first {
+        OAuthCallbackOutcome::Login(result) => result.user.id,
+        other => panic!("expected login, got {other:?}"),
+    };
+
+    // Pending enrollment: the factor row exists and `enabled` is still FALSE.
+    app.state
+        .totp_service
+        .enroll_totp(user_id)
+        .await
+        .expect("enroll");
+
+    // The activation is committed by `confirm_enrollment`, here held open to race the gate.
+    let mut activation = app.pool.begin().await.expect("activation transaction");
+    sqlx::query(
+        "UPDATE totp_secrets SET enabled = TRUE, updated_at = CURRENT_TIMESTAMP \
+         WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .execute(&mut *activation)
+    .await
+    .expect("hold the activation");
+
+    let sessions_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("count sessions");
+
+    let (auth_url, set_cookie) = svc
+        .get_authorization_url("google", None)
+        .expect("get auth url");
+    let state_token = extract_state_from_url(&auth_url).to_string();
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    let worker = svc.clone();
+    tokio::spawn(async move {
+        let outcome = worker
+            .handle_callback_extended(
+                "google",
+                "valid_code",
+                &state_token,
+                Some(&set_cookie),
+                "cookie",
+                Some("127.0.0.1"),
+                Some("test-agent"),
+            )
+            .await;
+        let _ = tx.send(outcome);
+    });
+
+    // Give the callback time to reach the gate, then require the gate to still be open.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let early = tokio::time::timeout(Duration::from_millis(300), &mut rx).await;
+    assert!(
+        early.is_err(),
+        "the oauth gate must wait for an in-flight enrollment activation"
+    );
+
+    activation.commit().await.expect("release the activation");
+
+    let outcome = rx.await.expect("callback task").expect("callback result");
+    let OAuthCallbackOutcome::TwoFactorRequired { .. } = outcome else {
+        panic!("an account activated during the callback must not receive a session");
+    };
+    let sessions_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("count sessions");
+    assert_eq!(sessions_after, sessions_before, "no session may be created");
 }
 
 #[tokio::test]
@@ -618,7 +839,7 @@ async fn test_oauth_email_normalization_on_provisioning() {
         .expect("handle callback");
     let res = match outcome {
         OAuthCallbackOutcome::Login(r) => r,
-        OAuthCallbackOutcome::Linked { .. } => panic!("expected login"),
+        other => panic!("expected login, got {other:?}"),
     };
 
     assert_eq!(res.user.email, normalized_expected);
@@ -726,7 +947,7 @@ async fn test_oauth_link_intent_in_callback_attaches_identity_without_session() 
             assert_eq!(redirect_url, "/settings");
             assert!(clear_cookie_header.contains("Max-Age=0"));
         }
-        OAuthCallbackOutcome::Login(_) => panic!("expected Linked outcome, got Login"),
+        other => panic!("expected Linked outcome, got {other:?}"),
     }
 
     // 3. Invariant: the callback issued no session beyond the initiating one
@@ -814,7 +1035,7 @@ async fn link_callback_succeeds_without_500_after_commit() {
             clear_cookie_header,
             ..
         } => (user, redirect_url, clear_cookie_header),
-        OAuthCallbackOutcome::Login(_) => panic!("expected Linked outcome, got Login"),
+        other => panic!("expected Linked outcome, got {other:?}"),
     };
     assert_eq!(linked_user.id, user_id);
     assert_eq!(redirect_url, "/settings");
@@ -1256,7 +1477,7 @@ async fn link_callback_race_with_revoke_stays_legal() {
         Ok(OAuthCallbackOutcome::Linked { .. }) => {
             assert_eq!(link_count.0, 1, "committed link must have its row");
         }
-        Ok(OAuthCallbackOutcome::Login(_)) => panic!("link intent must not log in"),
+        Ok(other) => panic!("unexpected outcome under revoke race: {other:?}"),
         Err(AppError::OAuthStateInvalid) => {
             assert_eq!(link_count.0, 0, "rejected link must leave no row");
         }

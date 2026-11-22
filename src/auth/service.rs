@@ -98,6 +98,11 @@ impl AuthServiceImpl {
         })
     }
 
+    /// Borrow the shared pool so sibling services reuse the same connections.
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     // ─── Signup ──────────────────────────────────────────────────────────────
 
     /// Register a new account.
@@ -688,8 +693,6 @@ mod tests {
         }
     }
 
-    static DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     struct DbTestContext {
         service: AuthServiceImpl,
         pool: PgPool,
@@ -703,7 +706,7 @@ mod tests {
     }
 
     async fn setup_db_context() -> Option<DbTestContext> {
-        let guard = DB_TEST_LOCK.lock().await;
+        let guard = crate::db::DB_TEST_LOCK.lock().await;
         dotenvy::dotenv().ok();
         let url = db_test_url()?;
         // Runs the embedded migrations, so a bare Postgres (CI service container) is enough.
@@ -717,6 +720,11 @@ mod tests {
         )
         .await
         .expect("DATABASE_URL is set, so the DB-backed test must connect");
+        // Same global claim as the integration binaries: a prior run's claimable rows would
+        // otherwise reach this test's capturing sender.
+        crate::db::outbox::discard_claimable_outbox(&pool)
+            .await
+            .expect("clear claimable outbox residue");
         let config = Arc::new(AppConfig {
             argon2_m_cost: 19456,
             argon2_t_cost: 2,
@@ -1010,7 +1018,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_dual_reset_tokens_serialized() {
+    async fn concurrent_dual_reset_tokens_leave_one_password_and_no_live_tokens() {
         let Some(ctx) = setup_db_context().await else {
             return;
         };
@@ -1029,8 +1037,9 @@ mod tests {
         .unwrap();
         let user_id: Uuid = row.get("id");
 
-        // Two distinct valid tokens: both DELETEs target different rows, so both
-        // consumes succeed; FOR UPDATE serializes the final UPDATEs.
+        // Two distinct valid tokens. Both deletes target different rows, but a completed
+        // reset blanket-deletes the user's remaining tokens, so whether the second call
+        // still finds its own token is a race.
         let (raw_tok1, hash1) = generate_token();
         let (raw_tok2, hash2) = generate_token();
         let future_time = Utc::now() + chrono::Duration::hours(1);
@@ -1052,10 +1061,24 @@ mod tests {
             ctx.service.reset_password(&raw_tok1, &new_password),
             ctx.service.reset_password(&raw_tok2, &new_password)
         );
+
+        // A completed reset invalidates every remaining reset token for the user. Both
+        // interleavings are valid: both tokens can be consumed before either commits, or
+        // the winner can invalidate the loser's token first. At least one reset must
+        // succeed and a loser must fail as an already-consumed token, never as a stale
+        // credential.
         assert!(
-            first.is_ok() && second.is_ok(),
-            "both distinct-token consumes must succeed: {first:?} / {second:?}"
+            first.is_ok() || second.is_ok(),
+            "at least one reset must succeed: {first:?} / {second:?}"
         );
+        for result in [&first, &second] {
+            if let Err(error) = result {
+                assert!(
+                    matches!(error, &AppError::InvalidToken),
+                    "a losing concurrent reset must report a consumed token, got {error:?}"
+                );
+            }
+        }
 
         // No tokens survive and the single final password verifies.
         let count_row =
@@ -1516,6 +1539,31 @@ mod tests {
         assert!(sender.delivered.load(std::sync::atomic::Ordering::SeqCst));
     }
 
+    /// Waits for the detached worker to settle the row it claimed as `sent`.
+    ///
+    /// The mailer returns before the worker marks the row, and ending the test right there
+    /// drops that task: the row stays leased until the next test's dispatcher claims it.
+    async fn wait_outbox_sent(pool: &PgPool, recipient: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let sent: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM email_outbox WHERE recipient = $1 AND status = 'sent'",
+            )
+            .bind(recipient)
+            .fetch_one(pool)
+            .await
+            .expect("poll outbox status");
+            if sent > 0 {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "detached worker must settle the row it claimed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// Regression guard for the signup request path: returning before the mailer does is
     /// the whole point. Re-awaiting the dispatch handle blocks past the 5 s guard.
     #[tokio::test]
@@ -1543,6 +1591,7 @@ mod tests {
 
         sender.release.notify_one();
         wait_mailer_delivered(&sender).await;
+        wait_outbox_sent(&ctx.pool, &email).await;
     }
 
     /// Same guard for the password-reset request path.
@@ -1581,6 +1630,7 @@ mod tests {
 
         sender.release.notify_one();
         wait_mailer_delivered(&sender).await;
+        wait_outbox_sent(&ctx.pool, &email).await;
     }
 
     // ─── Group B: no-DB early-return guard tests ─────────────────────────────

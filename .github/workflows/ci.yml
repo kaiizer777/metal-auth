@@ -110,6 +110,10 @@ jobs:
       - run: cargo test --locked --test oauth_service_test -- --test-threads=1
       - run: cargo test --locked --test oauth_security_test -- --test-threads=1
       - run: cargo test --locked --test oauth_integration_test -- --test-threads=1
+      - run: cargo test --locked --test totp_handler_test -- --test-threads=1
+      - run: cargo test --locked --test totp_e2e_test -- --test-threads=1
+      - run: cargo test --locked --test totp_migration_test -- --test-threads=1
+      - run: cargo test --locked --test totp_security_test -- --test-threads=1
 
   msrv:
     name: MSRV (1.94)
@@ -153,6 +157,10 @@ jobs:
       - run: cargo test --locked --test oauth_service_test -- --test-threads=1
       - run: cargo test --locked --test oauth_security_test -- --test-threads=1
       - run: cargo test --locked --test oauth_integration_test -- --test-threads=1
+      - run: cargo test --locked --test totp_handler_test -- --test-threads=1
+      - run: cargo test --locked --test totp_e2e_test -- --test-threads=1
+      - run: cargo test --locked --test totp_migration_test -- --test-threads=1
+      - run: cargo test --locked --test totp_security_test -- --test-threads=1
 
   coverage:
     name: Coverage

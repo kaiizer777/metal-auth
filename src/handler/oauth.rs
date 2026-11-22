@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
+    auth::models::LoginResponse,
     db::models::OAuthAccount,
     error::{AppError, truncate_for_log},
     handler::untrusted_client_ip,
@@ -413,6 +414,18 @@ async fn handle_callback_internal(
             }
 
             append_set_cookie(&mut resp, &result.clear_cookie_header);
+            resp
+        }
+        OAuthCallbackOutcome::TwoFactorRequired {
+            challenge_token,
+            clear_cookie_header,
+        } => {
+            let mut resp = (
+                StatusCode::OK,
+                Json(LoginResponse::two_factor_required(challenge_token)),
+            )
+                .into_response();
+            append_set_cookie(&mut resp, &clear_cookie_header);
             resp
         }
         OAuthCallbackOutcome::Linked {

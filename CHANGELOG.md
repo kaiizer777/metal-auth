@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** the two-factor public surface gained variants and attributes. `OAuthCallbackOutcome`
+  has a `TwoFactorRequired { challenge_token, clear_cookie_header }` arm, `RateLimitRejection::Exceeded`
+  carries the sliding window's remaining whole seconds (`Exceeded(u64)`, previously a unit variant), and
+  `ErrorCode`/`AppError` carry the TOTP codes. `ErrorCode`, `AppError`, `RateLimitRejection`, and
+  `OAuthCallbackOutcome` are now `#[non_exhaustive]`, so an exhaustive `match` on any of them must add a
+  wildcard arm.
+- **Breaking:** `OAuthService::new`, `OAuthService::with_providers`, and `OAuthService::new_with_manager`
+  take a required `Arc<TotpService>`; session issuance is gated on the account's second factor, so a
+  service built without it could not enforce that gate.
 - **Breaking:** `ASYNC_EMAIL_DISPATCH=false` is now rejected at boot (`Config::validate`). Email
   delivery is always detached, so the flag no longer controls anything. Migration: unset
   `ASYNC_EMAIL_DISPATCH` or set it to `true`.

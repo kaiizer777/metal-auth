@@ -536,19 +536,24 @@ impl TotpService {
     /// Deletes the secret (and its backup codes) plus the user's replay log. Any live
     /// challenge token therefore has no secret left to satisfy.
     ///
-    /// The code branch is one transaction that takes `FOR UPDATE` on the user's factor row
-    /// before reading the proof. That lock is what serializes two disables presenting the
-    /// same code: the second waits here and, once the first commits its delete, finds no
-    /// row and fails `TotpNotEnrolled` rather than reporting a second success. It covers
-    /// only that row and only for the life of this transaction — an enrollment committing a
-    /// new factor afterwards is not observed (an absent row takes no lock).
+    /// Both branches are one transaction and take the same locks in the same order — the
+    /// per-user advisory lock, then the factor row, then the users row — so a disable can
+    /// neither invert a login's order nor deadlock with one.
     ///
-    /// The password branch takes no factor row lock: two password proofs present no code and
-    /// converge on the same end state. It re-reads `users.password_hash` under `FOR UPDATE`
-    /// and constant-time compares it with the hash Argon2 verified, so a reset committing
-    /// between the proof and the delete rejects the disable rather than stripping the factor
-    /// for a superseded credential. The users row is taken last, the order
-    /// `create_session_in` uses.
+    /// The code branch takes `FOR UPDATE` on the factor row before reading the proof. The
+    /// advisory lock is what serializes two disables presenting the same code: the second
+    /// waits there and, once the first commits its delete, finds no row and fails
+    /// `TotpNotEnrolled` rather than reporting a second success. The row lock pins the row
+    /// the delete removes, but covers only that row and only for the life of this
+    /// transaction — an enrollment committing a new factor afterwards is not observed (an
+    /// absent row takes no lock).
+    ///
+    /// The password branch takes the same locks but does not require the factor to exist:
+    /// two password proofs present no code and converge on the same end state, so a repeat
+    /// disable still succeeds. It re-reads `users.password_hash` under `FOR UPDATE` after
+    /// the factor row and constant-time compares it with the hash Argon2 verified, so a reset
+    /// committing between the proof and the delete rejects the disable rather than stripping
+    /// the factor for a superseded credential.
     ///
     /// The replay row is then written against the same in-transaction clock the verification
     /// path uses, and while it exists `uq_totp_used_codes` rejects a code already spent at
@@ -644,6 +649,9 @@ impl TotpService {
     /// Commit a password-authorized disable, rejecting a proof whose credential was
     /// superseded after verification.
     ///
+    /// Locks are taken in the global order — advisory, factor row, users row — so this
+    /// cannot deadlock with a login or a redemption for the same user: those take the factor
+    /// row before the users row too, and the advisory key they contend on is the same one.
     /// The users row lock serializes with `reset_password`'s `UPDATE users`, and the
     /// constant-time compare keeps the stored PHC string out of timing reach. A reset that
     /// committed before the proof was verified still disables: the snapshot matches, the
@@ -654,6 +662,14 @@ impl TotpService {
         verified_hash: &str,
     ) -> Result<(), AppError> {
         let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
+        // Keeps the replay-log wipe below inside the per-user arbitration.
+        lock_totp_user(&mut transaction, user_id).await?;
+        // Absent row takes no lock; a repeat disable still succeeds.
+        sqlx::query("SELECT enabled FROM totp_secrets WHERE user_id = $1 FOR UPDATE")
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(AppError::Database)?;
         let current: Option<String> =
             sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1 FOR UPDATE")
                 .bind(user_id)
@@ -2014,6 +2030,52 @@ mod tests {
             1,
             "a superseded credential must not strip the second factor"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn password_disable_takes_the_factor_row_before_the_user_row() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let password = fixture_password();
+        let user_id = create_user(&ctx, true, &password).await;
+        enroll_and_confirm(&ctx, user_id).await;
+
+        // The login gate holds the factor row `FOR SHARE` before it touches the users row.
+        let mut gate = ctx.pool.begin().await.expect("gate");
+        sqlx::query("SELECT enabled FROM totp_secrets WHERE user_id = $1 FOR SHARE")
+            .bind(user_id)
+            .execute(&mut *gate)
+            .await
+            .expect("hold the factor row");
+
+        let service = ctx.service.clone();
+        let attempt = password.clone();
+        let disable = tokio::spawn(async move {
+            service
+                .disable_totp(user_id, FreshAuthProof::Password(attempt), "ip")
+                .await
+        });
+
+        // Give the disable time to reach its first lock, then prove it has not taken the
+        // users row: the inverted order held that row first and fails this NOWAIT.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !disable.is_finished(),
+            "the disable must wait on the factor row"
+        );
+        let user_lock = sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE NOWAIT")
+            .bind(user_id)
+            .execute(&ctx.pool)
+            .await;
+        gate.rollback().await.expect("release the factor row");
+        user_lock.expect("the disable must not hold the users row before the factor row");
+
+        disable
+            .await
+            .expect("join")
+            .expect("the disable lands once the factor row is released");
+        assert!(!ctx.service.is_totp_enabled(user_id).await.expect("state"));
     }
 
     #[tokio::test]

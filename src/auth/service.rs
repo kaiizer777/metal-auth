@@ -711,6 +711,20 @@ mod tests {
         _guard: tokio::sync::MutexGuard<'static, ()>,
     }
 
+    impl DbTestContext {
+        /// Awaits a delivery signal, reporting the outbox batch error that made delivery
+        /// impossible instead of only the elapsed deadline.
+        async fn await_delivery(&self, what: &str, signal: impl std::future::Future<Output = ()>) {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), signal).await {
+                Ok(()) => {}
+                Err(elapsed) => match self.service.dispatcher.inline_delivery_error() {
+                    Some(err) => panic!("{what}: inline outbox batch failed: {err}"),
+                    None => panic!("{what}: {elapsed}"),
+                },
+            }
+        }
+    }
+
     // Unique generated password per call: no hard-coded credential material in tests.
     fn fixture_password() -> String {
         format!("Fixture-{}-Aa1!", Uuid::new_v4().simple())
@@ -893,12 +907,11 @@ mod tests {
         ctx.service.signup(&email, password).await.unwrap();
 
         // Delivery is detached: wait for the sender signal instead of racing a sleep.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+        ctx.await_delivery(
+            "verification email must be dispatched",
             ctx.sender.sent.notified(),
         )
-        .await
-        .expect("verification email must be dispatched");
+        .await;
 
         let token = {
             let calls = ctx.sender.verification_calls.lock().unwrap();
@@ -936,12 +949,11 @@ mod tests {
             .await
             .unwrap();
 
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+        ctx.await_delivery(
+            "verification email must be dispatched",
             ctx.sender.sent.notified(),
         )
-        .await
-        .expect("verification email must be dispatched");
+        .await;
 
         let token = {
             let calls = ctx.sender.verification_calls.lock().unwrap();
@@ -1320,19 +1332,17 @@ mod tests {
 
         // Two sequential reset requests; each dispatch is awaited in turn.
         ctx.service.request_password_reset(&email).await.unwrap();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+        ctx.await_delivery(
+            "first reset email must be dispatched",
             ctx.sender.sent.notified(),
         )
-        .await
-        .expect("first reset email must be dispatched");
+        .await;
         ctx.service.request_password_reset(&email).await.unwrap();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+        ctx.await_delivery(
+            "second reset email must be dispatched",
             ctx.sender.sent.notified(),
         )
-        .await
-        .expect("second reset email must be dispatched");
+        .await;
 
         let (first_token, second_token) = {
             let calls = ctx.sender.reset_calls.lock().unwrap();

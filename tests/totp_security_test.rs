@@ -1195,7 +1195,33 @@ async fn password_reset_purges_the_pending_challenge() {
     let user_id = user_id_for_email(&app.pool, &email).await;
 
     let challenge_token = challenge(&app, &email, &password).await;
-    assert_eq!(pending_challenge_count(&app.pool, user_id).await, 1);
+    // Two extra rows: a purge limited to one row must not pass, and the second
+    // user's row below pins the `WHERE user_id` predicate.
+    for _ in 0..2 {
+        let (_token, token_hash) = generate_token();
+        sqlx::query(
+            "INSERT INTO two_factor_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
+        )
+        .bind(user_id)
+        .bind(token_hash.as_slice())
+        .bind(Utc::now() + Duration::hours(1))
+        .execute(&app.pool)
+        .await
+        .expect("seed extra challenge row");
+    }
+    assert_eq!(pending_challenge_count(&app.pool, user_id).await, 3);
+
+    let (other_email, other_password, _other_secret, _other_backups, _other_session) =
+        enabled_user(&app, &dynamic_ip()).await;
+    let other_user_id = user_id_for_email(&app.pool, &other_email).await;
+    challenge(&app, &other_email, &other_password).await;
+    assert_eq!(pending_challenge_count(&app.pool, other_user_id).await, 1);
+
+    let sessions_before_reset = count_sessions_for_user(&app.pool, user_id).await;
+    assert!(
+        sessions_before_reset > 0,
+        "the fixture must hold a live session before the reset"
+    );
 
     let (reset_token, reset_hash) = generate_token();
     sqlx::query(
@@ -1226,8 +1252,12 @@ async fn password_reset_purges_the_pending_challenge() {
         0,
         "a committed reset must purge every outstanding challenge token"
     );
+    assert_eq!(
+        pending_challenge_count(&app.pool, other_user_id).await,
+        1,
+        "the purge must not reach another user's challenge rows"
+    );
 
-    let sessions_before = count_sessions_for_user(&app.pool, user_id).await;
     let verify = app
         .post_json_with_ip(
             "/auth/totp/verify",
@@ -1244,7 +1274,8 @@ async fn password_reset_purges_the_pending_challenge() {
     assert_eq!(verify.error_code(), Some(ErrorCode::TwoFactorTokenInvalid));
     assert_eq!(
         count_sessions_for_user(&app.pool, user_id).await,
-        sessions_before,
-        "a pre-reset challenge must not issue a session"
+        0,
+        "a pre-reset challenge must not issue a session: {} live sessions were purged by the reset",
+        sessions_before_reset
     );
 }

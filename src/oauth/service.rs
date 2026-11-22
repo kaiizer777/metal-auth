@@ -628,7 +628,11 @@ impl OAuthService {
             // Minting can only fail on infrastructure (its INSERT), never on user input.
             // Report it as unavailable — the class `handler::auth` uses for the same
             // failure — instead of letting a `Database` error surface as a 500.
-            let challenge_token = match self.totp_service.generate_two_factor_token(user.id).await {
+            let challenge_token = match self
+                .totp_service
+                .generate_two_factor_token(user.id, &user.password_hash)
+                .await
+            {
                 Ok(token) => token,
                 Err(error) => {
                     tracing::error!(

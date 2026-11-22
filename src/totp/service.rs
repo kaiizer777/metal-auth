@@ -718,21 +718,32 @@ impl TotpService {
 
     /// Mint a half-authenticated challenge token; only its SHA-256 hash is stored.
     ///
+    /// `credential_hash` is the Argon2id PHC string the login just verified. It is persisted
+    /// with the row so redemption can reject a challenge whose authorizing credential was
+    /// superseded by a reset. Reading the live row here instead would bind the challenge to
+    /// whatever the credential became, not to the one that was proven.
+    ///
     /// Minting never needs the encryption key: a keyless deployment must still be able to
     /// present the backup-code leg, which matches Argon2id hashes and never decrypts the
     /// secret. The TOTP-code leg fails closed on its own when the key is missing.
-    pub async fn generate_two_factor_token(&self, user_id: Uuid) -> Result<String, AppError> {
+    pub async fn generate_two_factor_token(
+        &self,
+        user_id: Uuid,
+        credential_hash: &str,
+    ) -> Result<String, AppError> {
         let (raw_token, token_hash) = generate_token();
         let ttl_seconds = i64::try_from(self.config.totp.challenge_token_ttl_secs)
             .map_err(|_| AppError::Internal)?;
         let expires_at = Utc::now() + Duration::seconds(ttl_seconds);
 
         sqlx::query(
-            "INSERT INTO two_factor_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
+            "INSERT INTO two_factor_tokens (user_id, token_hash, expires_at, credential_hash) \
+             VALUES ($1, $2, $3, $4)",
         )
         .bind(user_id)
         .bind(&token_hash[..])
         .bind(expires_at)
+        .bind(credential_hash)
         .execute(&self.pool)
         .await
         .map_err(AppError::Database)?;
@@ -770,22 +781,26 @@ impl TotpService {
         transaction.commit().await.map_err(AppError::Database)
     }
 
-    /// Delete the challenge token on the caller's transaction.
+    /// Delete the challenge token on the caller's transaction, returning the credential
+    /// snapshot it was minted against.
+    ///
+    /// Redemption owns the comparison: the snapshot is only meaningful against the live
+    /// `users.password_hash` read under the user row lock, which the caller already holds
+    /// its transaction for.
     pub(crate) async fn consume_two_factor_token_in(
         &self,
         connection: &mut PgConnection,
         token: &str,
-    ) -> Result<(), AppError> {
+    ) -> Result<String, AppError> {
         let token_hash = hash_token(token).map_err(|_| AppError::TwoFactorTokenInvalid)?;
-        let deleted = sqlx::query("DELETE FROM two_factor_tokens WHERE token_hash = $1")
-            .bind(&token_hash[..])
-            .execute(&mut *connection)
-            .await
-            .map_err(AppError::Database)?;
-        if deleted.rows_affected() == 0 {
-            return Err(AppError::TwoFactorTokenInvalid);
-        }
-        Ok(())
+        let snapshot: Option<String> = sqlx::query_scalar(
+            "DELETE FROM two_factor_tokens WHERE token_hash = $1 RETURNING credential_hash",
+        )
+        .bind(&token_hash[..])
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(AppError::Database)?;
+        snapshot.ok_or(AppError::TwoFactorTokenInvalid)
     }
 
     /// Return true when `totp_secrets.enabled` is set for `user_id`.
@@ -1055,6 +1070,14 @@ mod tests {
 
     async fn create_user(ctx: &DbTestContext, verified: bool, password: &str) -> Uuid {
         create_user_with_email(ctx, verified, password).await.0
+    }
+
+    async fn credential_hash(ctx: &DbTestContext, user_id: Uuid) -> String {
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&ctx.pool)
+            .await
+            .expect("read credential")
     }
 
     fn current_code(secret_base32: &str) -> String {
@@ -2218,10 +2241,11 @@ mod tests {
             return;
         };
         let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let credential = credential_hash(&ctx, user_id).await;
 
         let token = ctx
             .service
-            .generate_two_factor_token(user_id)
+            .generate_two_factor_token(user_id, &credential)
             .await
             .expect("generate");
         assert_eq!(
@@ -2263,9 +2287,10 @@ mod tests {
             return;
         };
         let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let credential = credential_hash(&ctx, user_id).await;
         let token = ctx
             .service
-            .generate_two_factor_token(user_id)
+            .generate_two_factor_token(user_id, &credential)
             .await
             .expect("generate");
 

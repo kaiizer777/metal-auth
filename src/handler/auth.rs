@@ -395,7 +395,10 @@ pub async fn login(
 
     let (session, raw_id) = match outcome {
         PasswordLoginOutcome::SecondFactorRequired => {
-            let challenge_token = match state.totp_service.generate_two_factor_token(user_id).await
+            let challenge_token = match state
+                .totp_service
+                .generate_two_factor_token(user_id, &proof.credential_hash)
+                .await
             {
                 Ok(token) => token,
                 Err(e) => {

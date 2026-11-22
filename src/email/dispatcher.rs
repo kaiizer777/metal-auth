@@ -63,15 +63,11 @@ pub struct EmailDispatcher {
     /// Inline (caller-blocking) delivery — test-only, absent from default builds.
     #[cfg(any(test, feature = "test-utils"))]
     block_on_delivery: bool,
-    /// Restricts claims to one recipient — test-only, absent from default builds.
-    #[cfg(any(test, feature = "test-utils"))]
-    owned_recipient: Option<String>,
     /// First inline-batch failure — test-only, so a claim error is diagnosable instead of
     /// surfacing as the caller's delivery wait timing out.
     #[cfg(any(test, feature = "test-utils"))]
     inline_error: Arc<std::sync::Mutex<Option<String>>>,
 }
-
 impl EmailDispatcher {
     /// Creates a dispatcher that always delivers on a detached Tokio task.
     pub fn new(sender: Option<SharedEmailSender>, timeout: Duration) -> Self {
@@ -84,8 +80,6 @@ impl EmailDispatcher {
             outbox_config: OutboxWorkerConfig::default(),
             #[cfg(any(test, feature = "test-utils"))]
             block_on_delivery: false,
-            #[cfg(any(test, feature = "test-utils"))]
-            owned_recipient: None,
             #[cfg(any(test, feature = "test-utils"))]
             inline_error: Arc::new(std::sync::Mutex::new(None)),
         }
@@ -110,22 +104,10 @@ impl EmailDispatcher {
         self
     }
 
-    /// Restricts this dispatcher's outbox claims to messages addressed to `recipient`.
-    ///
-    /// Test-only: a scoped dispatcher is driven explicitly (`flush_outbox`, or blocking
-    /// dispatch) and never spawns the global worker, which claims every recipient's rows.
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn owning_recipient(mut self, recipient: impl Into<String>) -> Self {
-        self.owned_recipient = Some(recipient.into());
-        self
-    }
-
     /// Spawns the background outbox worker loop once if not already running.
     pub fn ensure_worker_started(&self, pool: &sqlx::PgPool) {
         #[cfg(any(test, feature = "test-utils"))]
-        if self.block_on_delivery || self.owned_recipient.is_some() {
-            // A recipient-scoped dispatcher must not spawn the global worker: it would
-            // claim and deliver every other participant's rows.
+        if self.block_on_delivery {
             return;
         }
 
@@ -155,27 +137,13 @@ impl EmailDispatcher {
     pub async fn on_outbox_committed(&self, _pool: &sqlx::PgPool) {
         #[cfg(any(test, feature = "test-utils"))]
         if self.block_on_delivery {
-            let result = match self.owned_recipient.as_deref() {
-                Some(recipient) => {
-                    crate::email::outbox::process_outbox_batch_for_recipient(
-                        _pool,
-                        recipient,
-                        &self.sender,
-                        self.timeout,
-                        &self.outbox_config,
-                    )
-                    .await
-                }
-                None => {
-                    crate::email::outbox::process_outbox_batch(
-                        _pool,
-                        &self.sender,
-                        self.timeout,
-                        &self.outbox_config,
-                    )
-                    .await
-                }
-            };
+            let result = crate::email::outbox::process_outbox_batch(
+                _pool,
+                &self.sender,
+                self.timeout,
+                &self.outbox_config,
+            )
+            .await;
             // Blocking mode deliberately spawns no worker, so nothing retries this batch:
             // discarding the error left the caller waiting out its delivery timeout with no
             // hint that the claim itself failed.
@@ -196,18 +164,6 @@ impl EmailDispatcher {
     /// typed boundary — DB failures surface as [`crate::AppError`] (wire
     /// envelope) instead of raw [`sqlx::Error`].
     pub async fn flush_outbox(&self, pool: &sqlx::PgPool) -> Result<usize, crate::AppError> {
-        #[cfg(any(test, feature = "test-utils"))]
-        if let Some(recipient) = self.owned_recipient.as_deref() {
-            return Ok(crate::email::outbox::process_outbox_batch_for_recipient(
-                pool,
-                recipient,
-                &self.sender,
-                self.timeout,
-                &self.outbox_config,
-            )
-            .await?);
-        }
-
         Ok(crate::email::outbox::process_outbox_batch(
             pool,
             &self.sender,
@@ -370,8 +326,6 @@ impl fmt::Debug for EmailDispatcher {
             .field("outbox_config", &self.outbox_config);
         #[cfg(any(test, feature = "test-utils"))]
         debug.field("block_on_delivery", &self.block_on_delivery);
-        #[cfg(any(test, feature = "test-utils"))]
-        debug.field("owned_recipient", &self.owned_recipient);
         #[cfg(any(test, feature = "test-utils"))]
         debug.field("inline_error", &self.inline_delivery_error());
         debug.finish()
@@ -561,18 +515,6 @@ mod tests {
         let pool = sqlx::PgPool::connect_lazy("postgres://localhost/dummy").unwrap();
         dispatcher.ensure_worker_started(&pool);
         assert!(!dispatcher.worker_started.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn recipient_scoped_dispatcher_skips_worker_spawn() {
-        let dispatcher = EmailDispatcher::new(None, Duration::from_secs(1))
-            .owning_recipient("owner@example.com");
-        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/dummy").unwrap();
-        dispatcher.ensure_worker_started(&pool);
-        assert!(
-            !dispatcher.worker_started.load(Ordering::SeqCst),
-            "the global worker would claim every other test's rows"
-        );
     }
 
     /// No worker to retry a blocking batch, so a lost claim must be reported instead of

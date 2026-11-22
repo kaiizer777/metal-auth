@@ -34,27 +34,6 @@ where
     .await
 }
 
-/// Single claim statement shared by the global and recipient-scoped variants.
-///
-/// `$5` is the optional recipient predicate: `NULL` claims globally (production), a value
-/// restricts the claim to rows addressed to exactly that recipient (test seam). Equality,
-/// not `LIKE`, so a caller cannot smuggle wildcards into its own ownership filter.
-const CLAIM_OUTBOX_SQL: &str = r#"
-        UPDATE email_outbox
-        SET status = $1, next_retry_at = $4
-        WHERE id IN (
-            SELECT id
-            FROM email_outbox
-            WHERE ((status = $2 AND next_retry_at <= NOW())
-               OR (status = $1 AND next_retry_at <= NOW()))
-              AND ($5::text IS NULL OR recipient = $5)
-            ORDER BY next_retry_at ASC
-            LIMIT $3
-            FOR UPDATE SKIP LOCKED
-        )
-        RETURNING id, recipient, email_type, payload, status, retry_count, next_retry_at, created_at, sent_at, error_log
-        "#;
-
 /// Atomically claims pending or expired processing outbox entries due for delivery using `FOR UPDATE SKIP LOCKED`.
 ///
 /// Sets `status = 'processing'` and advances `next_retry_at` to the lease expiration timestamp.
@@ -64,43 +43,31 @@ pub async fn claim_pending_outbox(
     limit: i64,
     lease_duration: Duration,
 ) -> Result<Vec<EmailOutbox>, sqlx::Error> {
-    claim_outbox(pool, None, limit, lease_duration).await
-}
-
-/// Atomically claims due entries addressed to exactly `recipient`.
-///
-/// Same lease mechanics as [`claim_pending_outbox`], but the claim can never reach a row
-/// addressed elsewhere, so a test-owned consumer cannot deliver a concurrent test's mail.
-/// An empty recipient matches nothing rather than acting as a wildcard.
-///
-/// Test-only: production keeps the global oldest-first claim.
-#[cfg(any(test, feature = "test-utils"))]
-pub async fn claim_pending_outbox_for_recipient(
-    pool: &PgPool,
-    recipient: &str,
-    limit: i64,
-    lease_duration: Duration,
-) -> Result<Vec<EmailOutbox>, sqlx::Error> {
-    claim_outbox(pool, Some(recipient), limit, lease_duration).await
-}
-
-async fn claim_outbox(
-    pool: &PgPool,
-    recipient_filter: Option<&str>,
-    limit: i64,
-    lease_duration: Duration,
-) -> Result<Vec<EmailOutbox>, sqlx::Error> {
     let lease_expires_at = Utc::now()
         + ChronoDuration::from_std(lease_duration).unwrap_or(ChronoDuration::seconds(300));
 
-    sqlx::query_as::<Postgres, EmailOutbox>(CLAIM_OUTBOX_SQL)
-        .bind(OUTBOX_STATUS_PROCESSING)
-        .bind(OUTBOX_STATUS_PENDING)
-        .bind(limit)
-        .bind(lease_expires_at)
-        .bind(recipient_filter)
-        .fetch_all(pool)
-        .await
+    sqlx::query_as::<Postgres, EmailOutbox>(
+        r#"
+        UPDATE email_outbox
+        SET status = $1, next_retry_at = $4
+        WHERE id IN (
+            SELECT id
+            FROM email_outbox
+            WHERE (status = $2 AND next_retry_at <= NOW())
+               OR (status = $1 AND next_retry_at <= NOW())
+            ORDER BY next_retry_at ASC
+            LIMIT $3
+            FOR UPDATE SKIP LOCKED
+        )
+        RETURNING id, recipient, email_type, payload, status, retry_count, next_retry_at, created_at, sent_at, error_log
+        "#,
+    )
+    .bind(OUTBOX_STATUS_PROCESSING)
+    .bind(OUTBOX_STATUS_PENDING)
+    .bind(limit)
+    .bind(lease_expires_at)
+    .fetch_all(pool)
+    .await
 }
 
 /// Deletes every row [`claim_pending_outbox`] could still claim.
@@ -591,99 +558,6 @@ mod tests {
             .bind(row_id)
             .execute(&pool)
             .await;
-    }
-
-    #[tokio::test]
-    async fn claim_for_recipient_leaves_a_foreign_row_untouched() {
-        let _guard = crate::db::DB_TEST_LOCK.lock().await;
-        let Some(pool) = test_pool().await else {
-            return;
-        };
-
-        let own = format!("own_{}@example.com", Uuid::new_v4());
-        let foreign = format!("foreign_{}@example.com", Uuid::new_v4());
-        let own_row = insert_outbox(&pool, &own, "verification", json!({}))
-            .await
-            .expect("insert own outbox");
-        let foreign_row = insert_outbox(&pool, &foreign, "verification", json!({}))
-            .await
-            .expect("insert foreign outbox");
-
-        let claimed = claim_pending_outbox_for_recipient(&pool, &own, 50, Duration::from_secs(60))
-            .await
-            .expect("claim own recipient");
-
-        assert_eq!(
-            claimed.iter().map(|r| r.id).collect::<Vec<_>>(),
-            vec![own_row.id],
-            "only the calling recipient's row may be claimed"
-        );
-
-        let untouched = get_outbox_by_id(&pool, foreign_row.id)
-            .await
-            .expect("fetch foreign row")
-            .expect("foreign row exists");
-        assert_eq!(untouched.status, OUTBOX_STATUS_PENDING);
-        assert_eq!(
-            untouched.next_retry_at, foreign_row.next_retry_at,
-            "a foreign row must keep its lease timestamp exactly"
-        );
-
-        let _ = sqlx::query("DELETE FROM email_outbox WHERE id IN ($1, $2)")
-            .bind(own_row.id)
-            .bind(foreign_row.id)
-            .execute(&pool)
-            .await;
-    }
-
-    #[tokio::test]
-    async fn claim_for_recipient_does_not_prefix_match_or_wildcard() {
-        let _guard = crate::db::DB_TEST_LOCK.lock().await;
-        let Some(pool) = test_pool().await else {
-            return;
-        };
-
-        let tag = format!("collide_{}", Uuid::new_v4().simple());
-        let shorter = format!("{tag}@example.com");
-        let longer = format!("{tag}extra@example.com");
-        let across_domain = format!("{tag}@other.example.com");
-        let rows = [
-            insert_outbox(&pool, &shorter, "verification", json!({}))
-                .await
-                .expect("insert shorter outbox"),
-            insert_outbox(&pool, &longer, "verification", json!({}))
-                .await
-                .expect("insert longer outbox"),
-            insert_outbox(&pool, &across_domain, "verification", json!({}))
-                .await
-                .expect("insert cross-domain outbox"),
-        ];
-
-        let claimed =
-            claim_pending_outbox_for_recipient(&pool, &shorter, 50, Duration::from_secs(60))
-                .await
-                .expect("claim exact recipient");
-
-        assert_eq!(
-            claimed.iter().map(|r| r.id).collect::<Vec<_>>(),
-            vec![rows[0].id],
-            "a recipient sharing the tag as a prefix is a different owner"
-        );
-
-        let empty = claim_pending_outbox_for_recipient(&pool, "", 50, Duration::from_secs(60))
-            .await
-            .expect("claim with an empty recipient");
-        assert!(
-            empty.is_empty(),
-            "an empty recipient must fail closed, not claim the whole table"
-        );
-
-        for row in &rows {
-            let _ = sqlx::query("DELETE FROM email_outbox WHERE id = $1")
-                .bind(row.id)
-                .execute(&pool)
-                .await;
-        }
     }
 
     #[tokio::test]

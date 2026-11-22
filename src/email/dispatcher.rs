@@ -63,8 +63,14 @@ pub struct EmailDispatcher {
     /// Inline (caller-blocking) delivery — test-only, absent from default builds.
     #[cfg(any(test, feature = "test-utils"))]
     block_on_delivery: bool,
+    /// First inline-batch failure — test-only, so a claim error is diagnosable instead of
+    /// surfacing as the caller's delivery wait timing out.
+    ///
+    /// Write-once, read-any: `OnceLock` needs no `Option`, no mutex and no poison handling.
+    /// `Arc` only because the dispatcher is `Clone`, like `notify` and `worker_started`.
+    #[cfg(any(test, feature = "test-utils"))]
+    inline_error: Arc<std::sync::OnceLock<String>>,
 }
-
 impl EmailDispatcher {
     /// Creates a dispatcher that always delivers on a detached Tokio task.
     pub fn new(sender: Option<SharedEmailSender>, timeout: Duration) -> Self {
@@ -77,6 +83,8 @@ impl EmailDispatcher {
             outbox_config: OutboxWorkerConfig::default(),
             #[cfg(any(test, feature = "test-utils"))]
             block_on_delivery: false,
+            #[cfg(any(test, feature = "test-utils"))]
+            inline_error: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -132,13 +140,21 @@ impl EmailDispatcher {
     pub async fn on_outbox_committed(&self, _pool: &sqlx::PgPool) {
         #[cfg(any(test, feature = "test-utils"))]
         if self.block_on_delivery {
-            let _ = crate::email::outbox::process_outbox_batch(
+            let result = crate::email::outbox::process_outbox_batch(
                 _pool,
                 &self.sender,
                 self.timeout,
                 &self.outbox_config,
             )
             .await;
+            // Blocking mode deliberately spawns no worker, so nothing retries this batch:
+            // discarding the error left the caller waiting out its delivery timeout with no
+            // hint that the claim itself failed.
+            if let Err(e) = result {
+                let err = crate::email::hook::sanitize_error_str(&e.to_string());
+                tracing::error!(err = %err, "inline outbox batch failed; no worker will retry it");
+                self.record_inline_error(err);
+            }
             return;
         }
 
@@ -163,6 +179,21 @@ impl EmailDispatcher {
     /// Returns a reference to the configured email sender, if any.
     pub fn sender(&self) -> Option<&SharedEmailSender> {
         self.sender.as_ref()
+    }
+
+    /// Returns the first inline batch failure, if any.
+    ///
+    /// Test-only: production dispatch is log-only by contract, so the error is reported here
+    /// instead of changing the return type of [`EmailDispatcher::on_outbox_committed`].
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn inline_delivery_error(&self) -> Option<String> {
+        self.inline_error.get().cloned()
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    fn record_inline_error(&self, err: String) {
+        // Keep the first failure: a later retry of the same batch is usually the same cause.
+        let _ = self.inline_error.set(err);
     }
 
     /// Configures a base URL on the dispatcher.
@@ -289,6 +320,8 @@ impl fmt::Debug for EmailDispatcher {
             .field("outbox_config", &self.outbox_config);
         #[cfg(any(test, feature = "test-utils"))]
         debug.field("block_on_delivery", &self.block_on_delivery);
+        #[cfg(any(test, feature = "test-utils"))]
+        debug.field("inline_error", &self.inline_delivery_error());
         debug.finish()
     }
 }
@@ -476,6 +509,33 @@ mod tests {
         let pool = sqlx::PgPool::connect_lazy("postgres://localhost/dummy").unwrap();
         dispatcher.ensure_worker_started(&pool);
         assert!(!dispatcher.worker_started.load(Ordering::SeqCst));
+    }
+
+    /// No worker to retry a blocking batch, so a lost claim must be reported instead of
+    /// leaving the caller to time out on a delivery that can never happen.
+    #[tokio::test]
+    async fn blocking_batch_claim_failure_is_reported_instead_of_discarded() {
+        let sender = Arc::new(RecordingSender::default());
+        let dispatcher = EmailDispatcher::new_blocking(
+            Some(sender.clone() as SharedEmailSender),
+            Duration::from_secs(1),
+        );
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(500))
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/postgres")
+            .expect("lazy pool");
+
+        assert_eq!(dispatcher.inline_delivery_error(), None);
+        dispatcher.on_outbox_committed(&pool).await;
+
+        let err = dispatcher
+            .inline_delivery_error()
+            .expect("a failed claim must be reported, not discarded");
+        assert!(!err.is_empty(), "the recorded failure must name its cause");
+        assert!(
+            sender.verification.lock().unwrap().is_empty(),
+            "a failed claim delivers nothing"
+        );
     }
 
     #[test]

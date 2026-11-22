@@ -8,8 +8,9 @@ mod common;
 use std::sync::{Arc, Mutex};
 
 use axum::http::{HeaderMap, Method, StatusCode, header};
+use chrono::{Duration, Utc};
 use common::*;
-use metal_auth::{ErrorCode, RateLimiter};
+use metal_auth::{ErrorCode, RateLimiter, crypto::token::generate_token};
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -1179,4 +1180,50 @@ async fn ip_budget_admits_exactly_ten_attempts_then_returns_429() {
         Some(ErrorCode::TotpRateLimitExceeded)
     );
     retry_after_secs(&rejected, app.state.config.totp.rate_limit_window_secs);
+}
+
+/// Scenario 12: a challenge minted before a password reset cannot be redeemed after it.
+#[tokio::test]
+async fn password_reset_purges_the_pending_challenge() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let (email, password, _secret, _backup_codes, _session) =
+        enabled_user(&app, &dynamic_ip()).await;
+    let user_id = user_id_for_email(&app.pool, &email).await;
+
+    let _challenge_token = challenge(&app, &email, &password).await;
+    assert_eq!(pending_challenge_count(&app.pool, user_id).await, 1);
+
+    let (reset_token, reset_hash) = generate_token();
+    sqlx::query(
+        "INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
+    )
+    .bind(reset_hash.as_slice())
+    .bind(user_id)
+    .bind(Utc::now() + Duration::hours(1))
+    .execute(&app.pool)
+    .await
+    .expect("seed reset token");
+
+    let reset = app
+        .post_json_with_ip(
+            "/auth/password/reset",
+            json!({ "token": reset_token, "new_password": dynamic_password() }),
+            &dynamic_ip(),
+        )
+        .await;
+    assert_eq!(
+        reset.status(),
+        StatusCode::OK,
+        "reset failed: {}",
+        reset.body_str
+    );
+    assert_eq!(
+        pending_challenge_count(&app.pool, user_id).await,
+        0,
+        "a committed reset must purge every outstanding challenge token"
+    );
 }

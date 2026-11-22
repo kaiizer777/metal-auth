@@ -7,6 +7,8 @@ use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::db::models::{EMAIL_TYPE_PASSWORD_RESET, EMAIL_TYPE_VERIFICATION, EmailOutbox};
+#[cfg(any(test, feature = "test-utils"))]
+use crate::db::outbox::claim_pending_outbox_for_recipient;
 use crate::db::outbox::{
     claim_pending_outbox, mark_outbox_failed, mark_outbox_sent, record_outbox_retry,
 };
@@ -92,16 +94,49 @@ pub async fn process_outbox_batch(
 
     let messages =
         claim_pending_outbox(pool, config.batch_size as i64, config.lease_duration).await?;
-    if messages.is_empty() {
-        return Ok(0);
-    }
 
+    Ok(deliver_outbox_batch(pool, sender, messages, timeout, config).await)
+}
+
+/// Atomically claims and processes the pending messages addressed to one recipient.
+///
+/// Test-only: a consumer built by a test owns its delivery path, so it can never deliver a
+/// concurrent test's row. Production [`process_outbox_batch`] stays global oldest-first.
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn process_outbox_batch_for_recipient(
+    pool: &PgPool,
+    recipient: &str,
+    sender: &Option<SharedEmailSender>,
+    timeout: Duration,
+    config: &OutboxWorkerConfig,
+) -> Result<usize, sqlx::Error> {
+    let Some(sender) = sender.as_ref() else {
+        return Ok(0);
+    };
+
+    let messages = claim_pending_outbox_for_recipient(
+        pool,
+        recipient,
+        config.batch_size as i64,
+        config.lease_duration,
+    )
+    .await?;
+
+    Ok(deliver_outbox_batch(pool, sender, messages, timeout, config).await)
+}
+
+async fn deliver_outbox_batch(
+    pool: &PgPool,
+    sender: &SharedEmailSender,
+    messages: Vec<EmailOutbox>,
+    timeout: Duration,
+    config: &OutboxWorkerConfig,
+) -> usize {
     let count = messages.len();
     for msg in messages {
         deliver_single_message(pool, sender, msg, timeout, config).await;
     }
-
-    Ok(count)
+    count
 }
 
 async fn deliver_single_message(
@@ -718,6 +753,92 @@ mod tests {
 
         let _ = sqlx::query("DELETE FROM email_outbox WHERE id = $1")
             .bind(row_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn process_batch_for_recipient_delivers_only_its_own_rows() {
+        let _guard = crate::db::DB_TEST_LOCK.lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+
+        let own = format!("scoped_own_{}@example.com", uuid::Uuid::new_v4());
+        let foreign = format!("scoped_foreign_{}@example.com", uuid::Uuid::new_v4());
+        let verification_payload = |to: &str| {
+            serde_json::json!({
+                "user_id": uuid::Uuid::new_v4(),
+                "to": to,
+                "token": "tok",
+                "url": "https://example.com",
+                "expires_at": chrono::Utc::now()
+            })
+        };
+        let own_row = crate::db::outbox::insert_outbox(
+            &pool,
+            &own,
+            crate::db::models::EMAIL_TYPE_VERIFICATION,
+            verification_payload(&own),
+        )
+        .await
+        .expect("insert own row");
+        let foreign_row = crate::db::outbox::insert_outbox(
+            &pool,
+            &foreign,
+            crate::db::models::EMAIL_TYPE_VERIFICATION,
+            verification_payload(&foreign),
+        )
+        .await
+        .expect("insert foreign row");
+
+        let sender = Arc::new(crate::email::test_utils::CapturingEmailSender::new());
+        let shared: Option<SharedEmailSender> = Some(sender.clone());
+
+        let delivered = process_outbox_batch_for_recipient(
+            &pool,
+            &own,
+            &shared,
+            Duration::from_secs(5),
+            &OutboxWorkerConfig::default(),
+        )
+        .await
+        .expect("process own recipient");
+
+        assert_eq!(delivered, 1);
+        let recipients: Vec<String> = sender
+            .verification_calls()
+            .into_iter()
+            .map(|call| call.to)
+            .collect();
+        assert_eq!(
+            recipients,
+            vec![own.clone()],
+            "a scoped batch must deliver only the calling recipient's mail"
+        );
+
+        let own_after = crate::db::outbox::get_outbox_by_id(&pool, own_row.id)
+            .await
+            .expect("fetch own row")
+            .expect("own row exists");
+        assert_eq!(own_after.status, crate::db::models::OUTBOX_STATUS_SENT);
+
+        let foreign_after = crate::db::outbox::get_outbox_by_id(&pool, foreign_row.id)
+            .await
+            .expect("fetch foreign row")
+            .expect("foreign row exists");
+        assert_eq!(
+            foreign_after.status,
+            crate::db::models::OUTBOX_STATUS_PENDING
+        );
+        assert_eq!(
+            foreign_after.next_retry_at, foreign_row.next_retry_at,
+            "a foreign row must be left exactly as it was inserted"
+        );
+
+        let _ = sqlx::query("DELETE FROM email_outbox WHERE id IN ($1, $2)")
+            .bind(own_row.id)
+            .bind(foreign_row.id)
             .execute(&pool)
             .await;
     }

@@ -1645,6 +1645,39 @@ async fn injected_trigger_is_removed_when_an_assertion_panics() {
         .await;
 }
 
+/// A cleanup that stalls before it can connect must not hold the dropping thread past its bound.
+#[tokio::test]
+async fn cleanup_stalled_before_connecting_returns_at_the_deadline() {
+    // A lazy pool never connects; `Drop` reads only its options, and the stall parks the
+    // cleanup before it would use them, so this test needs no database.
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://cleanup@127.0.0.1:1/stalled")
+        .expect("build lazy pool");
+    let stall = std::sync::Arc::new(CleanupStall::new(CLEANUP_STALL));
+    let injection = FailureInjection {
+        pool,
+        name: "totp_test_stalled_cleanup",
+        table: "sessions",
+        armed: true,
+        stall: Some(std::sync::Arc::clone(&stall)),
+    };
+
+    let started = std::time::Instant::now();
+    drop(injection);
+    let elapsed = started.elapsed();
+    // Releases the detached thread, so it cannot outlive the test.
+    stall.abandon();
+
+    assert!(
+        elapsed >= CLEANUP_DEADLINE,
+        "the cleanup must get its whole bound before it is abandoned, took {elapsed:?}"
+    );
+    assert!(
+        elapsed <= CLEANUP_DEADLINE + CLEANUP_SLACK,
+        "the bound must release the dropping thread, took {elapsed:?}"
+    );
+}
+
 /// Where an injected failure fires, and the name its trigger and function share.
 struct InjectionTarget {
     name: &'static str,
@@ -1690,6 +1723,8 @@ struct FailureInjection {
     name: &'static str,
     table: &'static str,
     armed: bool,
+    /// Test seam: parks the cleanup thread before it connects. See `CleanupStall`.
+    stall: Option<std::sync::Arc<CleanupStall>>,
 }
 
 impl FailureInjection {
@@ -1729,6 +1764,7 @@ impl FailureInjection {
             name,
             table,
             armed: true,
+            stall: None,
         }
     }
 
@@ -1752,6 +1788,46 @@ impl FailureInjection {
     }
 }
 
+/// Test seam that parks the cleanup thread before it connects.
+///
+/// The real failure mode — a connect that neither completes nor is refused — cannot be
+/// produced deterministically against a live server, so a test hands the guard a gate instead.
+struct CleanupStall {
+    park_for: std::time::Duration,
+    released: std::sync::Mutex<Option<bool>>,
+    wake: std::sync::Condvar,
+}
+
+impl CleanupStall {
+    fn new(park_for: std::time::Duration) -> Self {
+        Self {
+            park_for,
+            released: std::sync::Mutex::new(None),
+            wake: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Park until the test releases the gate or `park_for` lapses; report whether the cleanup
+    /// should run. A lapsed park gives up, so an unbounded wait fails instead of hanging.
+    fn park(&self) -> bool {
+        let (released, _) = self
+            .wake
+            .wait_timeout_while(
+                self.released.lock().expect("stall gate"),
+                self.park_for,
+                |outcome| outcome.is_none(),
+            )
+            .expect("stall gate");
+        released.unwrap_or(false)
+    }
+
+    /// Release a parked cleanup without letting it touch the database.
+    fn abandon(&self) {
+        *self.released.lock().expect("stall gate") = Some(false);
+        self.wake.notify_all();
+    }
+}
+
 /// Bound on the cleanup drops: `DROP TRIGGER` takes `ACCESS EXCLUSIVE`, so a conflicting
 /// backend would otherwise hang the test binary instead of failing.
 const CLEANUP_TIMEOUT: &str = "5s";
@@ -1764,6 +1840,13 @@ const CLEANUP_TIMEOUT: &str = "5s";
 /// deliberately far above it: expiry detaches the cleanup thread, which can still drop a
 /// trigger a later test has already re-installed, so detaching must stay a last resort.
 const CLEANUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How late the dropping frame may return after `CLEANUP_DEADLINE` before it counts as stuck.
+const CLEANUP_SLACK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long the proof test parks the cleanup: past the bound plus its slack, so an unbounded
+/// wait trips the elapsed assertion instead of hanging the binary.
+const CLEANUP_STALL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Drop the trigger and its function in one bounded transaction.
 ///
@@ -1796,12 +1879,18 @@ impl Drop for FailureInjection {
         }
         let options = self.pool.connect_options();
         let statements = self.drop_statements();
+        let stall = self.stall.take();
         let (finished, cleanup_done) = std::sync::mpsc::channel::<()>();
         // Wait for the cleanup: the next test takes `DB_LOCK` only after this frame has
         // finished unwinding.
         let cleanup = std::thread::spawn(move || {
             // Disconnected when this closure returns or panics, so it signals "finished".
             let _finished = finished;
+            if let Some(stall) = stall
+                && !stall.park()
+            {
+                return;
+            }
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()

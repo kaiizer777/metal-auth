@@ -1190,11 +1190,11 @@ async fn password_reset_purges_the_pending_challenge() {
         return;
     };
 
-    let (email, password, _secret, _backup_codes, _session) =
+    let (email, password, secret, _backup_codes, _session) =
         enabled_user(&app, &dynamic_ip()).await;
     let user_id = user_id_for_email(&app.pool, &email).await;
 
-    let _challenge_token = challenge(&app, &email, &password).await;
+    let challenge_token = challenge(&app, &email, &password).await;
     assert_eq!(pending_challenge_count(&app.pool, user_id).await, 1);
 
     let (reset_token, reset_hash) = generate_token();
@@ -1225,5 +1225,26 @@ async fn password_reset_purges_the_pending_challenge() {
         pending_challenge_count(&app.pool, user_id).await,
         0,
         "a committed reset must purge every outstanding challenge token"
+    );
+
+    let sessions_before = count_sessions_for_user(&app.pool, user_id).await;
+    let verify = app
+        .post_json_with_ip(
+            "/auth/totp/verify",
+            json!({ "challenge_token": challenge_token, "code": totp_code(&secret) }),
+            &dynamic_ip(),
+        )
+        .await;
+    assert_eq!(
+        verify.status(),
+        StatusCode::UNAUTHORIZED,
+        "body: {}",
+        verify.body_str
+    );
+    assert_eq!(verify.error_code(), Some(ErrorCode::TwoFactorTokenInvalid));
+    assert_eq!(
+        count_sessions_for_user(&app.pool, user_id).await,
+        sessions_before,
+        "a pre-reset challenge must not issue a session"
     );
 }

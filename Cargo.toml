@@ -15,12 +15,21 @@ autotests = true
 # async runtime
 tokio = { version = "1", features = ["macros", "rt", "time", "sync"] }
 
-# crypto (Phase 3)
+# crypto (Phase 3, 6 & 7)
 argon2 = { version = "0.5", features = ["std"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 sha2 = "0.10"
+sha1 = "0.10"
 hex = "0.4"
 subtle = "2.6"
+base64 = "0.22"
+hmac = "0.12"
+aes-gcm = "0.10"
+base32 = "0.4"
+jsonwebtoken = "9"
+
+# HTTP client for OAuth (Phase 6)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # rate limiting (Phase 4)
 dashmap = "6"
@@ -71,3 +80,12 @@ metal-auth = { path = ".", version = "0.1.0", features = ["test-utils"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wiremock = "0.6"
+
+# Argon2 is the dominant cost of the DB-backed test suites. Optimizing only the
+# hashing crates in the test profile is codegen-only: same m/t/p, same PHC output.
+[profile.test.package.argon2]
+opt-level = 3
+
+[profile.test.package.blake2]
+opt-level = 3

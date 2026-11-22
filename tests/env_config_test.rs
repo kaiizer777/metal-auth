@@ -26,6 +26,8 @@ async fn test_auth_new_fails_on_invalid_auth_env_config() {
         outbox_sent_retention: std::time::Duration::from_secs(7 * 24 * 3600),
         session: metal_auth::SessionConfig::default(),
         rate_limit: metal_auth::RateLimitConfig::default(),
+        oauth: metal_auth::OAuthConfig::default(),
+        totp: metal_auth::TotpConfig::default(),
     };
 
     let res = Auth::new(cfg).await;

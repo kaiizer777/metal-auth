@@ -2,9 +2,9 @@
 
 use chrono::Utc;
 use rand_core::{OsRng, RngCore};
-use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::{config::Config, db::models::Session, error::AppError};
@@ -32,26 +32,26 @@ impl SessionService {
         &self.config
     }
 
-    /// Generate 32-character lowercase hex raw session ID from 16 OsRng bytes (128-bit entropy).
+    /// Generate the canonical 64-character lowercase hex raw session ID (32 OsRng bytes).
     ///
-    /// Never logged or persisted directly.
+    /// Delegates to [`crate::session::generate_session_id`]: a single generator guarantees
+    /// every session token carries 256-bit entropy. Never logged or persisted directly.
     pub(crate) fn generate_raw_id() -> String {
-        let mut bytes = [0u8; 16];
-        OsRng.fill_bytes(&mut bytes);
-        hex::encode(bytes)
+        super::generate_session_id()
     }
 
     /// Returns the SHA-256 lowercase hex digest of a raw session ID.
     ///
+    /// Delegates to [`crate::session::hash_session_id`]: a single hash function, so
+    /// stored `token_hash` values are comparable regardless of call site.
     /// Deterministic 64-character hex output safe to query and store.
     pub fn hash_raw_id(raw_id: &str) -> String {
-        let digest = Sha256::digest(raw_id.as_bytes());
-        hex::encode(digest)
+        super::hash_session_id(raw_id)
     }
 
     /// Create a new session for `user_id`.
     ///
-    /// Generates a 128-bit entropy session token, SHA-256 hashes it for database storage,
+    /// Generates a 256-bit entropy session token, SHA-256 hashes it for database storage,
     /// enforces per-user concurrent session limits, and generates a CSRF token for cookie sessions.
     ///
     /// Returns `(Session, raw_session_token)`.
@@ -64,6 +64,19 @@ impl SessionService {
     ) -> Result<(Session, String), AppError> {
         self.create_session_inner(user_id, None, session_type, ip, user_agent)
             .await
+    }
+
+    /// Read the user's current Argon2id PHC string for a credential-freshness check.
+    ///
+    /// A missing row and a failed lookup both surface as `SessionInvalid`, so this path
+    /// gains no user-enumerating error variant.
+    pub async fn current_credential_hash(&self, user_id: Uuid) -> Result<String, AppError> {
+        sqlx::query_scalar::<_, String>("SELECT password_hash FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(AppError::Database)?
+            .ok_or(AppError::SessionInvalid)
     }
 
     /// Session creation gated on credential freshness (issue #37).
@@ -99,13 +112,60 @@ impl SessionService {
         ip: Option<&str>,
         user_agent: Option<&str>,
     ) -> Result<(Session, String), AppError> {
+        let mut tx = self.db.begin().await.map_err(|e| {
+            tracing::error!(error = %e, "Failed to begin transaction for create_session");
+            AppError::Database(e)
+        })?;
+
+        let result = self
+            .create_session_in(&mut tx, user_id, expected_credential_hash, session_type)
+            .await;
+        let (session, raw_id) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = tx.rollback().await;
+                return Err(error);
+            }
+        };
+
+        tx.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "Failed to commit session creation transaction");
+            AppError::Database(e)
+        })?;
+
+        tracing::info!(
+            event = "session_created",
+            user_id = %user_id,
+            session_type = session_type,
+            ip = ip.unwrap_or("unknown"),
+            user_agent = user_agent.unwrap_or("unknown"),
+        );
+
+        Ok((session, raw_id))
+    }
+
+    /// Insert the session row on the caller's transaction.
+    ///
+    /// Callers that must atomically couple session issuance with another state change
+    /// (the TOTP redemption path) own the transaction; the standalone paths wrap this in
+    /// [`Self::create_session_inner`].
+    pub(crate) async fn create_session_in(
+        &self,
+        tx: &mut PgConnection,
+        user_id: Uuid,
+        expected_credential_hash: Option<&str>,
+        session_type: &str,
+    ) -> Result<(Session, String), AppError> {
         let raw_id = Self::generate_raw_id();
         let token_hash = Self::hash_raw_id(&raw_id);
 
         let now = Utc::now();
         let absolute_expires_at = now + self.config.session.absolute_lifetime();
-        let idle_expires_at =
-            now + chrono::Duration::seconds(self.config.session.idle_timeout_secs as i64);
+        // Validated config bounds idle_timeout_secs far below i64::MAX, but fail
+        // closed instead of wrapping on absurd values.
+        let idle_secs =
+            i64::try_from(self.config.session.idle_timeout_secs).map_err(|_| AppError::Internal)?;
+        let idle_expires_at = now + chrono::Duration::seconds(idle_secs);
 
         let csrf_token = if session_type == "cookie" {
             let mut csrf_bytes = [0u8; 32];
@@ -114,11 +174,6 @@ impl SessionService {
         } else {
             None
         };
-
-        let mut tx = self.db.begin().await.map_err(|e| {
-            tracing::error!(error = %e, "Failed to begin transaction for create_session");
-            AppError::Database(e)
-        })?;
 
         // Row lock on the user row to serialize concurrent session creations for the user
         sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
@@ -133,7 +188,8 @@ impl SessionService {
         // Credential freshness: reject a login whose password was superseded
         // after verification. Same row, same lock — serializes with reset's
         // `UPDATE users ... WHERE id` commit. Missing row also rejects: no
-        // user-enumerating error variant leaves this path.
+        // user-enumerating error variant leaves this path. Constant-time compare
+        // avoids leaking the stored PHC string via timing.
         if let Some(expected) = expected_credential_hash {
             let current: Option<String> =
                 sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
@@ -141,7 +197,13 @@ impl SessionService {
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(AppError::Database)?;
-            if current.as_deref() != Some(expected) {
+            let fresh = match current {
+                Some(ref stored) if stored.len() == expected.len() => {
+                    stored.as_bytes().ct_eq(expected.as_bytes()).into()
+                }
+                _ => false,
+            };
+            if !fresh {
                 return Err(AppError::SessionInvalid);
             }
         }
@@ -213,19 +275,6 @@ impl SessionService {
             AppError::Database(e)
         })?;
 
-        tx.commit().await.map_err(|e| {
-            tracing::error!(error = %e, "Failed to commit session creation transaction");
-            AppError::Database(e)
-        })?;
-
-        tracing::info!(
-            event = "session_created",
-            user_id = %user_id,
-            session_type = session_type,
-            ip = ip.unwrap_or("unknown"),
-            user_agent = user_agent.unwrap_or("unknown"),
-        );
-
         Ok((session, raw_id))
     }
 
@@ -268,7 +317,9 @@ impl SessionService {
         // Defence-in-depth: check absolute timeout first.
         if now > session.absolute_expires_at {
             tracing::info!(event = "session_expired", reason = "absolute",);
-            let _ = self.invalidate_by_hash(&token_hash).await;
+            if let Err(e) = self.invalidate_by_hash(&token_hash).await {
+                tracing::warn!(event = "expired_session_purge_failed", error = %e);
+            }
             return Err(AppError::SessionExpired);
         }
 
@@ -278,7 +329,9 @@ impl SessionService {
                 .map_err(|_| AppError::Internal)?;
         if now > idle_deadline {
             tracing::info!(event = "session_expired", reason = "idle",);
-            let _ = self.invalidate_by_hash(&token_hash).await;
+            if let Err(e) = self.invalidate_by_hash(&token_hash).await {
+                tracing::warn!(event = "expired_session_purge_failed", error = %e);
+            }
             return Err(AppError::SessionExpired);
         }
 
@@ -328,7 +381,9 @@ impl SessionService {
         // Defence-in-depth: check absolute timeout first.
         if now > session.absolute_expires_at {
             tracing::info!(event = "session_expired", reason = "absolute",);
-            let _ = self.invalidate_by_hash(token_hash).await;
+            if let Err(e) = self.invalidate_by_hash(token_hash).await {
+                tracing::warn!(event = "expired_session_purge_failed", error = %e);
+            }
             return Err(AppError::SessionExpired);
         }
 
@@ -338,7 +393,9 @@ impl SessionService {
                 .map_err(|_| AppError::Internal)?;
         if now > idle_deadline {
             tracing::info!(event = "session_expired", reason = "idle",);
-            let _ = self.invalidate_by_hash(token_hash).await;
+            if let Err(e) = self.invalidate_by_hash(token_hash).await {
+                tracing::warn!(event = "expired_session_purge_failed", error = %e);
+            }
             return Err(AppError::SessionExpired);
         }
 
@@ -380,14 +437,36 @@ impl SessionService {
 
     /// Invalidate all active and inactive sessions belonging to `user_id`.
     pub async fn invalidate_all_user_sessions(&self, user_id: Uuid) -> Result<(), AppError> {
-        let _result = sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+        let mut tx = self.db.begin().await.map_err(|e| {
+            tracing::error!(error = %e, user_id = %user_id, "Failed to begin transaction for revoke-all");
+            AppError::Database(e)
+        })?;
+
+        // Serialize with rotate_session, which locks this row before
+        // deleting/inserting sessions: whichever tx locks first wins, so no
+        // rotate can mint a session this DELETE never sees.
+        sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
             .bind(user_id)
-            .execute(&self.db)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, user_id = %user_id, "Failed to lock user row for revoke-all");
+                AppError::Database(e)
+            })?;
+
+        sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&mut *tx)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, user_id = %user_id, "Failed to delete all user sessions");
                 AppError::Database(e)
             })?;
+
+        tx.commit().await.map_err(|e| {
+            tracing::error!(error = %e, user_id = %user_id, "Failed to commit revoke-all sessions transaction");
+            AppError::Database(e)
+        })?;
 
         tracing::info!(
             event = "all_sessions_invalidated",
@@ -420,6 +499,19 @@ impl SessionService {
             AppError::Database(e)
         })?;
 
+        // Serialize with reset_password's purge: the reset tx locks this row via
+        // `UPDATE users ... WHERE id` (src/auth/service.rs:437) before deleting
+        // sessions, so whichever tx locks first wins. Reset-first leaves zero
+        // rows for the DELETE below.
+        sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+            .bind(old_session.user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "Failed to lock user row for session rotation");
+                AppError::Database(e)
+            })?;
+
         // Atomically delete old session; must affect exactly 1 row to prevent replay/duplicate rotation
         let delete_res = sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
             .bind(&old_hash)
@@ -437,8 +529,9 @@ impl SessionService {
         let raw_id = Self::generate_raw_id();
         let token_hash = Self::hash_raw_id(&raw_id);
         let now = Utc::now();
-        let idle_expires_at =
-            now + chrono::Duration::seconds(self.config.session.idle_timeout_secs as i64);
+        let idle_secs =
+            i64::try_from(self.config.session.idle_timeout_secs).map_err(|_| AppError::Internal)?;
+        let idle_expires_at = now + chrono::Duration::seconds(idle_secs);
         // Preserve old absolute deadline to prevent infinite session extension (ASVS L1)
         let absolute_expires_at = old_session.absolute_expires_at;
 
@@ -489,11 +582,10 @@ impl SessionService {
             AppError::Database(e)
         })?;
 
+        // Token hashes are stable session correlators — never log them.
         tracing::info!(
             event = "session_rotated",
             user_id = %old_session.user_id,
-            old_hash = %old_hash,
-            new_hash = %session.token_hash,
             ip = ip.unwrap_or("unknown"),
             user_agent = user_agent.unwrap_or("unknown"),
         );
@@ -502,8 +594,13 @@ impl SessionService {
     }
 
     /// List active, non-expired sessions for a user ordered by most recently active.
+    ///
+    /// Excludes both absolute-expired and idle-expired rows, mirroring the
+    /// `get_session`/`touch_session` validation so listings never advertise a
+    /// session those paths would reject.
     pub async fn list_user_sessions(&self, user_id: Uuid) -> Result<Vec<Session>, AppError> {
         let now = Utc::now();
+        let idle_secs = self.config.session.idle_timeout_secs as f64;
         let sessions = sqlx::query_as::<_, Session>(
             r#"
             SELECT
@@ -513,11 +610,13 @@ impl SessionService {
             FROM sessions
             WHERE user_id = $1
               AND absolute_expires_at > $2
+              AND last_active_at + make_interval(secs => $3) > $2
             ORDER BY last_active_at DESC
             "#,
         )
         .bind(user_id)
         .bind(now)
+        .bind(idle_secs)
         .fetch_all(&self.db)
         .await
         .map_err(|e| {
@@ -542,8 +641,8 @@ mod tests {
             let id = SessionService::generate_raw_id();
             assert_eq!(
                 id.len(),
-                32,
-                "raw session ID must be 32 hex chars (16 bytes)"
+                64,
+                "raw session ID must be 64 hex chars (32 bytes)"
             );
             assert!(
                 id.chars().all(|c| c.is_ascii_hexdigit()),
@@ -555,6 +654,17 @@ mod tests {
             ids.len(),
             1000,
             "all 1000 generated session IDs must be unique"
+        );
+    }
+
+    #[test]
+    fn service_delegates_to_canonical_generator_and_hash() {
+        // Single generator/hash: service and crate-root outputs share shape.
+        let id = SessionService::generate_raw_id();
+        assert_eq!(id.len(), crate::session::generate_session_id().len());
+        assert_eq!(
+            SessionService::hash_raw_id(&id),
+            crate::session::hash_session_id(&id)
         );
     }
 
@@ -610,5 +720,98 @@ mod tests {
         // Case 2: Expiry in future -> active
         let valid_at = now + Duration::hours(12);
         assert!(now <= valid_at, "future absolute expiry must be active");
+    }
+
+    async fn live_pool() -> Option<PgPool> {
+        dotenvy::dotenv().ok();
+        let url = std::env::var("DATABASE_URL").ok()?;
+        let pool = crate::db::init_pool_with_options(
+            &url,
+            crate::db::DbPoolOptions {
+                max_connections: 2,
+                min_connections: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("DATABASE_URL is set, so the expiry test pool must connect");
+        Some(pool)
+    }
+
+    #[tokio::test]
+    async fn list_user_sessions_excludes_idle_and_absolute_expired() {
+        let Some(pool) = live_pool().await else {
+            eprintln!("SKIP: list_user_sessions expiry test needs DATABASE_URL");
+            return;
+        };
+        let config = Arc::new(crate::config::Config {
+            database_url: String::new(),
+            ..Default::default()
+        });
+        let service = SessionService::new(pool.clone(), config.clone());
+        let idle_margin = i64::try_from(config.session.idle_timeout_secs).unwrap_or(1800) + 120;
+
+        let user_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'test-hash')")
+            .bind(user_id)
+            .bind(format!("list_expiry_{user_id}@example.com"))
+            .execute(&pool)
+            .await
+            .expect("seed expiry-test user");
+
+        let (active, _) = service
+            .create_session_simple(user_id, "cookie")
+            .await
+            .expect("active session");
+        let (idle, _) = service
+            .create_session_simple(user_id, "cookie")
+            .await
+            .expect("idle-expired session");
+        let (absolute, _) = service
+            .create_session_simple(user_id, "cookie")
+            .await
+            .expect("absolute-expired session");
+
+        let now = Utc::now();
+        sqlx::query("UPDATE sessions SET last_active_at = $1 WHERE token_hash = $2")
+            .bind(now - Duration::seconds(idle_margin))
+            .bind(&idle.token_hash)
+            .execute(&pool)
+            .await
+            .expect("backdate idle-expired row");
+        sqlx::query(
+            "UPDATE sessions SET last_active_at = $1, absolute_expires_at = $2 WHERE token_hash = $3",
+        )
+        .bind(now)
+        .bind(now - Duration::seconds(60))
+        .bind(&absolute.token_hash)
+        .execute(&pool)
+        .await
+        .expect("backdate absolute-expired row");
+
+        let listed = service
+            .list_user_sessions(user_id)
+            .await
+            .expect("list sessions");
+        let hashes: Vec<&str> = listed.iter().map(|s| s.token_hash.as_str()).collect();
+        assert!(
+            hashes.contains(&active.token_hash.as_str()),
+            "active session must be listed"
+        );
+        assert!(
+            !hashes.contains(&idle.token_hash.as_str()),
+            "idle-expired row must be excluded"
+        );
+        assert!(
+            !hashes.contains(&absolute.token_hash.as_str()),
+            "absolute-expired row must be excluded"
+        );
+        assert_eq!(listed.len(), 1, "only the active session is listed");
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("remove expiry-test user");
     }
 }

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     db::models::Session,
     error::AppError,
+    handler::untrusted_client_ip,
     middleware::{
         auth::{AuthUser, require_auth},
         csrf_middleware,
@@ -39,36 +40,27 @@ pub struct SessionInfoResponse {
 /// GET /auth/session (and /auth/session/me)
 ///
 /// Returns metadata for the current authenticated session.
-pub async fn get_session(
-    State(state): State<AppState>,
-    auth_user: AuthUser,
-) -> Result<Json<SessionInfoResponse>, AppError> {
-    let session = sqlx::query_as::<_, Session>(
-        r#"
-        SELECT id, user_id, token_hash, created_at,
-               last_active_at, absolute_expires_at,
-               session_type, csrf_token
-        FROM sessions WHERE token_hash = $1
-        "#,
-    )
-    .bind(&auth_user.session_hash)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(AppError::Database)?
-    .ok_or(AppError::SessionNotFound)?;
-
-    Ok(Json(SessionInfoResponse {
+///
+/// Takes the row `require_auth` already validated (and touched) from request
+/// extensions — no second SELECT per request.
+pub async fn get_session(session: Session) -> Json<SessionInfoResponse> {
+    Json(SessionInfoResponse {
         session_id: session.token_hash,
         created_at: session.created_at,
         last_active_at: session.last_active_at,
         absolute_expires_at: session.absolute_expires_at,
         session_type: session.session_type,
-    }))
+    })
 }
 
 /// DELETE /auth/session (and POST /auth/session/revoke)
 ///
 /// Revokes the current session and clears the session cookie.
+///
+/// # Errors
+///
+/// Returns `AppError` when the session is missing, the database fails, or the
+/// clear cookie cannot be encoded.
 pub async fn delete_session(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -89,7 +81,7 @@ pub async fn delete_session(
     let mut response = StatusCode::OK.into_response();
     response
         .headers_mut()
-        .insert(header::SET_COOKIE, clear_session_cookie(&state.config));
+        .insert(header::SET_COOKIE, clear_session_cookie(&state.config)?);
     Ok(response)
 }
 
@@ -122,6 +114,10 @@ pub async fn list_sessions(
 /// DELETE /auth/sessions (and POST /auth/session/revoke-all)
 ///
 /// Revokes all active sessions for the authenticated user and clears the session cookie.
+///
+/// # Errors
+///
+/// Returns `AppError` when the database fails or the clear cookie cannot be encoded.
 pub async fn delete_all_sessions(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -140,13 +136,18 @@ pub async fn delete_all_sessions(
     let mut response = StatusCode::OK.into_response();
     response
         .headers_mut()
-        .insert(header::SET_COOKIE, clear_session_cookie(&state.config));
+        .insert(header::SET_COOKIE, clear_session_cookie(&state.config)?);
     Ok(response)
 }
 
 /// POST /auth/session/refresh
 ///
 /// Rotates the active session: revokes the old token and issues a fresh token.
+///
+/// # Errors
+///
+/// Returns `AppError` when the session is missing/expired, the database fails,
+/// or the rotated cookies cannot be encoded.
 pub async fn refresh_session(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -156,11 +157,8 @@ pub async fn refresh_session(
         .or_else(|| read_bearer_token(&headers))
         .ok_or(AppError::SessionNotFound)?;
 
-    let ip = headers
-        .get("x-forwarded-for")
-        .or_else(|| headers.get("x-real-ip"))
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or(s).trim());
+    // Spoofable unless a trusted proxy strips these headers; audit use only.
+    let ip = untrusted_client_ip(&headers);
 
     let user_agent = headers
         .get(header::USER_AGENT)
@@ -190,12 +188,12 @@ pub async fn refresh_session(
         let mut response = StatusCode::OK.into_response();
         response.headers_mut().insert(
             header::SET_COOKIE,
-            set_session_cookie(new_raw_id.as_str(), &state.config),
+            set_session_cookie(&state.config, new_raw_id.as_str())?,
         );
         if let Some(ref csrf) = session.csrf_token {
             response.headers_mut().append(
                 header::SET_COOKIE,
-                set_csrf_cookie(csrf.as_str(), &state.config),
+                set_csrf_cookie(&state.config, csrf.as_str())?,
             );
         }
         Ok(response)
@@ -234,6 +232,32 @@ pub fn routes(state: AppState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn get_session_serves_extension_row_without_refetch() {
+        let now = Utc::now();
+        let csrf = "f".repeat(64);
+        let session = Session {
+            id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            token_hash: "e".repeat(64),
+            created_at: now,
+            last_active_at: now,
+            absolute_expires_at: now,
+            session_type: "cookie".to_string(),
+            csrf_token: Some(csrf.clone()),
+        };
+        // Handler takes the validated row from extensions; no DB read involved.
+        let body = get_session(session.clone()).await.0;
+        assert_eq!(body.session_id, session.token_hash);
+        assert_eq!(body.created_at, session.created_at);
+        assert_eq!(body.last_active_at, session.last_active_at);
+        assert_eq!(body.absolute_expires_at, session.absolute_expires_at);
+        assert_eq!(body.session_type, session.session_type);
+        let serialized = serde_json::to_string(&body).unwrap();
+        assert!(!serialized.contains(&csrf));
+    }
 
     #[test]
     fn get_session_response_session_id_is_64_chars() {

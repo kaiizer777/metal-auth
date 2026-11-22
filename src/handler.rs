@@ -1,18 +1,37 @@
-use axum::Router;
+use axum::{Router, http::HeaderMap};
 use tower_http::trace::TraceLayer;
 
-use crate::{error::AppError, state::AppState};
+use crate::{error::AppError, middleware::security_headers_middleware, state::AppState};
 
 pub mod auth;
 pub mod cors;
+pub mod oauth;
 pub mod session;
+pub mod totp;
 
 pub use auth::routes as auth_routes;
 pub use cors::cors_layer;
+pub use oauth::routes as oauth_routes;
 pub use session::routes as session_routes;
+pub use totp::routes as totp_routes;
 
 async fn fallback_not_found() -> AppError {
     AppError::NotFound
+}
+
+/// Best-effort client IP for audit logs and rate-limit keys only.
+///
+/// `X-Forwarded-For`/`X-Real-IP` are client-controlled unless an
+/// upstream proxy strips them, so treat the result as untrusted: never use it
+/// for auth decisions. Takes the leftmost entry (original client per convention)
+/// and falls back to `None` when no header is present.
+pub(crate) fn untrusted_client_ip(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("x-forwarded-for")
+        .or_else(|| headers.get("x-real-ip"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or(s).trim())
+        .filter(|s| !s.is_empty())
 }
 
 pub fn create_router(state: AppState) -> Result<Router, AppError> {
@@ -21,14 +40,28 @@ pub fn create_router(state: AppState) -> Result<Router, AppError> {
     state.config.validate().map_err(AppError::Config)?;
     let cors = cors_layer(&state.config)?;
 
-    let auth_router =
-        auth::routes_with_app_state(state.clone()).merge(session::routes(state.clone()));
+    let oauth_router = oauth::routes(state.clone());
+    let auth_router = auth::routes_with_app_state(state.clone())
+        .merge(session::routes(state.clone()))
+        .merge(totp::routes(state.clone()))
+        .merge(oauth_router.clone());
 
     Ok(Router::new()
         .nest("/auth", auth_router)
+        .nest("/api/auth", oauth_router)
         .fallback(fallback_not_found)
         .layer(cors)
-        .layer(TraceLayer::new_for_http()))
+        .layer(axum::middleware::from_fn(security_headers_middleware))
+        .layer(TraceLayer::new_for_http().make_span_with(
+            |request: &axum::http::Request<axum::body::Body>| {
+                tracing::debug_span!(
+                    "request",
+                    method = %request.method(),
+                    uri = %request.uri().path(),
+                    version = ?request.version(),
+                )
+            },
+        )))
 }
 
 #[cfg(test)]
@@ -71,6 +104,8 @@ mod tests {
             ),
             session: crate::config::SessionConfig::default(),
             rate_limit: crate::config::RateLimitConfig::default(),
+            oauth: crate::config::OAuthConfig::default(),
+            totp: crate::config::TotpConfig::default(),
         }
     }
 
@@ -129,6 +164,24 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
+    #[test]
+    fn untrusted_client_ip_takes_leftmost_entry() {
+        use axum::http::HeaderValue;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("1.2.3.4, 5.6.7.8"),
+        );
+        assert_eq!(untrusted_client_ip(&headers), Some("1.2.3.4"));
+
+        let empty = HeaderMap::new();
+        assert_eq!(untrusted_client_ip(&empty), None);
+
+        let mut blank = HeaderMap::new();
+        blank.insert("x-real-ip", HeaderValue::from_static("   "));
+        assert_eq!(untrusted_client_ip(&blank), None);
+    }
+
     #[tokio::test]
     async fn test_session_mutating_routes_require_auth() {
         let cfg = valid_config();
@@ -146,5 +199,42 @@ mod tests {
 
         let resp = router.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_oauth_routes_mounted_under_auth_and_api_auth() {
+        let cfg = valid_config();
+        let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
+        let state =
+            AppState::with_configs_and_dispatcher(pool, cfg, Arc::new(AppConfig::default()), None)
+                .unwrap();
+        let mut router = create_router(state).unwrap();
+
+        // 1. Canonical /auth/oauth/accounts requires authentication
+        let req1 = Request::builder()
+            .uri("/auth/oauth/accounts")
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap();
+        let resp1 = router.call(req1).await.unwrap();
+        assert_eq!(resp1.status(), StatusCode::UNAUTHORIZED);
+
+        // 2. Alias /api/auth/oauth/accounts requires authentication
+        let req2 = Request::builder()
+            .uri("/api/auth/oauth/accounts")
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap();
+        let resp2 = router.call(req2).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::UNAUTHORIZED);
+
+        // 3. Unknown provider returns 404
+        let req3 = Request::builder()
+            .uri("/auth/oauth/unknown_provider")
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap();
+        let resp3 = router.call(req3).await.unwrap();
+        assert_eq!(resp3.status(), StatusCode::NOT_FOUND);
     }
 }

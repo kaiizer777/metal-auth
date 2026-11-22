@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -44,45 +46,71 @@ impl std::fmt::Debug for PasswordResetEmailPayload {
     }
 }
 
-fn redact_url_token(url: &str) -> String {
-    let Some((base, rest)) = url.split_once('?') else {
-        return url.to_string();
-    };
+const REDACTED: &str = "[REDACTED]";
 
-    let (query, fragment) = match rest.split_once('#') {
-        Some((q, f)) => (q, Some(f)),
-        None => (rest, None),
-    };
+// A query/fragment key carries a token when it is exactly `token` (any ASCII
+// case) or ends in `_token` (`auth_token=`); `token_type=` and friends stay.
+fn is_token_key(key: &str) -> bool {
+    key.eq_ignore_ascii_case("token")
+        || key.len() >= "_token".len()
+            && key.as_bytes()[key.len() - "_token".len()..].eq_ignore_ascii_case(b"_token")
+}
 
-    let mut redacted_query = String::with_capacity(query.len() + 16);
-    for (i, part) in query.split('&').enumerate() {
+fn redact_params(params: &str) -> String {
+    let mut redacted = String::with_capacity(params.len() + 16);
+    for (i, part) in params.split('&').enumerate() {
         if i > 0 {
-            redacted_query.push('&');
+            redacted.push('&');
         }
-        if let Some((k, _v)) = part.split_once('=') {
-            if k == "token" {
-                redacted_query.push_str("token=[REDACTED]");
-            } else {
-                redacted_query.push_str(part);
+        match part.split_once('=') {
+            Some((k, _)) if is_token_key(k) => {
+                redacted.push_str(k);
+                redacted.push_str("=[REDACTED]");
             }
-        } else if part == "token" {
-            redacted_query.push_str("token=[REDACTED]");
-        } else {
-            redacted_query.push_str(part);
+            None if is_token_key(part) => {
+                redacted.push_str(part);
+                redacted.push_str("=[REDACTED]");
+            }
+            _ => redacted.push_str(part),
         }
     }
+    redacted
+}
 
-    let mut result = String::with_capacity(
-        base.len() + 1 + redacted_query.len() + fragment.map_or(0, |f| f.len() + 1),
-    );
+fn redact_url_token(url: &str) -> Cow<'_, str> {
+    // Split the fragment first: everything after the first `#` is fragment,
+    // so a `?` there must never be parsed as a query string (and a token in
+    // the head must never be copied verbatim into the redacted output).
+    let (head, fragment) = match url.split_once('#') {
+        Some((h, f)) => (h, Some(f)),
+        None => (url, None),
+    };
+    let (base, query) = match head.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        // No query string and no fragment: nothing to redact.
+        None if fragment.is_none() => return Cow::Borrowed(url),
+        None => (head, None),
+    };
+
+    let mut result = String::with_capacity(url.len() + 16);
     result.push_str(base);
-    result.push('?');
-    result.push_str(&redacted_query);
+    if let Some(q) = query {
+        result.push('?');
+        result.push_str(&redact_params(q));
+    }
     if let Some(f) = fragment {
         result.push('#');
-        result.push_str(f);
+        // Builders never emit fragments; a bare fragment is unclassifiable, so
+        // redact it fail-closed while param-style fragments get key redaction.
+        // A `?` inside the fragment also separates params for this purpose so
+        // `frag?token=...` cannot smuggle a token past key matching.
+        if f.contains('=') {
+            result.push_str(&redact_params(&f.replace('?', "&")));
+        } else if !f.is_empty() {
+            result.push_str(REDACTED);
+        }
     }
-    result
+    Cow::Owned(result)
 }
 
 #[cfg(test)]
@@ -116,7 +144,7 @@ mod tests {
         let debug_str = format!("{payload:?}");
         assert!(debug_str.contains("[REDACTED]"));
         assert!(!debug_str.contains("supersecrettoken456"));
-        assert!(debug_str.contains("https://example.com/reset?token=[REDACTED]#frag"));
+        assert!(debug_str.contains("https://example.com/reset?token=[REDACTED]#[REDACTED]"));
     }
 
     #[test]
@@ -134,10 +162,59 @@ mod tests {
             "https://example.com/auth/verify?token_type=bearer&token=[REDACTED]"
         );
         assert_eq!(
+            redact_url_token("https://example.com/auth/verify?Token=abc&auth_token=def"),
+            "https://example.com/auth/verify?Token=[REDACTED]&auth_token=[REDACTED]"
+        );
+        assert_eq!(
+            redact_url_token("https://example.com/reset?token=abc#token=xyz"),
+            "https://example.com/reset?token=[REDACTED]#token=[REDACTED]"
+        );
+        assert_eq!(
+            redact_url_token("https://example.com/reset?token=abc#frag"),
+            "https://example.com/reset?token=[REDACTED]#[REDACTED]"
+        );
+        assert_eq!(
+            redact_url_token("https://example.com/reset?token=abc#"),
+            "https://example.com/reset?token=[REDACTED]#"
+        );
+        assert_eq!(
+            redact_url_token("https://example.com/reset#token=abc"),
+            "https://example.com/reset#token=[REDACTED]"
+        );
+        assert_eq!(
+            redact_url_token("https://example.com/reset#frag"),
+            "https://example.com/reset#[REDACTED]"
+        );
+        assert_eq!(
+            redact_url_token("https://example.com/reset#"),
+            "https://example.com/reset#"
+        );
+        assert_eq!(
             redact_url_token("https://example.com/auth/verify"),
             "https://example.com/auth/verify"
         );
         assert_eq!(redact_url_token(""), "");
+        assert!(matches!(
+            redact_url_token("https://example.com/auth/verify"),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn redact_url_token_fragment_token_with_query() {
+        // Query and fragment tokens are both redacted.
+        assert_eq!(
+            redact_url_token("https://example.com/reset?next=/home&token=qsecret#token=fsecret"),
+            "https://example.com/reset?next=/home&token=[REDACTED]#token=[REDACTED]"
+        );
+        // `#` before `?`: the `?` belongs to the fragment, never the query.
+        let redacted =
+            redact_url_token("https://example.com/reset#token=fsecret?token=qsecret").to_string();
+        assert!(!redacted.contains("fsecret"));
+        assert!(!redacted.contains("qsecret"));
+        // `?`-smuggled token behind a non-param fragment prefix.
+        let redacted = redact_url_token("https://example.com/reset#frag?token=sneaky").to_string();
+        assert!(!redacted.contains("sneaky"));
     }
 
     #[test]

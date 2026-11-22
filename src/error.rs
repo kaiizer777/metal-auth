@@ -13,6 +13,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::email::hook::DynError;
 
+/// Wire-level error code returned to API clients.
+///
+/// Non-exhaustive: every phase adds codes, and a caller matching on this type must not break
+/// when one lands. Match with a wildcard.
+#[non_exhaustive]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ErrorCode {
@@ -42,6 +47,44 @@ pub enum ErrorCode {
     CsrfTokenMissing,
     CsrfTokenInvalid,
     RateLimitExceeded,
+    // Phase 6 — OAuth / Social Login
+    #[serde(rename = "OAUTH_STATE_INVALID")]
+    OAuthStateInvalid,
+    #[serde(rename = "OAUTH_CODE_INVALID")]
+    OAuthCodeInvalid,
+    #[serde(rename = "OAUTH_EMAIL_UNVERIFIED")]
+    OAuthEmailUnverified,
+    #[serde(rename = "OAUTH_PROVIDER_ERROR")]
+    OAuthProviderError,
+    #[serde(rename = "OAUTH_ACCOUNT_LINK_CONFLICT")]
+    OAuthAccountLinkConflict,
+    #[serde(rename = "OAUTH_PROVIDER_NOT_FOUND")]
+    OAuthProviderNotFound,
+    // Phase 7 — TOTP two-factor authentication
+    #[serde(rename = "TOTP_NOT_ENROLLED")]
+    TotpNotEnrolled,
+    #[serde(rename = "TOTP_ALREADY_ENABLED")]
+    TotpAlreadyEnabled,
+    #[serde(rename = "TOTP_CODE_INVALID")]
+    TotpCodeInvalid,
+    #[serde(rename = "TOTP_CODE_EXPIRED")]
+    TotpCodeExpired,
+    #[serde(rename = "TOTP_CODE_REPLAYED")]
+    TotpCodeReplayed,
+    #[serde(rename = "TOTP_BACKUP_CODE_INVALID")]
+    TotpBackupCodeInvalid,
+    /// Not an error: the login sentinel returned when a second factor is required.
+    #[serde(rename = "TWO_FACTOR_REQUIRED")]
+    TwoFactorRequired,
+    #[serde(rename = "TWO_FACTOR_TOKEN_INVALID")]
+    TwoFactorTokenInvalid,
+    #[serde(rename = "TWO_FACTOR_TOKEN_EXPIRED")]
+    TwoFactorTokenExpired,
+    /// Server-side refusal: the deployment cannot verify a second factor right now.
+    #[serde(rename = "TWO_FACTOR_UNAVAILABLE")]
+    TwoFactorUnavailable,
+    #[serde(rename = "TOTP_RATE_LIMIT_EXCEEDED")]
+    TotpRateLimitExceeded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +135,9 @@ pub enum ConfigError {
     },
 }
 
+/// Non-exhaustive: each phase adds variants, and embedders match on this type in their own
+/// error mapping. Match with a wildcard.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("configuration error")]
@@ -183,6 +229,71 @@ pub enum AppError {
 
     #[error("rate limit exceeded")]
     RateLimitExceeded,
+
+    // Phase 6 — OAuth / Social Login
+    #[error("invalid oauth state")]
+    OAuthStateInvalid,
+
+    #[error("oauth code is invalid")]
+    OAuthCodeInvalid,
+
+    #[error("oauth provider email is not verified")]
+    OAuthEmailUnverified,
+
+    #[error("oauth provider error")]
+    OAuthProviderError,
+
+    #[error("cannot link oauth identity to unverified local account")]
+    OAuthAccountLinkConflict,
+
+    #[error("oauth provider not found")]
+    OAuthProviderNotFound,
+
+    // Phase 7 — TOTP two-factor authentication
+    #[error("totp not enrolled for this user")]
+    TotpNotEnrolled,
+
+    #[error("totp already enabled for this user")]
+    TotpAlreadyEnabled,
+
+    #[error("totp code is invalid")]
+    TotpCodeInvalid,
+
+    #[error("totp code window has expired")]
+    TotpCodeExpired,
+
+    #[error("totp code has already been used")]
+    TotpCodeReplayed,
+
+    #[error("backup code is invalid")]
+    TotpBackupCodeInvalid,
+
+    /// Wire-code mapping for [`ErrorCode::TwoFactorRequired`] only — never returned from a handler.
+    ///
+    /// [`Self::status_code`] maps it to `200 OK`, and the error envelope cannot carry the
+    /// `challenge_token`. The 2FA login contract is a success body
+    /// (`{"two_factor_required": true, "challenge_token": …}`), not an `Err`.
+    #[error("two factor authentication required")]
+    TwoFactorRequired,
+
+    #[error("two factor token is invalid")]
+    TwoFactorTokenInvalid,
+
+    #[error("two factor token has expired")]
+    TwoFactorTokenExpired,
+
+    /// The deployment cannot verify this factor (no TOTP key, missing challenge storage).
+    /// A server fault, never a statement about the presented code.
+    #[error("two factor authentication is temporarily unavailable")]
+    TwoFactorUnavailable,
+
+    #[error("totp rate limit exceeded")]
+    TotpRateLimitExceeded,
+
+    /// Enrollment on an unverified email. Distinct from [`Self::EmailNotVerified`],
+    /// which stays `403` for the login contract; this one answers `400`.
+    #[error("totp enrollment requires a verified email")]
+    TotpEmailNotVerified,
 }
 
 impl AppError {
@@ -218,7 +329,33 @@ impl AppError {
             Self::CsrfTokenMissing => ErrorCode::CsrfTokenMissing,
             Self::CsrfTokenInvalid => ErrorCode::CsrfTokenInvalid,
             Self::RateLimitExceeded => ErrorCode::RateLimitExceeded,
+            // Phase 6
+            Self::OAuthStateInvalid => ErrorCode::OAuthStateInvalid,
+            Self::OAuthCodeInvalid => ErrorCode::OAuthCodeInvalid,
+            Self::OAuthEmailUnverified => ErrorCode::OAuthEmailUnverified,
+            Self::OAuthProviderError => ErrorCode::OAuthProviderError,
+            Self::OAuthAccountLinkConflict => ErrorCode::OAuthAccountLinkConflict,
+            Self::OAuthProviderNotFound => ErrorCode::OAuthProviderNotFound,
+            // Phase 7
+            Self::TotpNotEnrolled => ErrorCode::TotpNotEnrolled,
+            Self::TotpAlreadyEnabled => ErrorCode::TotpAlreadyEnabled,
+            Self::TotpCodeInvalid => ErrorCode::TotpCodeInvalid,
+            Self::TotpCodeExpired => ErrorCode::TotpCodeExpired,
+            Self::TotpCodeReplayed => ErrorCode::TotpCodeReplayed,
+            Self::TotpBackupCodeInvalid => ErrorCode::TotpBackupCodeInvalid,
+            Self::TwoFactorRequired => ErrorCode::TwoFactorRequired,
+            Self::TwoFactorTokenInvalid => ErrorCode::TwoFactorTokenInvalid,
+            Self::TwoFactorTokenExpired => ErrorCode::TwoFactorTokenExpired,
+            Self::TwoFactorUnavailable => ErrorCode::TwoFactorUnavailable,
+            Self::TotpRateLimitExceeded => ErrorCode::TotpRateLimitExceeded,
+            // Shares the login wire code, keeps its own 400 mapping.
+            Self::TotpEmailNotVerified => ErrorCode::EmailNotVerified,
         }
+    }
+
+    #[must_use]
+    pub fn code(&self) -> ErrorCode {
+        self.error_code()
     }
 
     #[must_use]
@@ -242,11 +379,26 @@ impl AppError {
             | Self::SessionExpired
             | Self::SessionInvalid => StatusCode::UNAUTHORIZED,
             // 403
-            Self::EmailNotVerified | Self::CsrfTokenMissing | Self::CsrfTokenInvalid => {
-                StatusCode::FORBIDDEN
-            }
+            Self::EmailNotVerified
+            | Self::CsrfTokenMissing
+            | Self::CsrfTokenInvalid
+            | Self::OAuthStateInvalid => StatusCode::FORBIDDEN,
+            // 404
+            Self::OAuthProviderNotFound => StatusCode::NOT_FOUND,
+            // 409
+            Self::OAuthAccountLinkConflict => StatusCode::CONFLICT,
+            // 502
+            Self::OAuthProviderError => StatusCode::BAD_GATEWAY,
             // 429
-            Self::RateLimitExceeded => StatusCode::TOO_MANY_REQUESTS,
+            Self::RateLimitExceeded | Self::TotpRateLimitExceeded => StatusCode::TOO_MANY_REQUESTS,
+            // 200 — sentinel, not a failure
+            Self::TwoFactorRequired => StatusCode::OK,
+            // 401 — challenge token
+            Self::TwoFactorTokenInvalid | Self::TwoFactorTokenExpired => StatusCode::UNAUTHORIZED,
+            // 503 — the deployment cannot verify a factor at all
+            Self::TwoFactorUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            // 409 — already enrolled
+            Self::TotpAlreadyEnabled => StatusCode::CONFLICT,
             // 400
             Self::PasswordTooShort
             | Self::PasswordTooLong
@@ -254,12 +406,20 @@ impl AppError {
             | Self::InvalidEmail
             | Self::ValidationError(_)
             | Self::InvalidToken
-            | Self::TokenExpired => StatusCode::BAD_REQUEST,
+            | Self::TokenExpired
+            | Self::OAuthCodeInvalid
+            | Self::OAuthEmailUnverified
+            | Self::TotpNotEnrolled
+            | Self::TotpCodeInvalid
+            | Self::TotpCodeExpired
+            | Self::TotpCodeReplayed
+            | Self::TotpBackupCodeInvalid
+            | Self::TotpEmailNotVerified => StatusCode::BAD_REQUEST,
         }
     }
 
     #[must_use]
-    pub fn response_message(&self) -> &'static str {
+    pub fn response_message(&self) -> &str {
         match self {
             Self::Config(_) => "Invalid configuration",
             Self::Database(_) => "Database error",
@@ -280,7 +440,13 @@ impl AppError {
             Self::PasswordTooLong => "Password exceeds the maximum length requirement",
             Self::PasswordTooCommon => "Password is too common, please choose a stronger password",
             Self::InvalidEmail => "Invalid email address",
-            Self::ValidationError(_) => "Invalid request body",
+            Self::ValidationError(msg) => {
+                if msg.is_empty() {
+                    "Invalid request body"
+                } else {
+                    msg.as_str()
+                }
+            }
             Self::InvalidToken => "Invalid or already used token",
             Self::TokenExpired => "Token has expired",
             // Phase 4
@@ -290,9 +456,38 @@ impl AppError {
             Self::CsrfTokenMissing => "CSRF token is missing",
             Self::CsrfTokenInvalid => "CSRF token is invalid",
             Self::RateLimitExceeded => "Too many requests, please try again later",
+            // Phase 6
+            Self::OAuthStateInvalid => "invalid oauth state",
+            Self::OAuthCodeInvalid => "oauth code is invalid",
+            Self::OAuthEmailUnverified => "oauth provider email is not verified",
+            Self::OAuthProviderNotFound => "oauth provider not found",
+            Self::OAuthAccountLinkConflict => {
+                "cannot link oauth identity to unverified local account"
+            }
+            Self::OAuthProviderError => "oauth provider error",
+            // Phase 7
+            Self::TotpNotEnrolled => "totp not enrolled for this user",
+            Self::TotpAlreadyEnabled => "totp already enabled for this user",
+            Self::TotpCodeInvalid => "totp code is invalid",
+            Self::TotpCodeExpired => "totp code window has expired",
+            Self::TotpCodeReplayed => "totp code has already been used",
+            Self::TotpBackupCodeInvalid => "backup code is invalid",
+            Self::TwoFactorRequired => "two factor authentication required",
+            Self::TwoFactorTokenInvalid => "two factor token is invalid",
+            Self::TwoFactorTokenExpired => "two factor token has expired",
+            Self::TwoFactorUnavailable => "two factor authentication is temporarily unavailable",
+            Self::TotpRateLimitExceeded => "totp rate limit exceeded",
+            // Same wire code and message as the login gate.
+            Self::TotpEmailNotVerified => "Email address has not been verified",
         }
     }
 
+    /// Reconstruct a typed error from a wire [`ErrorCode`] for status mapping.
+    ///
+    /// Only meaningful for stateless codes (session, CSRF, rate limit, auth);
+    /// every production caller uses those arms. The infra arms synthesize
+    /// placeholder sources that were never observed — never treat their
+    /// `source()` chains as real diagnostics.
     #[must_use]
     pub fn from_code(code: ErrorCode) -> Self {
         match code {
@@ -324,12 +519,43 @@ impl AppError {
             ErrorCode::CsrfTokenMissing => Self::CsrfTokenMissing,
             ErrorCode::CsrfTokenInvalid => Self::CsrfTokenInvalid,
             ErrorCode::RateLimitExceeded => Self::RateLimitExceeded,
+            // Phase 6
+            ErrorCode::OAuthStateInvalid => Self::OAuthStateInvalid,
+            ErrorCode::OAuthCodeInvalid => Self::OAuthCodeInvalid,
+            ErrorCode::OAuthEmailUnverified => Self::OAuthEmailUnverified,
+            ErrorCode::OAuthProviderError => Self::OAuthProviderError,
+            ErrorCode::OAuthAccountLinkConflict => Self::OAuthAccountLinkConflict,
+            ErrorCode::OAuthProviderNotFound => Self::OAuthProviderNotFound,
+            // Phase 7
+            ErrorCode::TotpNotEnrolled => Self::TotpNotEnrolled,
+            ErrorCode::TotpAlreadyEnabled => Self::TotpAlreadyEnabled,
+            ErrorCode::TotpCodeInvalid => Self::TotpCodeInvalid,
+            ErrorCode::TotpCodeExpired => Self::TotpCodeExpired,
+            ErrorCode::TotpCodeReplayed => Self::TotpCodeReplayed,
+            ErrorCode::TotpBackupCodeInvalid => Self::TotpBackupCodeInvalid,
+            // Mapping-only: no handler ever produces this, see `Self::TwoFactorRequired`.
+            ErrorCode::TwoFactorRequired => Self::TwoFactorRequired,
+            ErrorCode::TwoFactorTokenInvalid => Self::TwoFactorTokenInvalid,
+            ErrorCode::TwoFactorTokenExpired => Self::TwoFactorTokenExpired,
+            ErrorCode::TwoFactorUnavailable => Self::TwoFactorUnavailable,
+            ErrorCode::TotpRateLimitExceeded => Self::TotpRateLimitExceeded,
         }
     }
 
     #[must_use]
     pub fn internal() -> Self {
         Self::Internal
+    }
+}
+
+/// Upper bound on user-controlled characters emitted into a single log field.
+const MAX_LOG_FIELD_CHARS: usize = 256;
+
+/// Truncate user-controlled input for log fields, always at a char boundary.
+pub(crate) fn truncate_for_log(input: &str) -> &str {
+    match input.char_indices().nth(MAX_LOG_FIELD_CHARS) {
+        Some((idx, _)) => &input[..idx],
+        None => input,
     }
 }
 
@@ -356,7 +582,9 @@ impl IntoResponse for AppError {
             Self::PasswordTooLong => tracing::debug!("password too long"),
             Self::PasswordTooCommon => tracing::debug!("password too common"),
             Self::InvalidEmail => tracing::debug!("invalid email format"),
-            Self::ValidationError(msg) => tracing::debug!(msg = %msg, "validation error"),
+            Self::ValidationError(msg) => {
+                tracing::debug!(msg = %truncate_for_log(msg), "validation error")
+            }
             Self::InvalidToken => tracing::debug!("invalid or consumed token"),
             Self::TokenExpired => tracing::debug!("expired token presented"),
             // EmailAlreadyExists is internal-only — never reaches this handler in normal flow
@@ -369,6 +597,29 @@ impl IntoResponse for AppError {
                 tracing::debug!("csrf validation failure")
             }
             Self::RateLimitExceeded => tracing::warn!("rate limit exceeded"),
+            // Phase 6
+            Self::OAuthStateInvalid => tracing::warn!("oauth state validation failed"),
+            Self::OAuthCodeInvalid => tracing::warn!("oauth code invalid"),
+            Self::OAuthEmailUnverified => tracing::warn!("oauth email unverified"),
+            Self::OAuthProviderError => tracing::error!("oauth provider error"),
+            Self::OAuthAccountLinkConflict => tracing::warn!("oauth account link conflict"),
+            Self::OAuthProviderNotFound => tracing::debug!("oauth provider not found"),
+            // Phase 7
+            Self::TotpNotEnrolled => tracing::debug!("totp not enrolled"),
+            Self::TotpAlreadyEnabled => tracing::debug!("totp already enabled"),
+            Self::TotpCodeInvalid => tracing::debug!("totp code invalid"),
+            Self::TotpCodeExpired => tracing::debug!("totp code window expired"),
+            Self::TotpCodeReplayed => tracing::warn!("totp code replay rejected"),
+            Self::TotpBackupCodeInvalid => tracing::debug!("backup code invalid"),
+            Self::TwoFactorRequired => tracing::debug!("two factor authentication required"),
+            Self::TwoFactorTokenInvalid | Self::TwoFactorTokenExpired => {
+                tracing::debug!("two factor token validation failure")
+            }
+            Self::TwoFactorUnavailable => tracing::error!("two factor verification unavailable"),
+            Self::TotpRateLimitExceeded => tracing::warn!("totp rate limit exceeded"),
+            Self::TotpEmailNotVerified => {
+                tracing::debug!("totp enrollment blocked: email not verified")
+            }
         }
 
         let status = self.status_code();
@@ -429,6 +680,56 @@ mod tests {
             (ErrorCode::ValidationError, "\"VALIDATION_ERROR\""),
             (ErrorCode::InvalidToken, "\"INVALID_TOKEN\""),
             (ErrorCode::TokenExpired, "\"TOKEN_EXPIRED\""),
+            // Phase 4
+            (ErrorCode::SessionNotFound, "\"SESSION_NOT_FOUND\""),
+            (ErrorCode::SessionExpired, "\"SESSION_EXPIRED\""),
+            (ErrorCode::SessionInvalid, "\"SESSION_INVALID\""),
+            (ErrorCode::CsrfTokenMissing, "\"CSRF_TOKEN_MISSING\""),
+            (ErrorCode::CsrfTokenInvalid, "\"CSRF_TOKEN_INVALID\""),
+            (ErrorCode::RateLimitExceeded, "\"RATE_LIMIT_EXCEEDED\""),
+            // Phase 6
+            (ErrorCode::OAuthStateInvalid, "\"OAUTH_STATE_INVALID\""),
+            (ErrorCode::OAuthCodeInvalid, "\"OAUTH_CODE_INVALID\""),
+            (
+                ErrorCode::OAuthEmailUnverified,
+                "\"OAUTH_EMAIL_UNVERIFIED\"",
+            ),
+            (ErrorCode::OAuthProviderError, "\"OAUTH_PROVIDER_ERROR\""),
+            (
+                ErrorCode::OAuthAccountLinkConflict,
+                "\"OAUTH_ACCOUNT_LINK_CONFLICT\"",
+            ),
+            (
+                ErrorCode::OAuthProviderNotFound,
+                "\"OAUTH_PROVIDER_NOT_FOUND\"",
+            ),
+            // Phase 7
+            (ErrorCode::TotpNotEnrolled, "\"TOTP_NOT_ENROLLED\""),
+            (ErrorCode::TotpAlreadyEnabled, "\"TOTP_ALREADY_ENABLED\""),
+            (ErrorCode::TotpCodeInvalid, "\"TOTP_CODE_INVALID\""),
+            (ErrorCode::TotpCodeExpired, "\"TOTP_CODE_EXPIRED\""),
+            (ErrorCode::TotpCodeReplayed, "\"TOTP_CODE_REPLAYED\""),
+            (
+                ErrorCode::TotpBackupCodeInvalid,
+                "\"TOTP_BACKUP_CODE_INVALID\"",
+            ),
+            (ErrorCode::TwoFactorRequired, "\"TWO_FACTOR_REQUIRED\""),
+            (
+                ErrorCode::TwoFactorTokenInvalid,
+                "\"TWO_FACTOR_TOKEN_INVALID\"",
+            ),
+            (
+                ErrorCode::TwoFactorTokenExpired,
+                "\"TWO_FACTOR_TOKEN_EXPIRED\"",
+            ),
+            (
+                ErrorCode::TwoFactorUnavailable,
+                "\"TWO_FACTOR_UNAVAILABLE\"",
+            ),
+            (
+                ErrorCode::TotpRateLimitExceeded,
+                "\"TOTP_RATE_LIMIT_EXCEEDED\"",
+            ),
         ];
 
         for (code, expected_json) in cases {
@@ -574,6 +875,12 @@ mod tests {
                 AppError::ValidationError("field required".into()),
                 StatusCode::BAD_REQUEST,
                 ErrorCode::ValidationError,
+                "field required",
+            ),
+            (
+                AppError::ValidationError("".into()),
+                StatusCode::BAD_REQUEST,
+                ErrorCode::ValidationError,
                 "Invalid request body",
             ),
             (
@@ -636,6 +943,110 @@ mod tests {
                 StatusCode::TOO_MANY_REQUESTS,
                 ErrorCode::RateLimitExceeded,
                 "Too many requests, please try again later",
+            ),
+            // Phase 6 — OAuth
+            (
+                AppError::OAuthStateInvalid,
+                StatusCode::FORBIDDEN,
+                ErrorCode::OAuthStateInvalid,
+                "invalid oauth state",
+            ),
+            (
+                AppError::OAuthCodeInvalid,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::OAuthCodeInvalid,
+                "oauth code is invalid",
+            ),
+            (
+                AppError::OAuthEmailUnverified,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::OAuthEmailUnverified,
+                "oauth provider email is not verified",
+            ),
+            (
+                AppError::OAuthProviderNotFound,
+                StatusCode::NOT_FOUND,
+                ErrorCode::OAuthProviderNotFound,
+                "oauth provider not found",
+            ),
+            (
+                AppError::OAuthAccountLinkConflict,
+                StatusCode::CONFLICT,
+                ErrorCode::OAuthAccountLinkConflict,
+                "cannot link oauth identity to unverified local account",
+            ),
+            (
+                AppError::OAuthProviderError,
+                StatusCode::BAD_GATEWAY,
+                ErrorCode::OAuthProviderError,
+                "oauth provider error",
+            ),
+            // Phase 7 — TOTP
+            (
+                AppError::TotpNotEnrolled,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::TotpNotEnrolled,
+                "totp not enrolled for this user",
+            ),
+            (
+                AppError::TotpAlreadyEnabled,
+                StatusCode::CONFLICT,
+                ErrorCode::TotpAlreadyEnabled,
+                "totp already enabled for this user",
+            ),
+            (
+                AppError::TotpCodeInvalid,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::TotpCodeInvalid,
+                "totp code is invalid",
+            ),
+            (
+                AppError::TotpCodeExpired,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::TotpCodeExpired,
+                "totp code window has expired",
+            ),
+            (
+                AppError::TotpCodeReplayed,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::TotpCodeReplayed,
+                "totp code has already been used",
+            ),
+            (
+                AppError::TotpBackupCodeInvalid,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::TotpBackupCodeInvalid,
+                "backup code is invalid",
+            ),
+            (
+                AppError::TwoFactorTokenInvalid,
+                StatusCode::UNAUTHORIZED,
+                ErrorCode::TwoFactorTokenInvalid,
+                "two factor token is invalid",
+            ),
+            (
+                AppError::TwoFactorTokenExpired,
+                StatusCode::UNAUTHORIZED,
+                ErrorCode::TwoFactorTokenExpired,
+                "two factor token has expired",
+            ),
+            (
+                AppError::TwoFactorUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::TwoFactorUnavailable,
+                "two factor authentication is temporarily unavailable",
+            ),
+            (
+                AppError::TotpRateLimitExceeded,
+                StatusCode::TOO_MANY_REQUESTS,
+                ErrorCode::TotpRateLimitExceeded,
+                "totp rate limit exceeded",
+            ),
+            (
+                AppError::TotpEmailNotVerified,
+                StatusCode::BAD_REQUEST,
+                ErrorCode::EmailNotVerified,
+                "Email address has not been verified",
             ),
         ];
 
@@ -791,5 +1202,154 @@ mod tests {
                 .get(axum::http::header::WWW_AUTHENTICATE)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn from_code_round_trips_every_wire_code() {
+        let codes = [
+            ErrorCode::InvalidConfig,
+            ErrorCode::DatabaseError,
+            ErrorCode::DatabaseUnavailable,
+            ErrorCode::MigrationFailed,
+            ErrorCode::InternalError,
+            ErrorCode::NotFound,
+            ErrorCode::MethodNotAllowed,
+            ErrorCode::InvalidCredentials,
+            ErrorCode::Unauthenticated,
+            ErrorCode::EmailNotVerified,
+            ErrorCode::PasswordTooShort,
+            ErrorCode::PasswordTooLong,
+            ErrorCode::PasswordTooCommon,
+            ErrorCode::InvalidEmail,
+            ErrorCode::ValidationError,
+            ErrorCode::InvalidToken,
+            ErrorCode::TokenExpired,
+            ErrorCode::SessionNotFound,
+            ErrorCode::SessionExpired,
+            ErrorCode::SessionInvalid,
+            ErrorCode::CsrfTokenMissing,
+            ErrorCode::CsrfTokenInvalid,
+            ErrorCode::RateLimitExceeded,
+            // Phase 6
+            ErrorCode::OAuthStateInvalid,
+            ErrorCode::OAuthCodeInvalid,
+            ErrorCode::OAuthEmailUnverified,
+            ErrorCode::OAuthProviderError,
+            ErrorCode::OAuthAccountLinkConflict,
+            ErrorCode::OAuthProviderNotFound,
+            // Phase 7
+            ErrorCode::TotpNotEnrolled,
+            ErrorCode::TotpAlreadyEnabled,
+            ErrorCode::TotpCodeInvalid,
+            ErrorCode::TotpCodeExpired,
+            ErrorCode::TotpCodeReplayed,
+            ErrorCode::TotpBackupCodeInvalid,
+            ErrorCode::TwoFactorRequired,
+            ErrorCode::TwoFactorTokenInvalid,
+            ErrorCode::TwoFactorTokenExpired,
+            ErrorCode::TwoFactorUnavailable,
+            ErrorCode::TotpRateLimitExceeded,
+        ];
+        for code in codes {
+            assert_eq!(AppError::from_code(code).error_code(), code);
+        }
+    }
+
+    #[test]
+    fn test_oauth_error_codes_wire_serialization_and_envelope() {
+        let cases = [
+            (
+                ErrorCode::OAuthStateInvalid,
+                "OAUTH_STATE_INVALID",
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                ErrorCode::OAuthCodeInvalid,
+                "OAUTH_CODE_INVALID",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                ErrorCode::OAuthEmailUnverified,
+                "OAUTH_EMAIL_UNVERIFIED",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                ErrorCode::OAuthProviderError,
+                "OAUTH_PROVIDER_ERROR",
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                ErrorCode::OAuthAccountLinkConflict,
+                "OAUTH_ACCOUNT_LINK_CONFLICT",
+                StatusCode::CONFLICT,
+            ),
+            (
+                ErrorCode::OAuthProviderNotFound,
+                "OAUTH_PROVIDER_NOT_FOUND",
+                StatusCode::NOT_FOUND,
+            ),
+        ];
+
+        for (code, expected_wire, expected_status) in cases {
+            let json = serde_json::to_string(&code).expect("serialize error code");
+            assert_eq!(json, format!("\"{expected_wire}\""));
+
+            let app_err = AppError::from_code(code);
+            assert_eq!(app_err.code(), code);
+            assert_eq!(app_err.status_code(), expected_status);
+
+            let resp = ErrorResponse::from(&app_err);
+            let resp_json = serde_json::to_string(&resp).expect("serialize ErrorResponse");
+            assert!(resp_json.contains(&format!("\"code\":\"{expected_wire}\"")));
+            assert!(resp_json.contains("\"message\":"));
+        }
+    }
+
+    #[test]
+    fn email_already_exists_stays_anti_enumerating() {
+        let err = AppError::EmailAlreadyExists;
+        assert_eq!(err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.error_code(), ErrorCode::InternalError);
+        assert_eq!(err.response_message(), "Internal error");
+    }
+
+    #[test]
+    fn phase7_unverified_email_gate_is_400_without_moving_login_gate() {
+        assert_eq!(
+            AppError::TotpEmailNotVerified.status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            AppError::TotpEmailNotVerified.error_code(),
+            ErrorCode::EmailNotVerified
+        );
+        assert_eq!(
+            AppError::EmailNotVerified.status_code(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn two_factor_required_is_a_success_sentinel() {
+        assert_eq!(AppError::TwoFactorRequired.status_code(), StatusCode::OK);
+        assert_eq!(
+            AppError::TwoFactorRequired.error_code(),
+            ErrorCode::TwoFactorRequired
+        );
+    }
+
+    #[test]
+    fn truncate_for_log_keeps_short_input() {
+        assert_eq!(truncate_for_log("field required"), "field required");
+        assert_eq!(truncate_for_log(""), "");
+    }
+
+    #[test]
+    fn truncate_for_log_caps_at_char_boundary() {
+        let long = "é".repeat(300);
+        let truncated = truncate_for_log(&long);
+        assert_eq!(truncated.chars().count(), MAX_LOG_FIELD_CHARS);
+        let ascii = "x".repeat(1000);
+        assert_eq!(truncate_for_log(&ascii).len(), MAX_LOG_FIELD_CHARS);
     }
 }

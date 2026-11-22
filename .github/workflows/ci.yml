@@ -107,6 +107,13 @@ jobs:
       - run: cargo test --locked --test email_test -- --test-threads=1
       - run: cargo test --locked --test env_config_test -- --test-threads=1
       - run: cargo test --locked --test security_tests -- --test-threads=1
+      - run: cargo test --locked --test oauth_service_test -- --test-threads=1
+      - run: cargo test --locked --test oauth_security_test -- --test-threads=1
+      - run: cargo test --locked --test oauth_integration_test -- --test-threads=1
+      - run: cargo test --locked --test totp_handler_test -- --test-threads=1
+      - run: cargo test --locked --test totp_e2e_test -- --test-threads=1
+      - run: cargo test --locked --test totp_migration_test -- --test-threads=1
+      - run: cargo test --locked --test totp_security_test -- --test-threads=1
 
   msrv:
     name: MSRV (1.94)
@@ -147,6 +154,13 @@ jobs:
       - run: cargo test --locked --test email_test -- --test-threads=1
       - run: cargo test --locked --test env_config_test -- --test-threads=1
       - run: cargo test --locked --test security_tests -- --test-threads=1
+      - run: cargo test --locked --test oauth_service_test -- --test-threads=1
+      - run: cargo test --locked --test oauth_security_test -- --test-threads=1
+      - run: cargo test --locked --test oauth_integration_test -- --test-threads=1
+      - run: cargo test --locked --test totp_handler_test -- --test-threads=1
+      - run: cargo test --locked --test totp_e2e_test -- --test-threads=1
+      - run: cargo test --locked --test totp_migration_test -- --test-threads=1
+      - run: cargo test --locked --test totp_security_test -- --test-threads=1
 
   coverage:
     name: Coverage
@@ -179,7 +193,7 @@ jobs:
           done
           exit 1
       - run: cargo llvm-cov --locked --tests --all-features --lcov --output-path lcov.info --fail-under-lines 70 -- --test-threads 1
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: lcov-report
           path: lcov.info
@@ -188,6 +202,9 @@ jobs:
     name: Cargo Audit
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
@@ -212,7 +229,10 @@ jobs:
       pull-requests: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: never
 
   release-build:
     name: Release Build

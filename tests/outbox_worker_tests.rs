@@ -10,7 +10,10 @@ use metal_auth::db::outbox::{
     claim_pending_outbox, cleanup_sent_outbox, get_outbox_by_id, insert_outbox,
     recover_stale_processing,
 };
-use metal_auth::email::outbox::{OutboxWorkerConfig, process_outbox_batch};
+use metal_auth::email::NoopEmailSender;
+use metal_auth::email::outbox::{
+    OutboxWorkerConfig, process_outbox_batch, run_outbox_worker_until,
+};
 use metal_auth::email::test_utils::CapturingEmailSender;
 use metal_auth::{EmailDispatcher, SharedEmailSender};
 use serde_json::json;
@@ -364,6 +367,55 @@ async fn test_outbox_durability_across_process_restart() {
         .await;
 }
 
+/// Issue #50: `claim_pending_outbox` claims globally oldest-first, so rows inserted
+/// by parallel test binaries can be claimed ahead of ours and `claimed[0].id == row.id`
+/// flakes. Claim with a wide limit, match our own row by id, and restore any foreign
+/// rows we swept up to their pre-claim state so other binaries are unaffected.
+async fn claim_own_outbox_row(
+    pool: &sqlx::PgPool,
+    row_id: uuid::Uuid,
+    lease: Duration,
+) -> Option<metal_auth::EmailOutbox> {
+    let foreign: Vec<(uuid::Uuid, String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT id, status, next_retry_at FROM email_outbox \
+         WHERE id <> $1 AND ((status = 'pending' AND next_retry_at <= NOW()) \
+         OR (status = 'processing' AND next_retry_at <= NOW()))",
+    )
+    .bind(row_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let claimed = claim_pending_outbox(pool, 1000, lease)
+        .await
+        .expect("claim outbox");
+
+    let mut own = None;
+    for c in claimed {
+        if c.id == row_id {
+            own = Some(c);
+        } else if let Some(snap) = foreign.iter().find(|(id, _, _)| *id == c.id) {
+            let _ = sqlx::query(
+                "UPDATE email_outbox SET status = $1, next_retry_at = $2 WHERE id = $3",
+            )
+            .bind(&snap.1)
+            .bind(snap.2)
+            .bind(c.id)
+            .execute(pool)
+            .await;
+        } else {
+            // Raced in after our snapshot: leave it claimable again.
+            let _ = sqlx::query(
+                "UPDATE email_outbox SET status = 'pending', next_retry_at = NOW() WHERE id = $1",
+            )
+            .bind(c.id)
+            .execute(pool)
+            .await;
+        }
+    }
+    own
+}
+
 #[tokio::test]
 async fn test_outbox_stale_processing_lease_recovery() {
     let _guard = DB_LOCK.lock().await;
@@ -383,12 +435,13 @@ async fn test_outbox_stale_processing_lease_recovery() {
         .await
         .expect("insert outbox");
 
-    // 1. Claim row with a 1-second lease
-    let claimed = claim_pending_outbox(&app.pool, 1, Duration::from_secs(1))
+    // 1. Claim row with a 1-second lease (any-match on our id: foreign rows from
+    // parallel binaries may be claimed alongside ours)
+    let first = claim_own_outbox_row(&app.pool, row.id, Duration::from_secs(1))
         .await
-        .expect("claim outbox");
-    assert_eq!(claimed.len(), 1);
-    assert_eq!(claimed[0].id, row.id);
+        .expect("our outbox row must be claimed");
+    assert_eq!(first.status, "processing");
+    assert!(first.next_retry_at > chrono::Utc::now());
 
     // Verify row in DB is 'processing' with next_retry_at in the future
     let row_in_db = get_outbox_by_id(&app.pool, row.id)
@@ -399,20 +452,19 @@ async fn test_outbox_stale_processing_lease_recovery() {
     assert!(row_in_db.next_retry_at > chrono::Utc::now());
 
     // 2. Immediate claim attempt while lease is active should NOT claim the row
-    let unexpired = claim_pending_outbox(&app.pool, 1, Duration::from_secs(1))
-        .await
-        .expect("claim outbox unexpired");
-    assert_eq!(unexpired.len(), 0, "active lease must not be reclaimed");
+    // (foreign due rows may still be claimed; only ours must be absent)
+    let unexpired = claim_own_outbox_row(&app.pool, row.id, Duration::from_secs(1)).await;
+    assert!(unexpired.is_none(), "active lease must not be reclaimed");
 
     // 3. Wait for lease to expire
     tokio::time::sleep(Duration::from_millis(1100)).await;
 
     // 4. Claiming again should reclaim the stale processing record
-    let reclaimed = claim_pending_outbox(&app.pool, 1, Duration::from_secs(60))
+    let reclaimed = claim_own_outbox_row(&app.pool, row.id, Duration::from_secs(60))
         .await
-        .expect("claim outbox expired lease");
-    assert_eq!(reclaimed.len(), 1, "expired lease must be reclaimed");
-    assert_eq!(reclaimed[0].id, row.id);
+        .expect("expired lease must be reclaimed");
+    assert_eq!(reclaimed.status, "processing");
+    assert!(reclaimed.next_retry_at > chrono::Utc::now());
 
     // 5. Verify recover_stale_processing resets expired processing records to pending
     sqlx::query(
@@ -564,6 +616,139 @@ async fn test_outbox_retention_cleanup() {
     let _ = sqlx::query("DELETE FROM email_outbox WHERE id IN ($1, $2)")
         .bind(fresh_row.id)
         .bind(pending_row.id)
+        .execute(&app.pool)
+        .await;
+}
+
+// Fails only our own recipient with a token-echoing error; foreign rows swept
+// into the same batch must still deliver so parallel binaries are unaffected.
+struct SelectiveEchoSender {
+    fail_recipient: String,
+}
+
+#[async_trait::async_trait]
+impl metal_auth::EmailSender for SelectiveEchoSender {
+    async fn send_verification_email(
+        &self,
+        payload: metal_auth::VerificationEmailPayload,
+    ) -> Result<(), metal_auth::DynError> {
+        if payload.to == self.fail_recipient {
+            return Err(Box::new(std::io::Error::other(format!(
+                "smtp refused token={} for {}",
+                payload.token, payload.to
+            ))));
+        }
+        Ok(())
+    }
+
+    async fn send_password_reset_email(
+        &self,
+        _payload: metal_auth::PasswordResetEmailPayload,
+    ) -> Result<(), metal_auth::DynError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_outbox_error_log_redacts_echoed_token() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let secret = format!("zx9-outbox-secret-{}", uuid::Uuid::new_v4());
+    let recipient = format!("echo_{}@example.com", uuid::Uuid::new_v4());
+    let payload = json!({
+        "user_id": uuid::Uuid::new_v4(),
+        "to": recipient,
+        "token": secret,
+        "url": format!("https://example.com/verify?token={secret}"),
+        "expires_at": chrono::Utc::now()
+    });
+    let row = insert_outbox(&app.pool, &recipient, "verification", payload)
+        .await
+        .expect("insert outbox");
+
+    let sender = Arc::new(SelectiveEchoSender {
+        fail_recipient: recipient.clone(),
+    });
+    let dispatcher = EmailDispatcher::new(
+        Some(Arc::clone(&sender) as SharedEmailSender),
+        Duration::from_secs(5),
+    );
+    let _ = dispatcher.flush_outbox(&app.pool).await;
+
+    let stored = get_outbox_by_id(&app.pool, row.id)
+        .await
+        .expect("get outbox")
+        .expect("own row present");
+    assert_ne!(stored.status, OUTBOX_STATUS_SENT, "echo sender must fail");
+    let error_log = stored.error_log.expect("failed delivery records error_log");
+    assert!(
+        !error_log.contains(&secret),
+        "raw token leaked into error_log"
+    );
+    assert!(error_log.contains("token=[REDACTED]"));
+
+    let _ = sqlx::query("DELETE FROM email_outbox WHERE id = $1")
+        .bind(row.id)
+        .execute(&app.pool)
+        .await;
+}
+
+#[tokio::test]
+async fn test_outbox_worker_until_stops_on_shutdown() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    // Seed pending rows: fails if shutdown skips the in-flight drain.
+    let mut ids = Vec::new();
+    for i in 0..2 {
+        let recipient = format!("shutdown_drain_{i}_{}@example.com", uuid::Uuid::new_v4());
+        let payload = json!({
+            "user_id": uuid::Uuid::new_v4(),
+            "to": recipient,
+            "token": "tok",
+            "url": "https://example.com",
+            "expires_at": chrono::Utc::now()
+        });
+        let row = insert_outbox(&app.pool, &recipient, "verification", payload)
+            .await
+            .expect("insert outbox row");
+        ids.push(row.id);
+    }
+
+    let sender: Option<SharedEmailSender> = Some(Arc::new(NoopEmailSender));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let worker = tokio::spawn(run_outbox_worker_until(
+        app.pool.clone(),
+        sender,
+        Duration::from_secs(5),
+        OutboxWorkerConfig::default(),
+        Arc::new(tokio::sync::Notify::new()),
+        shutdown_rx,
+    ));
+    shutdown_tx.send(true).expect("signal shutdown");
+    tokio::time::timeout(Duration::from_secs(10), worker)
+        .await
+        .expect("worker stops after shutdown signal")
+        .expect("worker join");
+
+    for id in &ids {
+        let row = get_outbox_by_id(&app.pool, *id)
+            .await
+            .expect("fetch row")
+            .expect("seeded row present");
+        assert_eq!(
+            row.status, OUTBOX_STATUS_SENT,
+            "shutdown must not abandon the in-flight drain"
+        );
+    }
+
+    let _ = sqlx::query("DELETE FROM email_outbox WHERE id = ANY($1)")
+        .bind(&ids)
         .execute(&app.pool)
         .await;
 }

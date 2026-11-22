@@ -56,42 +56,81 @@ impl MessageResponse {
     }
 }
 
+/// Successful login body, or the intermediate half-authenticated challenge.
+///
+/// Untagged so both variants keep their flat wire shape: normal logins keep
+/// `{"user_id": ..., "token": ...}` byte-for-byte, while 2FA logins return
+/// `{"two_factor_required": true, "challenge_token": ...}` with no session data.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LoginResponse {
-    pub user_id: Uuid,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub token: Option<String>,
+#[serde(untagged)]
+pub enum LoginResponse {
+    Session {
+        user_id: Uuid,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        token: Option<String>,
+    },
+    TwoFactorRequired {
+        two_factor_required: bool,
+        challenge_token: String,
+    },
 }
 
 impl std::fmt::Debug for LoginResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LoginResponse")
-            .field("user_id", &self.user_id)
-            .field("token", &self.token.as_ref().map(|_| "[redacted]"))
-            .finish()
+        match self {
+            Self::Session { user_id, token } => f
+                .debug_struct("LoginResponse::Session")
+                .field("user_id", user_id)
+                .field("token", &token.as_ref().map(|_| "[redacted]"))
+                .finish(),
+            Self::TwoFactorRequired { .. } => f
+                .debug_struct("LoginResponse::TwoFactorRequired")
+                .field("challenge_token", &"[redacted]")
+                .finish(),
+        }
     }
 }
 
 impl LoginResponse {
+    #[must_use]
     pub fn new(user_id: Uuid) -> Self {
-        Self {
+        Self::Session {
             user_id,
             token: None,
         }
     }
 
+    #[must_use]
     pub fn with_token(user_id: Uuid, token: impl Into<String>) -> Self {
-        Self {
+        Self::Session {
             user_id,
             token: Some(token.into()),
         }
     }
+
+    #[must_use]
+    pub fn two_factor_required(challenge_token: impl Into<String>) -> Self {
+        Self::TwoFactorRequired {
+            two_factor_required: true,
+            challenge_token: challenge_token.into(),
+        }
+    }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SignupRequest {
     pub email: String,
     pub password: String,
+}
+
+// Manual `Debug`: never render the plaintext password into logs or traces.
+impl std::fmt::Debug for SignupRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignupRequest")
+            .field("email", &self.email)
+            .field("password", &"[redacted]")
+            .finish()
+    }
 }
 
 impl SignupRequest {
@@ -102,10 +141,20 @@ impl SignupRequest {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct LoginRequest {
     pub email: String,
     pub password: String,
+}
+
+// Manual `Debug`: never render the plaintext password into logs or traces.
+impl std::fmt::Debug for LoginRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginRequest")
+            .field("email", &self.email)
+            .field("password", &"[redacted]")
+            .finish()
+    }
 }
 
 impl LoginRequest {
@@ -118,9 +167,18 @@ impl LoginRequest {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct VerifyEmailRequest {
     pub token: String,
+}
+
+// Manual `Debug`: the token is a single-use secret while live.
+impl std::fmt::Debug for VerifyEmailRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifyEmailRequest")
+            .field("token", &"[redacted]")
+            .finish()
+    }
 }
 
 impl VerifyEmailRequest {
@@ -140,10 +198,20 @@ impl PasswordResetRequest {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PasswordResetConfirmRequest {
     pub token: String,
     pub new_password: String,
+}
+
+// Manual `Debug`: never render the token or the plaintext password.
+impl std::fmt::Debug for PasswordResetConfirmRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasswordResetConfirmRequest")
+            .field("token", &"[redacted]")
+            .field("new_password", &"[redacted]")
+            .finish()
+    }
 }
 
 impl PasswordResetConfirmRequest {
@@ -542,5 +610,54 @@ mod tests {
         let resp_no_token = LoginResponse::new(Uuid::nil());
         let debug_no_token = format!("{resp_no_token:?}");
         assert!(debug_no_token.contains("None"));
+    }
+
+    #[test]
+    fn login_response_keeps_flat_wire_shapes() {
+        let user_id = Uuid::nil();
+        let session = serde_json::to_value(LoginResponse::with_token(user_id, "raw-token"))
+            .expect("serialize");
+        assert_eq!(session["user_id"], user_id.to_string());
+        assert_eq!(session["token"], "raw-token");
+        assert!(session.get("two_factor_required").is_none());
+
+        let challenge = serde_json::to_value(LoginResponse::two_factor_required("challenge"))
+            .expect("serialize");
+        assert_eq!(challenge["two_factor_required"], true);
+        assert_eq!(challenge["challenge_token"], "challenge");
+        assert!(challenge.get("user_id").is_none());
+
+        let debug_challenge = format!("{:?}", LoginResponse::two_factor_required("challenge"));
+        assert!(!debug_challenge.contains("\"challenge\""));
+    }
+
+    #[test]
+    fn request_debug_redacts_secrets() {
+        let signup = SignupRequest {
+            email: "user@example.com".to_string(),
+            password: "SuperSecret123!".to_string(),
+        };
+        let rendered = format!("{signup:?}");
+        assert!(!rendered.contains("SuperSecret123!"));
+        assert!(rendered.contains("user@example.com"));
+
+        let login = LoginRequest {
+            email: "user@example.com".to_string(),
+            password: "SuperSecret123!".to_string(),
+        };
+        assert!(!format!("{login:?}").contains("SuperSecret123!"));
+
+        let confirm = PasswordResetConfirmRequest {
+            token: "a".repeat(64),
+            new_password: "SuperSecret123!".to_string(),
+        };
+        let rendered = format!("{confirm:?}");
+        assert!(!rendered.contains("SuperSecret123!"));
+        assert!(!rendered.contains(&"a".repeat(64)));
+
+        let verify = VerifyEmailRequest {
+            token: "b".repeat(64),
+        };
+        assert!(!format!("{verify:?}").contains(&"b".repeat(64)));
     }
 }

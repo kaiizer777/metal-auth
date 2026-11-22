@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use axum::{
     body::Body,
@@ -38,6 +39,8 @@ fn create_test_router() -> axum::Router {
         outbox_sent_retention: std::time::Duration::from_secs(7 * 24 * 3600),
         session: metal_auth::SessionConfig::default(),
         rate_limit: metal_auth::RateLimitConfig::default(),
+        oauth: metal_auth::OAuthConfig::default(),
+        totp: metal_auth::TotpConfig::default(),
     };
     let pool = sqlx::postgres::PgPoolOptions::new()
         .acquire_timeout(std::time::Duration::from_millis(500))
@@ -70,6 +73,8 @@ fn create_failing_db_router() -> axum::Router {
         outbox_sent_retention: std::time::Duration::from_secs(7 * 24 * 3600),
         session: metal_auth::SessionConfig::default(),
         rate_limit: metal_auth::RateLimitConfig::default(),
+        oauth: metal_auth::OAuthConfig::default(),
+        totp: metal_auth::TotpConfig::default(),
     };
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
@@ -131,6 +136,8 @@ async fn setup_live_db() -> Option<LiveDbTestContext> {
         outbox_sent_retention: std::time::Duration::from_secs(7 * 24 * 3600),
         session: metal_auth::SessionConfig::default(),
         rate_limit: metal_auth::RateLimitConfig::default(),
+        oauth: metal_auth::OAuthConfig::default(),
+        totp: metal_auth::TotpConfig::default(),
     };
     let state = AppState::new(pool.clone(), cfg).expect("failed to create app state with live DB");
     let router = create_router(state.clone()).expect("failed to create router for live DB test");
@@ -146,6 +153,21 @@ fn json_request(method: Method, uri: &str, body: serde_json::Value) -> Request<B
         .method(method)
         .uri(uri)
         .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
+fn json_request_with_ip(
+    method: Method,
+    uri: &str,
+    ip: &str,
+    body: serde_json::Value,
+) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-forwarded-for", ip)
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap()
 }
@@ -1614,13 +1636,46 @@ async fn test_no_secrets_in_tracing_logs() {
         "/auth/verify",
         json!({"token": raw_verify_token}),
     );
-    let resp5 = ctx.router.oneshot(req5).await.unwrap();
+    let resp5 = ctx.router.clone().oneshot(req5).await.unwrap();
     assert_eq!(resp5.status(), StatusCode::OK);
+
+    // 6. Logout request with canary token to verify structured audit telemetry
+    let canary_bearer_token = format!("canary_bearer_{}", Uuid::new_v4());
+    let req6 = Request::builder()
+        .method(Method::POST)
+        .uri("/auth/logout")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {canary_bearer_token}"),
+        )
+        .header("x-forwarded-for", "198.51.100.42")
+        .body(Body::empty())
+        .unwrap();
+    let resp6 = ctx.router.oneshot(req6).await.unwrap();
+    assert_eq!(resp6.status(), StatusCode::NO_CONTENT);
 
     let logs = log_scope.text();
     assert!(
         !logs.is_empty(),
         "Log buffer should have captured tracing events from requests"
+    );
+    assert!(
+        logs.lines()
+            .any(|l| l.contains("security_event") && l.contains("logout")),
+        "Tracing logs must record structured logout event with target security_event: {logs}"
+    );
+    assert!(
+        logs.lines().any(|l| l.contains("security_event")
+            && (l.contains("password_reset_requested") || l.contains("password_reset_request"))),
+        "Tracing logs must record structured password_reset_request event with target security_event: {logs}"
+    );
+    assert!(
+        logs.contains("signup"),
+        "Tracing logs must record structured signup event: {logs}"
+    );
+    assert!(
+        !logs.contains(&canary_bearer_token),
+        "Canary raw bearer session token leaked in tracing logs: {logs}"
     );
     assert!(
         !logs.contains(&secret_pw),
@@ -2366,12 +2421,11 @@ async fn setup_rate_limit_router() -> axum::Router {
 ///
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
-#[ignore = "Phase 4: Rate limiting middleware not yet implemented"]
 async fn test_rate_limit_login() {
     let router = setup_rate_limit_router().await;
 
     let mut rate_limited = false;
-    for _ in 0..10 {
+    for _ in 0..15 {
         let req = json_request(
             Method::POST,
             "/auth/login",
@@ -2396,12 +2450,11 @@ async fn test_rate_limit_login() {
 ///
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
-#[ignore = "Phase 4: Rate limiting middleware not yet implemented"]
 async fn test_rate_limit_signup() {
     let router = setup_rate_limit_router().await;
 
     let mut rate_limited = false;
-    for i in 0..10 {
+    for i in 0..15 {
         let req = json_request(
             Method::POST,
             "/auth/signup",
@@ -2426,12 +2479,11 @@ async fn test_rate_limit_signup() {
 ///
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
-#[ignore = "Phase 4: Rate limiting middleware not yet implemented"]
 async fn test_rate_limit_password_reset_request() {
     let router = setup_rate_limit_router().await;
 
     let mut rate_limited = false;
-    for _ in 0..10 {
+    for _ in 0..15 {
         let req = json_request(
             Method::POST,
             "/auth/password/reset-request",
@@ -2453,12 +2505,11 @@ async fn test_rate_limit_password_reset_request() {
 ///
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
-#[ignore = "Phase 4: Rate limiting middleware not yet implemented"]
 async fn test_rate_limit_verify_token() {
     let router = setup_rate_limit_router().await;
 
     let mut rate_limited = false;
-    for _ in 0..10 {
+    for _ in 0..15 {
         let req = json_request(Method::POST, "/auth/verify", json!({"token": "12345"}));
         let resp = router.clone().oneshot(req).await.unwrap();
         if resp.status() == StatusCode::TOO_MANY_REQUESTS {
@@ -2476,12 +2527,11 @@ async fn test_rate_limit_verify_token() {
 ///
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
-#[ignore = "Phase 4: Rate limiting middleware not yet implemented"]
 async fn test_rate_limit_reset_confirm() {
     let router = setup_rate_limit_router().await;
 
     let mut rate_limited = false;
-    for _ in 0..10 {
+    for _ in 0..15 {
         let req = json_request(
             Method::POST,
             "/auth/password/reset",
@@ -2531,23 +2581,25 @@ async fn test_login_timing_parity_unknown_vs_wrong() {
     const MEASURED: usize = 10;
 
     // Warmup both paths to stabilise Argon2 state and OS scheduler.
-    for _ in 0..WARMUP {
-        ctx.state
-            .rate_limiter
-            .reset(&metal_auth::rate_limit_key("127.0.0.1", &email));
-        let req = json_request(
+    for i in 0..WARMUP {
+        let ip_wrong = format!("198.51.100.{}", i * 2 + 1);
+        ctx.state.rate_limiter.reset_account(&email);
+        ctx.state.rate_limiter.reset(&format!("ip:{ip_wrong}"));
+        let req = json_request_with_ip(
             Method::POST,
             "/auth/login",
+            &ip_wrong,
             json!({"email": email, "password": wrong_password.clone()}),
         );
         let _ = ctx.router.clone().oneshot(req).await.unwrap();
 
-        ctx.state
-            .rate_limiter
-            .reset(&metal_auth::rate_limit_key("127.0.0.1", &unknown_email));
-        let req = json_request(
+        let ip_unknown = format!("198.51.100.{}", i * 2 + 2);
+        ctx.state.rate_limiter.reset_account(&unknown_email);
+        ctx.state.rate_limiter.reset(&format!("ip:{ip_unknown}"));
+        let req = json_request_with_ip(
             Method::POST,
             "/auth/login",
+            &ip_unknown,
             json!({"email": unknown_email.clone(), "password": wrong_password.clone()}),
         );
         let _ = ctx.router.clone().oneshot(req).await.unwrap();
@@ -2557,27 +2609,29 @@ async fn test_login_timing_parity_unknown_vs_wrong() {
     let mut durations_wrong: Vec<std::time::Duration> = Vec::with_capacity(MEASURED);
     let mut durations_unknown: Vec<std::time::Duration> = Vec::with_capacity(MEASURED);
 
-    for _ in 0..MEASURED {
-        ctx.state
-            .rate_limiter
-            .reset(&metal_auth::rate_limit_key("127.0.0.1", &email));
+    for i in 0..MEASURED {
+        let ip_wrong = format!("198.51.100.{}", (WARMUP + i) * 2 + 1);
+        ctx.state.rate_limiter.reset_account(&email);
+        ctx.state.rate_limiter.reset(&format!("ip:{ip_wrong}"));
         let t = std::time::Instant::now();
-        let req = json_request(
+        let req = json_request_with_ip(
             Method::POST,
             "/auth/login",
+            &ip_wrong,
             json!({"email": email, "password": wrong_password.clone()}),
         );
         let resp = ctx.router.clone().oneshot(req).await.unwrap();
         durations_wrong.push(t.elapsed());
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        ctx.state
-            .rate_limiter
-            .reset(&metal_auth::rate_limit_key("127.0.0.1", &unknown_email));
+        let ip_unknown = format!("198.51.100.{}", (WARMUP + i) * 2 + 2);
+        ctx.state.rate_limiter.reset_account(&unknown_email);
+        ctx.state.rate_limiter.reset(&format!("ip:{ip_unknown}"));
         let t = std::time::Instant::now();
-        let req = json_request(
+        let req = json_request_with_ip(
             Method::POST,
             "/auth/login",
+            &ip_unknown,
             json!({"email": unknown_email.clone(), "password": wrong_password.clone()}),
         );
         let resp = ctx.router.clone().oneshot(req).await.unwrap();
@@ -2914,4 +2968,86 @@ async fn test_invalidate_all_user_sessions_spec_contract() {
 
     assert!(session_service.get_session(&raw1).await.is_err());
     assert!(session_service.get_session(&raw2).await.is_err());
+}
+
+/// Issue #48: revoke-all must serialize with a concurrent rotate via the
+/// users-row lock. The guard tx stands in for an in-flight rotate holding
+/// that lock across its tx (#47); revoke-all must wait on the row BEFORE
+/// deleting, or a rotate can mint a session the DELETE never sees.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_invalidate_all_user_sessions_waits_on_user_row() {
+    let Some(ctx) = setup_live_db().await else {
+        return;
+    };
+    let session_service =
+        metal_auth::SessionService::new(ctx.pool.clone(), Arc::new(ctx.state.config.clone()));
+
+    let user_id = Uuid::new_v4();
+    let email = format!("revoke48_{}@example.com", user_id);
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, email_verified) VALUES ($1, $2, $3, true)",
+    )
+    .bind(user_id)
+    .bind(&email)
+    .bind("hash_placeholder")
+    .execute(&ctx.pool)
+    .await
+    .expect("insert test user");
+    session_service
+        .create_session(user_id, "cookie", None, None)
+        .await
+        .expect("seed session mints");
+
+    let mut guard_tx = ctx.pool.begin().await.expect("guard tx begins");
+    sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        .bind(user_id)
+        .execute(&mut *guard_tx)
+        .await
+        .expect("guard lock acquired");
+
+    // Gate on the guard backend: the worker runs revoke-all on a pooled
+    // connection whose pid the test cannot observe, but the guard tx
+    // connection is held by this test, so its pid is a stable blocker id.
+    let guard_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *guard_tx)
+        .await
+        .expect("guard backend pid readable");
+    let revoke_handle =
+        tokio::spawn(async move { session_service.invalidate_all_user_sessions(user_id).await });
+
+    // Pre-fix revoke-all never issues SELECT ... FOR UPDATE, so no backend
+    // ever blocks and the deadline expires instead of passing by accident.
+    let deadline = Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity WHERE query LIKE 'SELECT id FROM users%FOR UPDATE' AND datname = current_database() AND wait_event_type = 'Lock' AND $1 = ANY (pg_blocking_pids(pid))",
+        )
+        .bind(guard_pid)
+        .fetch_one(&ctx.pool)
+        .await
+        .expect("pg_stat_activity must be readable");
+        if waiting > 0 {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("ISSUE48: revoke-all never waited on the user-row lock before deleting");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    guard_tx.commit().await.expect("guard tx commits");
+    revoke_handle
+        .await
+        .expect("revoke task joins")
+        .expect("revoke commits");
+
+    let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_one(&ctx.pool)
+        .await
+        .expect("session count readable");
+    assert_eq!(
+        live, 0,
+        "ISSUE48: live session survived committed revoke-all"
+    );
 }

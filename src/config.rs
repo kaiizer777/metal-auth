@@ -1,7 +1,7 @@
 use std::str::FromStr;
 use std::time::Duration;
 
-use crate::error::ConfigError;
+use crate::{error::ConfigError, totp::crypto::MIN_USED_CODE_PRUNE_AGE_SECS};
 
 pub const DEFAULT_PORT: u16 = 3000;
 pub const DEFAULT_MAX_CONNECTIONS: u32 = 25;
@@ -51,6 +51,12 @@ pub struct Config {
     // Phase 4: Session & Rate Limit
     pub session: SessionConfig,
     pub rate_limit: RateLimitConfig,
+
+    // Phase 6: OAuth
+    pub oauth: OAuthConfig,
+
+    // Phase 7: TOTP two-factor authentication
+    pub totp: TotpConfig,
 }
 
 impl std::fmt::Debug for Config {
@@ -74,6 +80,8 @@ impl std::fmt::Debug for Config {
             .field("outbox_sent_retention", &self.outbox_sent_retention)
             .field("session", &self.session)
             .field("rate_limit", &self.rate_limit)
+            .field("oauth", &self.oauth)
+            .field("totp", &self.totp)
             .finish()
     }
 }
@@ -105,9 +113,12 @@ impl Config {
             .base_url
             .parse::<axum::http::Uri>()
             .map_err(|_| ConfigError::InvalidEnvVar("BASE_URL"))?;
+        // Fragments would survive into email-link construction; `#` can only
+        // start a fragment here since it must be percent-encoded elsewhere.
         if !matches!(uri.scheme_str(), Some("http" | "https"))
             || uri.authority().is_none()
             || uri.query().is_some()
+            || self.base_url.contains('#')
             || uri.authority().is_some_and(|a| a.as_str().contains('@'))
         {
             return Err(ConfigError::InvalidEnvVar("BASE_URL"));
@@ -192,6 +203,16 @@ impl Config {
         }
         self.session.validate()?;
         self.rate_limit.validate()?;
+        self.oauth.validate()?;
+        self.totp.validate()?;
+        // The callback clears the state cookie after setting the session cookie;
+        // a shared name deletes the fresh session.
+        if self.oauth.state_cookie_name == self.session.cookie_name {
+            return Err(ConfigError::InvalidValue {
+                field: "oauth.state_cookie_name",
+                reason: "must not match the session cookie name",
+            });
+        }
         Ok(())
     }
 
@@ -226,6 +247,14 @@ impl Config {
             Err(std::env::VarError::NotPresent) => Vec::new(),
             Err(std::env::VarError::NotUnicode(_)) => {
                 return Err(ConfigError::NonUnicodeEnvVar("ALLOWED_ORIGINS"));
+            }
+        };
+
+        let allowed_headers = match lookup("ALLOWED_HEADERS") {
+            Ok(val) => parse_allowed_headers_str(&val),
+            Err(std::env::VarError::NotPresent) => default_allowed_headers(),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar("ALLOWED_HEADERS"));
             }
         };
 
@@ -415,11 +444,14 @@ impl Config {
         };
         let cookie_secure =
             parse_env_bool(&lookup, "SESSION_COOKIE_SECURE", default_cookie_secure())?;
-        let idle_timeout_secs = parse_env_u64(
+        let idle_timeout_secs = parse_env_from_str(
             &lookup,
             "SESSION_IDLE_TIMEOUT_SECS",
             default_idle_timeout_secs(),
         )?;
+        // Legacy alias: SESSION_ABSOLUTE_LIFETIME_SECS wins when both are set;
+        // SESSION_ABSOLUTE_TIMEOUT_SECS is only read as a fallback and an
+        // invalid fallback value is rejected rather than ignored.
         let absolute_lifetime_secs = match lookup("SESSION_ABSOLUTE_LIFETIME_SECS") {
             Ok(val) => val.parse::<u64>().map_err(|_| ConfigError::InvalidValue {
                 field: "absolute_lifetime_secs",
@@ -478,8 +510,9 @@ impl Config {
                 return Err(ConfigError::NonUnicodeEnvVar("RATE_LIMIT_MAX_ATTEMPTS"));
             }
         };
-        let window_secs = parse_env_u64(&lookup, "RATE_LIMIT_WINDOW_SECS", default_window_secs())?;
-        let login_cooldown_secs = parse_env_u64(
+        let window_secs =
+            parse_env_from_str(&lookup, "RATE_LIMIT_WINDOW_SECS", default_window_secs())?;
+        let login_cooldown_secs = parse_env_from_str(
             &lookup,
             "RATE_LIMIT_LOGIN_COOLDOWN_SECS",
             default_login_cooldown_secs(),
@@ -492,6 +525,136 @@ impl Config {
             login_cooldown_secs,
         };
 
+        let oauth_state_secret = lookup_env_or_default(&lookup, "OAUTH_STATE_SECRET", "")?;
+        let oauth_state_cookie_name = lookup_env_or_default(
+            &lookup,
+            "OAUTH_STATE_COOKIE_NAME",
+            DEFAULT_OAUTH_STATE_COOKIE_NAME,
+        )?;
+        let oauth_state_cookie_path = lookup_env_or_default(
+            &lookup,
+            "OAUTH_STATE_COOKIE_PATH",
+            DEFAULT_OAUTH_STATE_COOKIE_PATH,
+        )?;
+        let oauth_state_ttl_default = DEFAULT_OAUTH_STATE_TTL_SECS.to_string();
+        let oauth_state_ttl_secs =
+            lookup_env_or_default(&lookup, "OAUTH_STATE_TTL_SECS", &oauth_state_ttl_default)?
+                .parse::<u64>()
+                .map_err(|_| ConfigError::InvalidEnvVar("OAUTH_STATE_TTL_SECS"))?;
+        let oauth_callback_base_url =
+            lookup_env_or_default(&lookup, "OAUTH_CALLBACK_BASE_URL", "")?;
+
+        let mut providers: std::collections::HashMap<String, ProviderConfig> =
+            std::collections::HashMap::new();
+        for name in SUPPORTED_PROVIDERS {
+            let (enabled_key, client_id_key, client_secret_key, redirect_uri_key): (
+                &'static str,
+                &'static str,
+                &'static str,
+                &'static str,
+            ) = match *name {
+                "google" => (
+                    "OAUTH_GOOGLE_ENABLED",
+                    "OAUTH_GOOGLE_CLIENT_ID",
+                    "OAUTH_GOOGLE_CLIENT_SECRET",
+                    "OAUTH_GOOGLE_REDIRECT_URI",
+                ),
+                "github" => (
+                    "OAUTH_GITHUB_ENABLED",
+                    "OAUTH_GITHUB_CLIENT_ID",
+                    "OAUTH_GITHUB_CLIENT_SECRET",
+                    "OAUTH_GITHUB_REDIRECT_URI",
+                ),
+                "apple" => (
+                    "OAUTH_APPLE_ENABLED",
+                    "OAUTH_APPLE_CLIENT_ID",
+                    "OAUTH_APPLE_CLIENT_SECRET",
+                    "OAUTH_APPLE_REDIRECT_URI",
+                ),
+                _ => continue,
+            };
+            let enabled = lookup_env_or_default(&lookup, enabled_key, "false")?
+                .parse::<bool>()
+                .map_err(|_| ConfigError::InvalidEnvVar(enabled_key))?;
+            let client_id = lookup_env_or_default(&lookup, client_id_key, "")?;
+            let client_secret = lookup_env_or_default(&lookup, client_secret_key, "")?;
+            let redirect_uri = lookup_env_or_default(&lookup, redirect_uri_key, "")?;
+            let (team_id, key_id, private_key) = if *name == "apple" {
+                let team_id = lookup_env_or_default(&lookup, "OAUTH_APPLE_TEAM_ID", "")?;
+                let key_id = lookup_env_or_default(&lookup, "OAUTH_APPLE_KEY_ID", "")?;
+                let private_key = lookup_env_or_default(&lookup, "OAUTH_APPLE_PRIVATE_KEY", "")?;
+                (
+                    (!team_id.is_empty()).then_some(team_id),
+                    (!key_id.is_empty()).then_some(key_id),
+                    (!private_key.is_empty()).then_some(private_key),
+                )
+            } else {
+                (None, None, None)
+            };
+            providers.insert(
+                (*name).to_string(),
+                ProviderConfig {
+                    redirect_uri,
+                    client_id,
+                    client_secret,
+                    scopes: Vec::new(),
+                    enabled,
+                    team_id,
+                    key_id,
+                    private_key,
+                },
+            );
+        }
+
+        let oauth = OAuthConfig {
+            providers,
+            state_cookie_name: oauth_state_cookie_name,
+            state_cookie_path: oauth_state_cookie_path,
+            state_ttl: Duration::from_secs(oauth_state_ttl_secs),
+            state_secret: oauth_state_secret,
+            callback_base_url: oauth_callback_base_url,
+        };
+
+        let totp_encryption_key = match lookup("TOTP_ENCRYPTION_KEY") {
+            Ok(val) => {
+                let trimmed = val.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            }
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar("TOTP_ENCRYPTION_KEY"));
+            }
+        };
+        let totp = TotpConfig {
+            encryption_key: totp_encryption_key,
+            issuer: lookup_env_or_default(&lookup, "TOTP_ISSUER", DEFAULT_TOTP_ISSUER)?,
+            rate_limit_ip_max_attempts: parse_env_from_str(
+                &lookup,
+                "TOTP_RATE_LIMIT_IP_MAX_ATTEMPTS",
+                DEFAULT_TOTP_RATE_LIMIT_IP_MAX_ATTEMPTS,
+            )?,
+            rate_limit_user_max_attempts: parse_env_from_str(
+                &lookup,
+                "TOTP_RATE_LIMIT_USER_MAX_ATTEMPTS",
+                DEFAULT_TOTP_RATE_LIMIT_USER_MAX_ATTEMPTS,
+            )?,
+            rate_limit_window_secs: parse_env_from_str(
+                &lookup,
+                "TOTP_RATE_LIMIT_WINDOW_SECS",
+                DEFAULT_TOTP_RATE_LIMIT_WINDOW_SECS,
+            )?,
+            challenge_token_ttl_secs: parse_env_from_str(
+                &lookup,
+                "TOTP_CHALLENGE_TOKEN_TTL_SECS",
+                DEFAULT_TOTP_CHALLENGE_TOKEN_TTL_SECS,
+            )?,
+            used_code_prune_age_secs: parse_env_from_str(
+                &lookup,
+                "TOTP_USED_CODE_PRUNE_AGE_SECS",
+                DEFAULT_TOTP_USED_CODE_PRUNE_AGE_SECS,
+            )?,
+        };
+
         let cfg = Self {
             database_url,
             port,
@@ -500,10 +663,7 @@ impl Config {
                 .into_iter()
                 .map(String::from)
                 .collect(),
-            allowed_headers: vec!["Authorization", "Content-Type"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            allowed_headers,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             min_connections: DEFAULT_MIN_CONNECTIONS,
             base_url,
@@ -517,6 +677,8 @@ impl Config {
             outbox_sent_retention,
             session,
             rate_limit,
+            oauth,
+            totp,
         };
 
         cfg.validate()?;
@@ -524,12 +686,64 @@ impl Config {
     }
 }
 
+/// Canonical origin rule: origins are stored normalized (trimmed, no trailing
+/// `/`). The env loader normalizes via this helper; [`Config::validate`]
+/// rejects unnormalized programmatic values instead of silently fixing them.
 fn parse_allowed_origins_str(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(|s| s.trim().trim_end_matches('/'))
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect()
+}
+
+pub(crate) fn default_allowed_headers() -> Vec<String> {
+    vec![
+        "Authorization".to_string(),
+        "Content-Type".to_string(),
+        "X-CSRF-Token".to_string(),
+    ]
+}
+
+fn lookup_env_or_default<F>(
+    lookup: &F,
+    key: &'static str,
+    default: &str,
+) -> Result<String, ConfigError>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    match lookup(key) {
+        Ok(val) => Ok(val),
+        Err(std::env::VarError::NotPresent) => Ok(default.to_string()),
+        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::NonUnicodeEnvVar(key)),
+    }
+}
+
+pub(crate) fn parse_allowed_headers_str(raw: &str) -> Vec<String> {
+    if raw.trim().is_empty() {
+        return default_allowed_headers();
+    }
+
+    let mut headers: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+
+    if headers.is_empty() {
+        return default_allowed_headers();
+    }
+
+    if !headers
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case("x-csrf-token"))
+    {
+        headers.push("X-CSRF-Token".to_string());
+    }
+
+    headers
 }
 
 // ─── Phase 3 — Auth-specific configuration ───────────────────────────────────
@@ -652,19 +866,19 @@ impl AppConfig {
     {
         let defaults = Self::default();
 
-        let argon2_m_cost = parse_env_u32(&lookup, "ARGON2_M_COST", defaults.argon2_m_cost)?;
-        let argon2_t_cost = parse_env_u32(&lookup, "ARGON2_T_COST", defaults.argon2_t_cost)?;
-        let argon2_p_cost = parse_env_u32(&lookup, "ARGON2_P_COST", defaults.argon2_p_cost)?;
+        let argon2_m_cost = parse_env_from_str(&lookup, "ARGON2_M_COST", defaults.argon2_m_cost)?;
+        let argon2_t_cost = parse_env_from_str(&lookup, "ARGON2_T_COST", defaults.argon2_t_cost)?;
+        let argon2_p_cost = parse_env_from_str(&lookup, "ARGON2_P_COST", defaults.argon2_p_cost)?;
         let password_min_len =
-            parse_env_usize(&lookup, "PASSWORD_MIN_LEN", defaults.password_min_len)?;
+            parse_env_from_str(&lookup, "PASSWORD_MIN_LEN", defaults.password_min_len)?;
         let password_max_len =
-            parse_env_usize(&lookup, "PASSWORD_MAX_LEN", defaults.password_max_len)?;
-        let verification_token_ttl_secs = parse_env_u64(
+            parse_env_from_str(&lookup, "PASSWORD_MAX_LEN", defaults.password_max_len)?;
+        let verification_token_ttl_secs = parse_env_from_str(
             &lookup,
             "VERIFICATION_TOKEN_TTL_SECS",
             defaults.verification_token_ttl_secs,
         )?;
-        let reset_token_ttl_secs = parse_env_u64(
+        let reset_token_ttl_secs = parse_env_from_str(
             &lookup,
             "RESET_TOKEN_TTL_SECS",
             defaults.reset_token_ttl_secs,
@@ -694,43 +908,16 @@ impl AppConfig {
     }
 }
 
-fn parse_env_u32(
+fn parse_env_from_str<T>(
     lookup: &impl Fn(&str) -> Result<String, std::env::VarError>,
     key: &'static str,
-    default: u32,
-) -> Result<u32, ConfigError> {
+    default: T,
+) -> Result<T, ConfigError>
+where
+    T: FromStr,
+{
     match lookup(key) {
-        Ok(val) => val.parse::<u32>().map_err(|_| ConfigError::InvalidValue {
-            field: key,
-            reason: "must be a valid integer",
-        }),
-        Err(std::env::VarError::NotPresent) => Ok(default),
-        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::NonUnicodeEnvVar(key)),
-    }
-}
-
-fn parse_env_usize(
-    lookup: &impl Fn(&str) -> Result<String, std::env::VarError>,
-    key: &'static str,
-    default: usize,
-) -> Result<usize, ConfigError> {
-    match lookup(key) {
-        Ok(val) => val.parse::<usize>().map_err(|_| ConfigError::InvalidValue {
-            field: key,
-            reason: "must be a valid integer",
-        }),
-        Err(std::env::VarError::NotPresent) => Ok(default),
-        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::NonUnicodeEnvVar(key)),
-    }
-}
-
-fn parse_env_u64(
-    lookup: &impl Fn(&str) -> Result<String, std::env::VarError>,
-    key: &'static str,
-    default: u64,
-) -> Result<u64, ConfigError> {
-    match lookup(key) {
-        Ok(val) => val.parse::<u64>().map_err(|_| ConfigError::InvalidValue {
+        Ok(val) => val.parse::<T>().map_err(|_| ConfigError::InvalidValue {
             field: key,
             reason: "must be a valid integer",
         }),
@@ -764,8 +951,19 @@ fn parse_env_bool(
 pub struct SessionConfig {
     #[serde(default = "default_cookie_name")]
     pub cookie_name: String,
+    /// Cookie domain for session and CSRF cookies.
+    ///
+    /// In split-host or cross-subdomain architectures (e.g. frontend on `app.example.com` calling
+    /// an API on `api.example.com`), configure `SESSION_COOKIE_DOMAIN` (e.g. `.example.com`) so that
+    /// client-side JavaScript can read the `csrf_token` cookie for Double Submit Cookie verification.
+    ///
+    /// The `csrf_token` cookie uses `SESSION_COOKIE_PATH`. Browsers expose it to frontend JavaScript
+    /// only when the frontend document path matches that cookie path. Keep `SESSION_COOKIE_PATH` at
+    /// `/` (the default) for this setup.
     #[serde(default)]
     pub cookie_domain: Option<String>,
+    /// Cookie path for session and CSRF cookies. Must match the frontend document root (typically `/`)
+    /// so CSRF double-submit cookies are accessible to the browser client.
     #[serde(default = "default_cookie_path")]
     pub cookie_path: String,
     #[serde(default = "default_cookie_same_site")]
@@ -1001,6 +1199,8 @@ impl RateLimitConfig {
         default_rate_limit_enabled()
     }
 
+    /// Bounds are enforced only while enabled. A disabled config may hold
+    /// degenerate zeros; re-validate after flipping `enabled` back on.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.enabled {
             if self.max_attempts == 0 {
@@ -1036,9 +1236,404 @@ impl RateLimitConfig {
     }
 }
 
-impl Default for Config {
+// ─── Phase 6 — OAuth Config ──────────────────────────────────────────────────
+
+pub const SUPPORTED_PROVIDERS: &[&str] = &["google", "github", "apple"];
+pub const DEFAULT_OAUTH_STATE_COOKIE_NAME: &str = "oauth_state";
+pub const DEFAULT_OAUTH_STATE_COOKIE_PATH: &str = "/";
+pub const DEFAULT_OAUTH_STATE_TTL_SECS: u64 = 600; // 10 minutes
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderConfig {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub scopes: Vec<String>,
+    pub enabled: bool,
+
+    // Apple-specific credentials for dynamic ES256 client_secret JWT signing
+    pub team_id: Option<String>,
+    pub key_id: Option<String>,
+    pub private_key: Option<String>,
+}
+
+impl ProviderConfig {
+    pub fn new(
+        client_id: impl Into<String>,
+        client_secret: impl Into<String>,
+        redirect_uri: impl Into<String>,
+        scopes: Vec<String>,
+        enabled: bool,
+    ) -> Self {
+        Self {
+            client_id: client_id.into(),
+            client_secret: client_secret.into(),
+            redirect_uri: redirect_uri.into(),
+            scopes,
+            enabled,
+            team_id: None,
+            key_id: None,
+            private_key: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[REDACTED]")
+            .field("redirect_uri", &self.redirect_uri)
+            .field("scopes", &self.scopes)
+            .field("enabled", &self.enabled)
+            .field("team_id", &self.team_id)
+            .field("key_id", &self.key_id)
+            .field(
+                "private_key",
+                &self.private_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct OAuthConfig {
+    pub providers: std::collections::HashMap<String, ProviderConfig>,
+    pub state_cookie_name: String,
+    pub state_cookie_path: String,
+    pub state_ttl: Duration,
+    pub state_secret: String,
+    pub callback_base_url: String,
+}
+
+impl std::fmt::Debug for OAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthConfig")
+            .field("providers", &self.providers)
+            .field("state_cookie_name", &self.state_cookie_name)
+            .field("state_cookie_path", &self.state_cookie_path)
+            .field("state_ttl", &self.state_ttl)
+            .field("state_secret", &"[REDACTED]")
+            .field("callback_base_url", &self.callback_base_url)
+            .finish()
+    }
+}
+
+impl Default for OAuthConfig {
     fn default() -> Self {
         Self {
+            providers: std::collections::HashMap::new(),
+            state_cookie_name: DEFAULT_OAUTH_STATE_COOKIE_NAME.to_string(),
+            state_cookie_path: DEFAULT_OAUTH_STATE_COOKIE_PATH.to_string(),
+            state_ttl: Duration::from_secs(DEFAULT_OAUTH_STATE_TTL_SECS),
+            state_secret: String::new(),
+            callback_base_url: String::new(),
+        }
+    }
+}
+
+// RFC 6265 cookie-name token characters; spaces/separators break Set-Cookie.
+fn is_valid_cookie_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            matches!(
+                b,
+                b'0'..=b'9'
+                    | b'A'..=b'Z'
+                    | b'a'..=b'z'
+                    | b'!'
+                    | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
+        })
+}
+
+// RFC 6265 path-value minus whitespace: browsers trim it, breaking lookup.
+fn is_valid_cookie_path(path: &str) -> bool {
+    !path.is_empty() && path.bytes().all(|b| b >= 0x21 && b != 0x7f && b != b';')
+}
+
+impl OAuthConfig {
+    #[must_use]
+    pub fn state_ttl_secs(&self) -> u64 {
+        self.ttl().as_secs()
+    }
+
+    #[must_use]
+    pub fn ttl(&self) -> Duration {
+        self.state_ttl
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !is_valid_cookie_name(&self.state_cookie_name) {
+            return Err(ConfigError::InvalidValue {
+                field: "oauth.state_cookie_name",
+                reason: "must be a valid cookie name (RFC 6265 token characters)",
+            });
+        }
+        if !is_valid_cookie_path(&self.state_cookie_path) {
+            return Err(ConfigError::InvalidValue {
+                field: "oauth.state_cookie_path",
+                reason: "must be a valid cookie path (no whitespace, controls, or ';')",
+            });
+        }
+        let ttl_secs = self.ttl().as_secs();
+        if !(60..=3600).contains(&ttl_secs) {
+            return Err(ConfigError::InvalidValue {
+                field: "oauth.state_ttl",
+                reason: "must be between 60 and 3600 seconds",
+            });
+        }
+
+        let any_enabled = self.providers.values().any(|p| p.enabled);
+        if any_enabled && self.state_secret.len() < 32 {
+            return Err(ConfigError::InvalidValue {
+                field: "oauth.state_secret",
+                reason: "must be at least 32 bytes when oauth providers are enabled",
+            });
+        }
+
+        for (name, provider) in &self.providers {
+            if !SUPPORTED_PROVIDERS.contains(&name.as_str()) {
+                return Err(ConfigError::InvalidValue {
+                    field: "oauth.providers",
+                    reason: "unsupported provider key; supported providers are google, github, apple",
+                });
+            }
+
+            if provider.enabled {
+                validate_provider_credentials(name, provider)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Field/reason strings here are part of the boot error contract — keep byte-identical.
+fn validate_provider_credentials(name: &str, provider: &ProviderConfig) -> Result<(), ConfigError> {
+    if provider.client_id.trim().is_empty() {
+        return Err(ConfigError::InvalidValue {
+            field: "oauth.provider.client_id",
+            reason: "must not be empty for enabled provider",
+        });
+    }
+    if provider.redirect_uri.trim().is_empty() {
+        return Err(ConfigError::InvalidValue {
+            field: "oauth.provider.redirect_uri",
+            reason: "must not be empty for enabled provider",
+        });
+    }
+
+    if name == "google" || name == "github" {
+        if provider.client_secret.trim().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "oauth.provider.client_secret",
+                reason: "must not be empty for google/github provider",
+            });
+        }
+    } else if name == "apple" {
+        let has_secret = !provider.client_secret.trim().is_empty();
+        let has_p8 = provider
+            .team_id
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+            && provider
+                .key_id
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+            && provider
+                .private_key
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
+
+        if !has_secret && !has_p8 {
+            return Err(ConfigError::InvalidValue {
+                field: "oauth.provider.apple",
+                reason: "must configure either client_secret or team_id, key_id, and private_key",
+            });
+        }
+    }
+
+    Ok(())
+}
+
+// ─── Phase 7 — TOTP Config ───────────────────────────────────────────────────
+
+pub const DEFAULT_TOTP_ISSUER: &str = "metal-auth";
+pub const DEFAULT_TOTP_RATE_LIMIT_IP_MAX_ATTEMPTS: u32 = 10;
+pub const DEFAULT_TOTP_RATE_LIMIT_USER_MAX_ATTEMPTS: u32 = 5;
+pub const DEFAULT_TOTP_RATE_LIMIT_WINDOW_SECS: u64 = 600;
+pub const DEFAULT_TOTP_CHALLENGE_TOKEN_TTL_SECS: u64 = 900;
+pub const DEFAULT_TOTP_USED_CODE_PRUNE_AGE_SECS: u64 = MIN_USED_CODE_PRUNE_AGE_SECS;
+
+/// Upper bound for the replay-log prune horizon.
+///
+/// The value reaches SQL as `make_interval(secs => $2)`, whose time field is a 64-bit
+/// microsecond count. A year is far beyond any replay-log retention need and stays well
+/// inside that range, so an operator value cannot turn the prune into a range error.
+pub const MAX_TOTP_USED_CODE_PRUNE_AGE_SECS: u64 = 365 * 24 * 60 * 60;
+
+/// AES-256-GCM key size in bytes.
+pub const TOTP_ENCRYPTION_KEY_BYTES: usize = 32;
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct TotpConfig {
+    /// 64-character hex AES-256 key for encrypting TOTP secrets at rest.
+    ///
+    /// `None` means no key was configured; TOTP operations fail fast when they ask for the
+    /// key bytes. Kept optional so a deployment without 2FA still boots.
+    pub encryption_key: Option<String>,
+    /// Issuer label shown in authenticator apps.
+    pub issuer: String,
+    /// Max attempts per window on the `totp:ip:<ip>` dimension.
+    pub rate_limit_ip_max_attempts: u32,
+    /// Max attempts per window on the `totp:user:<user_id>` dimension.
+    pub rate_limit_user_max_attempts: u32,
+    /// Rate limit window in seconds.
+    pub rate_limit_window_secs: u64,
+    /// TTL for intermediate two-factor challenge tokens.
+    pub challenge_token_ttl_secs: u64,
+    /// Minimum age before `totp_used_codes` rows may be pruned.
+    pub used_code_prune_age_secs: u64,
+}
+
+impl std::fmt::Debug for TotpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TotpConfig")
+            .field(
+                "encryption_key",
+                &self.encryption_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("issuer", &self.issuer)
+            .field(
+                "rate_limit_ip_max_attempts",
+                &self.rate_limit_ip_max_attempts,
+            )
+            .field(
+                "rate_limit_user_max_attempts",
+                &self.rate_limit_user_max_attempts,
+            )
+            .field("rate_limit_window_secs", &self.rate_limit_window_secs)
+            .field("challenge_token_ttl_secs", &self.challenge_token_ttl_secs)
+            .field("used_code_prune_age_secs", &self.used_code_prune_age_secs)
+            .finish()
+    }
+}
+
+impl TotpConfig {
+    /// Decode the configured key into raw AES-256-GCM key bytes.
+    ///
+    /// Fails fast: callers build their crypto layer with this and must not proceed without it.
+    /// This is the only place the 64-hex rule lives; [`Self::validate`] reuses it.
+    pub fn encryption_key_bytes(&self) -> Result<[u8; TOTP_ENCRYPTION_KEY_BYTES], ConfigError> {
+        const HEX_LEN: usize = TOTP_ENCRYPTION_KEY_BYTES * 2;
+
+        let raw = self
+            .encryption_key
+            .as_deref()
+            .ok_or(ConfigError::InvalidValue {
+                field: "totp.encryption_key",
+                reason: "must be set to enable totp",
+            })?;
+        if raw.len() != HEX_LEN || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ConfigError::InvalidValue {
+                field: "totp.encryption_key",
+                reason: "must be exactly 64 hexadecimal characters",
+            });
+        }
+        let mut key = [0u8; TOTP_ENCRYPTION_KEY_BYTES];
+        hex::decode_to_slice(raw, &mut key).map_err(|_| ConfigError::InvalidValue {
+            field: "totp.encryption_key",
+            reason: "must be exactly 64 hexadecimal characters",
+        })?;
+        Ok(key)
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.encryption_key.is_some() {
+            self.encryption_key_bytes()?;
+        }
+        if self.issuer.trim().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "totp.issuer",
+                reason: "must not be empty",
+            });
+        }
+        if self.rate_limit_ip_max_attempts < 3 {
+            return Err(ConfigError::InvalidValue {
+                field: "totp.rate_limit_ip_max_attempts",
+                reason: "must be at least 3",
+            });
+        }
+        if self.rate_limit_user_max_attempts < 3 {
+            return Err(ConfigError::InvalidValue {
+                field: "totp.rate_limit_user_max_attempts",
+                reason: "must be at least 3",
+            });
+        }
+        if self.rate_limit_window_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "totp.rate_limit_window_secs",
+                reason: "must be greater than 0",
+            });
+        }
+        if !(300..=1800).contains(&self.challenge_token_ttl_secs) {
+            return Err(ConfigError::InvalidValue {
+                field: "totp.challenge_token_ttl_secs",
+                reason: "must be between 300 and 1800 seconds",
+            });
+        }
+        // A code is accepted across three TOTP steps; pruning inside that span plus a
+        // margin would erase a replay record while the same code is still redeemable.
+        if self.used_code_prune_age_secs < MIN_USED_CODE_PRUNE_AGE_SECS {
+            return Err(ConfigError::InvalidValue {
+                field: "totp.used_code_prune_age_secs",
+                reason: "must cover three TOTP steps plus a margin",
+            });
+        }
+        if self.used_code_prune_age_secs > MAX_TOTP_USED_CODE_PRUNE_AGE_SECS {
+            return Err(ConfigError::InvalidValue {
+                field: "totp.used_code_prune_age_secs",
+                // `reason` is `&'static str`, so the bound is spelled out here; the test
+                // `totp_validate_rejects_prune_age_beyond_postgres_interval` derives the
+                // digits from the constant and fails if the two drift apart.
+                reason: "must be at most 31536000 seconds (365 days)",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Default for TotpConfig {
+    fn default() -> Self {
+        Self {
+            encryption_key: None,
+            issuer: DEFAULT_TOTP_ISSUER.to_string(),
+            rate_limit_ip_max_attempts: DEFAULT_TOTP_RATE_LIMIT_IP_MAX_ATTEMPTS,
+            rate_limit_user_max_attempts: DEFAULT_TOTP_RATE_LIMIT_USER_MAX_ATTEMPTS,
+            rate_limit_window_secs: DEFAULT_TOTP_RATE_LIMIT_WINDOW_SECS,
+            challenge_token_ttl_secs: DEFAULT_TOTP_CHALLENGE_TOKEN_TTL_SECS,
+            used_code_prune_age_secs: DEFAULT_TOTP_USED_CODE_PRUNE_AGE_SECS,
+        }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        let cfg = Self {
             database_url: "postgres://localhost/test".into(),
             port: DEFAULT_PORT,
             allowed_origins: vec!["https://app.example.com".into()],
@@ -1049,7 +1644,7 @@ impl Default for Config {
                 "DELETE".into(),
                 "OPTIONS".into(),
             ],
-            allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
+            allowed_headers: default_allowed_headers(),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             min_connections: DEFAULT_MIN_CONNECTIONS,
             base_url: "https://app.example.com".into(),
@@ -1063,7 +1658,13 @@ impl Default for Config {
             outbox_sent_retention: Duration::from_secs(DEFAULT_OUTBOX_SENT_RETENTION_SECS),
             session: SessionConfig::default(),
             rate_limit: RateLimitConfig::default(),
-        }
+            oauth: OAuthConfig::default(),
+            totp: TotpConfig::default(),
+        };
+        // Compiled-in defaults must stay deployable: fail fast in debug/test
+        // if a future default edit stops validating.
+        debug_assert!(cfg.validate().is_ok());
+        cfg
     }
 }
 
@@ -1073,7 +1674,7 @@ impl Default for AppConfig {
     /// Default parameters meet RFC 9106 §4 second option and OWASP ASVS 5.0 L1 minimums:
     /// m=65536 KiB (64 MiB), t=3, p=4.
     fn default() -> Self {
-        Self {
+        let cfg = Self {
             argon2_m_cost: 65536,
             argon2_t_cost: 3,
             argon2_p_cost: 4,
@@ -1082,7 +1683,9 @@ impl Default for AppConfig {
             verification_token_ttl_secs: 1800,
             reset_token_ttl_secs: 900,
             require_email_verification: true,
-        }
+        };
+        debug_assert!(cfg.validate().is_ok());
+        cfg
     }
 }
 
@@ -1111,7 +1714,7 @@ mod tests {
             port: 3000,
             allowed_origins: vec!["https://app.example.com".into()],
             allowed_methods: vec!["GET".into(), "POST".into()],
-            allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
+            allowed_headers: default_allowed_headers(),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             min_connections: DEFAULT_MIN_CONNECTIONS,
             base_url: "https://app.example.com".into(),
@@ -1125,6 +1728,8 @@ mod tests {
             outbox_sent_retention: Duration::from_secs(DEFAULT_OUTBOX_SENT_RETENTION_SECS),
             session: SessionConfig::default(),
             rate_limit: RateLimitConfig::default(),
+            oauth: OAuthConfig::default(),
+            totp: TotpConfig::default(),
         }
     }
 
@@ -2297,5 +2902,787 @@ mod tests {
         };
         assert_eq!(rlc.window(), Duration::from_secs(600));
         assert_eq!(rlc.cooldown(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn defaults_pass_validation() {
+        assert!(Config::default().validate().is_ok());
+        assert!(AppConfig::default().validate().is_ok());
+        assert!(SessionConfig::default().validate().is_ok());
+        assert!(RateLimitConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn config_validate_rejects_base_url_with_fragment() {
+        let cfg = Config {
+            base_url: "https://app.example.com/callback#section".into(),
+            ..test_infra_config()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidEnvVar("BASE_URL"))
+        ));
+    }
+
+    #[test]
+    fn config_validate_accepts_uppercase_scheme_base_url() {
+        let cfg = Config {
+            base_url: "HTTPS://app.example.com".into(),
+            ..test_infra_config()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn from_lookup_normalizes_trailing_slash_origins() {
+        let cfg = Config::from_lookup(|key| match key {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "ALLOWED_ORIGINS" => Ok("https://a.example.com/, https://b.example.com".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        })
+        .expect("load config with trailing-slash origin");
+        assert_eq!(
+            cfg.allowed_origins,
+            vec![
+                "https://a.example.com".to_string(),
+                "https://b.example.com".to_string(),
+            ]
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn session_absolute_lifetime_prefers_canonical_over_legacy_alias() {
+        let cfg = Config::from_lookup(|key| match key {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "SESSION_ABSOLUTE_LIFETIME_SECS" => Ok("7200".into()),
+            "SESSION_ABSOLUTE_TIMEOUT_SECS" => Ok("3600".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        })
+        .expect("load config with both lifetime vars");
+        assert_eq!(cfg.session.absolute_lifetime_secs, 7200);
+    }
+
+    #[test]
+    fn session_absolute_lifetime_falls_back_to_legacy_alias() {
+        let cfg = Config::from_lookup(|key| match key {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "SESSION_ABSOLUTE_TIMEOUT_SECS" => Ok("3600".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        })
+        .expect("load config with legacy timeout only");
+        assert_eq!(cfg.session.absolute_lifetime_secs, 3600);
+    }
+
+    #[test]
+    fn session_absolute_lifetime_rejects_invalid_legacy_alias() {
+        let cfg = Config::from_lookup(|key| match key {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "SESSION_ABSOLUTE_TIMEOUT_SECS" => Ok("not_a_number".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        });
+        assert!(matches!(
+            cfg,
+            Err(ConfigError::InvalidValue {
+                field: "absolute_lifetime_secs",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn disabled_rate_limit_reenabled_without_validation_stays_invalid() {
+        let degenerate = RateLimitConfig {
+            enabled: false,
+            max_attempts: 0,
+            window_secs: 0,
+            login_cooldown_secs: 0,
+        };
+        assert!(degenerate.validate().is_ok());
+        let reenabled = RateLimitConfig {
+            enabled: true,
+            ..degenerate
+        };
+        assert!(reenabled.validate().is_err());
+    }
+
+    #[test]
+    fn default_allowed_headers_includes_csrf_token() {
+        let headers = default_allowed_headers();
+        assert!(
+            headers
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case("x-csrf-token"))
+        );
+    }
+
+    #[test]
+    fn parse_allowed_headers_appends_csrf_token_if_missing() {
+        let headers = parse_allowed_headers_str("Authorization, Content-Type, X-Custom");
+        assert_eq!(
+            headers,
+            vec!["Authorization", "Content-Type", "X-Custom", "X-CSRF-Token"]
+        );
+    }
+
+    #[test]
+    fn parse_allowed_headers_preserves_csrf_token_if_already_present() {
+        let headers = parse_allowed_headers_str("Authorization, X-CSRF-Token, Content-Type");
+        assert_eq!(
+            headers,
+            vec!["Authorization", "X-CSRF-Token", "Content-Type"]
+        );
+    }
+
+    #[test]
+    fn parse_allowed_headers_empty_or_whitespace_falls_back_to_defaults() {
+        for empty_val in ["", "   ", " \t\n ", ", ,  ,"] {
+            let headers = parse_allowed_headers_str(empty_val);
+            assert_eq!(
+                headers,
+                default_allowed_headers(),
+                "expected default allowed headers for input '{empty_val}'"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_headers_empty_env_lookup_falls_back_to_defaults() {
+        let cfg = Config::from_lookup(|key| match key {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "ALLOWED_HEADERS" => Ok("   ".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        })
+        .expect("load config with whitespace allowed headers");
+        assert_eq!(cfg.allowed_headers, default_allowed_headers());
+    }
+
+    #[test]
+    fn allowed_headers_loaded_from_env_lookup() {
+        let cfg = Config::from_lookup(|key| match key {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "ALLOWED_HEADERS" => Ok("Authorization, X-Custom-Header".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        })
+        .expect("load config with custom allowed headers");
+        assert_eq!(
+            cfg.allowed_headers,
+            vec!["Authorization", "X-Custom-Header", "X-CSRF-Token"]
+        );
+    }
+
+    #[test]
+    fn test_oauth_config_defaults() {
+        let oauth = OAuthConfig::default();
+        assert_eq!(oauth.state_cookie_name, "oauth_state");
+        assert_eq!(oauth.state_cookie_path, "/");
+        assert_eq!(oauth.ttl(), Duration::from_secs(600));
+        assert!(oauth.providers.is_empty());
+        assert!(oauth.validate().is_ok());
+    }
+
+    #[test]
+    fn test_oauth_config_validation_ttl_bounds() {
+        let mut oauth = OAuthConfig {
+            state_ttl: Duration::from_secs(59),
+            ..Default::default()
+        };
+        assert!(oauth.validate().is_err());
+
+        oauth.state_ttl = Duration::from_secs(3601);
+        assert!(oauth.validate().is_err());
+
+        oauth.state_ttl = Duration::from_secs(600);
+        assert!(oauth.validate().is_ok());
+        assert_eq!(oauth.state_ttl_secs(), 600);
+    }
+
+    #[test]
+    fn test_oauth_config_validation_secret_length() {
+        let mut oauth = OAuthConfig::default();
+        oauth.providers.insert(
+            "google".into(),
+            ProviderConfig::new("cid", "sec", "https://app.com/callback", vec![], true),
+        );
+        // Empty secret with enabled provider fails
+        assert!(oauth.validate().is_err());
+
+        // Short secret (< 32 bytes) fails
+        oauth.state_secret = "short_secret_under_32_bytes!!".into();
+        assert!(oauth.validate().is_err());
+
+        // Valid secret >= 32 bytes succeeds
+        oauth.state_secret = "01234567890123456789012345678901".into();
+        assert!(oauth.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_state_cookie_name() {
+        let mut oauth = OAuthConfig {
+            state_secret: "01234567890123456789012345678901".into(),
+            ..Default::default()
+        };
+
+        oauth.state_cookie_name = " oauth_state".into();
+        assert!(oauth.validate().is_err());
+
+        oauth.state_cookie_name = "bad;name".into();
+        assert!(oauth.validate().is_err());
+
+        oauth.state_cookie_name = "bad=name".into();
+        assert!(oauth.validate().is_err());
+
+        oauth.state_cookie_name = "my_oauth_state".into();
+        assert!(oauth.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_state_cookie_path() {
+        let mut oauth = OAuthConfig {
+            state_secret: "01234567890123456789012345678901".into(),
+            ..Default::default()
+        };
+
+        oauth.state_cookie_path = "/bad path".into();
+        assert!(oauth.validate().is_err());
+
+        oauth.state_cookie_path = "/bad;path".into();
+        assert!(oauth.validate().is_err());
+
+        oauth.state_cookie_path = "/".into();
+        assert!(oauth.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_state_cookie_name_matching_session_cookie() {
+        let mut cfg = test_infra_config();
+        cfg.oauth.state_cookie_name = cfg.session.cookie_name.clone();
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "oauth.state_cookie_name",
+                ..
+            })
+        ));
+
+        cfg.oauth.state_cookie_name = "oauth_state".into();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_oauth_config_validation_provider_keys() {
+        let mut oauth = OAuthConfig {
+            state_secret: "01234567890123456789012345678901".into(),
+            ..Default::default()
+        };
+        oauth.providers.insert(
+            "discord".into(),
+            ProviderConfig::new("cid", "sec", "https://app.com/callback", vec![], false),
+        );
+        assert!(oauth.validate().is_err());
+    }
+
+    #[test]
+    fn test_oauth_config_validation_provider_required_fields() {
+        let mut oauth = OAuthConfig {
+            state_secret: "01234567890123456789012345678901".into(),
+            ..Default::default()
+        };
+
+        // Missing client_secret on enabled Google provider
+        oauth.providers.insert(
+            "google".into(),
+            ProviderConfig::new("cid", "", "https://app.com/callback", vec![], true),
+        );
+        assert!(oauth.validate().is_err());
+
+        // Missing client_id
+        oauth.providers.insert(
+            "google".into(),
+            ProviderConfig::new("", "sec", "https://app.com/callback", vec![], true),
+        );
+        assert!(oauth.validate().is_err());
+
+        // Missing redirect_uri
+        oauth.providers.insert(
+            "google".into(),
+            ProviderConfig::new("cid", "sec", "", vec![], true),
+        );
+        assert!(oauth.validate().is_err());
+    }
+
+    #[test]
+    fn test_oauth_config_debug_redacts_secrets() {
+        let provider = ProviderConfig {
+            client_id: "client-id-123".into(),
+            client_secret: "super-secret-key".into(),
+            redirect_uri: "https://example.com/callback".into(),
+            scopes: vec!["email".into()],
+            enabled: true,
+            team_id: Some("team1".into()),
+            key_id: Some("key1".into()),
+            private_key: Some("private-key-secret".into()),
+        };
+
+        let rendered = format!("{provider:?}");
+        assert!(!rendered.contains("super-secret-key"));
+        assert!(!rendered.contains("private-key-secret"));
+        assert!(rendered.contains("[REDACTED]"));
+
+        let oauth = OAuthConfig {
+            state_secret: "super-secret-oauth-state-key-32b".into(),
+            ..Default::default()
+        };
+        let rendered_oauth = format!("{oauth:?}");
+        assert!(!rendered_oauth.contains("super-secret-oauth-state-key-32b"));
+        assert!(rendered_oauth.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn oauth_env_populates_providers_and_state() {
+        let cfg = Config::from_lookup(|key| match key {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "OAUTH_STATE_SECRET" => Ok("01234567890123456789012345678901".into()),
+            "OAUTH_STATE_COOKIE_NAME" => Ok("my_oauth_state".into()),
+            "OAUTH_STATE_TTL_SECS" => Ok("900".into()),
+            "OAUTH_CALLBACK_BASE_URL" => Ok("https://app.example.com".into()),
+            "OAUTH_GOOGLE_ENABLED" => Ok("true".into()),
+            "OAUTH_GOOGLE_CLIENT_ID" => Ok("google-id".into()),
+            "OAUTH_GOOGLE_CLIENT_SECRET" => Ok("google-secret".into()),
+            "OAUTH_GOOGLE_REDIRECT_URI" => Ok("https://app.example.com/cb".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        })
+        .expect("load oauth env vars");
+
+        assert_eq!(cfg.oauth.state_secret, "01234567890123456789012345678901");
+        assert_eq!(cfg.oauth.state_cookie_name, "my_oauth_state");
+        assert_eq!(cfg.oauth.state_cookie_path, DEFAULT_OAUTH_STATE_COOKIE_PATH);
+        assert_eq!(cfg.oauth.state_ttl, Duration::from_secs(900));
+        assert_eq!(cfg.oauth.callback_base_url, "https://app.example.com");
+        let google = &cfg.oauth.providers["google"];
+        assert!(google.enabled);
+        assert_eq!(google.client_id, "google-id");
+        assert_eq!(google.client_secret, "google-secret");
+        assert_eq!(google.redirect_uri, "https://app.example.com/cb");
+        assert!(!cfg.oauth.providers["github"].enabled);
+    }
+
+    #[test]
+    fn oauth_env_rejects_invalid_values() {
+        let bad_ttl = |key: &str| match key {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "OAUTH_STATE_TTL_SECS" => Ok("not-a-number".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        assert!(matches!(
+            Config::from_lookup(bad_ttl),
+            Err(ConfigError::InvalidEnvVar("OAUTH_STATE_TTL_SECS"))
+        ));
+
+        let bad_bool = |key: &str| match key {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "OAUTH_GOOGLE_ENABLED" => Ok("yes".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        assert!(matches!(
+            Config::from_lookup(bad_bool),
+            Err(ConfigError::InvalidEnvVar("OAUTH_GOOGLE_ENABLED"))
+        ));
+    }
+
+    #[test]
+    fn oauth_env_enabled_without_secret_fails_validation() {
+        let cfg = Config {
+            oauth: OAuthConfig {
+                state_secret: "01234567890123456789012345678901".into(),
+                providers: [(
+                    "google".to_string(),
+                    ProviderConfig::new(
+                        "google-id",
+                        "",
+                        "https://app.example.com/cb",
+                        vec![],
+                        true,
+                    ),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            ..test_infra_config()
+        };
+        assert!(cfg.validate().is_err());
+
+        let lookup = |key: &str| match key {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "OAUTH_GOOGLE_ENABLED" => Ok("true".into()),
+            "OAUTH_GOOGLE_CLIENT_ID" => Ok("google-id".into()),
+            "OAUTH_GOOGLE_REDIRECT_URI" => Ok("https://app.example.com/cb".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        assert!(Config::from_lookup(lookup).is_err());
+    }
+
+    #[test]
+    fn oauth_state_ttl_env_accepts_exact_bounds() {
+        let with_ttl = |ttl: &'static str| {
+            Config::from_lookup(move |key| match key {
+                "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+                "BASE_URL" => Ok("https://app.example.com".into()),
+                "OAUTH_STATE_TTL_SECS" => Ok(ttl.into()),
+                _ => Err(std::env::VarError::NotPresent),
+            })
+        };
+
+        for ttl in ["60", "3600"] {
+            let cfg = with_ttl(ttl).expect("boundary ttl must be accepted");
+            assert_eq!(cfg.oauth.state_ttl_secs(), ttl.parse::<u64>().unwrap());
+        }
+
+        for ttl in ["59", "3601"] {
+            assert!(
+                matches!(
+                    with_ttl(ttl),
+                    Err(ConfigError::InvalidValue {
+                        field: "oauth.state_ttl",
+                        ..
+                    })
+                ),
+                "ttl {ttl} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_provider_credential_branches() {
+        let base = OAuthConfig {
+            state_secret: "01234567890123456789012345678901".into(),
+            ..Default::default()
+        };
+
+        let check = |name: &str, provider: ProviderConfig| {
+            OAuthConfig {
+                providers: [(name.to_string(), provider)].into_iter().collect(),
+                ..base.clone()
+            }
+            .validate()
+        };
+
+        // google/github: client_secret is mandatory.
+        for name in ["google", "github"] {
+            assert!(
+                check(
+                    name,
+                    ProviderConfig::new("cid", "", "https://app/cb", vec![], true)
+                )
+                .is_err()
+            );
+            assert!(
+                check(
+                    name,
+                    ProviderConfig::new("cid", "sec", "https://app/cb", vec![], true)
+                )
+                .is_ok()
+            );
+        }
+
+        // apple: client_secret OR the p8 triple; neither is rejected by name.
+        let apple_no_credentials = || {
+            let mut p = ProviderConfig::new("cid", "", "https://app/cb", vec![], true);
+            p.team_id = Some("".into());
+            p.key_id = Some("KEY123".into());
+            p.private_key = Some("".into());
+            p
+        };
+        assert!(matches!(
+            check("apple", apple_no_credentials()),
+            Err(ConfigError::InvalidValue {
+                field: "oauth.provider.apple",
+                ..
+            })
+        ));
+        assert!(
+            check(
+                "apple",
+                ProviderConfig::new("cid", "sec", "https://app/cb", vec![], true)
+            )
+            .is_ok()
+        );
+
+        let mut apple_p8 = ProviderConfig::new("cid", "", "https://app/cb", vec![], true);
+        apple_p8.team_id = Some("TEAM123456".into());
+        apple_p8.key_id = Some("KEY1234567".into());
+        apple_p8.private_key = Some("-----BEGIN PRIVATE KEY-----".into());
+        assert!(check("apple", apple_p8).is_ok());
+    }
+
+    // ── Phase 7 — TOTP config tests ──────────────────────────────────────────
+
+    fn totp_key_hex() -> String {
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_string()
+    }
+
+    #[test]
+    fn totp_default_validates_and_redacts_key() {
+        let cfg = TotpConfig::default();
+        assert!(cfg.validate().is_ok());
+        assert!(Config::default().validate().is_ok());
+
+        let cfg = TotpConfig {
+            encryption_key: Some(totp_key_hex()),
+            ..TotpConfig::default()
+        };
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains(&totp_key_hex()));
+        assert!(rendered.contains("issuer: \"metal-auth\""));
+    }
+
+    #[test]
+    fn totp_validate_rejects_short_key() {
+        let cfg = TotpConfig {
+            encryption_key: Some("00".repeat(31)),
+            ..TotpConfig::default()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "totp.encryption_key",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn totp_validate_rejects_non_hex_key() {
+        let mut key = totp_key_hex();
+        key.replace_range(..2, "zz");
+        let cfg = TotpConfig {
+            encryption_key: Some(key),
+            ..TotpConfig::default()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "totp.encryption_key",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn totp_encryption_key_bytes_requires_key() {
+        assert!(matches!(
+            TotpConfig::default().encryption_key_bytes(),
+            Err(ConfigError::InvalidValue {
+                field: "totp.encryption_key",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn totp_encryption_key_bytes_decodes_hex() {
+        let cfg = TotpConfig {
+            encryption_key: Some(totp_key_hex()),
+            ..TotpConfig::default()
+        };
+        let key = cfg.encryption_key_bytes().expect("valid key");
+        assert_eq!(key[0], 0x00);
+        assert_eq!(key[1], 0x11);
+        assert_eq!(key[31], 0xff);
+
+        let uppercase = TotpConfig {
+            encryption_key: Some(totp_key_hex().to_uppercase()),
+            ..TotpConfig::default()
+        };
+        assert_eq!(
+            uppercase.encryption_key_bytes().expect("uppercase hex"),
+            key
+        );
+    }
+
+    #[test]
+    fn totp_encryption_key_bytes_rejects_bad_length_and_non_hex() {
+        for raw in [
+            String::new(),
+            "00".repeat(31),
+            "00".repeat(33),
+            "zz".repeat(32),
+            format!(" {}0", "0".repeat(62)),
+        ] {
+            let cfg = TotpConfig {
+                encryption_key: Some(raw.clone()),
+                ..TotpConfig::default()
+            };
+            assert!(
+                matches!(
+                    cfg.encryption_key_bytes(),
+                    Err(ConfigError::InvalidValue {
+                        field: "totp.encryption_key",
+                        ..
+                    })
+                ),
+                "accepted {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn totp_validate_rejects_empty_issuer() {
+        let cfg = TotpConfig {
+            issuer: "   ".into(),
+            ..TotpConfig::default()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "totp.issuer",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn totp_validate_bounds_challenge_ttl() {
+        let too_short = TotpConfig {
+            challenge_token_ttl_secs: 60,
+            ..TotpConfig::default()
+        };
+        assert!(too_short.validate().is_err());
+
+        let ok = TotpConfig {
+            challenge_token_ttl_secs: 900,
+            ..TotpConfig::default()
+        };
+        assert!(ok.validate().is_ok());
+
+        let too_long = TotpConfig {
+            challenge_token_ttl_secs: 1801,
+            ..TotpConfig::default()
+        };
+        assert!(too_long.validate().is_err());
+    }
+
+    #[test]
+    fn totp_validate_rejects_weak_rate_limits_and_prune_age() {
+        let low_ip = TotpConfig {
+            rate_limit_ip_max_attempts: 2,
+            ..TotpConfig::default()
+        };
+        assert!(low_ip.validate().is_err());
+
+        let low_user = TotpConfig {
+            rate_limit_user_max_attempts: 2,
+            ..TotpConfig::default()
+        };
+        assert!(low_user.validate().is_err());
+
+        let zero_window = TotpConfig {
+            rate_limit_window_secs: 0,
+            ..TotpConfig::default()
+        };
+        assert!(zero_window.validate().is_err());
+
+        for rejected in [59, 60, 89] {
+            let short_prune = TotpConfig {
+                used_code_prune_age_secs: rejected,
+                ..TotpConfig::default()
+            };
+            assert!(short_prune.validate().is_err(), "accepted {rejected}");
+        }
+
+        let floor = TotpConfig {
+            used_code_prune_age_secs: crate::totp::crypto::MIN_USED_CODE_PRUNE_AGE_SECS,
+            ..TotpConfig::default()
+        };
+        assert!(floor.validate().is_ok());
+    }
+
+    #[test]
+    fn totp_validate_rejects_prune_age_beyond_postgres_interval() {
+        let at_max = TotpConfig {
+            used_code_prune_age_secs: MAX_TOTP_USED_CODE_PRUNE_AGE_SECS,
+            ..TotpConfig::default()
+        };
+        assert!(at_max.validate().is_ok());
+
+        for rejected in [MAX_TOTP_USED_CODE_PRUNE_AGE_SECS + 1, u64::MAX] {
+            let over = TotpConfig {
+                used_code_prune_age_secs: rejected,
+                ..TotpConfig::default()
+            };
+            let error = over.validate().expect_err("above the bound");
+            let ConfigError::InvalidValue { field, reason } = error else {
+                panic!("expected InvalidValue, got {error:?}");
+            };
+            assert_eq!(field, "totp.used_code_prune_age_secs");
+            assert!(
+                reason.contains(&MAX_TOTP_USED_CODE_PRUNE_AGE_SECS.to_string()),
+                "the message must name the {MAX_TOTP_USED_CODE_PRUNE_AGE_SECS}s bound: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn totp_env_parsing_reads_key_and_defaults_the_rest() {
+        let key = totp_key_hex();
+        let lookup = move |name: &str| match name {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "TOTP_ENCRYPTION_KEY" => Ok(key.clone()),
+            "TOTP_ISSUER" => Ok("Acme".into()),
+            "TOTP_CHALLENGE_TOKEN_TTL_SECS" => Ok("600".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        let cfg = Config::from_lookup(lookup).expect("valid config");
+        assert_eq!(
+            cfg.totp.encryption_key.as_deref(),
+            Some(totp_key_hex().as_str())
+        );
+        assert_eq!(cfg.totp.issuer, "Acme");
+        assert_eq!(cfg.totp.challenge_token_ttl_secs, 600);
+        assert_eq!(
+            cfg.totp.rate_limit_ip_max_attempts,
+            DEFAULT_TOTP_RATE_LIMIT_IP_MAX_ATTEMPTS
+        );
+    }
+
+    #[test]
+    fn totp_env_empty_key_is_treated_as_absent() {
+        let lookup = |name: &str| match name {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "TOTP_ENCRYPTION_KEY" => Ok("   ".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        let cfg = Config::from_lookup(lookup).expect("valid config");
+        assert!(cfg.totp.encryption_key.is_none());
+    }
+
+    #[test]
+    fn totp_env_rejects_invalid_key_shape() {
+        let lookup = |name: &str| match name {
+            "DATABASE_URL" => Ok("postgres://localhost/test".into()),
+            "BASE_URL" => Ok("https://app.example.com".into()),
+            "TOTP_ENCRYPTION_KEY" => Ok("not-hex".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        assert!(matches!(
+            Config::from_lookup(lookup),
+            Err(ConfigError::InvalidValue {
+                field: "totp.encryption_key",
+                ..
+            })
+        ));
     }
 }

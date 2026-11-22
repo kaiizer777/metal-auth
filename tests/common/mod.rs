@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,10 +23,27 @@ use uuid::Uuid;
 /// test runs without PostgreSQL-level advisory locking (`pg_advisory_lock`).
 pub static DB_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Worker threads for the concurrency tests.
+pub const CONCURRENT_WORKER_THREADS: usize = 5;
+
+/// Runs `body` on a multi-thread runtime so simultaneously dispatched requests actually race.
+///
+/// A current-thread runtime serializes them at their first await, which would make a
+/// concurrency assertion pass without ever racing. Blocks the calling test thread, so use it
+/// from a plain `#[test]`, not from `#[tokio::test]`.
+pub fn block_on_concurrent<F: Future>(body: F) -> F::Output {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(CONCURRENT_WORKER_THREADS)
+        .enable_all()
+        .build()
+        .expect("build multi-thread test runtime")
+        .block_on(body)
+}
+
 /// Truncates all authentication and session domain tables with CASCADE.
 pub async fn truncate_tables(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "TRUNCATE TABLE users, sessions, verification_tokens, password_reset_tokens, email_outbox CASCADE",
+        "TRUNCATE TABLE users, sessions, verification_tokens, password_reset_tokens, email_outbox, oauth_accounts CASCADE",
     )
     .execute(pool)
     .await?;
@@ -121,6 +139,22 @@ impl TestApp {
         self.dispatch(req).await
     }
 
+    /// Dispatches a JSON POST request with an explicit client IP (`x-forwarded-for`).
+    pub async fn post_json_with_ip(
+        &self,
+        uri: &str,
+        body: serde_json::Value,
+        ip: &str,
+    ) -> TestResponse {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            ip.parse().expect("valid x-forwarded-for header"),
+        );
+        let req = json_request_with_headers(Method::POST, uri, body, headers);
+        self.dispatch(req).await
+    }
+
     /// Dispatches an empty POST request (e.g. for logout or verify).
     pub async fn post_empty(&self, uri: &str) -> TestResponse {
         let req = empty_request(Method::POST, uri);
@@ -205,6 +239,16 @@ pub fn dynamic_email() -> String {
 /// Generates a valid randomized dynamic password satisfying OWASP password policies.
 pub fn dynamic_password() -> String {
     format!("JourneyPass!_{}", Uuid::new_v4())
+}
+
+/// Generates a randomized, unique client IP address in TEST-NET-2 (198.51.100.0/24) to avoid rate limit collisions.
+pub fn dynamic_ip() -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static IP_COUNTER: AtomicU32 = AtomicU32::new(1);
+    let count = IP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let b = ((count >> 8) & 0xff) as u8;
+    let c = (count & 0xff) as u8;
+    format!("198.51.{b}.{c}")
 }
 
 /// DB query helper: counts total rows in the `users` table.
@@ -305,13 +349,47 @@ pub async fn get_outbox_rows_for_recipient(
     .await
 }
 
-/// Initializes a live-DB test app with default `AppConfig` and blocking email dispatcher.
+/// Test-only pool ceiling.
+///
+/// Concurrency tests dispatch five requests at once and each holds more than one connection
+/// in flight; the old ceiling of 5 sat exactly at the request count and timed out.
+pub const TEST_POOL_MAX_CONNECTIONS: u32 = 10;
+
+/// Test-only Argon2id cost floor: the cheapest parameters `AppConfig::validate` accepts.
+///
+/// Production defaults (65536/3/4) stay untouched; integration tests would otherwise need
+/// ~87 minutes because every signup, dummy hash, and TOTP enrollment pays full cost.
+pub fn test_auth_config() -> AppConfig {
+    AppConfig {
+        argon2_m_cost: 19456,
+        argon2_t_cost: 2,
+        argon2_p_cost: 1,
+        ..AppConfig::default()
+    }
+}
+
+/// Initializes a live-DB test app with the Argon2 floor and blocking email dispatcher.
 pub async fn setup_test_app() -> Option<TestApp> {
-    setup_test_app_with_auth_config(Arc::new(AppConfig::default())).await
+    setup_test_app_with(|_| {}).await
+}
+
+/// Initializes a live-DB test app after letting the caller adjust its server config.
+///
+/// `AppState` owns its `Config`, so settings a test depends on — TOTP rate-limit budgets in
+/// particular — must be fixed before the state is built.
+pub async fn setup_test_app_with(customize: impl FnOnce(&mut Config)) -> Option<TestApp> {
+    setup_test_app_with_auth_config_and(Arc::new(test_auth_config()), customize).await
 }
 
 /// Initializes a live-DB test app with custom `AppConfig` and blocking email dispatcher.
 pub async fn setup_test_app_with_auth_config(auth_config: Arc<AppConfig>) -> Option<TestApp> {
+    setup_test_app_with_auth_config_and(auth_config, |_| {}).await
+}
+
+async fn setup_test_app_with_auth_config_and(
+    auth_config: Arc<AppConfig>,
+    customize: impl FnOnce(&mut Config),
+) -> Option<TestApp> {
     dotenvy::dotenv().ok();
     let url = match std::env::var("DATABASE_URL") {
         Ok(val) => val,
@@ -326,33 +404,13 @@ pub async fn setup_test_app_with_auth_config(auth_config: Arc<AppConfig>) -> Opt
         Err(e) => panic!("invalid DATABASE_URL environment variable: {e}"),
     };
 
-    let pool = metal_auth::db::init_pool_with_options(
-        &url,
-        metal_auth::db::DbPoolOptions {
-            max_connections: 5,
-            min_connections: 1,
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("DATABASE_URL is set, so the DB-backed test must connect");
-
-    let email_sender = Arc::new(CapturingEmailSender::new());
-    let dispatcher = Arc::new(
-        EmailDispatcher::new_blocking(
-            Some(Arc::clone(&email_sender) as metal_auth::SharedEmailSender),
-            Duration::from_secs(10),
-        )
-        .with_base_url("https://example.com"),
-    );
-
-    let cfg = Config {
-        database_url: url.clone(),
+    let mut cfg = Config {
+        database_url: url,
         port: 8080,
         allowed_origins: vec!["https://app.example.com".into()],
         allowed_methods: vec!["GET".into(), "POST".into(), "OPTIONS".into()],
         allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
-        max_connections: 5,
+        max_connections: TEST_POOL_MAX_CONNECTIONS,
         min_connections: 1,
         base_url: "https://example.com".into(),
         email_dispatch_timeout: Duration::from_secs(10),
@@ -365,7 +423,43 @@ pub async fn setup_test_app_with_auth_config(auth_config: Arc<AppConfig>) -> Opt
         outbox_sent_retention: Duration::from_secs(7 * 24 * 3600),
         session: metal_auth::SessionConfig::default(),
         rate_limit: metal_auth::RateLimitConfig::default(),
+        oauth: metal_auth::OAuthConfig::default(),
+        totp: metal_auth::TotpConfig {
+            // TOTP handlers resolve the key per operation; without it every call is a 500.
+            encryption_key: Some("00".repeat(32)),
+            ..metal_auth::TotpConfig::default()
+        },
     };
+
+    customize(&mut cfg);
+
+    // Built from the customized config so `AppState.config` and the pool can never point at
+    // different databases.
+    let pool = metal_auth::db::init_pool_with_options(
+        &cfg.database_url,
+        metal_auth::db::DbPoolOptions {
+            max_connections: cfg.max_connections,
+            min_connections: cfg.min_connections,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("DATABASE_URL is set, so the DB-backed test must connect");
+
+    // The claim is global and the binaries share this database: drop claimable rows a
+    // previous binary left behind before this app can deliver them to its own sender.
+    metal_auth::db::outbox::discard_claimable_outbox(&pool)
+        .await
+        .expect("clear claimable outbox residue");
+
+    let email_sender = Arc::new(CapturingEmailSender::new());
+    let dispatcher = Arc::new(
+        EmailDispatcher::new_blocking(
+            Some(Arc::clone(&email_sender) as metal_auth::SharedEmailSender),
+            Duration::from_secs(10),
+        )
+        .with_base_url("https://example.com"),
+    );
 
     let state = AppState::with_dispatcher(pool.clone(), cfg, auth_config, dispatcher)
         .expect("create test app state");
@@ -379,4 +473,267 @@ pub async fn setup_test_app_with_auth_config(auth_config: Arc<AppConfig>) -> Opt
         email_sender,
         base_url: "https://example.com".into(),
     })
+}
+
+// ─── Session and TOTP journey helpers ────────────────────────────────────────
+
+/// The cookies a browser replays after login: session id plus its CSRF pair.
+pub struct Session {
+    pub sid: String,
+    pub csrf: String,
+}
+
+pub fn extract_cookie_val(headers: &HeaderMap, name: &str) -> Option<String> {
+    for val in headers.get_all(header::SET_COOKIE) {
+        if let Ok(s) = val.to_str() {
+            for part in s.split(';') {
+                let part = part.trim();
+                if let Some((k, v)) = part.split_once('=')
+                    && k.trim() == name
+                {
+                    return Some(v.trim().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn extract_cookie_header_string(headers: &HeaderMap, name: &str) -> Option<String> {
+    for val in headers.get_all(header::SET_COOKIE) {
+        if let Ok(s) = val.to_str()
+            && s.starts_with(&format!("{name}="))
+        {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
+/// Request carrying the session + CSRF cookies, the `x-csrf-token` header, and a client IP.
+///
+/// Protected TOTP routes sit behind CSRF middleware; omitting the header would test the CSRF
+/// layer instead of the handler.
+pub fn session_request(
+    app: &TestApp,
+    method: Method,
+    uri: &str,
+    body: serde_json::Value,
+    session: &Session,
+    ip: &str,
+) -> Request<Body> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::COOKIE,
+        format!(
+            "{}={}; csrf_token={}",
+            app.state.config.session.cookie_name, session.sid, session.csrf
+        )
+        .parse()
+        .expect("valid cookie header"),
+    );
+    headers.insert(
+        "x-csrf-token",
+        session.csrf.parse().expect("valid csrf header"),
+    );
+    headers.insert("x-forwarded-for", ip.parse().expect("valid ip header"));
+    json_request_with_headers(method, uri, body, headers)
+}
+
+/// Current six-digit code for an enrolled base32 secret.
+pub fn totp_code(secret_base32: &str) -> String {
+    code_at(
+        secret_base32,
+        metal_auth::totp::crypto::current_totp_counter(),
+    )
+}
+
+pub fn code_at(secret_base32: &str, counter: u64) -> String {
+    let secret =
+        metal_auth::totp::crypto::decode_totp_secret(secret_base32).expect("valid base32 secret");
+    let code = metal_auth::totp::crypto::generate_totp(&secret, counter).expect("code");
+    format!("{code:06}")
+}
+
+/// Six-digit code outside the acceptance band of the current step, so a rejection test
+/// cannot accidentally present a valid code.
+///
+/// The server verifies against `clock_timestamp()`, not this process's clock, so the band is
+/// widened by three steps either side before excluding it.
+pub fn invalid_totp_code(secret_base32: &str) -> String {
+    let counter = metal_auth::totp::crypto::current_totp_counter();
+    let accepted: Vec<String> = (counter.saturating_sub(3)..=counter + 3)
+        .map(|step| code_at(secret_base32, step))
+        .collect();
+    let mut candidate = (accepted[3].parse::<u32>().expect("six-digit code") + 1) % 1_000_000;
+    loop {
+        let code = format!("{candidate:06}");
+        if !accepted.contains(&code) {
+            return code;
+        }
+        candidate = (candidate + 1) % 1_000_000;
+    }
+}
+
+/// Signs up and verifies the email through the in-process mailer.
+pub async fn create_verified_user(app: &TestApp) -> (String, String) {
+    let email = dynamic_email();
+    let password = dynamic_password();
+
+    let signup_resp = app
+        .post_json(
+            "/auth/signup",
+            serde_json::json!({ "email": email, "password": password }),
+        )
+        .await;
+    assert_eq!(
+        signup_resp.status(),
+        StatusCode::OK,
+        "signup failed: {}",
+        signup_resp.body_str
+    );
+
+    let token = app
+        .email_sender
+        .verification_token_for(&email)
+        .expect("signup must capture a verification token");
+    let verify_resp = app
+        .post_json("/auth/verify", serde_json::json!({ "token": token }))
+        .await;
+    assert_eq!(
+        verify_resp.status(),
+        StatusCode::OK,
+        "email verification failed: {}",
+        verify_resp.body_str
+    );
+
+    (email, password)
+}
+
+pub async fn login(app: &TestApp, email: &str, password: &str) -> Session {
+    let resp = app
+        .post_json(
+            "/auth/login",
+            serde_json::json!({ "email": email, "password": password }),
+        )
+        .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "login failed: {}",
+        resp.body_str
+    );
+    Session {
+        sid: extract_cookie_val(&resp.headers, &app.state.config.session.cookie_name)
+            .expect("session cookie"),
+        csrf: extract_cookie_val(&resp.headers, "csrf_token").expect("csrf cookie"),
+    }
+}
+
+/// Password login for a 2FA user: challenge token, no session cookie.
+pub async fn challenge(app: &TestApp, email: &str, password: &str) -> String {
+    let resp = app
+        .post_json(
+            "/auth/login",
+            serde_json::json!({ "email": email, "password": password }),
+        )
+        .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "login failed: {}",
+        resp.body_str
+    );
+    assert_eq!(resp.json["two_factor_required"], serde_json::json!(true));
+    assert!(
+        !resp.headers.contains_key(header::SET_COOKIE),
+        "2FA login must not issue a session cookie"
+    );
+    resp.json["challenge_token"]
+        .as_str()
+        .expect("challenge token")
+        .to_string()
+}
+
+pub async fn enroll(app: &TestApp, session: &Session, ip: &str) -> serde_json::Value {
+    let resp = app
+        .dispatch(session_request(
+            app,
+            Method::POST,
+            "/auth/totp/enroll",
+            serde_json::json!({}),
+            session,
+            ip,
+        ))
+        .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "enroll failed: {}",
+        resp.body_str
+    );
+    resp.json.clone()
+}
+
+pub async fn confirm(app: &TestApp, session: &Session, secret: &str, ip: &str) -> TestResponse {
+    let code = totp_code(secret);
+    app.dispatch(session_request(
+        app,
+        Method::POST,
+        "/auth/totp/confirm",
+        serde_json::json!({ "code": code }),
+        session,
+        ip,
+    ))
+    .await
+}
+
+/// Create a user, enroll, and confirm so 2FA is enabled.
+///
+/// Returns the pre-enablement session too: a password login for a 2FA user yields a
+/// challenge, not a cookie, so later protected calls must reuse this session.
+pub async fn enabled_user(
+    app: &TestApp,
+    ip: &str,
+) -> (String, String, String, Vec<String>, Session) {
+    let (email, password) = create_verified_user(app).await;
+    let session = login(app, &email, &password).await;
+    let enrollment = enroll(app, &session, ip).await;
+    let secret = enrollment["secret_base32"]
+        .as_str()
+        .expect("secret_base32")
+        .to_string();
+    let backup_codes: Vec<String> = enrollment["backup_codes"]
+        .as_array()
+        .expect("backup_codes")
+        .iter()
+        .map(|code| code.as_str().expect("backup code string").to_string())
+        .collect();
+
+    let resp = confirm(app, &session, &secret, ip).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "confirm failed: {}",
+        resp.body_str
+    );
+
+    (email, password, secret, backup_codes, session)
+}
+
+/// Resolves the user row behind an email so a journey can assert identity in `sessions`.
+pub async fn user_id_for_email(pool: &PgPool, email: &str) -> Uuid {
+    sqlx::query_scalar("SELECT id FROM users WHERE email = $1")
+        .bind(email)
+        .fetch_one(pool)
+        .await
+        .expect("user row must exist for the journey email")
+}
+
+pub async fn count_sessions_for_user(pool: &PgPool, user_id: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .expect("count sessions")
 }

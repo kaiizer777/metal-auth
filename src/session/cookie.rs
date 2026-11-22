@@ -1,6 +1,9 @@
 //! Session and CSRF cookie builders and parsers.
 
-use crate::config::{Config, SessionConfig};
+use crate::{
+    config::{Config, SessionConfig},
+    error::AppError,
+};
 use axum::http::{HeaderMap, HeaderValue};
 
 /// Trait abstracting access to session cookie configuration.
@@ -65,8 +68,63 @@ impl SessionCookieSource for Config {
     }
 }
 
-/// Helper to build a session cookie `Set-Cookie` header value.
-pub fn build_session_cookie(sc: &impl SessionCookieSource, raw_id: &str) -> HeaderValue {
+/// Tokens placed in cookies are hex by construction; anything else is a bug.
+/// Values must be RFC 6265 `cookie-octet` (`%x21 / %x23-2B / %x2D-3A /
+/// %x3C-5B / %x5D-7E`): graphic ASCII minus `"`, `,`, `;`, `\`, which would
+/// split or re-quote the `Set-Cookie` value.
+fn valid_token_chars(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .bytes()
+            .all(|b| matches!(b, 0x21 | 0x23..=0x2B | 0x2D..=0x3A | 0x3C..=0x5B | 0x5D..=0x7E))
+}
+
+/// Cookie names follow RFC 6265 `token`: letters, digits, and
+/// `!#$%&'*+-.^_`|~` only. `Config::validate` enforces this too; builders
+/// re-check defensively so an unvalidated `SessionConfig` can never produce
+/// a splittable `Set-Cookie`.
+fn valid_cookie_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+/// Build a session cookie `Set-Cookie` header value, failing closed on invalid content.
+///
+/// A `HeaderValue` encoding failure (non-ASCII/control bytes in the token or cookie
+/// name) is a server-side bug — hex tokens must always encode — so callers surface
+/// `AppError::Internal` (500) instead of emitting an empty `Set-Cookie`.
+///
+/// # Errors
+///
+/// Returns `AppError::Internal` when the cookie name or token contains characters
+/// that cannot appear in a `Set-Cookie` value.
+pub fn build_session_cookie(
+    sc: &impl SessionCookieSource,
+    raw_id: &str,
+) -> Result<HeaderValue, AppError> {
+    if !valid_cookie_name(sc.cookie_name()) || !valid_token_chars(raw_id) {
+        tracing::error!(event = "cookie_build_failed", kind = "session");
+        return Err(AppError::Internal);
+    }
     let mut parts = vec![
         format!("{}={}", sc.cookie_name(), raw_id),
         format!("Max-Age={}", sc.absolute_lifetime_secs()),
@@ -83,11 +141,22 @@ pub fn build_session_cookie(sc: &impl SessionCookieSource, raw_id: &str) -> Head
         parts.push(format!("Domain={}", domain));
     }
 
-    HeaderValue::from_str(&parts.join("; ")).unwrap_or_else(|_| HeaderValue::from_static(""))
+    HeaderValue::from_str(&parts.join("; ")).map_err(|_| {
+        tracing::error!(event = "cookie_build_failed", kind = "session");
+        AppError::Internal
+    })
 }
 
-/// Helper to build a clear session cookie `Set-Cookie` header value.
-pub fn build_clear_cookie(sc: &impl SessionCookieSource) -> HeaderValue {
+/// Build a clear-session cookie `Set-Cookie` header value, failing closed on invalid content.
+///
+/// # Errors
+///
+/// Returns `AppError::Internal` when the cookie name cannot appear in a `Set-Cookie` value.
+pub fn build_clear_cookie(sc: &impl SessionCookieSource) -> Result<HeaderValue, AppError> {
+    if !valid_cookie_name(sc.cookie_name()) {
+        tracing::error!(event = "cookie_build_failed", kind = "clear");
+        return Err(AppError::Internal);
+    }
     let mut parts = vec![
         format!("{}=", sc.cookie_name()),
         "Max-Age=0".to_string(),
@@ -104,11 +173,26 @@ pub fn build_clear_cookie(sc: &impl SessionCookieSource) -> HeaderValue {
         parts.push(format!("Domain={}", domain));
     }
 
-    HeaderValue::from_str(&parts.join("; ")).unwrap_or_else(|_| HeaderValue::from_static(""))
+    HeaderValue::from_str(&parts.join("; ")).map_err(|_| {
+        tracing::error!(event = "cookie_build_failed", kind = "clear");
+        AppError::Internal
+    })
 }
 
-/// Helper to build a CSRF cookie `Set-Cookie` header value.
-pub fn build_csrf_cookie(sc: &impl SessionCookieSource, csrf_token: &str) -> HeaderValue {
+/// Build a CSRF cookie `Set-Cookie` header value, failing closed on invalid content.
+///
+/// # Errors
+///
+/// Returns `AppError::Internal` when the token contains characters that cannot
+/// appear in a `Set-Cookie` value.
+pub fn build_csrf_cookie(
+    sc: &impl SessionCookieSource,
+    csrf_token: &str,
+) -> Result<HeaderValue, AppError> {
+    if !valid_token_chars(csrf_token) {
+        tracing::error!(event = "cookie_build_failed", kind = "csrf");
+        return Err(AppError::Internal);
+    }
     let mut parts = vec![
         format!("csrf_token={}", csrf_token),
         format!("Path={}", sc.cookie_path()),
@@ -124,66 +208,89 @@ pub fn build_csrf_cookie(sc: &impl SessionCookieSource, csrf_token: &str) -> Hea
         parts.push(format!("Domain={}", domain));
     }
 
-    HeaderValue::from_str(&parts.join("; ")).unwrap_or_else(|_| HeaderValue::from_static(""))
-}
-
-/// Trait to support flexible argument order for `set_session_cookie`.
-pub trait SetSessionCookieArgs {
-    fn into_header_value(self) -> HeaderValue;
-}
-
-impl<'a, C: SessionCookieSource> SetSessionCookieArgs for (&'a str, &'a C) {
-    fn into_header_value(self) -> HeaderValue {
-        build_session_cookie(self.1, self.0)
-    }
-}
-
-impl<'a, C: SessionCookieSource> SetSessionCookieArgs for (&'a C, &'a str) {
-    fn into_header_value(self) -> HeaderValue {
-        build_session_cookie(self.0, self.1)
-    }
-}
-
-/// Trait to support flexible argument order for `set_csrf_cookie`.
-pub trait SetCsrfCookieArgs {
-    fn into_header_value(self) -> HeaderValue;
-}
-
-impl<'a, C: SessionCookieSource> SetCsrfCookieArgs for (&'a str, &'a C) {
-    fn into_header_value(self) -> HeaderValue {
-        build_csrf_cookie(self.1, self.0)
-    }
-}
-
-impl<'a, C: SessionCookieSource> SetCsrfCookieArgs for (&'a C, &'a str) {
-    fn into_header_value(self) -> HeaderValue {
-        build_csrf_cookie(self.0, self.1)
-    }
+    HeaderValue::from_str(&parts.join("; ")).map_err(|_| {
+        tracing::error!(event = "cookie_build_failed", kind = "csrf");
+        AppError::Internal
+    })
 }
 
 /// Build a `Set-Cookie` header value for the session cookie.
 ///
 /// Unconditional `HttpOnly = true`.
-pub fn set_session_cookie<A, B>(a: A, b: B) -> HeaderValue
-where
-    (A, B): SetSessionCookieArgs,
-{
-    (a, b).into_header_value()
+///
+/// # Errors
+///
+/// Returns `AppError::Internal` when the cookie name or token cannot be encoded.
+pub fn set_session_cookie(
+    sc: &impl SessionCookieSource,
+    raw_id: &str,
+) -> Result<HeaderValue, AppError> {
+    build_session_cookie(sc, raw_id)
 }
 
 /// Build a `Set-Cookie` header that clears the session cookie.
-pub fn clear_session_cookie(sc: &impl SessionCookieSource) -> HeaderValue {
+///
+/// # Errors
+///
+/// Returns `AppError::Internal` when the cookie name cannot be encoded.
+pub fn clear_session_cookie(sc: &impl SessionCookieSource) -> Result<HeaderValue, AppError> {
     build_clear_cookie(sc)
 }
 
 /// Build a `Set-Cookie` header for the CSRF token.
 ///
 /// INTENTIONALLY NOT HttpOnly so client scripts can read it for Double Submit Cookie CSRF defense.
-pub fn set_csrf_cookie<A, B>(a: A, b: B) -> HeaderValue
-where
-    (A, B): SetCsrfCookieArgs,
-{
-    (a, b).into_header_value()
+///
+/// # Errors
+///
+/// Returns `AppError::Internal` when the token cannot be encoded.
+pub fn set_csrf_cookie(
+    sc: &impl SessionCookieSource,
+    csrf_token: &str,
+) -> Result<HeaderValue, AppError> {
+    build_csrf_cookie(sc, csrf_token)
+}
+
+/// Build a clear-CSRF cookie `Set-Cookie` header value, expiring the `csrf_token` cookie.
+///
+/// # Security Invariant
+/// Clearing the CSRF cookie must strictly be associated with valid authenticated session
+/// invalidation (e.g. successful logout where credentials were verified). Handlers must never
+/// emit clear-cookie headers on unauthenticated or rejected requests.
+///
+/// # Errors
+///
+/// Returns `AppError::Internal` when the header value cannot be encoded.
+pub fn build_clear_csrf_cookie(sc: &impl SessionCookieSource) -> Result<HeaderValue, AppError> {
+    let mut parts = vec![
+        "csrf_token=".to_string(),
+        "Max-Age=0".to_string(),
+        "Expires=Thu, 01 Jan 1970 00:00:00 GMT".to_string(),
+        format!("Path={}", sc.cookie_path()),
+        "SameSite=Strict".to_string(),
+    ];
+    if sc.cookie_secure() {
+        parts.push("Secure".to_string());
+    }
+    if let Some(domain) = sc.cookie_domain() {
+        parts.push(format!("Domain={}", domain));
+    }
+
+    HeaderValue::from_str(&parts.join("; ")).map_err(|_| {
+        tracing::error!(event = "cookie_build_failed", kind = "clear_csrf");
+        AppError::Internal
+    })
+}
+
+/// Build a `Set-Cookie` header that clears the CSRF token cookie.
+///
+/// See [`build_clear_csrf_cookie`] for security invariants regarding authenticated logout.
+///
+/// # Errors
+///
+/// Returns `AppError::Internal` when the header value cannot be encoded.
+pub fn clear_csrf_cookie(sc: &impl SessionCookieSource) -> Result<HeaderValue, AppError> {
+    build_clear_csrf_cookie(sc)
 }
 
 /// Extract the session cookie value from the `Cookie` header.
@@ -236,13 +343,15 @@ mod tests {
             ),
             session: SessionConfig::default(),
             rate_limit: crate::config::RateLimitConfig::default(),
+            oauth: crate::config::OAuthConfig::default(),
+            totp: crate::config::TotpConfig::default(),
         }
     }
 
     #[test]
     fn test_cookie_flags() {
         let cfg = test_config();
-        let cookie = set_session_cookie("rawtoken123", &cfg);
+        let cookie = set_session_cookie(&cfg, "rawtoken123").expect("hex token encodes");
         let s = cookie.to_str().expect("valid ascii");
 
         assert!(s.contains("sid=rawtoken123"));
@@ -257,9 +366,8 @@ mod tests {
             "HttpOnly must occur exactly once"
         );
 
-        // Test with SessionConfig directly and inverted argument order
-        let sc = SessionConfig::default();
-        let cookie2 = set_session_cookie(&sc, "rawtoken123");
+        // SessionConfig subset builds the identical value
+        let cookie2 = set_session_cookie(&cfg.session, "rawtoken123").expect("hex token encodes");
         assert_eq!(cookie, cookie2);
     }
 
@@ -270,7 +378,7 @@ mod tests {
             cookie_secure: false,
             ..Default::default()
         };
-        let cookie = set_session_cookie("rawtoken123", &sc);
+        let cookie = set_session_cookie(&sc, "rawtoken123").expect("hex token encodes");
         let s = cookie.to_str().expect("valid ascii");
 
         assert!(s.contains("Domain=auth.example.com"));
@@ -279,9 +387,59 @@ mod tests {
     }
 
     #[test]
+    fn rejects_token_with_crlf() {
+        let cfg = test_config();
+        assert!(set_session_cookie(&cfg, "abc\r\nSet-Cookie: x=y").is_err());
+        assert!(set_csrf_cookie(&cfg, "tok\nen").is_err());
+        assert!(build_session_cookie(&cfg, "non-ascii-tökën").is_err());
+    }
+
+    #[test]
+    fn rejects_cookie_name_with_separator() {
+        let sc = SessionConfig {
+            cookie_name: "bad;name".into(),
+            ..Default::default()
+        };
+        assert!(set_session_cookie(&sc, "rawtoken123").is_err());
+        assert!(clear_session_cookie(&sc).is_err());
+    }
+
+    #[test]
+    fn rejects_token_with_semicolon() {
+        let cfg = test_config();
+        assert!(set_session_cookie(&cfg, "abc;HttpOnly").is_err());
+        assert!(set_csrf_cookie(&cfg, "tok;en").is_err());
+    }
+
+    #[test]
+    fn rejects_non_cookie_octet_delimiters() {
+        let cfg = test_config();
+        for token in ["ab\"cd", "ab,cd", "ab\\cd"] {
+            assert!(set_session_cookie(&cfg, token).is_err(), "{token}");
+            assert!(set_csrf_cookie(&cfg, token).is_err(), "{token}");
+        }
+    }
+
+    #[test]
+    fn rejects_cookie_name_with_rfc6265_separators() {
+        // `'` is a valid RFC 6265 tchar, so it is intentionally absent here.
+        for name in [
+            "a/b", "a:b", "a\"b", "a(b)", "a)b", "a,b", "a=b", "a b", "a@b", "a[b]", "a]b", "a{b}",
+            "a}b", "a?b", "a\\b", "a<b", "a>b",
+        ] {
+            let sc = SessionConfig {
+                cookie_name: name.into(),
+                ..Default::default()
+            };
+            assert!(set_session_cookie(&sc, "rawtoken123").is_err(), "{name}");
+            assert!(clear_session_cookie(&sc).is_err(), "{name}");
+        }
+    }
+
+    #[test]
     fn test_clear_cookie() {
         let cfg = test_config();
-        let cookie = clear_session_cookie(&cfg);
+        let cookie = clear_session_cookie(&cfg).expect("static parts encode");
         let s = cookie.to_str().expect("valid ascii");
 
         assert!(s.contains("sid="));
@@ -294,7 +452,7 @@ mod tests {
     #[test]
     fn test_csrf_cookie_not_httponly() {
         let cfg = test_config();
-        let cookie = set_csrf_cookie("csrftoken456", &cfg);
+        let cookie = set_csrf_cookie(&cfg, "csrftoken456").expect("hex token encodes");
         let s = cookie.to_str().expect("valid ascii");
 
         assert!(s.contains("csrf_token=csrftoken456"));
@@ -303,8 +461,28 @@ mod tests {
         assert!(s.contains("Secure"));
         assert!(s.contains("Path=/"));
 
-        // Inverted argument order support
-        let cookie2 = set_csrf_cookie(&cfg.session, "csrftoken456");
+        let cookie2 = set_csrf_cookie(&cfg.session, "csrftoken456").expect("hex token encodes");
+        assert_eq!(cookie, cookie2);
+    }
+
+    #[test]
+    fn test_clear_csrf_cookie() {
+        let cfg = test_config();
+        let cookie = clear_csrf_cookie(&cfg).expect("clear csrf cookie encodes");
+        let s = cookie.to_str().expect("valid ascii");
+
+        assert!(s.contains("csrf_token="));
+        assert!(s.contains("Max-Age=0"));
+        assert!(s.contains("Expires=Thu, 01 Jan 1970 00:00:00 GMT"));
+        assert!(s.contains("SameSite=Strict"));
+        assert!(s.contains("Path=/"));
+        assert!(s.contains("Secure"));
+        assert!(
+            !s.contains("HttpOnly"),
+            "Clear CSRF cookie must not be HttpOnly"
+        );
+
+        let cookie2 = clear_csrf_cookie(&cfg.session).expect("clear csrf cookie encodes");
         assert_eq!(cookie, cookie2);
     }
 
@@ -335,5 +513,32 @@ mod tests {
         let mut headers2 = HeaderMap::new();
         headers2.insert("cookie", HeaderValue::from_static("sid=; other=val"));
         assert_eq!(read_session_cookie(&headers2, "sid"), None);
+    }
+
+    #[test]
+    fn ignores_name_prefix_and_keeps_equals_in_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            HeaderValue::from_static("sid2=wrong; sid=right; tok=a=b=c"),
+        );
+        assert_eq!(
+            read_session_cookie(&headers, "sid"),
+            Some("right".to_string())
+        );
+        assert_eq!(
+            read_session_cookie(&headers, "tok"),
+            Some("a=b=c".to_string())
+        );
+    }
+
+    #[test]
+    fn first_duplicate_cookie_wins() {
+        let mut headers = HeaderMap::new();
+        headers.insert("cookie", HeaderValue::from_static("sid=first; sid=second"));
+        assert_eq!(
+            read_session_cookie(&headers, "sid"),
+            Some("first".to_string())
+        );
     }
 }

@@ -66,7 +66,7 @@ pub fn create_router(state: AppState) -> Result<Router, AppError> {
     let oauth_router = oauth::routes(state.clone());
     let auth_router = auth::routes_with_app_state(state.clone())?
         .merge(session::routes(state.clone()))
-        .merge(totp::routes(state.clone()))
+        .merge(totp::routes(state.clone())?)
         .merge(oauth_router.clone());
 
     Ok(Router::new()
@@ -260,6 +260,34 @@ mod tests {
 
         let resp = router.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn totp_routes_rejects_absent_totp_encryption_key() {
+        let cfg = Config {
+            totp: crate::config::TotpConfig::default(),
+            ..valid_config()
+        };
+
+        assert_eq!(
+            totp_key_error_reason(crate::handler::totp::routes(state_with_config(cfg))),
+            "must be set to enable totp"
+        );
+    }
+
+    #[tokio::test]
+    async fn totp_routes_serves_a_keyed_config() {
+        let mut router = crate::handler::totp::routes(state_with_config(valid_config()))
+            .expect("keyed config builds the totp router");
+
+        let req = Request::builder()
+            .uri("/totp/verify")
+            .method(Method::POST)
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

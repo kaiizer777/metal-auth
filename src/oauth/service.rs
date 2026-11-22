@@ -618,7 +618,21 @@ impl OAuthService {
 
         if enabled {
             rollback_quietly(transaction).await;
-            let challenge_token = self.totp_service.generate_two_factor_token(user.id).await?;
+            // Minting can only fail on infrastructure (its INSERT), never on user input.
+            // Report it as unavailable — the class `handler::auth` uses for the same
+            // failure — instead of letting a `Database` error surface as a 500.
+            let challenge_token = match self.totp_service.generate_two_factor_token(user.id).await {
+                Ok(token) => token,
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        user_id = %user.id,
+                        provider = ctx.provider_id,
+                        "oauth callback refused: second-factor challenge could not be minted"
+                    );
+                    return Err(AppError::TwoFactorUnavailable);
+                }
+            };
             tracing::info!(
                 target: "security_event",
                 event = "two_factor_challenge_issued",
@@ -1566,5 +1580,218 @@ mod tests {
         assert!(debug.contains("[REDACTED]"));
         // Not secret: the same header is printed for a completed login.
         assert!(debug.contains("oauth_state=; Max-Age=0"));
+    }
+
+    /// A failed challenge mint is infrastructure, not user input: it must surface as
+    /// `TwoFactorUnavailable` (503) rather than a `Database` error (500).
+    #[tokio::test]
+    async fn challenge_mint_failure_maps_to_two_factor_unavailable() {
+        let Some(ctx) = setup_oauth_db_context().await else {
+            return;
+        };
+        let email = format!("totp-oauth-{}@example.com", Uuid::new_v4().simple());
+        let user_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO users (email, password_hash, email_verified) \
+             VALUES ($1, $2, TRUE) RETURNING id",
+        )
+        .bind(&email)
+        .bind(OAUTH_UNUSABLE_PASSWORD_HASH)
+        .fetch_one(&ctx.pool)
+        .await
+        .expect("seed user");
+        // The gate only reads `enabled`; the blob's shape is irrelevant here.
+        sqlx::query(
+            "INSERT INTO totp_secrets (user_id, encrypted_secret, enabled) \
+             VALUES ($1, $2, TRUE)",
+        )
+        .bind(user_id)
+        .bind(vec![0u8; 44])
+        .execute(&ctx.pool)
+        .await
+        .expect("seed enabled factor");
+
+        let svc = oauth_service_over_pool(
+            &ctx.pool,
+            Arc::clone(&ctx.config),
+            UserInfo {
+                provider_id: "google".to_string(),
+                provider_user_id: format!("goog_{}", Uuid::new_v4().simple()),
+                email: email.clone(),
+                email_verified: true,
+                name: None,
+                avatar_url: None,
+            },
+        );
+
+        let injection = reject_challenge_inserts_for(&ctx.pool, user_id).await;
+        let (auth_url, set_cookie) = svc
+            .get_authorization_url("google", None)
+            .expect("init flow");
+        let state_token = extract_state_token(&auth_url);
+        let result = svc
+            .handle_callback_extended(
+                "google",
+                "valid_code",
+                &state_token,
+                Some(&set_cookie),
+                "cookie",
+                Some("127.0.0.1"),
+                Some("test-agent"),
+            )
+            .await;
+        // Disarm before asserting: a panicking assertion must not leave the trigger behind.
+        injection.disarm().await;
+
+        let error = result.expect_err("the challenge insert is injected to fail");
+        assert!(
+            matches!(error, AppError::TwoFactorUnavailable),
+            "a mint failure must not surface as a database error, got {error:?}"
+        );
+
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&ctx.pool)
+            .await
+            .expect("count sessions");
+        assert_eq!(sessions, 0, "the failure must not issue a session");
+    }
+
+    struct OAuthDbContext {
+        pool: PgPool,
+        config: Arc<Config>,
+        _guard: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    async fn setup_oauth_db_context() -> Option<OAuthDbContext> {
+        let guard = crate::db::DB_TEST_LOCK.lock().await;
+        dotenvy::dotenv().ok();
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) => {
+                assert!(
+                    std::env::var_os("CI").is_none(),
+                    "DATABASE_URL must be set in CI: DB-backed tests must never skip silently"
+                );
+                eprintln!("SKIP: DB-backed oauth tests need DATABASE_URL");
+                return None;
+            }
+        };
+        let pool = crate::db::init_pool_with_options(
+            &url,
+            crate::db::DbPoolOptions {
+                max_connections: 5,
+                min_connections: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("DATABASE_URL is set, so the DB-backed test must connect");
+
+        let mut config = Config {
+            database_url: url,
+            ..Default::default()
+        };
+        config.oauth.state_secret = "01234567890123456789012345678901".to_string();
+        Some(OAuthDbContext {
+            pool,
+            config: Arc::new(config),
+            _guard: guard,
+        })
+    }
+
+    fn oauth_service_over_pool(
+        pool: &PgPool,
+        config: Arc<Config>,
+        user_info: UserInfo,
+    ) -> OAuthService {
+        let session_service = Arc::new(SessionService::new(pool.clone(), Arc::clone(&config)));
+        let totp_service = Arc::new(crate::totp::service::TotpService::new(
+            pool.clone(),
+            Arc::clone(&config),
+            Arc::new(crate::config::AppConfig::default()),
+        ));
+        let mut providers: HashMap<String, Arc<dyn OAuthProvider>> = HashMap::new();
+        providers.insert(
+            "google".to_string(),
+            Arc::new(MockProvider {
+                id: "google",
+                user_info,
+                exchange_fail: false,
+            }),
+        );
+        OAuthService::with_providers(
+            pool.clone(),
+            config,
+            session_service,
+            totp_service,
+            providers,
+        )
+    }
+
+    fn extract_state_token(auth_url: &str) -> String {
+        auth_url
+            .split("state=")
+            .nth(1)
+            .expect("auth url carries a state")
+            .split('&')
+            .next()
+            .expect("state value")
+            .to_string()
+    }
+
+    /// Rejects `two_factor_tokens` inserts for one user, so the mint fails on infrastructure.
+    ///
+    /// The trigger name is unique per run, so residue from a crashed run cannot block a
+    /// later one, and the predicate is scoped to one freshly created user.
+    struct RejectedChallengeInsert {
+        pool: PgPool,
+        trigger: String,
+    }
+
+    impl RejectedChallengeInsert {
+        async fn install(pool: &PgPool, user_id: Uuid) -> Self {
+            let trigger = format!("oauth_test_reject_challenge_{}", Uuid::new_v4().simple());
+            // Only a generated identifier and a `Uuid` are interpolated; a trigger
+            // predicate cannot take binds.
+            let statements = [
+                format!(
+                    "CREATE FUNCTION {trigger}() RETURNS trigger LANGUAGE plpgsql \
+                     AS $$ BEGIN RAISE EXCEPTION 'injected challenge insert failure'; END $$"
+                ),
+                format!(
+                    "CREATE TRIGGER {trigger} BEFORE INSERT ON two_factor_tokens FOR EACH ROW \
+                     WHEN (NEW.user_id = '{user_id}') EXECUTE FUNCTION {trigger}()"
+                ),
+            ];
+            for statement in statements {
+                sqlx::query(sqlx::AssertSqlSafe(statement))
+                    .execute(pool)
+                    .await
+                    .expect("install challenge-insert rejection");
+            }
+            Self {
+                pool: pool.clone(),
+                trigger,
+            }
+        }
+
+        async fn disarm(self) {
+            for statement in [
+                format!(
+                    "DROP TRIGGER IF EXISTS {} ON two_factor_tokens",
+                    self.trigger
+                ),
+                format!("DROP FUNCTION IF EXISTS {}()", self.trigger),
+            ] {
+                sqlx::query(sqlx::AssertSqlSafe(statement))
+                    .execute(&self.pool)
+                    .await
+                    .expect("drop challenge-insert rejection");
+            }
+        }
+    }
+
+    async fn reject_challenge_inserts_for(pool: &PgPool, user_id: Uuid) -> RejectedChallengeInsert {
+        RejectedChallengeInsert::install(pool, user_id).await
     }
 }

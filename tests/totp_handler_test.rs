@@ -1756,6 +1756,15 @@ impl FailureInjection {
 /// backend would otherwise hang the test binary instead of failing.
 const CLEANUP_TIMEOUT: &str = "5s";
 
+/// Bound on the whole cleanup — connect plus both drops — measured from thread spawn.
+///
+/// Nothing bounds the connect: `PgConnectOptions` in sqlx 0.9 has no connect timeout, and the
+/// pool's `acquire_timeout` does not apply to the raw connection `Drop` opens. Two statements
+/// may legitimately spend `CLEANUP_TIMEOUT` each, so the floor is just over 10s. The value is
+/// deliberately far above it: expiry detaches the cleanup thread, which can still drop a
+/// trigger a later test has already re-installed, so detaching must stay a last resort.
+const CLEANUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Drop the trigger and its function in one bounded transaction.
 ///
 /// `IF EXISTS` makes a retry after a timeout safe.
@@ -1787,9 +1796,12 @@ impl Drop for FailureInjection {
         }
         let options = self.pool.connect_options();
         let statements = self.drop_statements();
+        let (finished, cleanup_done) = std::sync::mpsc::channel::<()>();
         // Wait for the cleanup: the next test takes `DB_LOCK` only after this frame has
         // finished unwinding.
         let cleanup = std::thread::spawn(move || {
+            // Disconnected when this closure returns or panics, so it signals "finished".
+            let _finished = finished;
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1811,6 +1823,18 @@ impl Drop for FailureInjection {
                 );
             }
         });
+        let expired = matches!(
+            cleanup_done.recv_timeout(CLEANUP_DEADLINE),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        if expired {
+            // The thread is detached from here on: it may still reach the database, which is
+            // why `CLEANUP_DEADLINE` is sized to make this path unreachable in practice.
+            eprintln!(
+                "failure injection cleanup abandoned after {CLEANUP_DEADLINE:?}: still running"
+            );
+            return;
+        }
         if cleanup.join().is_err() {
             eprintln!("failure injection cleanup thread panicked");
         }

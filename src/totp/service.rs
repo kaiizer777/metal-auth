@@ -2312,7 +2312,10 @@ mod tests {
             AuthServiceImpl::new(
                 ctx.pool.clone(),
                 auth_config,
-                Arc::new(EmailDispatcher::new(
+                // Worker-free: a detached dispatcher spawns the production outbox worker on
+                // this real pool, whose 1 s cleanup tick can delete rows a concurrent test
+                // holds DB_TEST_LOCK for.
+                Arc::new(EmailDispatcher::new_blocking(
                     None,
                     std::time::Duration::from_secs(10),
                 )),

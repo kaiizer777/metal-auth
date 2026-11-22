@@ -24,7 +24,7 @@ use crate::{
     config::Config,
     db::models::Session,
     error::{AppError, ErrorCode, ErrorResponse},
-    handler::untrusted_client_ip,
+    handler::{require_totp_key, untrusted_client_ip},
     ratelimit::{RateLimitRejection, RateLimiter},
     session::{
         SessionService,
@@ -85,7 +85,13 @@ pub fn routes(service: Arc<AuthServiceImpl>, config: Arc<Config>) -> Result<Rout
     }))
 }
 
-pub fn routes_with_app_state(state: AppState) -> Router {
+/// Build the auth router on top of an existing [`AppState`].
+///
+/// Fails at startup when the TOTP encryption key is absent or unusable: this router mounts
+/// `/auth/login`, so a keyless config would mint challenges it cannot verify.
+pub fn routes_with_app_state(state: AppState) -> Result<Router, AppError> {
+    require_totp_key(&state.config)?;
+
     let handler_state = AuthHandlerState {
         service: Arc::clone(&state.auth_service),
         session_service: Some(Arc::clone(&state.session_service)),
@@ -126,7 +132,7 @@ pub fn routes_with_app_state(state: AppState) -> Router {
         )
         .with_state(handler_state);
 
-    public_routes.merge(csrf_routes)
+    Ok(public_routes.merge(csrf_routes))
 }
 
 pub fn routes_with_state(state: AuthHandlerState) -> Router {
@@ -1176,14 +1182,21 @@ mod tests {
     async fn logout_unsupported_methods_return_405() {
         use tower::ServiceExt;
         let pool = sqlx::PgPool::connect_lazy("postgres://localhost/test").unwrap();
+        let config = Config {
+            totp: crate::config::TotpConfig {
+                encryption_key: Some("00".repeat(crate::config::TOTP_ENCRYPTION_KEY_BYTES)),
+                ..crate::config::TotpConfig::default()
+            },
+            ..Config::default()
+        };
         let app_state = AppState::with_configs_and_dispatcher(
             pool,
-            Config::default(),
+            config,
             Arc::new(AppConfig::default()),
             None,
         )
         .expect("valid test AppState");
-        let app = routes_with_app_state(app_state);
+        let app = routes_with_app_state(app_state).expect("keyed config builds the auth router");
 
         for method in [
             axum::http::Method::PUT,

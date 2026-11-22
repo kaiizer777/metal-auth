@@ -22,6 +22,10 @@ use metal_auth::{
 fn dummy_app_state() -> AppState {
     let cfg = Config {
         database_url: "postgres://postgres:postgres@127.0.0.1:1/postgres".to_string(),
+        totp: metal_auth::TotpConfig {
+            encryption_key: Some("00".repeat(32)),
+            ..metal_auth::TotpConfig::default()
+        },
         ..Default::default()
     };
     let pool = PgPoolOptions::new()
@@ -63,6 +67,10 @@ async fn setup_live_db() -> Option<(PgPool, AppState)> {
             ..Default::default()
         },
         rate_limit: RateLimitConfig::default(),
+        totp: metal_auth::TotpConfig {
+            encryption_key: Some("00".repeat(32)),
+            ..metal_auth::TotpConfig::default()
+        },
         ..Default::default()
     };
 

@@ -40,7 +40,10 @@ fn create_test_router() -> axum::Router {
         session: metal_auth::SessionConfig::default(),
         rate_limit: metal_auth::RateLimitConfig::default(),
         oauth: metal_auth::OAuthConfig::default(),
-        totp: metal_auth::TotpConfig::default(),
+        totp: metal_auth::TotpConfig {
+            encryption_key: Some("00".repeat(32)),
+            ..metal_auth::TotpConfig::default()
+        },
     };
     let pool = sqlx::postgres::PgPoolOptions::new()
         .acquire_timeout(std::time::Duration::from_millis(500))
@@ -74,7 +77,10 @@ fn create_failing_db_router() -> axum::Router {
         session: metal_auth::SessionConfig::default(),
         rate_limit: metal_auth::RateLimitConfig::default(),
         oauth: metal_auth::OAuthConfig::default(),
-        totp: metal_auth::TotpConfig::default(),
+        totp: metal_auth::TotpConfig {
+            encryption_key: Some("00".repeat(32)),
+            ..metal_auth::TotpConfig::default()
+        },
     };
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
@@ -137,7 +143,10 @@ async fn setup_live_db() -> Option<LiveDbTestContext> {
         session: metal_auth::SessionConfig::default(),
         rate_limit: metal_auth::RateLimitConfig::default(),
         oauth: metal_auth::OAuthConfig::default(),
-        totp: metal_auth::TotpConfig::default(),
+        totp: metal_auth::TotpConfig {
+            encryption_key: Some("00".repeat(32)),
+            ..metal_auth::TotpConfig::default()
+        },
     };
     let state = AppState::new(pool.clone(), cfg).expect("failed to create app state with live DB");
     let router = create_router(state.clone()).expect("failed to create router for live DB test");

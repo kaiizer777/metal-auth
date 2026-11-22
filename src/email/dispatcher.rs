@@ -65,8 +65,11 @@ pub struct EmailDispatcher {
     block_on_delivery: bool,
     /// First inline-batch failure — test-only, so a claim error is diagnosable instead of
     /// surfacing as the caller's delivery wait timing out.
+    ///
+    /// Write-once, read-any: `OnceLock` needs no `Option`, no mutex and no poison handling.
+    /// `Arc` only because the dispatcher is `Clone`, like `notify` and `worker_started`.
     #[cfg(any(test, feature = "test-utils"))]
-    inline_error: Arc<std::sync::Mutex<Option<String>>>,
+    inline_error: Arc<std::sync::OnceLock<String>>,
 }
 impl EmailDispatcher {
     /// Creates a dispatcher that always delivers on a detached Tokio task.
@@ -81,7 +84,7 @@ impl EmailDispatcher {
             #[cfg(any(test, feature = "test-utils"))]
             block_on_delivery: false,
             #[cfg(any(test, feature = "test-utils"))]
-            inline_error: Arc::new(std::sync::Mutex::new(None)),
+            inline_error: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -184,22 +187,13 @@ impl EmailDispatcher {
     /// instead of changing the return type of [`EmailDispatcher::on_outbox_committed`].
     #[cfg(any(test, feature = "test-utils"))]
     pub fn inline_delivery_error(&self) -> Option<String> {
-        self.inline_error
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        self.inline_error.get().cloned()
     }
 
     #[cfg(any(test, feature = "test-utils"))]
     fn record_inline_error(&self, err: String) {
-        let mut slot = self
-            .inline_error
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Keep the first failure: a later retry of the same batch is usually the same cause.
-        if slot.is_none() {
-            *slot = Some(err);
-        }
+        let _ = self.inline_error.set(err);
     }
 
     /// Configures a base URL on the dispatcher.

@@ -1534,6 +1534,50 @@ async fn failed_disable_keeps_the_totp_proof_retryable() {
 
 // ─── Failure injection ───────────────────────────────────────────────────────
 
+/// The cleanup drops must give up on a held table instead of blocking the run forever, and
+/// the still-armed guard must remove the trigger once the table is free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cleanup_gives_up_at_the_lock_timeout_and_the_guard_retries() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let injection = reject_factor_deletes_for(&app.pool, Uuid::new_v4()).await;
+    let mut blocker = app.pool.begin().await.expect("blocking transaction");
+    sqlx::query("LOCK TABLE totp_secrets IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *blocker)
+        .await
+        .expect("hold the table");
+
+    let mut connection = app.pool.acquire().await.expect("cleanup connection");
+    let started = std::time::Instant::now();
+    let blocked = drop_injection(&mut connection, injection.drop_statements()).await;
+    let elapsed = started.elapsed();
+    drop(connection);
+
+    assert!(
+        blocked.is_err(),
+        "an ACCESS EXCLUSIVE hold must fail the drop, not wait it out"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_secs(4)
+            && elapsed <= std::time::Duration::from_secs(15),
+        "the drop must give up on its own timeout, took {elapsed:?}"
+    );
+
+    blocker.rollback().await.expect("release the table");
+    // Still armed: this must retry on its scratch connection and remove the trigger.
+    drop(injection);
+
+    let triggers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pg_trigger WHERE tgname = $1")
+        .bind(SECRET_DELETE.name)
+        .fetch_one(&app.pool)
+        .await
+        .expect("count triggers");
+    assert_eq!(triggers, 0, "the retry must remove the trigger");
+}
+
 /// A panicking assertion must not leave the injected trigger behind for the next test.
 #[tokio::test]
 async fn injected_trigger_is_removed_when_an_assertion_panics() {

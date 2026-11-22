@@ -1481,7 +1481,7 @@ pub const DEFAULT_TOTP_USED_CODE_PRUNE_AGE_SECS: u64 = MIN_USED_CODE_PRUNE_AGE_S
 
 /// Upper bound for the replay-log prune horizon.
 ///
-/// The value reaches SQL as `make_interval(secs => $2)`, whose time field is a 64-bit
+/// The value reaches SQL as `make_interval(secs => $3)`, whose time field is a 64-bit
 /// microsecond count. A year is far beyond any replay-log retention need and stays well
 /// inside that range, so an operator value cannot turn the prune into a range error.
 pub const MAX_TOTP_USED_CODE_PRUNE_AGE_SECS: u64 = 365 * 24 * 60 * 60;

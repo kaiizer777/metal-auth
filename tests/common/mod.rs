@@ -557,14 +557,15 @@ pub fn code_at(secret_base32: &str, counter: u64) -> String {
 
 /// Six-digit code outside the acceptance band of the current step, so a rejection test
 /// cannot accidentally present a valid code.
+///
+/// The server verifies against `clock_timestamp()`, not this process's clock, so the band is
+/// widened by three steps either side before excluding it.
 pub fn invalid_totp_code(secret_base32: &str) -> String {
     let counter = metal_auth::totp::crypto::current_totp_counter();
-    let accepted = [
-        code_at(secret_base32, counter.saturating_sub(1)),
-        code_at(secret_base32, counter),
-        code_at(secret_base32, counter + 1),
-    ];
-    let mut candidate = (accepted[1].parse::<u32>().expect("six-digit code") + 1) % 1_000_000;
+    let accepted: Vec<String> = (counter.saturating_sub(3)..=counter + 3)
+        .map(|step| code_at(secret_base32, step))
+        .collect();
+    let mut candidate = (accepted[3].parse::<u32>().expect("six-digit code") + 1) % 1_000_000;
     loop {
         let code = format!("{candidate:06}");
         if !accepted.contains(&code) {

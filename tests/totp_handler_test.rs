@@ -1659,15 +1659,13 @@ impl FailureInjection {
 
     /// Remove the injection now, on a path that is about to assert.
     ///
-    /// The guard stays armed until both drops complete, so a failing or cancelled drop
-    /// leaves `Drop` to retry on its scratch connection instead of leaking the trigger.
+    /// The guard stays armed until both drops commit, so a failing or cancelled drop leaves
+    /// `Drop` to retry on its scratch connection instead of leaking the trigger.
     async fn disarm(mut self) {
-        for statement in self.drop_statements() {
-            sqlx::query(sqlx::AssertSqlSafe(statement))
-                .execute(&self.pool)
-                .await
-                .expect("drop failure injection");
-        }
+        let mut connection = self.pool.acquire().await.expect("cleanup connection");
+        drop_injection(&mut connection, self.drop_statements())
+            .await
+            .expect("drop failure injection");
         self.armed = false;
     }
 
@@ -1677,6 +1675,34 @@ impl FailureInjection {
             format!("DROP FUNCTION IF EXISTS {}()", self.name),
         ]
     }
+}
+
+/// Bound on the cleanup drops: `DROP TRIGGER` takes `ACCESS EXCLUSIVE`, so a conflicting
+/// backend would otherwise hang the test binary instead of failing.
+const CLEANUP_TIMEOUT: &str = "5s";
+
+/// Drop the trigger and its function in one bounded transaction.
+///
+/// `IF EXISTS` makes a retry after a timeout safe.
+async fn drop_injection(
+    connection: &mut PgConnection,
+    statements: [String; 2],
+) -> Result<(), sqlx::Error> {
+    let mut transaction = connection.begin().await?;
+    for timeout in [
+        format!("SET LOCAL lock_timeout = '{CLEANUP_TIMEOUT}'"),
+        format!("SET LOCAL statement_timeout = '{CLEANUP_TIMEOUT}'"),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(timeout))
+            .execute(&mut *transaction)
+            .await?;
+    }
+    for statement in statements {
+        sqlx::query(sqlx::AssertSqlSafe(statement))
+            .execute(&mut *transaction)
+            .await?;
+    }
+    transaction.commit().await
 }
 
 impl Drop for FailureInjection {
@@ -1701,15 +1727,13 @@ impl Drop for FailureInjection {
             };
             let dropped = runtime.block_on(async move {
                 let mut connection = PgConnection::connect_with(&options).await?;
-                for statement in statements {
-                    sqlx::query(sqlx::AssertSqlSafe(statement))
-                        .execute(&mut connection)
-                        .await?;
-                }
-                Ok::<(), sqlx::Error>(())
+                drop_injection(&mut connection, statements).await
             });
             if let Err(error) = dropped {
-                eprintln!("failure injection cleanup failed: {error}");
+                eprintln!(
+                    "failure injection cleanup failed ({} lock timeout): {error}",
+                    CLEANUP_TIMEOUT
+                );
             }
         });
         if cleanup.join().is_err() {

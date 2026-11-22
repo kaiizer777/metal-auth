@@ -66,7 +66,7 @@ impl std::fmt::Debug for OAuthCallbackResult {
 /// Non-exhaustive: embedders consume this from their own HTTP layer, so a new outcome
 /// (the second-factor challenge, for one) must not break an exhaustive `match`.
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum OAuthCallbackOutcome {
     Login(OAuthCallbackResult),
     /// Second factor outstanding: no session was issued. The challenge token is the same
@@ -81,6 +81,36 @@ pub enum OAuthCallbackOutcome {
         redirect_url: String,
         clear_cookie_header: String,
     },
+}
+
+// Manual `Debug`: `challenge_token` is a live half-authenticated credential that a session
+// can be minted from, so it must never reach a log line or a panic message.
+impl std::fmt::Debug for OAuthCallbackOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Login(result) => f.debug_tuple("Login").field(result).finish(),
+            Self::TwoFactorRequired {
+                clear_cookie_header,
+                ..
+            } => f
+                .debug_struct("TwoFactorRequired")
+                .field("challenge_token", &"[REDACTED]")
+                .field("clear_cookie_header", clear_cookie_header)
+                .finish(),
+            Self::Linked {
+                user,
+                account,
+                redirect_url,
+                clear_cookie_header,
+            } => f
+                .debug_struct("Linked")
+                .field("user", user)
+                .field("account", account)
+                .field("redirect_url", redirect_url)
+                .field("clear_cookie_header", clear_cookie_header)
+                .finish(),
+        }
+    }
 }
 
 /// Per-request transport metadata for a callback.
@@ -1522,5 +1552,19 @@ mod tests {
         let debug = format!("{result:?}");
         assert!(!debug.contains("live-bearer-token"));
         assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn callback_outcome_debug_redacts_the_challenge_token() {
+        let outcome = OAuthCallbackOutcome::TwoFactorRequired {
+            challenge_token: "live-challenge-token".to_string(),
+            clear_cookie_header: "oauth_state=; Max-Age=0".to_string(),
+        };
+
+        let debug = format!("{outcome:?}");
+        assert!(!debug.contains("live-challenge-token"));
+        assert!(debug.contains("[REDACTED]"));
+        // Not secret: the same header is printed for a completed login.
+        assert!(debug.contains("oauth_state=; Max-Age=0"));
     }
 }

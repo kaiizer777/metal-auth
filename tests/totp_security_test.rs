@@ -8,8 +8,9 @@ mod common;
 use std::sync::{Arc, Mutex};
 
 use axum::http::{HeaderMap, Method, StatusCode, header};
+use chrono::{Duration, Utc};
 use common::*;
-use metal_auth::{ErrorCode, RateLimiter};
+use metal_auth::{ErrorCode, RateLimiter, crypto::token::generate_token};
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -1179,4 +1180,102 @@ async fn ip_budget_admits_exactly_ten_attempts_then_returns_429() {
         Some(ErrorCode::TotpRateLimitExceeded)
     );
     retry_after_secs(&rejected, app.state.config.totp.rate_limit_window_secs);
+}
+
+/// Scenario 12: a challenge minted before a password reset cannot be redeemed after it.
+#[tokio::test]
+async fn password_reset_purges_the_pending_challenge() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let (email, password, secret, _backup_codes, _session) =
+        enabled_user(&app, &dynamic_ip()).await;
+    let user_id = user_id_for_email(&app.pool, &email).await;
+
+    let challenge_token = challenge(&app, &email, &password).await;
+    // Two extra rows: a purge limited to one row must not pass, and the second
+    // user's row below pins the `WHERE user_id` predicate.
+    for _ in 0..2 {
+        let (_token, token_hash) = generate_token();
+        sqlx::query(
+            "INSERT INTO two_factor_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
+        )
+        .bind(user_id)
+        .bind(token_hash.as_slice())
+        .bind(Utc::now() + Duration::hours(1))
+        .execute(&app.pool)
+        .await
+        .expect("seed extra challenge row");
+    }
+    assert_eq!(pending_challenge_count(&app.pool, user_id).await, 3);
+
+    let (other_email, other_password, _other_secret, _other_backups, _other_session) =
+        enabled_user(&app, &dynamic_ip()).await;
+    let other_user_id = user_id_for_email(&app.pool, &other_email).await;
+    challenge(&app, &other_email, &other_password).await;
+    assert_eq!(pending_challenge_count(&app.pool, other_user_id).await, 1);
+
+    let sessions_before_reset = count_sessions_for_user(&app.pool, user_id).await;
+    assert!(
+        sessions_before_reset > 0,
+        "the fixture must hold a live session before the reset"
+    );
+
+    let (reset_token, reset_hash) = generate_token();
+    sqlx::query(
+        "INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
+    )
+    .bind(reset_hash.as_slice())
+    .bind(user_id)
+    .bind(Utc::now() + Duration::hours(1))
+    .execute(&app.pool)
+    .await
+    .expect("seed reset token");
+
+    let reset = app
+        .post_json_with_ip(
+            "/auth/password/reset",
+            json!({ "token": reset_token, "new_password": dynamic_password() }),
+            &dynamic_ip(),
+        )
+        .await;
+    assert_eq!(
+        reset.status(),
+        StatusCode::OK,
+        "reset failed: {}",
+        reset.body_str
+    );
+    assert_eq!(
+        pending_challenge_count(&app.pool, user_id).await,
+        0,
+        "a committed reset must purge every outstanding challenge token"
+    );
+    assert_eq!(
+        pending_challenge_count(&app.pool, other_user_id).await,
+        1,
+        "the purge must not reach another user's challenge rows"
+    );
+
+    let verify = app
+        .post_json_with_ip(
+            "/auth/totp/verify",
+            json!({ "challenge_token": challenge_token, "code": totp_code(&secret) }),
+            &dynamic_ip(),
+        )
+        .await;
+    assert_eq!(
+        verify.status(),
+        StatusCode::UNAUTHORIZED,
+        "body: {}",
+        verify.body_str
+    );
+    assert_eq!(verify.error_code(), Some(ErrorCode::TwoFactorTokenInvalid));
+    assert_eq!(
+        count_sessions_for_user(&app.pool, user_id).await,
+        0,
+        "a pre-reset challenge must not issue a session: {} live sessions were purged by the reset",
+        sessions_before_reset
+    );
 }

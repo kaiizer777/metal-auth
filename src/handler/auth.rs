@@ -488,9 +488,6 @@ enum PasswordLoginOutcome {
 /// bypass: enabling 2FA does not revoke live sessions, so a session minted before activation
 /// survives, exactly like any session older than the factor.
 ///
-/// Still not enforced: the challenge token carries no credential state, so one minted
-/// before a password reset stays redeemable (#58).
-///
 /// Lock order is factor row, then user row — the same order [`crate::handler::totp`]
 /// redemption takes, so the two cannot deadlock.
 async fn issue_session_after_gate(

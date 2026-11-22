@@ -6,6 +6,7 @@
 //! cookie, so they are mounted outside the CSRF layer on purpose.
 
 use serde::Deserialize;
+use subtle::ConstantTimeEq;
 
 use axum::{
     Json, Router,
@@ -13,6 +14,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::{
@@ -446,13 +448,16 @@ enum PresentedFactor<'a> {
 /// Ordering, and what commits when:
 /// 1. the factor use — the replay-row insert for a TOTP code, the hash removal for a
 ///    backup code. This is the single-use arbiter, so it takes the code's row lock first;
-/// 2. the challenge-token delete — the single-winner check on the challenge;
-/// 3. the session insert — last, because it locks the user row for the credential check.
+/// 2. the challenge-token delete — the single-winner check on the challenge, which also
+///    yields the credential snapshot it was minted against;
+/// 3. the credential check — locks the user row and compares that snapshot with the live
+///    hash. A challenge minted before a reset is rejected here, whatever the reset's timing;
+/// 4. the session insert — last, re-running the same compare under the lock already held.
 ///
-/// Committing only after step 3 means a failure anywhere leaves the code unspent and the
+/// Committing only after step 4 means a failure anywhere leaves the code unspent and the
 /// challenge intact, so the client can retry the same code, and no session can be minted
-/// from a code that was not spent. The lock order above is the same for every redemption,
-/// so two of them cannot deadlock.
+/// from a code that was not spent. The lock order above — factor, challenge, users — is the
+/// same for every redemption and for `reset_password`, so two of them cannot deadlock.
 async fn redeem_challenge(
     state: &AppState,
     headers: &HeaderMap,
@@ -468,16 +473,6 @@ async fn redeem_challenge(
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.eq_ignore_ascii_case("bearer"));
     let session_type = if is_bearer { "bearer" } else { "cookie" };
-
-    // `create_session_in` re-reads this column under the user row lock and rejects a
-    // mismatch, so a reset racing *this request* cannot mint a session. A reset that
-    // committed before this read yields the same value at both reads and is not detected:
-    // the challenge token carries no credential material. Follow-up: bind the credential
-    // state to the challenge token.
-    let credential_hash = match state.session_service.current_credential_hash(user_id).await {
-        Ok(hash) => hash,
-        Err(error) => return service_error_response(error),
-    };
 
     let mut transaction = match state.pool.begin().await {
         Ok(transaction) => transaction,
@@ -506,10 +501,24 @@ async fn redeem_challenge(
         return service_error_response(error);
     }
 
-    if let Err(error) = state
+    let credential_snapshot = match state
         .totp_service
         .consume_two_factor_token_in(&mut transaction, challenge_token)
         .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            return service_error_response(error);
+        }
+    };
+
+    // The snapshot the challenge was minted against must still be the live credential.
+    // A reset that committed after the mint purges the challenge row, so this catches what
+    // a fresh read could not: the challenge was authorized by a credential that no longer
+    // exists. A reset committing *now* waits for the user row lock taken here.
+    if let Err(error) =
+        ensure_credential_matches(&mut transaction, user_id, &credential_snapshot).await
     {
         let _ = transaction.rollback().await;
         return service_error_response(error);
@@ -520,7 +529,7 @@ async fn redeem_challenge(
         .create_session_in(
             &mut transaction,
             user_id,
-            Some(&credential_hash),
+            Some(&credential_snapshot),
             session_type,
         )
         .await
@@ -573,6 +582,39 @@ async fn redeem_challenge(
             Ok(response) => response,
             Err(error) => service_error_response(error),
         }
+    }
+}
+
+/// Reject a challenge whose credential snapshot is no longer the live credential.
+///
+/// Locks the `users` row in the position redemption already takes it — after the factor use
+/// and the challenge delete — which is also the order `reset_password` uses (challenges, then
+/// users). Taking it anywhere earlier would invert against reset and deadlock.
+///
+/// The length guard keeps the constant-time compare from being the only distinction: a
+/// different-length value is rejected without reaching `ct_eq`, exactly as
+/// `create_session_in` does it. The stored PHC string never leaves this function.
+async fn ensure_credential_matches(
+    transaction: &mut PgConnection,
+    user_id: Uuid,
+    snapshot: &str,
+) -> Result<(), AppError> {
+    let current: Option<String> =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1 FOR UPDATE")
+            .bind(user_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(AppError::Database)?;
+    let matches = match current {
+        Some(ref stored) if stored.len() == snapshot.len() => {
+            stored.as_bytes().ct_eq(snapshot.as_bytes()).into()
+        }
+        _ => false,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(AppError::TwoFactorTokenInvalid)
     }
 }
 

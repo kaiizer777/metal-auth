@@ -1204,7 +1204,12 @@ mod tests {
             pool,
             config,
             Arc::new(AppConfig::default()),
-            None,
+            // Worker-free, like `create_test_state`: the default dispatcher would spawn the
+            // production outbox worker against whatever the lazy pool resolves to.
+            Some(Arc::new(EmailDispatcher::new_blocking(
+                None,
+                std::time::Duration::from_secs(10),
+            ))),
         )
         .expect("valid test AppState");
         let app = routes_with_app_state(app_state).expect("keyed config builds the auth router");

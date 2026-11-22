@@ -1390,6 +1390,97 @@ async fn disable_with_password_drops_the_login_challenge() {
     assert!(login_resp.json["user_id"].is_string());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn password_disable_does_not_deadlock_with_the_login_gate() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let (email, password, _secret, _backup_codes, session) =
+        enabled_user(&app, &dynamic_ip()).await;
+    let user_id: Uuid = sqlx::query_scalar("SELECT id FROM users WHERE email = $1")
+        .bind(&email)
+        .fetch_one(&app.pool)
+        .await
+        .expect("user row");
+
+    // T1: the login gate's order — factor row `FOR SHARE`, then the users row.
+    let pool = app.pool.clone();
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel::<()>();
+    let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+    let gate = tokio::spawn(async move {
+        let mut transaction = pool.begin().await.expect("gate transaction");
+        sqlx::query("SELECT enabled FROM totp_secrets WHERE user_id = $1 FOR SHARE")
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .expect("gate holds the factor row");
+        locked_tx.send(()).expect("signal the factor lock");
+        go_rx.await.expect("gate release");
+        let users_row = sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await;
+        transaction.commit().await.expect("gate commit");
+        users_row.map(|_| ())
+    });
+    locked_rx.await.expect("gate ready");
+
+    // T2: the password-authorized disable, while the gate holds the factor row.
+    let disable_app = app.clone();
+    let mut disable = tokio::spawn(async move {
+        disable_app
+            .dispatch(session_request(
+                &disable_app,
+                Method::DELETE,
+                "/auth/totp",
+                json!({ "password": password }),
+                &session,
+                &dynamic_ip(),
+            ))
+            .await
+    });
+
+    // Bounded proof that the disable is waiting rather than done: it cannot pass the gate's
+    // factor row, so anything but a wait here means it never reached its locks.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut disable)
+            .await
+            .is_err(),
+        "the disable must wait on the factor row the gate holds"
+    );
+    // The discriminator: with the factor row taken first this succeeds; with the users row
+    // first the disable already holds it and the gate below would deadlock.
+    let users_row_free = sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE NOWAIT")
+        .bind(user_id)
+        .execute(&app.pool)
+        .await;
+
+    go_tx.send(()).expect("release the gate");
+    let gate_result = tokio::time::timeout(std::time::Duration::from_secs(10), gate)
+        .await
+        .expect("the login gate must not deadlock")
+        .expect("gate join");
+    let response = tokio::time::timeout(std::time::Duration::from_secs(10), disable)
+        .await
+        .expect("the disable must finish, not deadlock")
+        .expect("disable join");
+
+    assert!(
+        users_row_free.is_ok(),
+        "the disable must not hold the users row before the factor row: {users_row_free:?}"
+    );
+    gate_result.expect("the login gate must take the users row and commit");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "body: {}",
+        response.body_str
+    );
+    assert!(!totp_enabled(&app.pool, user_id).await);
+}
+
 #[tokio::test]
 async fn disable_with_totp_code() {
     let _guard = DB_LOCK.lock().await;

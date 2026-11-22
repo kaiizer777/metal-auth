@@ -258,14 +258,16 @@ async fn confirm_rejects_invalid_code() {
 
     let (email, password) = create_verified_user(&app).await;
     let session = login(&app, &email, &password).await;
-    enroll(&app, &session, &dynamic_ip()).await;
+    let enrollment = enroll(&app, &session, &dynamic_ip()).await;
+    let secret = enrollment["secret_base32"].as_str().expect("secret");
+    let code = invalid_totp_code(secret);
 
     let resp = app
         .dispatch(session_request(
             &app,
             Method::POST,
             "/auth/totp/confirm",
-            json!({ "code": "000000" }),
+            json!({ "code": code }),
             &session,
             &dynamic_ip(),
         ))
@@ -305,7 +307,8 @@ async fn confirm_rate_limits_its_own_dimension() {
 
     let (email, password) = create_verified_user(&app).await;
     let session = login(&app, &email, &password).await;
-    enroll(&app, &session, &dynamic_ip()).await;
+    let enrollment = enroll(&app, &session, &dynamic_ip()).await;
+    let code = invalid_totp_code(enrollment["secret_base32"].as_str().expect("secret"));
     let ip = dynamic_ip();
 
     let mut rejected_codes = 0u32;
@@ -316,7 +319,7 @@ async fn confirm_rate_limits_its_own_dimension() {
                 &app,
                 Method::POST,
                 "/auth/totp/confirm",
-                json!({ "code": "000000" }),
+                json!({ "code": code }),
                 &session,
                 &ip,
             ))
@@ -354,9 +357,12 @@ async fn confirm_does_not_spend_the_enrollment_budget() {
     let (email, password) = create_verified_user(&app).await;
     let session = login(&app, &email, &password).await;
     let ip = dynamic_ip();
-    for _ in 0..max {
-        enroll(&app, &session, &ip).await;
+    // Each reroll replaces the pending secret, so the last response is the one under test.
+    let mut enrollment = enroll(&app, &session, &ip).await;
+    for _ in 1..max {
+        enrollment = enroll(&app, &session, &ip).await;
     }
+    let code = invalid_totp_code(enrollment["secret_base32"].as_str().expect("secret"));
 
     // ...and the first code check still reaches the verifier instead of a 429.
     let confirm_response = app
@@ -364,7 +370,7 @@ async fn confirm_does_not_spend_the_enrollment_budget() {
             &app,
             Method::POST,
             "/auth/totp/confirm",
-            json!({ "code": "000000" }),
+            json!({ "code": code }),
             &session,
             &ip,
         ))
@@ -384,14 +390,15 @@ async fn confirm_does_not_spend_the_enrollment_budget() {
     let (email, password) = create_verified_user(&app).await;
     let session = login(&app, &email, &password).await;
     let ip = dynamic_ip();
-    enroll(&app, &session, &ip).await;
+    let enrollment = enroll(&app, &session, &ip).await;
+    let code = invalid_totp_code(enrollment["secret_base32"].as_str().expect("secret"));
     for _ in 0..max {
         let resp = app
             .dispatch(session_request(
                 &app,
                 Method::POST,
                 "/auth/totp/confirm",
-                json!({ "code": "000000" }),
+                json!({ "code": code }),
                 &session,
                 &ip,
             ))
@@ -408,7 +415,7 @@ async fn confirm_does_not_spend_the_enrollment_budget() {
             &app,
             Method::POST,
             "/auth/totp/confirm",
-            json!({ "code": "000000" }),
+            json!({ "code": code }),
             &session,
             &ip,
         ))
@@ -518,9 +525,9 @@ async fn verify_with_an_ambient_cookie_reaches_the_code_check() {
         return;
     };
 
-    let (email, password, _secret, _backup_codes, session) =
-        enabled_user(&app, &dynamic_ip()).await;
+    let (email, password, secret, _backup_codes, session) = enabled_user(&app, &dynamic_ip()).await;
     let token = challenge(&app, &email, &password).await;
+    let code = invalid_totp_code(&secret);
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -535,7 +542,7 @@ async fn verify_with_an_ambient_cookie_reaches_the_code_check() {
     let req = json_request_with_headers(
         Method::POST,
         "/auth/totp/verify",
-        json!({ "challenge_token": token, "code": "000000" }),
+        json!({ "challenge_token": token, "code": code }),
         headers,
     );
     let resp = app.dispatch(req).await;
@@ -691,14 +698,15 @@ async fn verify_rejects_invalid_code() {
         return;
     };
 
-    let (email, password, _secret, _backup_codes, _session) =
+    let (email, password, secret, _backup_codes, _session) =
         enabled_user(&app, &dynamic_ip()).await;
     let token = challenge(&app, &email, &password).await;
+    let code = invalid_totp_code(&secret);
 
     let resp = app
         .post_json(
             "/auth/totp/verify",
-            json!({ "challenge_token": token, "code": "000000" }),
+            json!({ "challenge_token": token, "code": code }),
         )
         .await;
 
@@ -848,9 +856,10 @@ async fn verify_rate_limits_user_dimension() {
         return;
     };
 
-    let (email, password, _secret, _backup_codes, _session) =
+    let (email, password, secret, _backup_codes, _session) =
         enabled_user(&app, &dynamic_ip()).await;
     let token = challenge(&app, &email, &password).await;
+    let code = invalid_totp_code(&secret);
 
     // Enrollment spends only the `totp:enroll:*` dimensions, so the whole user budget is
     // available to verification; a fresh IP per attempt keeps the dimensions isolated.
@@ -860,7 +869,7 @@ async fn verify_rate_limits_user_dimension() {
         let resp = app
             .post_json_with_ip(
                 "/auth/totp/verify",
-                json!({ "challenge_token": token, "code": "000000" }),
+                json!({ "challenge_token": token, "code": code }),
                 &dynamic_ip(),
             )
             .await;
@@ -904,10 +913,11 @@ async fn verify_checks_ip_before_the_token_and_keeps_dimensions_separate() {
         return;
     };
 
-    let (email, password, _secret, _backup_codes, _session) =
+    let (email, password, secret, _backup_codes, _session) =
         enabled_user(&app, &dynamic_ip()).await;
     let token = challenge(&app, &email, &password).await;
     let ip = dynamic_ip();
+    let code = invalid_totp_code(&secret);
 
     for attempt in 0..11 {
         let resp = app
@@ -945,7 +955,7 @@ async fn verify_checks_ip_before_the_token_and_keeps_dimensions_separate() {
     let resp = app
         .post_json_with_ip(
             "/auth/totp/verify",
-            json!({ "challenge_token": token, "code": "000000" }),
+            json!({ "challenge_token": token, "code": code }),
             &ip,
         )
         .await;
@@ -956,7 +966,7 @@ async fn verify_checks_ip_before_the_token_and_keeps_dimensions_separate() {
     let resp = app
         .post_json_with_ip(
             "/auth/totp/verify",
-            json!({ "challenge_token": token, "code": "000000" }),
+            json!({ "challenge_token": token, "code": code }),
             &dynamic_ip(),
         )
         .await;

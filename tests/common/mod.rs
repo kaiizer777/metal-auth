@@ -555,6 +555,25 @@ pub fn code_at(secret_base32: &str, counter: u64) -> String {
     format!("{code:06}")
 }
 
+/// Six-digit code outside the acceptance band of the current step, so a rejection test
+/// cannot accidentally present a valid code.
+pub fn invalid_totp_code(secret_base32: &str) -> String {
+    let counter = metal_auth::totp::crypto::current_totp_counter();
+    let accepted = [
+        code_at(secret_base32, counter.saturating_sub(1)),
+        code_at(secret_base32, counter),
+        code_at(secret_base32, counter + 1),
+    ];
+    let mut candidate = (accepted[1].parse::<u32>().expect("six-digit code") + 1) % 1_000_000;
+    loop {
+        let code = format!("{candidate:06}");
+        if !accepted.contains(&code) {
+            return code;
+        }
+        candidate = (candidate + 1) % 1_000_000;
+    }
+}
+
 /// Signs up and verifies the email through the in-process mailer.
 pub async fn create_verified_user(app: &TestApp) -> (String, String) {
     let email = dynamic_email();

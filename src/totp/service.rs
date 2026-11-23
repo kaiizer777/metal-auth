@@ -2519,6 +2519,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn predisabled_challenge_stays_dead_after_reenroll() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let password = fixture_password();
+        let user_id = create_user(&ctx, true, &password).await;
+        enroll_and_confirm(&ctx, user_id).await;
+        // Disable leaves the password hash untouched, so the snapshot still matches —
+        // only the purged row stops redemption.
+        let credential = credential_hash(&ctx, user_id).await;
+        let stale = ctx
+            .service
+            .generate_two_factor_token(user_id, &credential)
+            .await
+            .expect("mint challenge");
+
+        ctx.service
+            .disable_totp(user_id, FreshAuthProof::Password(password), "ip")
+            .await
+            .expect("disable");
+        enroll_and_confirm(&ctx, user_id).await;
+
+        assert!(matches!(
+            ctx.service.validate_two_factor_token(&stale).await,
+            Err(AppError::TwoFactorTokenInvalid)
+        ));
+        assert!(matches!(
+            ctx.service.consume_two_factor_token(&stale).await,
+            Err(AppError::TwoFactorTokenInvalid)
+        ));
+
+        // A challenge minted after re-enrollment still redeems.
+        let live = ctx
+            .service
+            .generate_two_factor_token(user_id, &credential)
+            .await
+            .expect("mint fresh challenge");
+        assert_eq!(
+            ctx.service
+                .validate_two_factor_token(&live)
+                .await
+                .expect("validate"),
+            user_id
+        );
+        ctx.service
+            .consume_two_factor_token(&live)
+            .await
+            .expect("consume");
+    }
+
+    #[tokio::test]
     async fn expired_challenge_token_is_rejected_and_left_for_cleanup() {
         let Some(ctx) = setup_db_context().await else {
             return;

@@ -42,7 +42,7 @@ pub trait AuthService: Send + Sync {
 
 /// Proof of a successful credential check: the user id plus the exact Argon2id
 /// PHC string that was verified. Session creation compares this snapshot
-/// against the live row under `FOR UPDATE`; a mismatch means a concurrent
+/// against the live row under `FOR NO KEY UPDATE`; a mismatch means a concurrent
 /// password change superseded the check and the session must not be minted.
 #[derive(Clone)]
 pub struct AuthenticatedLogin {
@@ -394,7 +394,7 @@ impl AuthServiceImpl {
             // Serialize concurrent issuance for this user: the row lock orders
             // racing requests so the second DELETE observes the first INSERT,
             // preserving the single-live-token policy. Held through commit.
-            let locked = sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+            let locked = sqlx::query("SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE")
                 .bind(user_id)
                 .fetch_optional(&mut *tx)
                 .await
@@ -504,7 +504,7 @@ impl AuthServiceImpl {
         // Serialize concurrent resets for this user: the lock orders two
         // simultaneously consumed tokens deterministically instead of racing
         // the final `UPDATE users` (last-writer-wins on identical cost).
-        let locked = sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        let locked = sqlx::query("SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE")
             .bind(user_id)
             .fetch_optional(&mut *tx)
             .await

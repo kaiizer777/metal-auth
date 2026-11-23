@@ -30,8 +30,8 @@ const SELECT_LINK_ID_BY_USER_PROVIDER: &str =
     "SELECT id FROM oauth_accounts WHERE user_id = $1 AND provider_id = $2";
 const DELETE_USER_LINKS: &str =
     "DELETE FROM oauth_accounts WHERE user_id = $1 AND provider_id = $2";
-const SELECT_USER_PASSWORD_HASH_FOR_UPDATE: &str =
-    "SELECT password_hash FROM users WHERE id = $1 FOR UPDATE";
+const SELECT_USER_PASSWORD_HASH_FOR_NO_KEY_UPDATE: &str =
+    "SELECT password_hash FROM users WHERE id = $1 FOR NO KEY UPDATE";
 const SELECT_SESSION_BY_HASH_FOR_UPDATE: &str = "SELECT id, user_id, token_hash, created_at, last_active_at, absolute_expires_at, session_type, csrf_token FROM sessions WHERE token_hash = $1 AND user_id = $2 FOR UPDATE";
 
 /// Result envelope returned by [`OAuthService::handle_callback_extended`].
@@ -1089,7 +1089,7 @@ impl OAuthService {
         let mut tx = self.db.begin().await.map_err(AppError::Database)?;
 
         // Acquire exclusive row lock on user record to serialize concurrent unlinking.
-        let user = sqlx::query_as::<_, (String,)>(SELECT_USER_PASSWORD_HASH_FOR_UPDATE)
+        let user = sqlx::query_as::<_, (String,)>(SELECT_USER_PASSWORD_HASH_FOR_NO_KEY_UPDATE)
             .bind(user_id)
             .fetch_optional(&mut *tx)
             .await

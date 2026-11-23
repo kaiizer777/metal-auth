@@ -1575,6 +1575,7 @@ impl TestLogScope {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_no_secrets_in_tracing_logs() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -1796,6 +1797,7 @@ async fn test_db_error_does_not_leak_sql_text() {
 
 #[tokio::test]
 async fn test_anti_enumeration_signup() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -1831,6 +1833,7 @@ async fn test_anti_enumeration_signup() {
 
 #[tokio::test]
 async fn test_signup_duplicate_does_not_create_verification_token() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -1885,6 +1888,7 @@ async fn test_signup_duplicate_does_not_create_verification_token() {
 
 #[tokio::test]
 async fn test_anti_enumeration_password_reset() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -1940,6 +1944,7 @@ async fn test_anti_enumeration_password_reset() {
 
 #[tokio::test]
 async fn test_require_email_verification_block() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };

@@ -257,6 +257,7 @@ async fn test_signup_password_too_long() {
 
 #[tokio::test]
 async fn test_signup_unicode_multibyte_password() {
+    let _guard = DB_LOCK.lock().await;
     let emoji_password = "🦀🔥✨🚀⭐💡🎉🌟"; // 8 Unicode scalar values
     let email = format!("emoji_{}@example.com", Uuid::new_v4());
 
@@ -322,6 +323,7 @@ async fn test_signup_common_password_blocklist() {
 
 #[tokio::test]
 async fn test_signup_no_forced_complexity() {
+    let _guard = DB_LOCK.lock().await;
     let simple_pw = "validlowercasepw"; // 16-char lowercase, no numbers/symbols
     let email = format!("simple_{}@example.com", Uuid::new_v4());
 

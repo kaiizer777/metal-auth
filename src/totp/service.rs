@@ -2105,6 +2105,10 @@ mod tests {
             .execute(&mut *gate)
             .await
             .expect("hold the factor row");
+        let gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *gate)
+            .await
+            .expect("gate backend");
 
         let service = ctx.service.clone();
         let attempt = password.clone();
@@ -2114,25 +2118,69 @@ mod tests {
                 .await
         });
 
-        // Give the disable time to reach its first lock, then prove it has not taken the
-        // users row: the inverted order held that row first and fails this NOWAIT.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // Password verification runs before `BEGIN`, so elapsed time proves nothing: wait for
+        // the disable to hold the user's advisory lock and block on the gate's row lock.
+        let parked = disable_parked_on_the_gate_lock(&ctx.pool, user_id, gate_pid).await;
         assert!(
             !disable.is_finished(),
             "the disable must wait on the factor row"
         );
+        // The discriminator: with the factor row taken first this succeeds; with the users row
+        // first the parked disable already holds it and fails this NOWAIT.
         let user_lock = sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE NOWAIT")
             .bind(user_id)
             .execute(&ctx.pool)
             .await;
         gate.rollback().await.expect("release the factor row");
+
+        assert!(
+            parked,
+            "the disable never parked on the factor row the gate holds"
+        );
         user_lock.expect("the disable must not hold the users row before the factor row");
 
-        disable
+        tokio::time::timeout(std::time::Duration::from_secs(10), disable)
             .await
+            .expect("the disable must land once the factor row is released")
             .expect("join")
             .expect("the disable lands once the factor row is released");
         assert!(!ctx.service.is_totp_enabled(user_id).await.expect("state"));
+    }
+
+    /// Bounded poll for the disable's lock state: it must hold the user's advisory lock and be
+    /// waiting on a lock the gate's backend holds. A poll that expires reports a missing
+    /// checkpoint, not a lock-order verdict.
+    async fn disable_parked_on_the_gate_lock(pool: &PgPool, user_id: Uuid, gate_pid: i32) -> bool {
+        const CHECKPOINT_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+        let deadline = tokio::time::Instant::now() + CHECKPOINT_BUDGET;
+        loop {
+            let parked = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS ( \
+                     SELECT 1 FROM pg_stat_activity activity \
+                     WHERE activity.datname = current_database() \
+                       AND $2 = ANY (pg_blocking_pids(activity.pid)) \
+                       AND EXISTS ( \
+                           SELECT 1 FROM pg_locks held \
+                           WHERE held.pid = activity.pid AND held.locktype = 'advisory' \
+                             AND held.granted \
+                             AND held.database = (SELECT oid FROM pg_database \
+                                                  WHERE datname = current_database()) \
+                             AND ((held.classid::bigint << 32) | held.objid::bigint) \
+                                 = hashtextextended(($1::uuid)::text, 0)))",
+            )
+            .bind(user_id)
+            .bind(gate_pid)
+            .fetch_one(pool)
+            .await
+            .expect("inspect pg_stat_activity");
+            if parked {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
 
     #[tokio::test]

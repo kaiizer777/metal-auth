@@ -805,6 +805,7 @@ async fn test_malformed_json_body_rejection() {
 
 #[tokio::test]
 async fn test_logout_returns_no_content() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -825,6 +826,7 @@ async fn test_logout_returns_no_content() {
 
 #[tokio::test]
 async fn test_logout_invalid_bearer_does_not_panic() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -913,6 +915,7 @@ async fn test_verify_invalid_token_format() {
 
 #[tokio::test]
 async fn test_verify_valid_format_nonexistent_token_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -933,6 +936,7 @@ async fn test_verify_valid_format_nonexistent_token_rejected() {
 
 #[tokio::test]
 async fn test_verify_tampered_token_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -983,6 +987,7 @@ async fn test_verify_tampered_token_rejected() {
 
 #[tokio::test]
 async fn test_verify_uppercase_hex_accepted() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -1035,6 +1040,7 @@ async fn test_verify_uppercase_hex_accepted() {
 
 #[tokio::test]
 async fn test_verify_token_from_reset_flow_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };

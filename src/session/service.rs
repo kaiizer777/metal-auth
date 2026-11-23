@@ -82,7 +82,7 @@ impl SessionService {
     /// Session creation gated on credential freshness (issue #37).
     ///
     /// `expected_credential_hash` is the Argon2id PHC string verified at login.
-    /// It is compared against the live row under the existing user `FOR UPDATE`
+    /// It is compared against the live row under the existing user `FOR NO KEY UPDATE`
     /// lock — a cheap string compare, never a re-hash — so a password reset
     /// committing between verification and insert rejects with
     /// `InvalidCredentials` instead of minting a stale session.
@@ -175,8 +175,10 @@ impl SessionService {
             None
         };
 
-        // Row lock on the user row to serialize concurrent session creations for the user
-        sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        // Row lock on the user row to serialize concurrent session creations for the user.
+        // `FOR NO KEY UPDATE` keeps that serialization (and the conflict with `UPDATE users`)
+        // without blocking the `FOR KEY SHARE` child inserts the FKs take on this row.
+        sqlx::query("SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE")
             .bind(user_id)
             .execute(&mut *tx)
             .await
@@ -445,7 +447,7 @@ impl SessionService {
         // Serialize with rotate_session, which locks this row before
         // deleting/inserting sessions: whichever tx locks first wins, so no
         // rotate can mint a session this DELETE never sees.
-        sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        sqlx::query("SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE")
             .bind(user_id)
             .execute(&mut *tx)
             .await
@@ -503,7 +505,7 @@ impl SessionService {
         // `UPDATE users ... WHERE id` (src/auth/service.rs:437) before deleting
         // sessions, so whichever tx locks first wins. Reset-first leaves zero
         // rows for the DELETE below.
-        sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        sqlx::query("SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE")
             .bind(old_session.user_id)
             .execute(&mut *tx)
             .await

@@ -1401,6 +1401,7 @@ async fn test_password_reset_confirm_method_not_allowed() {
 
 #[tokio::test]
 async fn test_cors_preflight_on_auth_endpoints() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     let req = Request::builder()
@@ -1431,6 +1432,7 @@ async fn test_cors_preflight_on_auth_endpoints() {
 
 #[tokio::test]
 async fn test_cors_disallowed_origin_no_acao_on_actual_post() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     let req = Request::builder()
@@ -1454,6 +1456,7 @@ async fn test_cors_disallowed_origin_no_acao_on_actual_post() {
 
 #[tokio::test]
 async fn test_cors_null_origin_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     let req = Request::builder()
@@ -1479,6 +1482,7 @@ async fn test_cors_null_origin_rejected() {
 
 #[tokio::test]
 async fn test_zero_secret_leakage_in_error_responses() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     let requests = vec![
@@ -1791,6 +1795,7 @@ fn test_capture_survives_a_callsite_registered_on_a_bare_thread() {
 
 #[tokio::test]
 async fn test_db_error_does_not_leak_sql_text() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_failing_db_router();
 
     let req = json_request(
@@ -2313,6 +2318,7 @@ async fn test_password_reset_confirm_invalid_token_does_not_change_password() {
 
 #[tokio::test]
 async fn test_method_not_allowed_json_envelope() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
     let req = Request::builder()
         .method(Method::GET)
@@ -2337,6 +2343,7 @@ async fn test_method_not_allowed_json_envelope() {
 
 #[tokio::test]
 async fn test_signup_invalid_content_type_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     let req = Request::builder()
@@ -2356,6 +2363,7 @@ async fn test_signup_invalid_content_type_rejected() {
 
 #[tokio::test]
 async fn test_signup_method_not_allowed_matrix() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for method in [Method::GET, Method::PUT, Method::DELETE, Method::PATCH] {

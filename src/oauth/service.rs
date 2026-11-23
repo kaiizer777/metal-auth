@@ -635,8 +635,13 @@ impl OAuthService {
             {
                 Ok(token) => token,
                 Err(error) => {
+                    // `AppError`'s variants display a fixed summary, so the SQLx cause is only
+                    // reachable through the source chain; without it this line cannot diagnose
+                    // a real mint failure.
+                    let cause = std::error::Error::source(&error);
                     tracing::error!(
                         error = %error,
+                        cause = ?cause,
                         user_id = %user.id,
                         provider = ctx.provider_id,
                         "oauth callback refused: second-factor challenge could not be minted"
@@ -1595,13 +1600,9 @@ mod tests {
         assert!(debug.contains("/app/settings"));
     }
 
-    /// A failed challenge mint is infrastructure, not user input: it must surface as
-    /// `TwoFactorUnavailable` (503) rather than a `Database` error (500).
-    #[tokio::test]
-    async fn challenge_mint_failure_maps_to_two_factor_unavailable() {
-        let Some(ctx) = setup_oauth_db_context().await else {
-            return;
-        };
+    /// A verified user with an enabled factor, plus a service whose provider resolves to
+    /// that user, so the callback's gate takes the challenge branch.
+    async fn gate_user_with_enabled_factor(ctx: &OAuthDbContext) -> (Uuid, OAuthService) {
         let email = format!("totp-oauth-{}@example.com", Uuid::new_v4().simple());
         let user_id: Uuid = sqlx::query_scalar(
             "INSERT INTO users (email, password_hash, email_verified) \
@@ -1623,18 +1624,29 @@ mod tests {
         .await
         .expect("seed enabled factor");
 
-        let svc = oauth_service_over_pool(
+        let service = oauth_service_over_pool(
             &ctx.pool,
             Arc::clone(&ctx.config),
             UserInfo {
                 provider_id: "google".to_string(),
                 provider_user_id: format!("goog_{}", Uuid::new_v4().simple()),
-                email: email.clone(),
+                email,
                 email_verified: true,
                 name: None,
                 avatar_url: None,
             },
         );
+        (user_id, service)
+    }
+
+    /// A failed challenge mint is infrastructure, not user input: it must surface as
+    /// `TwoFactorUnavailable` (503) rather than a `Database` error (500).
+    #[tokio::test]
+    async fn challenge_mint_failure_maps_to_two_factor_unavailable() {
+        let Some(ctx) = setup_oauth_db_context().await else {
+            return;
+        };
+        let (user_id, svc) = gate_user_with_enabled_factor(&ctx).await;
 
         let injection = reject_challenge_inserts_for(&ctx.pool, user_id).await;
         let (auth_url, set_cookie) = svc
@@ -1667,6 +1679,144 @@ mod tests {
             .await
             .expect("count sessions");
         assert_eq!(sessions, 0, "the failure must not issue a session");
+    }
+
+    /// Discarding global subscriber that reports maximum interest.
+    struct DiscardSubscriber;
+
+    impl tracing::Subscriber for DiscardSubscriber {
+        fn register_callsite(
+            &self,
+            metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            if metadata.level() <= &tracing::Level::DEBUG {
+                tracing::subscriber::Interest::always()
+            } else {
+                tracing::subscriber::Interest::never()
+            }
+        }
+
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.level() <= &tracing::Level::DEBUG
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::DEBUG)
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(0xDEAD)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, _event: &tracing::Event<'_>) {}
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Keeps `get_global` from being `NoSubscriber`, so a callsite first reached on a
+    /// subscriber-less thread is not cached as `Interest::never()` for the whole process.
+    ///
+    /// Mirrors `tests/common/mod.rs::install_global_log_sink`, which this test target cannot import.
+    fn install_global_log_sink() {
+        static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            let _ = tracing::subscriber::set_global_default(DiscardSubscriber);
+            tracing::callsite::rebuild_interest_cache();
+        });
+    }
+
+    /// Drive the injected mint failure the way the callback does. Returns `false` when the
+    /// DB-backed suite is skipped.
+    async fn drive_rejected_challenge_mint() -> bool {
+        let Some(ctx) = setup_oauth_db_context().await else {
+            return false;
+        };
+        let (user_id, svc) = gate_user_with_enabled_factor(&ctx).await;
+        let injection = reject_challenge_inserts_for(&ctx.pool, user_id).await;
+        let (auth_url, set_cookie) = svc
+            .get_authorization_url("google", None)
+            .expect("init flow");
+        let state_token = extract_state_token(&auth_url);
+        let result = svc
+            .handle_callback_extended(
+                "google",
+                "valid_code",
+                &state_token,
+                Some(&set_cookie),
+                "cookie",
+                Some("127.0.0.1"),
+                Some("test-agent"),
+            )
+            .await;
+        injection.disarm().await;
+
+        let error = result.expect_err("the challenge insert is injected to fail");
+        assert!(
+            matches!(error, AppError::TwoFactorUnavailable),
+            "a mint failure must not surface as a database error, got {error:?}"
+        );
+        true
+    }
+
+    /// The mint-failure log must carry the SQLx cause: `AppError`'s display is a fixed
+    /// summary, so without the source a real mint failure is undiagnosable.
+    #[test]
+    fn challenge_mint_failure_logs_the_underlying_database_error() {
+        install_global_log_sink();
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("log buffer poisoned")
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let subscriber = tracing_subscriber::fmt::Subscriber::builder()
+            .with_writer({
+                let buffer = Arc::clone(&buffer);
+                move || Capture(Arc::clone(&buffer))
+            })
+            .finish();
+        // A current-thread runtime keeps the dispatcher on the thread that polls the future.
+        let ran = tracing::dispatcher::with_default(
+            &tracing::dispatcher::Dispatch::new(subscriber),
+            || {
+                // Repairs callsites cached as `never` before the global sink existed.
+                tracing::callsite::rebuild_interest_cache();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                runtime.block_on(drive_rejected_challenge_mint())
+            },
+        );
+        let logs = String::from_utf8(buffer.lock().expect("log buffer poisoned").clone())
+            .expect("logs are UTF-8");
+        if !ran {
+            return;
+        }
+        assert!(
+            logs.contains("injected challenge insert failure"),
+            "the log must carry the SQLx cause: {logs}"
+        );
+        assert!(
+            !logs.contains(OAUTH_UNUSABLE_PASSWORD_HASH),
+            "the log must not carry the credential hash: {logs}"
+        );
     }
 
     struct OAuthDbContext {

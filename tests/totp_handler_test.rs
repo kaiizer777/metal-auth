@@ -1347,7 +1347,7 @@ async fn password_disable_does_not_deadlock_with_the_login_gate() {
 
     // T1: the login gate's order — factor row `FOR SHARE`, then the users row.
     let pool = app.pool.clone();
-    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel::<()>();
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel::<i32>();
     let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
     let gate = tokio::spawn(async move {
         let mut transaction = pool.begin().await.expect("gate transaction");
@@ -1356,7 +1356,11 @@ async fn password_disable_does_not_deadlock_with_the_login_gate() {
             .execute(&mut *transaction)
             .await
             .expect("gate holds the factor row");
-        locked_tx.send(()).expect("signal the factor lock");
+        let gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *transaction)
+            .await
+            .expect("gate backend");
+        locked_tx.send(gate_pid).expect("signal the factor lock");
         go_rx.await.expect("gate release");
         let users_row = sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
             .bind(user_id)
@@ -1365,11 +1369,11 @@ async fn password_disable_does_not_deadlock_with_the_login_gate() {
         transaction.commit().await.expect("gate commit");
         users_row.map(|_| ())
     });
-    locked_rx.await.expect("gate ready");
+    let gate_pid = locked_rx.await.expect("gate ready");
 
     // T2: the password-authorized disable, while the gate holds the factor row.
     let disable_app = app.clone();
-    let mut disable = tokio::spawn(async move {
+    let disable = tokio::spawn(async move {
         disable_app
             .dispatch(session_request(
                 &disable_app,
@@ -1382,16 +1386,15 @@ async fn password_disable_does_not_deadlock_with_the_login_gate() {
             .await
     });
 
-    // Bounded proof that the disable is waiting rather than done: it cannot pass the gate's
-    // factor row, so anything but a wait here means it never reached its locks.
+    // Password verification runs before the disable opens its transaction, so elapsed time
+    // proves nothing: wait for it to hold the advisory lock and block on the gate's row lock.
+    let parked = disable_parked_on_the_gate_lock(&app.pool, user_id, gate_pid).await;
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(300), &mut disable)
-            .await
-            .is_err(),
+        !disable.is_finished(),
         "the disable must wait on the factor row the gate holds"
     );
     // The discriminator: with the factor row taken first this succeeds; with the users row
-    // first the disable already holds it and the gate below would deadlock.
+    // first the parked disable already holds it.
     let users_row_free = sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE NOWAIT")
         .bind(user_id)
         .execute(&app.pool)
@@ -1407,6 +1410,10 @@ async fn password_disable_does_not_deadlock_with_the_login_gate() {
         .expect("the disable must finish, not deadlock")
         .expect("disable join");
 
+    assert!(
+        parked,
+        "the disable never parked on the factor row the gate holds"
+    );
     assert!(
         users_row_free.is_ok(),
         "the disable must not hold the users row before the factor row: {users_row_free:?}"
@@ -1985,6 +1992,42 @@ async fn totp_enabled(pool: &PgPool, user_id: Uuid) -> bool {
         .await
         .expect("read factor state")
         .unwrap_or_default()
+}
+
+/// Bounded poll for the disable's lock state: it must hold the user's advisory lock and be
+/// waiting on a lock the gate's backend holds. A poll that expires reports a missing
+/// checkpoint, not a lock-order verdict.
+async fn disable_parked_on_the_gate_lock(pool: &PgPool, user_id: Uuid, gate_pid: i32) -> bool {
+    const CHECKPOINT_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + CHECKPOINT_BUDGET;
+    loop {
+        let parked = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM pg_stat_activity activity \
+                 WHERE activity.datname = current_database() \
+                   AND $2 = ANY (pg_blocking_pids(activity.pid)) \
+                   AND EXISTS ( \
+                       SELECT 1 FROM pg_locks held \
+                       WHERE held.pid = activity.pid AND held.locktype = 'advisory' \
+                         AND held.granted \
+                         AND held.database = (SELECT oid FROM pg_database \
+                                              WHERE datname = current_database()) \
+                         AND ((held.classid::bigint << 32) | held.objid::bigint) \
+                             = hashtextextended(($1::uuid)::text, 0)))",
+        )
+        .bind(user_id)
+        .bind(gate_pid)
+        .fetch_one(pool)
+        .await
+        .expect("inspect pg_stat_activity");
+        if parked {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 }
 
 // ─── Harness invariants ──────────────────────────────────────────────────────

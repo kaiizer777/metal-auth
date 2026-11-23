@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
-use sqlx::{PgConnection, PgPool, Row};
+use sqlx::{PgConnection, PgPool, Row, postgres::PgQueryResult};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
@@ -34,6 +34,10 @@ pub struct TotpService {
     pool: PgPool,
     config: Arc<Config>,
     auth_config: Arc<AppConfig>,
+    /// Test-only override of the guarded insert's write clock. `None` — always the case in
+    /// production — compares against the database clock.
+    #[cfg(test)]
+    write_clock: Option<DateTime<Utc>>,
 }
 
 impl TotpService {
@@ -47,7 +51,17 @@ impl TotpService {
             pool,
             config,
             auth_config,
+            #[cfg(test)]
+            write_clock: None,
         }
+    }
+
+    /// Pin the guarded insert's write clock, so a test can land a write exactly on the
+    /// exclusive bound. Production never overrides the database clock.
+    #[cfg(test)]
+    fn with_write_clock(mut self, instant: DateTime<Utc>) -> Self {
+        self.write_clock = Some(instant);
+        self
     }
 
     /// Step 1 of enrollment: rotate the secret, store it encrypted, and issue backup codes.
@@ -395,16 +409,26 @@ impl TotpService {
         // row earlier than the reference its own cutoff uses and a later transaction would
         // prune it sooner.
         let window_end = code_window_end(step).ok_or(AppError::TotpCodeInvalid)?;
-        let inserted = sqlx::query(
-            "INSERT INTO totp_used_codes (user_id, code_hash, used_at) \
-             SELECT $1, $2, $3 WHERE clock_timestamp() < $4",
-        )
-        .bind(user_id)
-        .bind(&replay_hash[..])
-        .bind(reference)
-        .bind(window_end)
-        .execute(&mut *connection)
-        .await;
+        #[cfg(not(test))]
+        let inserted =
+            insert_used_code(connection, user_id, &replay_hash, reference, window_end).await;
+        #[cfg(test)]
+        let inserted = match self.write_clock {
+            Some(write_clock) => {
+                insert_used_code_at(
+                    connection,
+                    user_id,
+                    &replay_hash,
+                    reference,
+                    write_clock,
+                    window_end,
+                )
+                .await
+            }
+            None => {
+                insert_used_code(connection, user_id, &replay_hash, reference, window_end).await
+            }
+        };
         let inserted = match inserted {
             Ok(result) => result,
             Err(error) => return Err(classify_used_code_error(error)),
@@ -894,6 +918,53 @@ async fn lock_totp_user(connection: &mut PgConnection, user_id: Uuid) -> Result<
         .await
         .map(|_| ())
         .map_err(AppError::Database)
+}
+
+/// The guarded replay insert, shared so the window comparison has one definition.
+///
+/// Zero rows means the write landed at or after the matched step's exclusive bound.
+const GUARDED_INSERT: &str = "INSERT INTO totp_used_codes (user_id, code_hash, used_at) \
+     SELECT $1, $2, $3 WHERE clock_timestamp() < $4";
+
+/// Record the replay tombstone if the database clock is still inside the accepted band.
+async fn insert_used_code(
+    connection: &mut PgConnection,
+    user_id: Uuid,
+    replay_hash: &[u8],
+    used_at: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+) -> Result<PgQueryResult, sqlx::Error> {
+    sqlx::query(GUARDED_INSERT)
+        .bind(user_id)
+        .bind(replay_hash)
+        .bind(used_at)
+        .bind(window_end)
+        .execute(&mut *connection)
+        .await
+}
+
+/// [`GUARDED_INSERT`] with the write clock bound instead of read from the database.
+///
+/// Test-only: `clock_timestamp()` cannot be pinned, so exact equality with the bound is
+/// otherwise unreachable. Derived from the production text so the two cannot drift.
+#[cfg(test)]
+async fn insert_used_code_at(
+    connection: &mut PgConnection,
+    user_id: Uuid,
+    replay_hash: &[u8],
+    used_at: DateTime<Utc>,
+    write_clock: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+) -> Result<PgQueryResult, sqlx::Error> {
+    let statement = GUARDED_INSERT.replace("clock_timestamp()", "$5");
+    sqlx::query(sqlx::AssertSqlSafe(statement))
+        .bind(user_id)
+        .bind(replay_hash)
+        .bind(used_at)
+        .bind(window_end)
+        .bind(write_clock)
+        .execute(&mut *connection)
+        .await
 }
 
 /// Single clock reference for one verification transaction.
@@ -1592,8 +1663,10 @@ mod tests {
         // Wait for a provable state, not a fixed delay: T2 either waits on the user lock or,
         // with no serialization, finishes and records the code itself.
         let mut waited = false;
-        for _ in 0..300 {
+        let mut finished_early = false;
+        for _ in 0..600 {
             if second.is_finished() {
+                finished_early = true;
                 break;
             }
             waited = sqlx::query_scalar::<_, bool>(
@@ -1615,8 +1688,20 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         if !waited {
-            let raced = second.await.expect("join");
-            panic!("second verifier ran past the paused one instead of waiting: {raced:?}");
+            // T2 is queued on the lock this transaction holds, so it cannot finish until the
+            // lock is released: roll back first, then join under a bound, or the join hangs.
+            stalled.rollback().await.expect("T1 rollback");
+            let raced = tokio::time::timeout(std::time::Duration::from_secs(10), second)
+                .await
+                .expect("the second verifier must finish once T1 releases its lock")
+                .expect("join");
+            if finished_early {
+                panic!("second verifier ran past the paused one instead of waiting: {raced:?}");
+            }
+            panic!(
+                "the probe never observed a waiter within its budget; T1 was rolled back and \
+                 the second attempt returned {raced:?}, so serialization was not disproven"
+            );
         }
 
         // T1 resumes: prune, guarded insert, commit — the paused half of `record_totp_use`.
@@ -1688,16 +1773,35 @@ mod tests {
             "a write past the bound must expire: {write_late:?}"
         );
 
-        // At the bound the code's own reference is one counter outside the band.
+        // At the bound the write is refused for being exactly on it, and the code's own
+        // reference stays one step inside the accepted band, so the counter cannot be the
+        // rejecter: only the write guard can be.
+        let inside_band = stale_end - Duration::seconds(1);
         let at_bound = ctx
             .service
-            .verify_totp_at_reference(user_id, &stale, stale_end)
+            .clone()
+            .with_write_clock(stale_end)
+            .verify_totp_at_reference(user_id, &stale, inside_band)
             .await;
         assert!(
             matches!(at_bound, Err(AppError::TotpCodeInvalid)),
             "the bound is exclusive: {at_bound:?}"
         );
         assert_eq!(count_used_code(&ctx.pool, user_id, &stale).await, 0);
+
+        // One instant earlier the same write lands, so the rejection above is the bound and
+        // not some other refusal.
+        let just_inside = ctx
+            .service
+            .clone()
+            .with_write_clock(stale_end - Duration::microseconds(1))
+            .verify_totp_at_reference(user_id, &stale, inside_band)
+            .await;
+        assert!(
+            just_inside.is_ok(),
+            "one instant before the bound must land: {just_inside:?}"
+        );
+        assert_eq!(count_used_code(&ctx.pool, user_id, &stale).await, 1);
     }
 
     #[tokio::test]
@@ -2091,6 +2195,10 @@ mod tests {
             .execute(&mut *gate)
             .await
             .expect("hold the factor row");
+        let gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *gate)
+            .await
+            .expect("gate backend");
 
         let service = ctx.service.clone();
         let attempt = password.clone();
@@ -2100,25 +2208,69 @@ mod tests {
                 .await
         });
 
-        // Give the disable time to reach its first lock, then prove it has not taken the
-        // users row: the inverted order held that row first and fails this NOWAIT.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // Password verification runs before `BEGIN`, so elapsed time proves nothing: wait for
+        // the disable to hold the user's advisory lock and block on the gate's row lock.
+        let parked = disable_parked_on_the_gate_lock(&ctx.pool, user_id, gate_pid).await;
         assert!(
             !disable.is_finished(),
             "the disable must wait on the factor row"
         );
+        // The discriminator: with the factor row taken first this succeeds; with the users row
+        // first the parked disable already holds it and fails this NOWAIT.
         let user_lock = sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE NOWAIT")
             .bind(user_id)
             .execute(&ctx.pool)
             .await;
         gate.rollback().await.expect("release the factor row");
+
+        assert!(
+            parked,
+            "the disable never parked on the factor row the gate holds"
+        );
         user_lock.expect("the disable must not hold the users row before the factor row");
 
-        disable
+        tokio::time::timeout(std::time::Duration::from_secs(10), disable)
             .await
+            .expect("the disable must land once the factor row is released")
             .expect("join")
             .expect("the disable lands once the factor row is released");
         assert!(!ctx.service.is_totp_enabled(user_id).await.expect("state"));
+    }
+
+    /// Bounded poll for the disable's lock state: it must hold the user's advisory lock and be
+    /// waiting on a lock the gate's backend holds. A poll that expires reports a missing
+    /// checkpoint, not a lock-order verdict.
+    async fn disable_parked_on_the_gate_lock(pool: &PgPool, user_id: Uuid, gate_pid: i32) -> bool {
+        const CHECKPOINT_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+        let deadline = tokio::time::Instant::now() + CHECKPOINT_BUDGET;
+        loop {
+            let parked = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS ( \
+                     SELECT 1 FROM pg_stat_activity activity \
+                     WHERE activity.datname = current_database() \
+                       AND $2 = ANY (pg_blocking_pids(activity.pid)) \
+                       AND EXISTS ( \
+                           SELECT 1 FROM pg_locks held \
+                           WHERE held.pid = activity.pid AND held.locktype = 'advisory' \
+                             AND held.granted \
+                             AND held.database = (SELECT oid FROM pg_database \
+                                                  WHERE datname = current_database()) \
+                             AND ((held.classid::bigint << 32) | held.objid::bigint) \
+                                 = hashtextextended(($1::uuid)::text, 0)))",
+            )
+            .bind(user_id)
+            .bind(gate_pid)
+            .fetch_one(pool)
+            .await
+            .expect("inspect pg_stat_activity");
+            if parked {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
 
     #[tokio::test]

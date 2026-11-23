@@ -652,6 +652,18 @@ mod tests {
     }
 
     #[test]
+    fn test_header_value_rejects_unencodable_cookie_bytes() {
+        // Probe result: `HeaderValue::from_str` rejects C0 controls and DEL
+        // but accepts obs-text (>= 0x80), which `is_valid_cookie_path` also
+        // permits. A boot-validated config therefore rarely trips the `Err`
+        // arm; the reachable surface is validate-bypass construction and any
+        // future input, and the defect is the silent drop itself.
+        assert!(header::HeaderValue::from_str("oauth_state=abc; Path=/\n").is_err());
+        assert!(header::HeaderValue::from_str("oauth_state=abc; Path=/\u{7f}").is_err());
+        assert!(header::HeaderValue::from_str("oauth_state=abc; Path=/\u{80}").is_ok());
+    }
+
+    #[test]
     fn test_check_redirect_url_caps_length() {
         assert!(check_redirect_url(None).unwrap().is_none());
 

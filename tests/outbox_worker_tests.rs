@@ -752,3 +752,99 @@ async fn test_outbox_worker_until_stops_on_shutdown() {
         .execute(&app.pool)
         .await;
 }
+
+async fn two_factor_token_exists(pool: &sqlx::PgPool, token_hash: &[u8]) -> bool {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM two_factor_tokens WHERE token_hash = $1")
+        .bind(token_hash)
+        .fetch_one(pool)
+        .await
+        .expect("count challenge tokens")
+        > 0
+}
+
+#[tokio::test]
+async fn test_outbox_worker_prunes_expired_two_factor_challenges() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let email = dynamic_email();
+    let password_hash = metal_auth::crypto::hash_password(&dynamic_password(), &test_auth_config())
+        .expect("hash fixture password");
+    let user_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, TRUE) \
+         RETURNING id",
+    )
+    .bind(&email)
+    .bind(password_hash)
+    .fetch_one(&app.pool)
+    .await
+    .expect("insert user");
+
+    // Unique hashes: the assertions below can only ever observe fixtures seeded here.
+    let expired_hash = uuid::Uuid::new_v4().into_bytes().to_vec();
+    let live_hash = uuid::Uuid::new_v4().into_bytes().to_vec();
+    sqlx::query(
+        "INSERT INTO two_factor_tokens (user_id, token_hash, expires_at, credential_hash) \
+         VALUES ($1, $2, NOW() - INTERVAL '1 minute', $3)",
+    )
+    .bind(user_id)
+    .bind(&expired_hash[..])
+    .bind("prune-fixture-credential")
+    .execute(&app.pool)
+    .await
+    .expect("seed expired challenge");
+    sqlx::query(
+        "INSERT INTO two_factor_tokens (user_id, token_hash, expires_at, credential_hash) \
+         VALUES ($1, $2, NOW() + INTERVAL '1 hour', $3)",
+    )
+    .bind(user_id)
+    .bind(&live_hash[..])
+    .bind("prune-fixture-credential")
+    .execute(&app.pool)
+    .await
+    .expect("seed live challenge");
+    assert!(
+        two_factor_token_exists(&app.pool, &expired_hash).await,
+        "the expired fixture must exist before the worker starts"
+    );
+    assert!(
+        two_factor_token_exists(&app.pool, &live_hash).await,
+        "the live fixture must exist before the worker starts"
+    );
+
+    // The startup prune runs before the first select!, so joining the shutdown proves it ran.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let worker = tokio::spawn(run_outbox_worker_until(
+        app.pool.clone(),
+        None,
+        Duration::from_secs(5),
+        OutboxWorkerConfig::default(),
+        Arc::new(tokio::sync::Notify::new()),
+        shutdown_rx,
+    ));
+    shutdown_tx.send(true).expect("signal shutdown");
+    tokio::time::timeout(Duration::from_secs(10), worker)
+        .await
+        .expect("worker stops after shutdown signal")
+        .expect("worker join");
+
+    assert!(
+        !two_factor_token_exists(&app.pool, &expired_hash).await,
+        "the worker must delete a challenge whose TTL has passed"
+    );
+    assert!(
+        two_factor_token_exists(&app.pool, &live_hash).await,
+        "a challenge still inside its TTL must survive the prune"
+    );
+
+    let _ = sqlx::query("DELETE FROM two_factor_tokens WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&app.pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&app.pool)
+        .await;
+}

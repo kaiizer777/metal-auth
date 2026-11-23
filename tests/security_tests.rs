@@ -1,5 +1,6 @@
 mod common;
 
+use common::DB_LOCK;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 

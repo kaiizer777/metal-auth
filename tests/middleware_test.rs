@@ -72,8 +72,7 @@ async fn setup_live_db() -> Option<(PgPool, AppState)> {
         ..Default::default()
     };
 
-    let state =
-        AppState::new(pool.clone(), cfg).expect("create app state with live DB");
+    let state = AppState::new(pool.clone(), cfg).expect("create app state with live DB");
     Some((pool, state))
 }
 

@@ -32,6 +32,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   return `Response` instead of `Result<_, AppError>`. They build their error responses internally so
   a failed call can also clear the provider-scoped `oauth_state` cookie; router registration is
   unchanged.
+- **Breaking:** building a router without a TOTP encryption key now fails at startup.
+  `create_router`, `routes_with_app_state`, `routes_with_state`, and `totp::routes`/`totp_routes`
+  all reject a keyless configuration, and the latter three return `Result<Router, AppError>`.
+- **Breaking:** `OAuthCallbackOutcome::TwoFactorRequired` now carries the saved destination. A browser
+  OAuth login that requires a second factor answers `302` to `<destination>#totp_challenge=<token>`
+  instead of `200` JSON; bearer and JSON clients are unchanged. The pending challenge reaches the
+  client through the URL fragment and never through a query parameter.
+- **Breaking:** `TotpService::generate_two_factor_token` takes the credential that authorized the
+  challenge, and each challenge is bound to a snapshot of it and rejected once that no longer
+  matches. The accompanying migration deletes existing challenge rows before adding
+  `credential_hash TEXT NOT NULL`, so an in-flight challenge at deploy time is invalidated and the
+  user retries the second factor once. Direct inserts into `two_factor_tokens` must now supply
+  `credential_hash`.
 - Signup and password-reset responses no longer wait for the mailer, and delivery survives a client
   disconnect.
 
@@ -40,3 +53,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A link callback whose initiating user no longer exists now returns 403 instead of a 500.
 - OAuth state that would render a cookie above the browser size budget is rejected with 400 instead
   of emitting an over-limit `Set-Cookie`.
+- A password reset purges outstanding two-factor challenge tokens for that user, so a challenge
+  issued before the reset can no longer mint a session afterwards.
+- Expired two-factor challenge tokens are pruned by the background worker at startup and on each
+  tick instead of accumulating indefinitely.
+- `405 Method Not Allowed` responses advertise the route's actual method set in the `Allow` header
+  instead of a hardcoded `POST`.
+- A failure while minting an OAuth challenge logs the underlying database error instead of only
+  "database error".
+- The TOTP used-code prune age rustdoc documents the correct SQL bind position.
+- User-row locks are narrowed so unrelated child-row inserts no longer block.
+- The test outbox worker no longer leaks across test databases.
+- Log-capture tests no longer depend on process-global callsite interest state.
+- The failure-injection cleanup is bounded, so a stalled connect fails instead of hanging the suite.
+- Two-factor concurrency tests fail with a clear message instead of hanging, and prove lock ordering
+  from `pg_locks` rather than elapsed time.

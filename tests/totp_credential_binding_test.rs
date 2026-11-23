@@ -6,6 +6,10 @@
 //! what a mint that lost the race against the reset writes: the reset's purge has already
 //! committed, so nothing deletes the row, and only the stored snapshot can distinguish it
 //! from a legitimately minted challenge.
+//!
+//! Issue #82 extension: unlinking an OAuth provider must purge that user's pending
+//! challenges, or a challenge minted through the unlinked provider stays redeemable
+//! (the binding snapshot is the untouched `users.password_hash`).
 
 mod common;
 
@@ -66,6 +70,31 @@ async fn insert_pre_reset_challenge(app: &TestApp, user_id: Uuid, pre_reset_hash
     .expect("insert challenge");
 
     raw_token
+}
+
+/// Attach a link row directly: the unlink guard only needs the row present, and the
+/// password user already counts as a remaining method, so no provider mocks are needed.
+async fn link_provider(app: &TestApp, user_id: Uuid, email: &str, provider: &str) {
+    sqlx::query(
+        "INSERT INTO oauth_accounts (id, user_id, provider_id, provider_user_id, email) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(user_id)
+    .bind(provider)
+    .bind(format!("{provider}-uid-{}", Uuid::new_v4().simple()))
+    .bind(email)
+    .execute(&app.pool)
+    .await
+    .expect("link provider");
+}
+
+async fn live_credential_hash(app: &TestApp, user_id: Uuid) -> String {
+    sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&app.pool)
+        .await
+        .expect("read live credential")
 }
 
 async fn challenge_row_count(app: &TestApp, user_id: Uuid) -> i64 {
@@ -150,6 +179,112 @@ async fn stale_challenge_is_not_redeemable_with_a_backup_code() {
     );
     assert_eq!(resp.error_code(), Some(ErrorCode::TwoFactorTokenInvalid));
     assert_eq!(count_sessions_for_user(&app.pool, user_id).await, 0);
+}
+
+#[tokio::test]
+async fn unlink_purges_pending_challenge_for_totp_code() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    let ip = dynamic_ip();
+    let (email, _password, secret, _backup_codes, _enrollment_session) =
+        enabled_user(&app, &ip).await;
+    let user_id = user_id_for_email(&app.pool, &email).await;
+    // Password user plus two links: the guard must let one provider go.
+    link_provider(&app, user_id, &email, "google").await;
+    link_provider(&app, user_id, &email, "github").await;
+    let baseline = count_sessions_for_user(&app.pool, user_id).await;
+
+    // Same snapshot an OAuth mint writes: the live hash, untouched by the unlink.
+    let live_hash = live_credential_hash(&app, user_id).await;
+    let challenge_token = app
+        .state
+        .totp_service
+        .generate_two_factor_token(user_id, &live_hash)
+        .await
+        .expect("mint challenge");
+    assert_eq!(challenge_row_count(&app, user_id).await, 1);
+
+    app.state
+        .oauth_service
+        .unlink_account(user_id, "google")
+        .await
+        .expect("unlink commits");
+    assert_eq!(
+        live_credential_hash(&app, user_id).await,
+        live_hash,
+        "unlink must never rotate the credential"
+    );
+    assert_eq!(
+        challenge_row_count(&app, user_id).await,
+        0,
+        "a challenge authorized by the unlinked provider must die with it"
+    );
+
+    let resp = app
+        .post_json_with_ip(
+            "/auth/totp/verify",
+            json!({ "challenge_token": challenge_token, "code": totp_code(&secret) }),
+            &ip,
+        )
+        .await;
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "purged challenge must not mint a session: {}",
+        resp.body_str
+    );
+    assert_eq!(resp.error_code(), Some(ErrorCode::TwoFactorTokenInvalid));
+    assert_eq!(count_sessions_for_user(&app.pool, user_id).await, baseline);
+}
+
+#[tokio::test]
+async fn unlink_purges_pending_challenge_for_backup_code() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+    let ip = dynamic_ip();
+    let (email, _password, _secret, backup_codes, _enrollment_session) =
+        enabled_user(&app, &ip).await;
+    let user_id = user_id_for_email(&app.pool, &email).await;
+    link_provider(&app, user_id, &email, "google").await;
+    link_provider(&app, user_id, &email, "github").await;
+    let baseline = count_sessions_for_user(&app.pool, user_id).await;
+
+    let live_hash = live_credential_hash(&app, user_id).await;
+    let challenge_token = app
+        .state
+        .totp_service
+        .generate_two_factor_token(user_id, &live_hash)
+        .await
+        .expect("mint challenge");
+
+    app.state
+        .oauth_service
+        .unlink_account(user_id, "google")
+        .await
+        .expect("unlink commits");
+    assert_eq!(challenge_row_count(&app, user_id).await, 0);
+
+    let resp = app
+        .post_json_with_ip(
+            "/auth/totp/backup",
+            json!({ "challenge_token": challenge_token, "code": backup_codes[0] }),
+            &ip,
+        )
+        .await;
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "the backup leg funnels into the same redemption: {}",
+        resp.body_str
+    );
+    assert_eq!(resp.error_code(), Some(ErrorCode::TwoFactorTokenInvalid));
+    assert_eq!(count_sessions_for_user(&app.pool, user_id).await, baseline);
 }
 
 #[tokio::test]

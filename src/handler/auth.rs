@@ -395,7 +395,10 @@ pub async fn login(
 
     let (session, raw_id) = match outcome {
         PasswordLoginOutcome::SecondFactorRequired => {
-            let challenge_token = match state.totp_service.generate_two_factor_token(user_id).await
+            let challenge_token = match state
+                .totp_service
+                .generate_two_factor_token(user_id, &proof.credential_hash)
+                .await
             {
                 Ok(token) => token,
                 Err(e) => {
@@ -484,9 +487,6 @@ enum PasswordLoginOutcome {
 /// login already past that gate can outrun a confirmation that started earlier. Neither is a
 /// bypass: enabling 2FA does not revoke live sessions, so a session minted before activation
 /// survives, exactly like any session older than the factor.
-///
-/// Still not enforced: the challenge token carries no credential state, so one minted
-/// before a password reset stays redeemable (#58).
 ///
 /// Lock order is factor row, then user row — the same order [`crate::handler::totp`]
 /// redemption takes, so the two cannot deadlock.

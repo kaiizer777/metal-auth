@@ -508,6 +508,29 @@ async fn test_oauth_login_for_totp_user_issues_challenge_and_no_session() {
         user_id
     );
 
+    // The binding the OAuth mint claims: the persisted snapshot is the credential the login
+    // authorized, not an arbitrary value that would dead-end every TOTP-enabled OAuth login.
+    let persisted_snapshot: String =
+        sqlx::query_scalar("SELECT credential_hash FROM two_factor_tokens WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("the OAuth mint must persist exactly one challenge row");
+    let bound_credential: String =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read the credential the login is bound to");
+    assert_eq!(
+        persisted_snapshot, bound_credential,
+        "the challenge must carry the user row's credential"
+    );
+    assert_eq!(
+        persisted_snapshot, "$unusable$oauth$",
+        "an OAuth-only account has no password, so the binding is the sentinel"
+    );
+
     let sessions_after: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = $1")
             .bind(user_id)
@@ -515,6 +538,35 @@ async fn test_oauth_login_for_totp_user_issues_challenge_and_no_session() {
             .await
             .expect("count sessions");
     assert_eq!(sessions_after, sessions_before, "no session may be created");
+
+    // The binding round-trips: the same challenge redeems through the route the password path
+    // uses, so a wrong snapshot would surface as a 401 here instead of a dead end in production.
+    let verify = app
+        .post_json(
+            "/auth/totp/verify",
+            serde_json::json!({
+                "challenge_token": challenge_token,
+                "code": totp_code(&enrollment.secret_base32),
+            }),
+        )
+        .await;
+    assert_eq!(
+        verify.status(),
+        StatusCode::OK,
+        "an OAuth-minted challenge must redeem against the live credential: {}",
+        verify.body_str
+    );
+    let sessions_redeemed: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("count sessions");
+    assert_eq!(
+        sessions_redeemed,
+        sessions_before + 1,
+        "redemption must mint exactly one session"
+    );
 }
 
 #[tokio::test]

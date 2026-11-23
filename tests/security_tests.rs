@@ -2363,6 +2363,7 @@ async fn test_signup_method_not_allowed_matrix() {
 
 #[tokio::test]
 async fn test_expired_verification_token() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -2412,6 +2413,7 @@ async fn test_expired_verification_token() {
 
 #[tokio::test]
 async fn test_expired_password_reset_token_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -2490,6 +2492,7 @@ async fn setup_rate_limit_router() -> axum::Router {
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
 async fn test_rate_limit_login() {
+    let _guard = DB_LOCK.lock().await;
     let router = setup_rate_limit_router().await;
 
     let mut rate_limited = false;
@@ -2519,6 +2522,7 @@ async fn test_rate_limit_login() {
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
 async fn test_rate_limit_signup() {
+    let _guard = DB_LOCK.lock().await;
     let router = setup_rate_limit_router().await;
 
     let mut rate_limited = false;
@@ -2548,6 +2552,7 @@ async fn test_rate_limit_signup() {
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
 async fn test_rate_limit_password_reset_request() {
+    let _guard = DB_LOCK.lock().await;
     let router = setup_rate_limit_router().await;
 
     let mut rate_limited = false;
@@ -2574,6 +2579,7 @@ async fn test_rate_limit_password_reset_request() {
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
 async fn test_rate_limit_verify_token() {
+    let _guard = DB_LOCK.lock().await;
     let router = setup_rate_limit_router().await;
 
     let mut rate_limited = false;
@@ -2596,6 +2602,7 @@ async fn test_rate_limit_verify_token() {
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
 async fn test_rate_limit_reset_confirm() {
+    let _guard = DB_LOCK.lock().await;
     let router = setup_rate_limit_router().await;
 
     let mut rate_limited = false;

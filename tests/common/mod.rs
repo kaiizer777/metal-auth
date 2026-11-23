@@ -19,48 +19,105 @@ use uuid::Uuid;
 ///
 /// Note: Cargo compiles each integration test file (`tests/*.rs`) into a separate OS process.
 /// Logical cross-binary test isolation is guaranteed by `dynamic_email()` and unique UUID keys,
-/// except for the global two-factor prune (see `PruneIsolationGuard`): it reaps by expiry only.
+/// except for global statements (the two-factor prune, the outbox discard/claim): each binary
+/// gets its own database below, so those can only ever touch their own fixtures.
 /// Global table truncation (`truncate_tables`) must not be called during parallel multi-binary
 /// test runs without PostgreSQL-level advisory locking (`pg_advisory_lock`).
 pub static DB_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Advisory-lock key serializing the global two-factor prune across test binaries.
-///
-/// `prune_expired_challenges` reaps expired rows table-wide with no owner predicate, and
-/// `run_outbox_worker_until` fires it on startup and every poll tick. `DB_LOCK` above is
-/// per-process, so without this a worker in one binary reaps expired fixtures seeded by
-/// another (flipping `TwoFactorTokenExpired` to `TwoFactorTokenInvalid`). Fixed constant,
-/// disjoint by convention from the hashed per-user keys in `TotpService`.
-pub const TWO_FACTOR_PRUNE_LOCK_KEY: i64 = 8_700_201_983_700_087;
+/// Process-wide setup serializer: creating and migrating the binary database once.
+static SETUP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Holds `pg_advisory_xact_lock` on an open transaction for the whole test.
+/// Database name for this test binary, derived from `DATABASE_URL` and the binary name.
 ///
-/// Transaction-scoped like the production per-user lock: rollback (including drop on panic)
-/// releases it, so a failed test cannot poison the pooled connection for the next binary.
-/// Every test that exposes an expired `two_factor_tokens` row, or that runs the prune via a
-/// spawned worker, holds this for the full test body.
-pub struct PruneIsolationGuard<'a> {
-    tx: Option<sqlx::Transaction<'a, sqlx::Postgres>>,
+/// Every `tests/*.rs` file compiles to its own OS process pointing at one schema, so a
+/// global statement in one binary (the two-factor prune, the outbox discard/claim) deletes
+/// rows another binary just seeded. `DB_LOCK` cannot help across processes. Giving each
+/// binary its own `{base}_{binary}` database (created on first use; `init_pool` migrates
+/// it) isolates all of them without touching `src/`. Lib tests keep the base database.
+fn binary_database_name(base_url: &str) -> String {
+    let base = database_name_of(base_url);
+    let stem = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.file_stem()?.to_str()?.to_string().into())
+        .unwrap_or_else(|| "shared".to_string());
+    let stem = match stem.rsplit_once('-') {
+        Some((prefix, hash)) if hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            prefix.to_string()
+        }
+        _ => stem,
+    };
+    let mut sanitized: String = stem
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() {
+                b.to_ascii_lowercase() as char
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    sanitized.truncate(32);
+    let mut name = format!("{base}_{sanitized}");
+    name.truncate(63);
+    name
 }
 
-impl<'a> PruneIsolationGuard<'a> {
-    /// Takes the cross-binary prune lock on a dedicated pooled connection.
-    pub async fn acquire(pool: &'a PgPool) -> Result<Self, sqlx::Error> {
-        let mut tx = pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(TWO_FACTOR_PRUNE_LOCK_KEY)
-            .execute(&mut *tx)
-            .await?;
-        Ok(Self { tx: Some(tx) })
+/// Path segment of a Postgres URL (`db` in `postgres://host/db?opt=1`), without decoding.
+fn database_name_of(url: &str) -> &str {
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    let path_start = after_scheme.find('/').map(|i| i + 1).unwrap_or(0);
+    if path_start == 0 || path_start >= after_scheme.len() {
+        return "metal_auth_test";
     }
+    let rest = &after_scheme[path_start..];
+    let end = rest.find(['?', '#']).unwrap_or(rest.len());
+    if end == 0 {
+        "metal_auth_test"
+    } else {
+        &rest[..end]
+    }
+}
 
-    /// Rolls back, releasing the lock. Drop does the same on panic paths.
-    pub async fn release(mut self) -> Result<(), sqlx::Error> {
-        if let Some(tx) = self.tx.take() {
-            tx.rollback().await?;
+/// Swaps the path segment of a Postgres URL, preserving authority and query string.
+fn with_database_name(url: &str, db_name: &str) -> String {
+    let scheme_end = url.find("://").map(|i| i + 3).unwrap_or(0);
+    let after_scheme = &url[scheme_end..];
+    match after_scheme.find('/') {
+        Some(slash) => {
+            let rest = &after_scheme[slash + 1..];
+            let query_start = rest.find(['?', '#']).unwrap_or(rest.len());
+            format!(
+                "{}/{}{}",
+                &url[..scheme_end + slash],
+                db_name,
+                &rest[query_start..]
+            )
         }
-        Ok(())
+        None => format!("{url}/{db_name}"),
     }
+}
+
+/// Creates the binary database when missing; a name clash with another binary is impossible
+/// because the name carries this binary's stem, and same-process setups hold `SETUP_LOCK`.
+async fn ensure_binary_database(admin_url: &str, db_name: &str) {
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(admin_url)
+        .await
+        .expect("DATABASE_URL is set, so the DB-backed test must connect");
+    // Safe: `db_name` is built by `binary_database_name` from alphanumerics and `_`
+    // only (base names come from our own `DATABASE_URL`), so no injection is possible.
+    let create = sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE \"{}\"",
+        db_name.replace('"', "\"\"")
+    ));
+    match sqlx::query(create).execute(&admin).await {
+        Ok(_) => {}
+        Err(sqlx::Error::Database(db)) if db.code() == Some("42P04".into()) => {}
+        Err(e) => panic!("create isolated test database {db_name}: {e}"),
+    }
+    admin.close().await;
 }
 
 /// Worker threads for the concurrency tests.
@@ -507,8 +564,16 @@ async fn setup_test_app_with_auth_config_and(
         Err(e) => panic!("invalid DATABASE_URL environment variable: {e}"),
     };
 
+    // Each test binary runs on its own database so a global statement in one binary can
+    // never reap or discard rows seeded by another. Held through `init_pool`: creating and
+    // migrating the binary database must not interleave with another setup in this process.
+    let _setup = SETUP_LOCK.lock().await;
+    let name = binary_database_name(&url);
+    ensure_binary_database(&url, &name).await;
+    let database_url = with_database_name(&url, &name);
+
     let mut cfg = Config {
-        database_url: url,
+        database_url,
         port: 8080,
         allowed_origins: vec!["https://app.example.com".into()],
         allowed_methods: vec!["GET".into(), "POST".into(), "OPTIONS".into()],
@@ -549,8 +614,8 @@ async fn setup_test_app_with_auth_config_and(
     .await
     .expect("DATABASE_URL is set, so the DB-backed test must connect");
 
-    // The claim is global and the binaries share this database: drop claimable rows a
-    // previous binary left behind before this app can deliver them to its own sender.
+    // Drop claimable rows a previous run of this binary left behind in its own database
+    // before this app can deliver them to its own sender.
     metal_auth::db::outbox::discard_claimable_outbox(&pool)
         .await
         .expect("clear claimable outbox residue");

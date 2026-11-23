@@ -78,9 +78,6 @@ async fn expired_challenge_token_is_rejected() {
     let Some(app) = setup_test_app().await else {
         return;
     };
-    let prune_guard = PruneIsolationGuard::acquire(&app.pool)
-        .await
-        .expect("take cross-binary prune lock");
 
     let (email, password, secret, _backup_codes, _session) =
         enabled_user(&app, &dynamic_ip()).await;
@@ -121,10 +118,6 @@ async fn expired_challenge_token_is_rejected() {
         sessions_before,
         "an expired challenge must not issue a session"
     );
-    prune_guard
-        .release()
-        .await
-        .expect("release cross-binary prune lock");
 }
 
 /// Scenario 2: a code accepted once is burned for every later presentation.

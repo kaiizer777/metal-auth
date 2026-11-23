@@ -2633,6 +2633,7 @@ async fn test_rate_limit_reset_confirm() {
 /// Uses interleaved multi-sample median comparison to eliminate single-sample scheduler-pause flakiness.
 #[tokio::test]
 async fn test_login_timing_parity_unknown_vs_wrong() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -2742,6 +2743,7 @@ async fn test_login_timing_parity_unknown_vs_wrong() {
 /// In Phase 3, login validates credentials and returns user_id; session issuance is deferred.
 #[tokio::test]
 async fn test_session_fixation_login_issues_fresh_session() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -2828,6 +2830,7 @@ async fn test_csrf_state_changing_request_requires_allowed_origin() {
 
 #[tokio::test]
 async fn test_rotate_session_rejects_expired_session() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -2915,6 +2918,7 @@ async fn test_rotate_session_rejects_expired_session() {
 
 #[tokio::test]
 async fn test_touch_session_rejects_expired_session() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -2958,6 +2962,7 @@ async fn test_touch_session_rejects_expired_session() {
 
 #[tokio::test]
 async fn test_rotate_session_success_lifecycle() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -3008,6 +3013,7 @@ async fn test_rotate_session_success_lifecycle() {
 
 #[tokio::test]
 async fn test_invalidate_all_user_sessions_spec_contract() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -3051,6 +3057,7 @@ async fn test_invalidate_all_user_sessions_spec_contract() {
 /// deleting, or a rotate can mint a session the DELETE never sees.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_invalidate_all_user_sessions_waits_on_user_row() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };

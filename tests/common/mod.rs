@@ -18,10 +18,50 @@ use uuid::Uuid;
 /// In-process database serialization mutex for tests running within the same binary process.
 ///
 /// Note: Cargo compiles each integration test file (`tests/*.rs`) into a separate OS process.
-/// Logical cross-binary test isolation is guaranteed by `dynamic_email()` and unique UUID keys.
+/// Logical cross-binary test isolation is guaranteed by `dynamic_email()` and unique UUID keys,
+/// except for the global two-factor prune (see `PruneIsolationGuard`): it reaps by expiry only.
 /// Global table truncation (`truncate_tables`) must not be called during parallel multi-binary
 /// test runs without PostgreSQL-level advisory locking (`pg_advisory_lock`).
 pub static DB_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Advisory-lock key serializing the global two-factor prune across test binaries.
+///
+/// `prune_expired_challenges` reaps expired rows table-wide with no owner predicate, and
+/// `run_outbox_worker_until` fires it on startup and every poll tick. `DB_LOCK` above is
+/// per-process, so without this a worker in one binary reaps expired fixtures seeded by
+/// another (flipping `TwoFactorTokenExpired` to `TwoFactorTokenInvalid`). Fixed constant,
+/// disjoint by convention from the hashed per-user keys in `TotpService`.
+pub const TWO_FACTOR_PRUNE_LOCK_KEY: i64 = 8_700_201_983_700_087;
+
+/// Holds `pg_advisory_xact_lock` on an open transaction for the whole test.
+///
+/// Transaction-scoped like the production per-user lock: rollback (including drop on panic)
+/// releases it, so a failed test cannot poison the pooled connection for the next binary.
+/// Every test that exposes an expired `two_factor_tokens` row, or that runs the prune via a
+/// spawned worker, holds this for the full test body.
+pub struct PruneIsolationGuard<'a> {
+    tx: Option<sqlx::Transaction<'a, sqlx::Postgres>>,
+}
+
+impl<'a> PruneIsolationGuard<'a> {
+    /// Takes the cross-binary prune lock on a dedicated pooled connection.
+    pub async fn acquire(pool: &'a PgPool) -> Result<Self, sqlx::Error> {
+        let mut tx = pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(TWO_FACTOR_PRUNE_LOCK_KEY)
+            .execute(&mut *tx)
+            .await?;
+        Ok(Self { tx: Some(tx) })
+    }
+
+    /// Rolls back, releasing the lock. Drop does the same on panic paths.
+    pub async fn release(mut self) -> Result<(), sqlx::Error> {
+        if let Some(tx) = self.tx.take() {
+            tx.rollback().await?;
+        }
+        Ok(())
+    }
+}
 
 /// Worker threads for the concurrency tests.
 pub const CONCURRENT_WORKER_THREADS: usize = 5;

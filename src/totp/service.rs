@@ -2444,6 +2444,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disable_with_code_purges_challenges() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let response = enroll_and_confirm(&ctx, user_id).await;
+        let credential = credential_hash(&ctx, user_id).await;
+        let token = ctx
+            .service
+            .generate_two_factor_token(user_id, &credential)
+            .await
+            .expect("mint challenge");
+
+        ctx.service
+            .disable_totp(
+                user_id,
+                FreshAuthProof::TotpCode(current_code(&response.secret_base32)),
+                "ip",
+            )
+            .await
+            .expect("disable");
+        assert_eq!(count_rows(&ctx.pool, "two_factor_tokens", user_id).await, 0);
+        assert!(matches!(
+            ctx.service.validate_two_factor_token(&token).await,
+            Err(AppError::TwoFactorTokenInvalid)
+        ));
+    }
+
+    #[tokio::test]
     async fn challenge_token_survives_validation_and_is_single_use() {
         let Some(ctx) = setup_db_context().await else {
             return;

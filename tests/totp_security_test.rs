@@ -1198,16 +1198,26 @@ async fn password_reset_purges_the_pending_challenge() {
     let user_id = user_id_for_email(&app.pool, &email).await;
 
     let challenge_token = challenge(&app, &email, &password).await;
+    // The two rows below are seeded by hand, so they carry the binding a real mint writes:
+    // the credential the login verified, which is still the pre-reset hash at this point.
+    let pre_reset_hash: String =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read the live credential");
     // Two extra rows: a purge limited to one row must not pass, and the second
     // user's row below pins the `WHERE user_id` predicate.
     for _ in 0..2 {
         let (_token, token_hash) = generate_token();
         sqlx::query(
-            "INSERT INTO two_factor_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
+            "INSERT INTO two_factor_tokens (user_id, token_hash, expires_at, credential_hash) \
+             VALUES ($1, $2, $3, $4)",
         )
         .bind(user_id)
         .bind(token_hash.as_slice())
         .bind(Utc::now() + Duration::hours(1))
+        .bind(&pre_reset_hash)
         .execute(&app.pool)
         .await
         .expect("seed extra challenge row");

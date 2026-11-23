@@ -866,6 +866,20 @@ impl TotpService {
     }
 }
 
+/// Delete every challenge token whose TTL has passed, returning the number of rows removed.
+///
+/// Rows at or past `expires_at` are unreachable — the handler rejects them before redemption
+/// is attempted — so this only reclaims storage that no request can claim. Reaps globally, not
+/// per user, and takes no user row lock: deleting an FK child never touches the parent.
+///
+/// One autocommit statement; `idx_two_factor_tokens_expires` serves the range predicate.
+pub(crate) async fn prune_expired_challenges(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM two_factor_tokens WHERE expires_at <= NOW()")
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 /// Serialize every check that consumes a code for one user, for the life of the transaction.
 ///
 /// Transaction-scoped: commit or rollback releases it, no manual unlock. Taken before the
@@ -2308,6 +2322,51 @@ mod tests {
             Err(AppError::TwoFactorTokenExpired)
         ));
         assert_eq!(count_rows(&ctx.pool, "two_factor_tokens", user_id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn prune_expired_challenges_removes_only_expired_rows() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let credential = credential_hash(&ctx, user_id).await;
+        let expired = ctx
+            .service
+            .generate_two_factor_token(user_id, &credential)
+            .await
+            .expect("mint expiring challenge");
+        let live = ctx
+            .service
+            .generate_two_factor_token(user_id, &credential)
+            .await
+            .expect("mint live challenge");
+
+        let expired_hash = hash_token(&expired).expect("hash expiring challenge");
+        sqlx::query(
+            "UPDATE two_factor_tokens SET expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second' \
+             WHERE token_hash = $1",
+        )
+        .bind(&expired_hash[..])
+        .execute(&ctx.pool)
+        .await
+        .expect("expire");
+
+        // Global reap: other users' rows may exist, so assert on this user's rows only.
+        let pruned = prune_expired_challenges(&ctx.pool).await.expect("prune");
+        assert!(pruned >= 1, "the expired row must be counted as pruned");
+        assert_eq!(count_rows(&ctx.pool, "two_factor_tokens", user_id).await, 1);
+        assert!(matches!(
+            ctx.service.validate_two_factor_token(&expired).await,
+            Err(AppError::TwoFactorTokenInvalid)
+        ));
+        assert_eq!(
+            ctx.service
+                .validate_two_factor_token(&live)
+                .await
+                .expect("live challenge survives the prune"),
+            user_id
+        );
     }
 
     #[tokio::test]

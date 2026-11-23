@@ -311,6 +311,9 @@ pub async fn run_outbox_worker_until(
     if let Err(e) = crate::db::outbox::cleanup_sent_outbox(&pool, config.sent_retention).await {
         error!(err = %e, "failed to cleanup sent outbox records on startup");
     }
+    if let Err(e) = crate::totp::service::prune_expired_challenges(&pool).await {
+        error!(err = %e, "failed to prune expired two-factor challenge tokens on startup");
+    }
 
     // Drain existing pending records immediately on startup before sleeping
     drain_outbox_batches(&pool, &sender, timeout, &config, &shutdown).await;
@@ -327,6 +330,9 @@ pub async fn run_outbox_worker_until(
         drain_outbox_batches(&pool, &sender, timeout, &config, &shutdown).await;
         if let Err(e) = crate::db::outbox::cleanup_sent_outbox(&pool, config.sent_retention).await {
             error!(err = %e, "failed to cleanup sent outbox records");
+        }
+        if let Err(e) = crate::totp::service::prune_expired_challenges(&pool).await {
+            error!(err = %e, "failed to prune expired two-factor challenge tokens");
         }
     }
 }

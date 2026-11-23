@@ -752,3 +752,173 @@ async fn test_outbox_worker_until_stops_on_shutdown() {
         .execute(&app.pool)
         .await;
 }
+
+async fn two_factor_token_exists(pool: &sqlx::PgPool, token_hash: &[u8]) -> bool {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM two_factor_tokens WHERE token_hash = $1")
+        .bind(token_hash)
+        .fetch_one(pool)
+        .await
+        .expect("count challenge tokens")
+        > 0
+}
+
+#[tokio::test]
+async fn test_outbox_worker_prunes_expired_two_factor_challenges() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(app) = setup_test_app().await else {
+        return;
+    };
+
+    let email = dynamic_email();
+    let password_hash = metal_auth::crypto::hash_password(&dynamic_password(), &test_auth_config())
+        .expect("hash fixture password");
+    let user_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, TRUE) \
+         RETURNING id",
+    )
+    .bind(&email)
+    .bind(password_hash)
+    .fetch_one(&app.pool)
+    .await
+    .expect("insert user");
+
+    // Unique hashes: the assertions below can only ever observe fixtures seeded here.
+    let expired_hash = uuid::Uuid::new_v4().into_bytes().to_vec();
+    let live_hash = uuid::Uuid::new_v4().into_bytes().to_vec();
+    sqlx::query(
+        "INSERT INTO two_factor_tokens (user_id, token_hash, expires_at, credential_hash) \
+         VALUES ($1, $2, NOW() - INTERVAL '1 minute', $3)",
+    )
+    .bind(user_id)
+    .bind(&expired_hash[..])
+    .bind("prune-fixture-credential")
+    .execute(&app.pool)
+    .await
+    .expect("seed expired challenge");
+    sqlx::query(
+        "INSERT INTO two_factor_tokens (user_id, token_hash, expires_at, credential_hash) \
+         VALUES ($1, $2, NOW() + INTERVAL '1 hour', $3)",
+    )
+    .bind(user_id)
+    .bind(&live_hash[..])
+    .bind("prune-fixture-credential")
+    .execute(&app.pool)
+    .await
+    .expect("seed live challenge");
+    assert!(
+        two_factor_token_exists(&app.pool, &expired_hash).await,
+        "the expired fixture must exist before the worker starts"
+    );
+    assert!(
+        two_factor_token_exists(&app.pool, &live_hash).await,
+        "the live fixture must exist before the worker starts"
+    );
+
+    // A seeded pending row gives the startup phase visible work: it is claimed and marked
+    // sent only after the startup prune has already run.
+    let recipient = format!("prune_{}@example.com", uuid::Uuid::new_v4());
+    let outbox_row = insert_outbox(
+        &app.pool,
+        &recipient,
+        "verification",
+        json!({
+            "user_id": user_id,
+            "to": recipient,
+            "token": "tok",
+            "url": "https://example.com",
+            "expires_at": chrono::Utc::now()
+        }),
+    )
+    .await
+    .expect("insert outbox row");
+
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let worker = tokio::spawn(run_outbox_worker_until(
+        app.pool.clone(),
+        Some(Arc::new(NoopEmailSender) as SharedEmailSender),
+        Duration::from_secs(5),
+        OutboxWorkerConfig::default(),
+        Arc::clone(&notify),
+        shutdown_rx,
+    ));
+
+    // The startup drain is the last startup step, so the sent row proves the startup prune ran.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let delivered = get_outbox_by_id(&app.pool, outbox_row.id)
+                .await
+                .expect("get outbox row")
+                .expect("seeded outbox row present");
+            if delivered.status == OUTBOX_STATUS_SENT {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("startup drain must deliver the seeded outbox row");
+
+    assert!(
+        !two_factor_token_exists(&app.pool, &expired_hash).await,
+        "the startup prune must delete a challenge whose TTL has passed"
+    );
+    assert!(
+        two_factor_token_exists(&app.pool, &live_hash).await,
+        "a challenge still inside its TTL must survive the startup prune"
+    );
+
+    // Seeded after startup, so only a poll iteration can reap it: a surviving row means the
+    // per-tick prune is gone, and no startup sweep can mask that.
+    let tick_hash = uuid::Uuid::new_v4().into_bytes().to_vec();
+    sqlx::query(
+        "INSERT INTO two_factor_tokens (user_id, token_hash, expires_at, credential_hash) \
+         VALUES ($1, $2, NOW() - INTERVAL '1 minute', $3)",
+    )
+    .bind(user_id)
+    .bind(&tick_hash[..])
+    .bind("prune-fixture-credential")
+    .execute(&app.pool)
+    .await
+    .expect("seed expired challenge for the tick");
+    assert!(
+        two_factor_token_exists(&app.pool, &tick_hash).await,
+        "the tick fixture must be committed before the worker is woken"
+    );
+
+    notify.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if !two_factor_token_exists(&app.pool, &tick_hash).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a poll iteration must prune a challenge that expired after startup");
+
+    assert!(
+        two_factor_token_exists(&app.pool, &live_hash).await,
+        "a challenge still inside its TTL must survive a poll iteration"
+    );
+
+    shutdown_tx.send(true).expect("signal shutdown");
+    tokio::time::timeout(Duration::from_secs(10), worker)
+        .await
+        .expect("worker stops after shutdown signal")
+        .expect("worker join");
+
+    let _ = sqlx::query("DELETE FROM two_factor_tokens WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&app.pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM email_outbox WHERE id = $1")
+        .bind(outbox_row.id)
+        .execute(&app.pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&app.pool)
+        .await;
+}

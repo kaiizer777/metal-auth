@@ -814,33 +814,107 @@ async fn test_outbox_worker_prunes_expired_two_factor_challenges() {
         "the live fixture must exist before the worker starts"
     );
 
-    // The startup prune runs before the first select!, so joining the shutdown proves it ran.
+    // A seeded pending row gives the startup phase visible work: it is claimed and marked
+    // sent only after the startup prune has already run.
+    let recipient = format!("prune_{}@example.com", uuid::Uuid::new_v4());
+    let outbox_row = insert_outbox(
+        &app.pool,
+        &recipient,
+        "verification",
+        json!({
+            "user_id": user_id,
+            "to": recipient,
+            "token": "tok",
+            "url": "https://example.com",
+            "expires_at": chrono::Utc::now()
+        }),
+    )
+    .await
+    .expect("insert outbox row");
+
+    let notify = Arc::new(tokio::sync::Notify::new());
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let worker = tokio::spawn(run_outbox_worker_until(
         app.pool.clone(),
-        None,
+        Some(Arc::new(NoopEmailSender) as SharedEmailSender),
         Duration::from_secs(5),
         OutboxWorkerConfig::default(),
-        Arc::new(tokio::sync::Notify::new()),
+        Arc::clone(&notify),
         shutdown_rx,
     ));
+
+    // The startup drain is the last startup step, so the sent row proves the startup prune ran.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let delivered = get_outbox_by_id(&app.pool, outbox_row.id)
+                .await
+                .expect("get outbox row")
+                .expect("seeded outbox row present");
+            if delivered.status == OUTBOX_STATUS_SENT {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("startup drain must deliver the seeded outbox row");
+
+    assert!(
+        !two_factor_token_exists(&app.pool, &expired_hash).await,
+        "the startup prune must delete a challenge whose TTL has passed"
+    );
+    assert!(
+        two_factor_token_exists(&app.pool, &live_hash).await,
+        "a challenge still inside its TTL must survive the startup prune"
+    );
+
+    // Seeded after startup, so only a poll iteration can reap it: a surviving row means the
+    // per-tick prune is gone, and no startup sweep can mask that.
+    let tick_hash = uuid::Uuid::new_v4().into_bytes().to_vec();
+    sqlx::query(
+        "INSERT INTO two_factor_tokens (user_id, token_hash, expires_at, credential_hash) \
+         VALUES ($1, $2, NOW() - INTERVAL '1 minute', $3)",
+    )
+    .bind(user_id)
+    .bind(&tick_hash[..])
+    .bind("prune-fixture-credential")
+    .execute(&app.pool)
+    .await
+    .expect("seed expired challenge for the tick");
+    assert!(
+        two_factor_token_exists(&app.pool, &tick_hash).await,
+        "the tick fixture must be committed before the worker is woken"
+    );
+
+    notify.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if !two_factor_token_exists(&app.pool, &tick_hash).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a poll iteration must prune a challenge that expired after startup");
+
+    assert!(
+        two_factor_token_exists(&app.pool, &live_hash).await,
+        "a challenge still inside its TTL must survive a poll iteration"
+    );
+
     shutdown_tx.send(true).expect("signal shutdown");
     tokio::time::timeout(Duration::from_secs(10), worker)
         .await
         .expect("worker stops after shutdown signal")
         .expect("worker join");
 
-    assert!(
-        !two_factor_token_exists(&app.pool, &expired_hash).await,
-        "the worker must delete a challenge whose TTL has passed"
-    );
-    assert!(
-        two_factor_token_exists(&app.pool, &live_hash).await,
-        "a challenge still inside its TTL must survive the prune"
-    );
-
     let _ = sqlx::query("DELETE FROM two_factor_tokens WHERE user_id = $1")
         .bind(user_id)
+        .execute(&app.pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM email_outbox WHERE id = $1")
+        .bind(outbox_row.id)
         .execute(&app.pool)
         .await;
     let _ = sqlx::query("DELETE FROM users WHERE id = $1")

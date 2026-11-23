@@ -2136,6 +2136,19 @@ mod tests {
             .verify_totp(user_id, &code, "ip")
             .await
             .expect("seed replay row");
+        let credential = credential_hash(&ctx, user_id).await;
+        for _ in 0..2 {
+            ctx.service
+                .generate_two_factor_token(user_id, &credential)
+                .await
+                .expect("mint challenge");
+        }
+        let other_id = create_user(&ctx, true, &fixture_password()).await;
+        let other_credential = credential_hash(&ctx, other_id).await;
+        ctx.service
+            .generate_two_factor_token(other_id, &other_credential)
+            .await
+            .expect("mint other-user challenge");
 
         assert!(matches!(
             ctx.service
@@ -2149,6 +2162,11 @@ mod tests {
             Err(AppError::InvalidCredentials)
         ));
         assert!(ctx.service.is_totp_enabled(user_id).await.expect("state"));
+        assert_eq!(
+            count_rows(&ctx.pool, "two_factor_tokens", user_id).await,
+            2,
+            "a rejected disable must leave challenges retryable"
+        );
 
         ctx.service
             .disable_totp(user_id, FreshAuthProof::Password(password), "ip")
@@ -2157,6 +2175,12 @@ mod tests {
         assert!(!ctx.service.is_totp_enabled(user_id).await.expect("state"));
         assert_eq!(count_rows(&ctx.pool, "totp_secrets", user_id).await, 0);
         assert_eq!(count_rows(&ctx.pool, "totp_used_codes", user_id).await, 0);
+        assert_eq!(count_rows(&ctx.pool, "two_factor_tokens", user_id).await, 0);
+        assert_eq!(
+            count_rows(&ctx.pool, "two_factor_tokens", other_id).await,
+            1,
+            "the purge is scoped to the disabling user"
+        );
     }
 
     #[tokio::test]

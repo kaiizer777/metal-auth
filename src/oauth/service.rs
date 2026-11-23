@@ -1910,6 +1910,8 @@ mod tests {
         pool: PgPool,
         trigger: String,
         armed: bool,
+        /// Test seam: parks the cleanup thread before it connects. See `CleanupStall`.
+        stall: Option<std::sync::Arc<CleanupStall>>,
     }
 
     impl RejectedChallengeInsert {
@@ -1937,6 +1939,7 @@ mod tests {
                 pool: pool.clone(),
                 trigger,
                 armed: true,
+                stall: None,
             }
         }
 
@@ -2005,6 +2008,48 @@ mod tests {
                 .await?;
         }
         transaction.commit().await
+    }
+
+    /// Test seam that parks the cleanup thread before it connects.
+    ///
+    /// The real failure mode — a connect that neither completes nor is refused — cannot
+    /// be produced deterministically against a live server, so a test hands the guard a
+    /// gate instead.
+    struct CleanupStall {
+        park_for: std::time::Duration,
+        released: std::sync::Mutex<Option<bool>>,
+        wake: std::sync::Condvar,
+    }
+
+    impl CleanupStall {
+        fn new(park_for: std::time::Duration) -> Self {
+            Self {
+                park_for,
+                released: std::sync::Mutex::new(None),
+                wake: std::sync::Condvar::new(),
+            }
+        }
+
+        /// Park until the test releases the gate or `park_for` lapses; report whether
+        /// the cleanup should run. A lapsed park gives up, so an unbounded wait fails
+        /// instead of hanging.
+        fn park(&self) -> bool {
+            let (released, _) = self
+                .wake
+                .wait_timeout_while(
+                    self.released.lock().expect("stall gate"),
+                    self.park_for,
+                    |outcome| outcome.is_none(),
+                )
+                .expect("stall gate");
+            released.unwrap_or(false)
+        }
+
+        /// Release a parked cleanup without letting it touch the database.
+        fn abandon(&self) {
+            *self.released.lock().expect("stall gate") = Some(false);
+            self.wake.notify_all();
+        }
     }
 
     impl Drop for RejectedChallengeInsert {

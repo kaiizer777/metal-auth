@@ -212,6 +212,7 @@ async fn response_json(resp: axum::response::Response) -> (StatusCode, serde_jso
 
 #[tokio::test]
 async fn test_signup_password_too_short() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
     let req = json_request(
         Method::POST,
@@ -234,6 +235,7 @@ async fn test_signup_password_too_short() {
 
 #[tokio::test]
 async fn test_signup_password_too_long() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
     let long_password = "a".repeat(129);
     let req = json_request(
@@ -293,6 +295,7 @@ async fn test_signup_unicode_multibyte_password() {
 
 #[tokio::test]
 async fn test_signup_common_password_blocklist() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for common_pw in ["password", "12345678", "qwerty123"] {
@@ -359,6 +362,7 @@ async fn test_signup_no_forced_complexity() {
 
 #[tokio::test]
 async fn test_signup_invalid_email_format() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for bad_email in [
@@ -395,6 +399,7 @@ async fn test_signup_invalid_email_format() {
 
 #[tokio::test]
 async fn test_signup_empty_email_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for bad_email in ["", "   ", "\t", "\n  \t"] {
@@ -424,6 +429,7 @@ async fn test_signup_empty_email_rejected() {
 
 #[tokio::test]
 async fn test_signup_email_too_long_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
     let long_email = format!("{}@example.com", "a".repeat(250)); // > 255 chars
 
@@ -448,6 +454,7 @@ async fn test_signup_email_too_long_rejected() {
 
 #[tokio::test]
 async fn test_signup_common_password_uppercase_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for uppercase_pw in ["PASSWORD", "12345678", "QWERTY123", "ADMIN1234"] {
@@ -478,6 +485,7 @@ async fn test_signup_common_password_uppercase_rejected() {
 
 #[tokio::test]
 async fn test_signup_sql_injection_email_no_leak() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for sqli_payload in [
@@ -514,6 +522,7 @@ async fn test_signup_sql_injection_email_no_leak() {
 
 #[tokio::test]
 async fn test_signup_xss_email_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for xss_payload in [

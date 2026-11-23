@@ -2817,6 +2817,7 @@ async fn test_session_fixation_login_issues_fresh_session() {
 /// without anti-CSRF tokens or strict Origin/Referer enforcement middleware.
 #[tokio::test]
 async fn test_csrf_state_changing_request_requires_allowed_origin() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     // Allowed origin receives CORS approval header

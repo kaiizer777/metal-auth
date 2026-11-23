@@ -1996,6 +1996,7 @@ async fn test_require_email_verification_block() {
 
 #[tokio::test]
 async fn test_verification_token_replay_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -2046,6 +2047,7 @@ async fn test_verification_token_replay_rejected() {
 
 #[tokio::test]
 async fn test_reset_password_revokes_all_tokens() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -2114,6 +2116,7 @@ async fn test_reset_password_revokes_all_tokens() {
 
 #[tokio::test]
 async fn test_password_reset_confirm_same_token_replay_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -2176,6 +2179,7 @@ async fn test_password_reset_confirm_same_token_replay_rejected() {
 
 #[tokio::test]
 async fn test_password_reset_confirm_token_from_verify_flow_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -2233,6 +2237,7 @@ async fn test_password_reset_confirm_token_from_verify_flow_rejected() {
 
 #[tokio::test]
 async fn test_password_reset_confirm_invalid_token_does_not_change_password() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };

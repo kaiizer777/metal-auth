@@ -1592,8 +1592,10 @@ mod tests {
         // Wait for a provable state, not a fixed delay: T2 either waits on the user lock or,
         // with no serialization, finishes and records the code itself.
         let mut waited = false;
-        for _ in 0..300 {
+        let mut finished_early = false;
+        for _ in 0..600 {
             if second.is_finished() {
+                finished_early = true;
                 break;
             }
             waited = sqlx::query_scalar::<_, bool>(
@@ -1615,8 +1617,20 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         if !waited {
-            let raced = second.await.expect("join");
-            panic!("second verifier ran past the paused one instead of waiting: {raced:?}");
+            // T2 is queued on the lock this transaction holds, so it cannot finish until the
+            // lock is released: roll back first, then join under a bound, or the join hangs.
+            stalled.rollback().await.expect("T1 rollback");
+            let raced = tokio::time::timeout(std::time::Duration::from_secs(10), second)
+                .await
+                .expect("the second verifier must finish once T1 releases its lock")
+                .expect("join");
+            if finished_early {
+                panic!("second verifier ran past the paused one instead of waiting: {raced:?}");
+            }
+            panic!(
+                "the probe never observed a waiter within its budget; T1 was rolled back and \
+                 the second attempt returned {raced:?}, so serialization was not disproven"
+            );
         }
 
         // T1 resumes: prune, guarded insert, commit — the paused half of `record_totp_use`.

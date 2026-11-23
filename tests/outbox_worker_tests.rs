@@ -702,6 +702,11 @@ async fn test_outbox_worker_until_stops_on_shutdown() {
     let Some(app) = setup_test_app().await else {
         return;
     };
+    // The spawned worker prunes on startup: hold the cross-binary lock so it cannot reap
+    // another binary's expired fixtures while this worker is alive.
+    let prune_guard = PruneIsolationGuard::acquire(&app.pool)
+        .await
+        .expect("take cross-binary prune lock");
 
     // Seed pending rows: fails if shutdown skips the in-flight drain.
     let mut ids = Vec::new();
@@ -751,6 +756,10 @@ async fn test_outbox_worker_until_stops_on_shutdown() {
         .bind(&ids)
         .execute(&app.pool)
         .await;
+    prune_guard
+        .release()
+        .await
+        .expect("release cross-binary prune lock");
 }
 
 async fn two_factor_token_exists(pool: &sqlx::PgPool, token_hash: &[u8]) -> bool {
@@ -768,6 +777,11 @@ async fn test_outbox_worker_prunes_expired_two_factor_challenges() {
     let Some(app) = setup_test_app().await else {
         return;
     };
+    // This worker must still reap globally, but only while no other binary exposes expired
+    // fixtures: the lock serializes pruners against victims without narrowing the prune.
+    let prune_guard = PruneIsolationGuard::acquire(&app.pool)
+        .await
+        .expect("take cross-binary prune lock");
 
     let email = dynamic_email();
     let password_hash = metal_auth::crypto::hash_password(&dynamic_password(), &test_auth_config())
@@ -921,4 +935,8 @@ async fn test_outbox_worker_prunes_expired_two_factor_challenges() {
         .bind(user_id)
         .execute(&app.pool)
         .await;
+    prune_guard
+        .release()
+        .await
+        .expect("release cross-binary prune lock");
 }

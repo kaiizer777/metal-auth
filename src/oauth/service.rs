@@ -2059,9 +2059,18 @@ mod tests {
             }
             let options = self.pool.connect_options();
             let statements = self.drop_statements();
+            let stall = self.stall.take();
+            let (finished, cleanup_done) = std::sync::mpsc::channel::<()>();
             // A panicking assertion cannot await: finish the drops on a scratch thread with
             // its own runtime so the trigger cannot leak into another test binary.
             let cleanup = std::thread::spawn(move || {
+                // Disconnected when this closure returns or panics, so it signals "finished".
+                let _finished = finished;
+                if let Some(stall) = stall
+                    && !stall.park()
+                {
+                    return;
+                }
                 let runtime = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -2082,6 +2091,19 @@ mod tests {
                     );
                 }
             });
+            let expired = matches!(
+                cleanup_done.recv_timeout(CLEANUP_DEADLINE),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            );
+            if expired {
+                // The thread is detached from here on: it may still reach the database,
+                // which is why `CLEANUP_DEADLINE` is sized to make this path unreachable
+                // in practice.
+                eprintln!(
+                    "oauth injection cleanup abandoned after {CLEANUP_DEADLINE:?}: still running"
+                );
+                return;
+            }
             if cleanup.join().is_err() {
                 eprintln!("oauth injection cleanup thread panicked");
             }

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
-use sqlx::{PgConnection, PgPool, Row};
+use sqlx::{PgConnection, PgPool, Row, postgres::PgQueryResult};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
@@ -34,6 +34,10 @@ pub struct TotpService {
     pool: PgPool,
     config: Arc<Config>,
     auth_config: Arc<AppConfig>,
+    /// Test-only override of the guarded insert's write clock. `None` — always the case in
+    /// production — compares against the database clock.
+    #[cfg(test)]
+    write_clock: Option<DateTime<Utc>>,
 }
 
 impl TotpService {
@@ -47,7 +51,17 @@ impl TotpService {
             pool,
             config,
             auth_config,
+            #[cfg(test)]
+            write_clock: None,
         }
+    }
+
+    /// Pin the guarded insert's write clock, so a test can land a write exactly on the
+    /// exclusive bound. Production never overrides the database clock.
+    #[cfg(test)]
+    fn with_write_clock(mut self, instant: DateTime<Utc>) -> Self {
+        self.write_clock = Some(instant);
+        self
     }
 
     /// Step 1 of enrollment: rotate the secret, store it encrypted, and issue backup codes.
@@ -395,16 +409,26 @@ impl TotpService {
         // row earlier than the reference its own cutoff uses and a later transaction would
         // prune it sooner.
         let window_end = code_window_end(step).ok_or(AppError::TotpCodeInvalid)?;
-        let inserted = sqlx::query(
-            "INSERT INTO totp_used_codes (user_id, code_hash, used_at) \
-             SELECT $1, $2, $3 WHERE clock_timestamp() < $4",
-        )
-        .bind(user_id)
-        .bind(&replay_hash[..])
-        .bind(reference)
-        .bind(window_end)
-        .execute(&mut *connection)
-        .await;
+        #[cfg(not(test))]
+        let inserted =
+            insert_used_code(connection, user_id, &replay_hash, reference, window_end).await;
+        #[cfg(test)]
+        let inserted = match self.write_clock {
+            Some(write_clock) => {
+                insert_used_code_at(
+                    connection,
+                    user_id,
+                    &replay_hash,
+                    reference,
+                    write_clock,
+                    window_end,
+                )
+                .await
+            }
+            None => {
+                insert_used_code(connection, user_id, &replay_hash, reference, window_end).await
+            }
+        };
         let inserted = match inserted {
             Ok(result) => result,
             Err(error) => return Err(classify_used_code_error(error)),
@@ -894,6 +918,53 @@ async fn lock_totp_user(connection: &mut PgConnection, user_id: Uuid) -> Result<
         .await
         .map(|_| ())
         .map_err(AppError::Database)
+}
+
+/// The guarded replay insert, shared so the window comparison has one definition.
+///
+/// Zero rows means the write landed at or after the matched step's exclusive bound.
+const GUARDED_INSERT: &str = "INSERT INTO totp_used_codes (user_id, code_hash, used_at) \
+     SELECT $1, $2, $3 WHERE clock_timestamp() < $4";
+
+/// Record the replay tombstone if the database clock is still inside the accepted band.
+async fn insert_used_code(
+    connection: &mut PgConnection,
+    user_id: Uuid,
+    replay_hash: &[u8],
+    used_at: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+) -> Result<PgQueryResult, sqlx::Error> {
+    sqlx::query(GUARDED_INSERT)
+        .bind(user_id)
+        .bind(replay_hash)
+        .bind(used_at)
+        .bind(window_end)
+        .execute(&mut *connection)
+        .await
+}
+
+/// [`GUARDED_INSERT`] with the write clock bound instead of read from the database.
+///
+/// Test-only: `clock_timestamp()` cannot be pinned, so exact equality with the bound is
+/// otherwise unreachable. Derived from the production text so the two cannot drift.
+#[cfg(test)]
+async fn insert_used_code_at(
+    connection: &mut PgConnection,
+    user_id: Uuid,
+    replay_hash: &[u8],
+    used_at: DateTime<Utc>,
+    write_clock: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+) -> Result<PgQueryResult, sqlx::Error> {
+    let statement = GUARDED_INSERT.replace("clock_timestamp()", "$5");
+    sqlx::query(sqlx::AssertSqlSafe(statement))
+        .bind(user_id)
+        .bind(replay_hash)
+        .bind(used_at)
+        .bind(window_end)
+        .bind(write_clock)
+        .execute(&mut *connection)
+        .await
 }
 
 /// Single clock reference for one verification transaction.
@@ -1702,16 +1773,35 @@ mod tests {
             "a write past the bound must expire: {write_late:?}"
         );
 
-        // At the bound the code's own reference is one counter outside the band.
+        // At the bound the write is refused for being exactly on it, and the code's own
+        // reference stays one step inside the accepted band, so the counter cannot be the
+        // rejecter: only the write guard can be.
+        let inside_band = stale_end - Duration::seconds(1);
         let at_bound = ctx
             .service
-            .verify_totp_at_reference(user_id, &stale, stale_end)
+            .clone()
+            .with_write_clock(stale_end)
+            .verify_totp_at_reference(user_id, &stale, inside_band)
             .await;
         assert!(
             matches!(at_bound, Err(AppError::TotpCodeInvalid)),
             "the bound is exclusive: {at_bound:?}"
         );
         assert_eq!(count_used_code(&ctx.pool, user_id, &stale).await, 0);
+
+        // One instant earlier the same write lands, so the rejection above is the bound and
+        // not some other refusal.
+        let just_inside = ctx
+            .service
+            .clone()
+            .with_write_clock(stale_end - Duration::microseconds(1))
+            .verify_totp_at_reference(user_id, &stale, inside_band)
+            .await;
+        assert!(
+            just_inside.is_ok(),
+            "one instant before the bound must land: {just_inside:?}"
+        );
+        assert_eq!(count_used_code(&ctx.pool, user_id, &stale).await, 1);
     }
 
     #[tokio::test]

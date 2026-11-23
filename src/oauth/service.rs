@@ -1819,6 +1819,39 @@ mod tests {
         );
     }
 
+    /// A cleanup that stalls before it can connect must not hold the dropping thread
+    /// past its bound.
+    #[tokio::test]
+    async fn cleanup_stalled_before_connecting_returns_at_the_deadline() {
+        // A lazy pool never connects; `Drop` reads only its options, and the stall parks
+        // the cleanup before it would use them, so this test needs no database.
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://cleanup@127.0.0.1:1/stalled")
+            .expect("build lazy pool");
+        let stall = std::sync::Arc::new(CleanupStall::new(CLEANUP_STALL));
+        let injection = RejectedChallengeInsert {
+            pool,
+            trigger: format!("oauth_test_stalled_cleanup_{}", Uuid::new_v4().simple()),
+            armed: true,
+            stall: Some(std::sync::Arc::clone(&stall)),
+        };
+
+        let started = std::time::Instant::now();
+        drop(injection);
+        let elapsed = started.elapsed();
+        // Releases the detached thread, so it cannot outlive the test.
+        stall.abandon();
+
+        assert!(
+            elapsed >= CLEANUP_DEADLINE,
+            "the cleanup must get its whole bound before it is abandoned, took {elapsed:?}"
+        );
+        assert!(
+            elapsed <= CLEANUP_DEADLINE + CLEANUP_SLACK,
+            "the bound must release the dropping thread, took {elapsed:?}"
+        );
+    }
+
     struct OAuthDbContext {
         pool: PgPool,
         config: Arc<Config>,

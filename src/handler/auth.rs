@@ -959,6 +959,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_method_not_allowed_derives_allow_from_the_method_router() {
+        use tower::ServiceExt;
+
+        let app: Router = Router::new()
+            .route(
+                "/post-only",
+                axum::routing::post(|| async { StatusCode::OK }).fallback(method_not_allowed),
+            )
+            .route(
+                "/get-and-post",
+                axum::routing::get(|| async { StatusCode::OK })
+                    .post(|| async { StatusCode::OK })
+                    .fallback(method_not_allowed),
+            );
+
+        for (uri, expected_allow) in [("/post-only", "POST"), ("/get-and-post", "GET,HEAD,POST")] {
+            let req = axum::http::Request::builder()
+                .method(axum::http::Method::PUT)
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+            assert_eq!(
+                resp.headers()
+                    .get(header::ALLOW)
+                    .and_then(|v| v.to_str().ok()),
+                Some(expected_allow),
+                "{uri}: Allow must reflect the route's method set"
+            );
+
+            let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+            let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
+            assert_eq!(err.code, ErrorCode::MethodNotAllowed);
+        }
+    }
+
+    #[tokio::test]
     async fn login_handler_rate_limits_and_normalizes_email() {
         let mut state = create_test_state();
         let limiter = Arc::new(RateLimiter::with_config(crate::config::RateLimitConfig {

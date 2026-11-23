@@ -112,11 +112,28 @@ fn oauth_error_response(state: &AppState, provider: &str, err: AppError) -> Resp
     resp
 }
 
-/// Appends a `Set-Cookie` header. Cookie strings are built from config values that
-/// `OAuthConfig::validate` already vetted for header safety, so failure is unreachable.
+/// Appends a `Set-Cookie` header, logging when the value cannot be encoded.
+///
+/// Cookie strings are usually built from config values vetted by
+/// `OAuthConfig::validate`, but that guarantee is bypassable, so a
+/// `HeaderValue::from_str` rejection drops the header and emits an error log
+/// (cookie name only, never the value) instead of failing silently. Callers
+/// keep their status/`Location` semantics; the missing `Set-Cookie` is now
+/// traceable. Valid input takes the identical append path as before.
 fn append_set_cookie(resp: &mut Response, cookie: &str) {
-    if let Ok(hv) = header::HeaderValue::from_str(cookie) {
-        resp.headers_mut().append(header::SET_COOKIE, hv);
+    match header::HeaderValue::from_str(cookie) {
+        Ok(hv) => {
+            resp.headers_mut().append(header::SET_COOKIE, hv);
+        }
+        Err(_) => {
+            let name = cookie.split(['=', ';']).next().unwrap_or("");
+            tracing::error!(
+                event = "cookie_build_failed",
+                kind = "oauth_state",
+                cookie = %truncate_for_log(name),
+                "oauth state cookie attach failed",
+            );
+        }
     }
 }
 
@@ -661,6 +678,33 @@ mod tests {
         assert!(header::HeaderValue::from_str("oauth_state=abc; Path=/\n").is_err());
         assert!(header::HeaderValue::from_str("oauth_state=abc; Path=/\u{7f}").is_err());
         assert!(header::HeaderValue::from_str("oauth_state=abc; Path=/\u{80}").is_ok());
+    }
+
+    #[test]
+    fn test_append_set_cookie_attaches_valid_value() {
+        let mut resp = StatusCode::FOUND.into_response();
+        let cookie = "oauth_state=abc; Path=/; Max-Age=600; HttpOnly; SameSite=Lax";
+        append_set_cookie(&mut resp, cookie);
+        let attached = resp
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect::<Vec<_>>();
+        assert_eq!(attached, [cookie]);
+    }
+
+    #[test]
+    fn test_append_set_cookie_drops_unencodable_value() {
+        let mut resp = StatusCode::FOUND.into_response();
+        append_set_cookie(&mut resp, "oauth_state=abc; Path=/\n");
+        assert!(
+            resp.headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .next()
+                .is_none()
+        );
     }
 
     #[test]

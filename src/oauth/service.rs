@@ -1965,6 +1965,24 @@ mod tests {
     /// backend holding the table would otherwise hang the test binary.
     const CLEANUP_TIMEOUT: &str = "5s";
 
+    /// Bound on the whole cleanup — connect plus both drops — measured from thread spawn.
+    ///
+    /// Nothing bounds the connect: `PgConnectOptions` has no connect timeout, and the
+    /// pool's `acquire_timeout` does not apply to the raw connection `Drop` opens. Two
+    /// statements may legitimately spend `CLEANUP_TIMEOUT` each, so the floor is just
+    /// over 10s. The value is deliberately far above it: expiry detaches the cleanup
+    /// thread, which can still drop a trigger a later test has already re-installed, so
+    /// detaching must stay a last resort.
+    const CLEANUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// How late the dropping frame may return after `CLEANUP_DEADLINE` before it counts
+    /// as stuck.
+    const CLEANUP_SLACK: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// How long the proof test parks the cleanup: past the bound plus its slack, so an
+    /// unbounded wait trips the elapsed assertion instead of hanging the binary.
+    const CLEANUP_STALL: std::time::Duration = std::time::Duration::from_secs(30);
+
     /// Drop the trigger and its function in one bounded transaction.
     ///
     /// `IF EXISTS` makes a retry after a timeout safe.

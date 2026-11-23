@@ -665,7 +665,7 @@ pub fn routes(state: AppState) -> Result<Router, AppError> {
             "/totp/confirm",
             axum::routing::post(totp_confirm).fallback(method_not_allowed),
         )
-        // No JSON 405 fallback here: the shared helper advertises POST only.
+        // No JSON 405 fallback here: this route keeps axum's empty-bodied 405.
         .route("/totp", axum::routing::delete(totp_disable))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

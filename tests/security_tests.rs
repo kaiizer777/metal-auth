@@ -553,6 +553,7 @@ async fn test_signup_xss_email_rejected() {
 
 #[tokio::test]
 async fn test_login_empty_credentials_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     let cases = [
@@ -690,6 +691,7 @@ async fn test_login_anti_enumeration_response_equality() {
 
 #[tokio::test]
 async fn test_login_password_over_1024_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
     let long_pw = "a".repeat(1025);
 
@@ -752,6 +754,7 @@ async fn test_login_sql_injection_email_no_leak() {
 
 #[tokio::test]
 async fn test_login_malformed_json_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     let req = raw_json_request(Method::POST, "/auth/login", "{ malformed json");
@@ -768,6 +771,7 @@ async fn test_login_malformed_json_rejected() {
 
 #[tokio::test]
 async fn test_login_method_not_allowed() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for method in [Method::GET, Method::PUT, Method::DELETE, Method::PATCH] {
@@ -798,6 +802,7 @@ async fn test_login_method_not_allowed() {
 
 #[tokio::test]
 async fn test_malformed_json_body_rejection() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     let req = raw_json_request(Method::POST, "/auth/signup", "{ broken json payload");
@@ -867,6 +872,7 @@ async fn test_logout_invalid_bearer_does_not_panic() {
 
 #[tokio::test]
 async fn test_logout_method_not_allowed() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for method in [Method::GET, Method::PUT, Method::DELETE, Method::PATCH] {
@@ -897,6 +903,7 @@ async fn test_logout_method_not_allowed() {
 
 #[tokio::test]
 async fn test_verify_invalid_token_format() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for bad_token in [
@@ -1100,6 +1107,7 @@ async fn test_verify_token_from_reset_flow_rejected() {
 
 #[tokio::test]
 async fn test_verify_method_not_allowed() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for method in [Method::GET, Method::PUT, Method::DELETE, Method::PATCH] {

@@ -576,6 +576,7 @@ async fn test_login_empty_credentials_rejected() {
 
 #[tokio::test]
 async fn test_login_unknown_email_returns_invalid_credentials() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -599,6 +600,7 @@ async fn test_login_unknown_email_returns_invalid_credentials() {
 
 #[tokio::test]
 async fn test_login_wrong_password_returns_invalid_credentials() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -634,6 +636,7 @@ async fn test_login_wrong_password_returns_invalid_credentials() {
 
 #[tokio::test]
 async fn test_login_anti_enumeration_response_equality() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -702,6 +705,7 @@ async fn test_login_password_over_1024_rejected() {
 
 #[tokio::test]
 async fn test_login_sql_injection_email_no_leak() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };

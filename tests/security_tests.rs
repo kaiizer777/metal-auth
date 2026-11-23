@@ -1138,6 +1138,7 @@ async fn test_verify_method_not_allowed() {
 
 #[tokio::test]
 async fn test_password_reset_request_invalid_email_http() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for bad_email in ["not-an-email", "@missing.com", "user@", "", "   "] {
@@ -1157,6 +1158,7 @@ async fn test_password_reset_request_invalid_email_http() {
 
 #[tokio::test]
 async fn test_password_reset_request_sql_injection_no_leak() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for sqli in [
@@ -1186,6 +1188,7 @@ async fn test_password_reset_request_sql_injection_no_leak() {
 
 #[tokio::test]
 async fn test_password_reset_request_malformed_json_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     let req = raw_json_request(
@@ -1203,6 +1206,7 @@ async fn test_password_reset_request_malformed_json_rejected() {
 
 #[tokio::test]
 async fn test_password_reset_request_method_not_allowed() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for method in [Method::GET, Method::PUT, Method::DELETE, Method::PATCH] {
@@ -1233,6 +1237,7 @@ async fn test_password_reset_request_method_not_allowed() {
 
 #[tokio::test]
 async fn test_password_reset_confirm_invalid_token() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     let req = json_request(
@@ -1254,6 +1259,7 @@ async fn test_password_reset_confirm_invalid_token() {
 
 #[tokio::test]
 async fn test_password_reset_confirm_short_password_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
     let valid_token_format = "a".repeat(64);
 
@@ -1276,6 +1282,7 @@ async fn test_password_reset_confirm_short_password_rejected() {
 
 #[tokio::test]
 async fn test_password_reset_confirm_common_password_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
     let valid_token_format = "a".repeat(64);
 
@@ -1305,6 +1312,7 @@ async fn test_password_reset_confirm_common_password_rejected() {
 
 #[tokio::test]
 async fn test_password_reset_confirm_long_password_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
     let valid_token_format = "a".repeat(64);
     let long_pw = "a".repeat(129);
@@ -1328,6 +1336,7 @@ async fn test_password_reset_confirm_long_password_rejected() {
 
 #[tokio::test]
 async fn test_password_reset_confirm_sql_injection_no_leak() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for sqli in [
@@ -1361,6 +1370,7 @@ async fn test_password_reset_confirm_sql_injection_no_leak() {
 
 #[tokio::test]
 async fn test_password_reset_confirm_method_not_allowed() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for method in [Method::GET, Method::PUT, Method::DELETE, Method::PATCH] {

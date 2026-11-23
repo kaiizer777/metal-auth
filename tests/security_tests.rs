@@ -1,3 +1,5 @@
+mod common;
+
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -1539,6 +1541,7 @@ struct TestLogScope {
 
 impl TestLogScope {
     fn new() -> Self {
+        common::install_global_log_sink();
         let buf = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::DEBUG)
@@ -1546,6 +1549,9 @@ impl TestLogScope {
             .with_ansi(false)
             .finish();
         let guard = tracing::subscriber::set_default(subscriber);
+        // Repairs callsites cached as `never` before the global sink existed. With `JustOne`
+        // this rebuilds against this capture, so it can only enable what the capture accepts.
+        tracing::callsite::rebuild_interest_cache();
         Self { buf, _guard: guard }
     }
 
@@ -1709,6 +1715,36 @@ async fn test_no_secrets_in_tracing_logs() {
     assert!(
         !logs.to_lowercase().contains("syntax error"),
         "Raw SQL syntax error leaked in tracing logs: {logs}"
+    );
+}
+
+/// One callsite, reached from whichever thread calls this.
+fn emit_interest_cache_probe() {
+    tracing::info!(
+        target: "interest_cache_probe",
+        "probe event after bare-thread registration"
+    );
+}
+
+/// `set_default` is thread-scoped but the callsite interest cache is process-global: a callsite
+/// first reached on a thread with no subscriber is cached as `Interest::never()` and the `event!`
+/// macro then drops it everywhere, including on the capturing thread.
+#[test]
+fn test_capture_survives_a_callsite_registered_on_a_bare_thread() {
+    let log_scope = TestLogScope::new();
+
+    // First hit lands on a thread with no subscriber, after the capture is installed — the
+    // registration path the concurrent tests in this binary take.
+    std::thread::spawn(emit_interest_cache_probe)
+        .join()
+        .expect("bare probe thread");
+
+    emit_interest_cache_probe();
+
+    let logs = log_scope.text();
+    assert!(
+        logs.contains("probe event after bare-thread registration"),
+        "capture lost a callsite that was registered on a subscriber-less thread: {logs}"
     );
 }
 

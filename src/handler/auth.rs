@@ -50,10 +50,11 @@ pub struct AuthHandlerState {
     pub totp_service: Arc<TotpService>,
 }
 
+/// Axum attaches the route's derived `Allow` header to this response. Setting it here
+/// would shadow that value, so this handler must never advertise a method set.
 pub(crate) async fn method_not_allowed() -> impl IntoResponse {
     (
         StatusCode::METHOD_NOT_ALLOWED,
-        [(header::ALLOW, "POST")],
         Json(ErrorResponse::from(&AppError::MethodNotAllowed)),
     )
 }

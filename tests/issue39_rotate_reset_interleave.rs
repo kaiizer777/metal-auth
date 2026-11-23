@@ -120,7 +120,7 @@ async fn rotate_concurrent_with_reset_leaves_zero_live_sessions() {
 /// Characterization: pins closed behavior post-reset (SessionNotFound, zero
 /// live sessions). NOT a guard-branch regression pin — red/green ownership
 /// belongs to the serialization interleave test, whose pg_stat_activity gate
-/// matches a `SELECT ... FOR UPDATE` the pre-fix code never emits.
+/// matches a `SELECT ... FOR NO KEY UPDATE` the pre-fix code never emits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rotate_after_committed_reset_stays_closed() {
     let Some(app) = common::setup_test_app().await else {
@@ -198,12 +198,12 @@ async fn rotate_waits_on_user_row_before_delete() {
     });
 
     // The in-flight rotate backend must show up blocked inside its explicit
-    // SELECT ... FOR UPDATE. Pre-fix rotate never issues that statement, so
+    // SELECT ... FOR NO KEY UPDATE. Pre-fix rotate never issues that statement, so
     // the deadline expires and the test fails instead of passing by accident.
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let waiting: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM pg_stat_activity WHERE query LIKE 'SELECT id FROM users%FOR UPDATE' AND datname = current_database() AND wait_event_type = 'Lock' AND $1 = ANY (pg_blocking_pids(pid))",
+            "SELECT COUNT(*) FROM pg_stat_activity WHERE query LIKE 'SELECT id FROM users%FOR NO KEY UPDATE' AND datname = current_database() AND wait_event_type = 'Lock' AND $1 = ANY (pg_blocking_pids(pid))",
         )
         .bind(guard_pid)
         .fetch_one(pool)
@@ -228,7 +228,7 @@ async fn rotate_waits_on_user_row_before_delete() {
 /// Guard-branch pin: rotate blocks on the user-row lock, the sessions vanish
 /// underneath it while it waits, and it must fail closed (SessionNotFound)
 /// with zero live sessions once the guard releases. Pre-fix rotate never
-/// emits SELECT ... FOR UPDATE, so the wait-gate deadline expires and this
+/// emits SELECT ... FOR NO KEY UPDATE, so the wait-gate deadline expires and this
 /// test fails instead of passing by accident.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rotate_blocked_by_guard_then_purged_fails_closed() {
@@ -263,7 +263,7 @@ async fn rotate_blocked_by_guard_then_purged_fails_closed() {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let waiting: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM pg_stat_activity WHERE query LIKE 'SELECT id FROM users%FOR UPDATE' AND datname = current_database() AND wait_event_type = 'Lock' AND $1 = ANY (pg_blocking_pids(pid))",
+            "SELECT COUNT(*) FROM pg_stat_activity WHERE query LIKE 'SELECT id FROM users%FOR NO KEY UPDATE' AND datname = current_database() AND wait_event_type = 'Lock' AND $1 = ANY (pg_blocking_pids(pid))",
         )
         .bind(guard_pid)
         .fetch_one(pool)

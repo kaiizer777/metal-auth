@@ -3060,12 +3060,12 @@ async fn test_invalidate_all_user_sessions_waits_on_user_row() {
     let revoke_handle =
         tokio::spawn(async move { session_service.invalidate_all_user_sessions(user_id).await });
 
-    // Pre-fix revoke-all never issues SELECT ... FOR UPDATE, so no backend
+    // Pre-fix revoke-all never issues SELECT ... FOR NO KEY UPDATE, so no backend
     // ever blocks and the deadline expires instead of passing by accident.
     let deadline = Instant::now() + std::time::Duration::from_secs(15);
     loop {
         let waiting: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM pg_stat_activity WHERE query LIKE 'SELECT id FROM users%FOR UPDATE' AND datname = current_database() AND wait_event_type = 'Lock' AND $1 = ANY (pg_blocking_pids(pid))",
+            "SELECT COUNT(*) FROM pg_stat_activity WHERE query LIKE 'SELECT id FROM users%FOR NO KEY UPDATE' AND datname = current_database() AND wait_event_type = 'Lock' AND $1 = ANY (pg_blocking_pids(pid))",
         )
         .bind(guard_pid)
         .fetch_one(&ctx.pool)

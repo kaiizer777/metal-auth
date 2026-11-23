@@ -550,7 +550,7 @@ impl TotpService {
     ///
     /// The password branch takes the same locks but does not require the factor to exist:
     /// two password proofs present no code and converge on the same end state, so a repeat
-    /// disable still succeeds. It re-reads `users.password_hash` under `FOR UPDATE` after
+    /// disable still succeeds. It re-reads `users.password_hash` under `FOR NO KEY UPDATE` after
     /// the factor row and constant-time compares it with the hash Argon2 verified, so a reset
     /// committing between the proof and the delete rejects the disable rather than stripping
     /// the factor for a superseded credential.
@@ -671,7 +671,7 @@ impl TotpService {
             .await
             .map_err(AppError::Database)?;
         let current: Option<String> =
-            sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1 FOR UPDATE")
+            sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1 FOR NO KEY UPDATE")
                 .bind(user_id)
                 .fetch_optional(&mut *transaction)
                 .await
@@ -821,7 +821,7 @@ impl TotpService {
     /// on the lock and commits after the session, never between the decision and the
     /// insert. Coverage stops at that row — a factor created after this read is not
     /// observed, because `enroll_totp` inserts a new row and an absent row takes no lock.
-    /// Closing that case would mean `SELECT … FOR UPDATE` on the user row before this read;
+    /// Closing that case would mean `SELECT … FOR NO KEY UPDATE` on the user row before this read;
     /// `create_session_in` takes that same lock later in the same transaction, so the
     /// acquisition would not add serialization, only move it earlier. It is not taken
     /// because the boundary is not a bypass: a factor created after this decision did not

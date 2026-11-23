@@ -600,7 +600,7 @@ async fn ensure_credential_matches(
     snapshot: &str,
 ) -> Result<(), AppError> {
     let current: Option<String> =
-        sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1 FOR UPDATE")
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1 FOR NO KEY UPDATE")
             .bind(user_id)
             .fetch_optional(&mut *transaction)
             .await

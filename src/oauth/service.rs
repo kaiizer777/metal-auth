@@ -1093,6 +1093,17 @@ impl OAuthService {
     pub async fn unlink_account(&self, user_id: Uuid, provider_id: &str) -> Result<(), AppError> {
         let mut tx = self.db.begin().await.map_err(AppError::Database)?;
 
+        // Purge pending challenges before the users lock: their snapshot is the live
+        // `password_hash`, which unlink never changes, so a challenge minted through
+        // this provider would otherwise stay redeemable. Challenges-first mirrors
+        // `reset_password` and the redemption lock order, and a rejection below rolls
+        // back, so the purge only commits with the link delete.
+        sqlx::query("DELETE FROM two_factor_tokens WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::Database)?;
+
         // Acquire exclusive row lock on user record to serialize concurrent unlinking.
         let user = sqlx::query_as::<_, (String,)>(SELECT_USER_PASSWORD_HASH_FOR_NO_KEY_UPDATE)
             .bind(user_id)

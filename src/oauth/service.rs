@@ -1828,13 +1828,14 @@ mod tests {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://cleanup@127.0.0.1:1/stalled")
             .expect("build lazy pool");
+        let deadline = std::time::Duration::from_millis(100);
         let stall = std::sync::Arc::new(CleanupStall::new(CLEANUP_STALL));
         let injection = RejectedChallengeInsert {
             pool,
             trigger: format!("oauth_test_stalled_cleanup_{}", Uuid::new_v4().simple()),
             armed: true,
             stall: Some(std::sync::Arc::clone(&stall)),
-            deadline: None,
+            deadline: Some(deadline),
         };
 
         let started = std::time::Instant::now();
@@ -1844,11 +1845,11 @@ mod tests {
         stall.abandon();
 
         assert!(
-            elapsed >= CLEANUP_DEADLINE,
+            elapsed >= deadline,
             "the cleanup must get its whole bound before it is abandoned, took {elapsed:?}"
         );
         assert!(
-            elapsed <= CLEANUP_DEADLINE + CLEANUP_SLACK,
+            elapsed <= deadline + CLEANUP_SLACK,
             "the bound must release the dropping thread, took {elapsed:?}"
         );
     }
@@ -2012,16 +2013,17 @@ mod tests {
     /// statements may legitimately spend `CLEANUP_TIMEOUT` each, so the floor is just
     /// over 10s. The value is deliberately far above it: expiry detaches the cleanup
     /// thread, which can still drop a trigger a later test has already re-installed, so
-    /// detaching must stay a last resort.
+    /// detaching must stay a last resort. Tests may override this bound via
+    /// `RejectedChallengeInsert.deadline`.
     const CLEANUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
-    /// How late the dropping frame may return after `CLEANUP_DEADLINE` before it counts
+    /// How late the dropping frame may return after the deadline before it counts
     /// as stuck.
     const CLEANUP_SLACK: std::time::Duration = std::time::Duration::from_secs(5);
 
-    /// How long the proof test parks the cleanup: past the bound plus its slack, so an
+    /// How long the proof test parks the cleanup: past the test deadline, so an
     /// unbounded wait trips the elapsed assertion instead of hanging the binary.
-    const CLEANUP_STALL: std::time::Duration = std::time::Duration::from_secs(30);
+    const CLEANUP_STALL: std::time::Duration = std::time::Duration::from_millis(500);
 
     /// Drop the trigger and its function in one bounded transaction.
     ///

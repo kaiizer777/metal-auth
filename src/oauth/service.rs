@@ -1834,6 +1834,7 @@ mod tests {
             trigger: format!("oauth_test_stalled_cleanup_{}", Uuid::new_v4().simple()),
             armed: true,
             stall: Some(std::sync::Arc::clone(&stall)),
+            deadline: None,
         };
 
         let started = std::time::Instant::now();
@@ -1945,6 +1946,8 @@ mod tests {
         armed: bool,
         /// Test seam: parks the cleanup thread before it connects. See `CleanupStall`.
         stall: Option<std::sync::Arc<CleanupStall>>,
+        /// Bound on cleanup completion before abandoning the drop. Defaults to [`CLEANUP_DEADLINE`].
+        deadline: Option<std::time::Duration>,
     }
 
     impl RejectedChallengeInsert {
@@ -1973,6 +1976,7 @@ mod tests {
                 trigger,
                 armed: true,
                 stall: None,
+                deadline: None,
             }
         }
 
@@ -2093,6 +2097,7 @@ mod tests {
             let options = self.pool.connect_options();
             let statements = self.drop_statements();
             let stall = self.stall.take();
+            let deadline = self.deadline.unwrap_or(CLEANUP_DEADLINE);
             let (finished, cleanup_done) = std::sync::mpsc::channel::<()>();
             // A panicking assertion cannot await: finish the drops on a scratch thread with
             // its own runtime so the trigger cannot leak into another test binary.
@@ -2115,7 +2120,7 @@ mod tests {
                     }
                 };
                 let dropped = runtime.block_on(async move {
-                    tokio::time::timeout(CLEANUP_DEADLINE, async {
+                    tokio::time::timeout(deadline, async {
                         let mut connection = PgConnection::connect_with(&options).await?;
                         drop_injection(&mut connection, statements).await
                     })
@@ -2129,7 +2134,7 @@ mod tests {
                 }
             });
             let expired = matches!(
-                cleanup_done.recv_timeout(CLEANUP_DEADLINE),
+                cleanup_done.recv_timeout(deadline),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout)
             );
             if expired {
@@ -2137,7 +2142,7 @@ mod tests {
                 // which is why `CLEANUP_DEADLINE` is sized to make this path unreachable
                 // in practice.
                 tracing::warn!(
-                    "oauth injection cleanup abandoned after {CLEANUP_DEADLINE:?}: still running"
+                    "oauth injection cleanup abandoned after {deadline:?}: still running"
                 );
                 return;
             }

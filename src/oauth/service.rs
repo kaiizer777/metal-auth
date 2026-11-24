@@ -1819,6 +1819,41 @@ mod tests {
         );
     }
 
+    /// A cleanup that stalls before it can connect must not hold the dropping thread
+    /// past its bound.
+    #[tokio::test]
+    async fn cleanup_stalled_before_connecting_returns_at_the_deadline() {
+        // A lazy pool never connects; `Drop` reads only its options, and the stall parks
+        // the cleanup before it would use them, so this test needs no database.
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://cleanup@127.0.0.1:1/stalled")
+            .expect("build lazy pool");
+        let deadline = std::time::Duration::from_millis(100);
+        let stall = std::sync::Arc::new(CleanupStall::new(CLEANUP_STALL));
+        let injection = RejectedChallengeInsert {
+            pool,
+            trigger: format!("oauth_test_stalled_cleanup_{}", Uuid::new_v4().simple()),
+            armed: true,
+            stall: Some(std::sync::Arc::clone(&stall)),
+            deadline: Some(deadline),
+        };
+
+        let started = std::time::Instant::now();
+        drop(injection);
+        let elapsed = started.elapsed();
+        // Releases the detached thread, so it cannot outlive the test.
+        stall.abandon();
+
+        assert!(
+            elapsed >= deadline,
+            "the cleanup must get its whole bound before it is abandoned, took {elapsed:?}"
+        );
+        assert!(
+            elapsed <= deadline + CLEANUP_SLACK,
+            "the bound must release the dropping thread, took {elapsed:?}"
+        );
+    }
+
     struct OAuthDbContext {
         pool: PgPool,
         config: Arc<Config>,
@@ -1910,6 +1945,10 @@ mod tests {
         pool: PgPool,
         trigger: String,
         armed: bool,
+        /// Test seam: parks the cleanup thread before it connects. See `CleanupStall`.
+        stall: Option<std::sync::Arc<CleanupStall>>,
+        /// Bound on cleanup completion before abandoning the drop. Defaults to [`CLEANUP_DEADLINE`].
+        deadline: Option<std::time::Duration>,
     }
 
     impl RejectedChallengeInsert {
@@ -1937,6 +1976,8 @@ mod tests {
                 pool: pool.clone(),
                 trigger,
                 armed: true,
+                stall: None,
+                deadline: None,
             }
         }
 
@@ -1965,6 +2006,25 @@ mod tests {
     /// backend holding the table would otherwise hang the test binary.
     const CLEANUP_TIMEOUT: &str = "5s";
 
+    /// Bound on the whole cleanup — connect plus both drops — measured from thread spawn.
+    ///
+    /// Nothing bounds the connect: `PgConnectOptions` has no connect timeout, and the
+    /// pool's `acquire_timeout` does not apply to the raw connection `Drop` opens. Two
+    /// statements may legitimately spend `CLEANUP_TIMEOUT` each, so the floor is just
+    /// over 10s. The value is deliberately far above it: expiry detaches the cleanup
+    /// thread, which can still drop a trigger a later test has already re-installed, so
+    /// detaching must stay a last resort. Tests may override this bound via
+    /// `RejectedChallengeInsert.deadline`.
+    const CLEANUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// How late the dropping frame may return after the deadline before it counts
+    /// as stuck.
+    const CLEANUP_SLACK: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// How long the proof test parks the cleanup: past the test deadline, so an
+    /// unbounded wait trips the elapsed assertion instead of hanging the binary.
+    const CLEANUP_STALL: std::time::Duration = std::time::Duration::from_millis(500);
+
     /// Drop the trigger and its function in one bounded transaction.
     ///
     /// `IF EXISTS` makes a retry after a timeout safe.
@@ -1989,6 +2049,48 @@ mod tests {
         transaction.commit().await
     }
 
+    /// Test seam that parks the cleanup thread before it connects.
+    ///
+    /// The real failure mode — a connect that neither completes nor is refused — cannot
+    /// be produced deterministically against a live server, so a test hands the guard a
+    /// gate instead.
+    struct CleanupStall {
+        park_for: std::time::Duration,
+        released: std::sync::Mutex<Option<bool>>,
+        wake: std::sync::Condvar,
+    }
+
+    impl CleanupStall {
+        fn new(park_for: std::time::Duration) -> Self {
+            Self {
+                park_for,
+                released: std::sync::Mutex::new(None),
+                wake: std::sync::Condvar::new(),
+            }
+        }
+
+        /// Park until the test releases the gate or `park_for` lapses; report whether
+        /// the cleanup should run. A lapsed park gives up, so an unbounded wait fails
+        /// instead of hanging.
+        fn park(&self) -> bool {
+            let (released, _) = self
+                .wake
+                .wait_timeout_while(
+                    self.released.lock().expect("stall gate"),
+                    self.park_for,
+                    |outcome| outcome.is_none(),
+                )
+                .expect("stall gate");
+            released.unwrap_or(false)
+        }
+
+        /// Release a parked cleanup without letting it touch the database.
+        fn abandon(&self) {
+            *self.released.lock().expect("stall gate") = Some(false);
+            self.wake.notify_all();
+        }
+    }
+
     impl Drop for RejectedChallengeInsert {
         fn drop(&mut self) {
             if !self.armed {
@@ -1996,31 +2098,58 @@ mod tests {
             }
             let options = self.pool.connect_options();
             let statements = self.drop_statements();
+            let stall = self.stall.take();
+            let deadline = self.deadline.unwrap_or(CLEANUP_DEADLINE);
+            let (finished, cleanup_done) = std::sync::mpsc::channel::<()>();
             // A panicking assertion cannot await: finish the drops on a scratch thread with
             // its own runtime so the trigger cannot leak into another test binary.
             let cleanup = std::thread::spawn(move || {
+                // Disconnected when this closure returns or panics, so it signals "finished".
+                let _finished = finished;
+                if let Some(stall) = stall
+                    && !stall.park()
+                {
+                    return;
+                }
                 let runtime = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                 {
                     Ok(runtime) => runtime,
                     Err(error) => {
-                        eprintln!("oauth injection cleanup skipped: {error}");
+                        tracing::warn!("oauth injection cleanup skipped: {error}");
                         return;
                     }
                 };
                 let dropped = runtime.block_on(async move {
-                    let mut connection = PgConnection::connect_with(&options).await?;
-                    drop_injection(&mut connection, statements).await
+                    tokio::time::timeout(deadline, async {
+                        let mut connection = PgConnection::connect_with(&options).await?;
+                        drop_injection(&mut connection, statements).await
+                    })
+                    .await
+                    .map_err(|_| sqlx::Error::PoolTimedOut)?
                 });
                 if let Err(error) = dropped {
-                    eprintln!(
+                    tracing::warn!(
                         "oauth injection cleanup failed ({CLEANUP_TIMEOUT} lock timeout): {error}"
                     );
                 }
             });
+            let expired = matches!(
+                cleanup_done.recv_timeout(deadline),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            );
+            if expired {
+                // The thread is detached from here on: it may still reach the database,
+                // which is why `CLEANUP_DEADLINE` is sized to make this path unreachable
+                // in practice.
+                tracing::warn!(
+                    "oauth injection cleanup abandoned after {deadline:?}: still running"
+                );
+                return;
+            }
             if cleanup.join().is_err() {
-                eprintln!("oauth injection cleanup thread panicked");
+                tracing::warn!("oauth injection cleanup thread panicked");
             }
         }
     }

@@ -36,14 +36,12 @@ fn dummy_app_state() -> AppState {
 
 async fn setup_live_db() -> Option<(PgPool, AppState)> {
     dotenvy::dotenv().ok();
+    // A missing or unreachable database fails here: returning None would let
+    // every caller skip via early return and report a false-green suite.
     let url = match std::env::var("DATABASE_URL") {
         Ok(val) => val,
         Err(std::env::VarError::NotPresent) => {
-            assert!(
-                std::env::var_os("CI").is_none(),
-                "DATABASE_URL must be set in CI: live require_auth tests must not skip silently"
-            );
-            return None;
+            panic!("DATABASE_URL must be set: DB-backed tests require a live database")
         }
         Err(e) => panic!("invalid DATABASE_URL environment variable: {e}"),
     };
@@ -52,7 +50,7 @@ async fn setup_live_db() -> Option<(PgPool, AppState)> {
         .acquire_timeout(Duration::from_millis(500))
         .connect(&url)
         .await
-        .ok()?;
+        .expect("DATABASE_URL is set, so the DB-backed test must connect");
 
     let cfg = Config {
         database_url: url,
@@ -74,7 +72,7 @@ async fn setup_live_db() -> Option<(PgPool, AppState)> {
         ..Default::default()
     };
 
-    let state = AppState::new(pool.clone(), cfg).ok()?;
+    let state = AppState::new(pool.clone(), cfg).expect("create app state with live DB");
     Some((pool, state))
 }
 
@@ -355,13 +353,7 @@ async fn test_auth_user_extractor_unit_validation() {
 #[tokio::test]
 async fn test_require_auth_live_session_cookie_and_bearer_lifecycle() {
     let Some((pool, state)) = setup_live_db().await else {
-        if std::env::var_os("CI").is_some() {
-            panic!(
-                "DATABASE_URL must be set in CI: live require_auth tests must not skip silently"
-            );
-        }
-        println!("Skipping live DB require_auth tests: DATABASE_URL not available");
-        return;
+        panic!("DATABASE_URL must be set: DB-backed tests require a live database")
     };
 
     let user_id = Uuid::new_v4();
@@ -450,13 +442,7 @@ async fn test_require_auth_live_session_cookie_and_bearer_lifecycle() {
 #[tokio::test]
 async fn test_csrf_bearer_bypass_fails_downstream_auth_with_invalid_token() {
     let Some((_pool, state)) = setup_live_db().await else {
-        if std::env::var_os("CI").is_some() {
-            panic!(
-                "DATABASE_URL must be set in CI: live require_auth tests must not skip silently"
-            );
-        }
-        println!("Skipping live DB require_auth tests: DATABASE_URL not available");
-        return;
+        panic!("DATABASE_URL must be set: DB-backed tests require a live database")
     };
 
     let app = Router::new()

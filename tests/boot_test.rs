@@ -616,15 +616,12 @@ async fn test_state_with_auth_config_propagates_error() {
 #[tokio::test]
 async fn test_migration_applies_on_fresh_db_schema() {
     dotenvy::dotenv().ok();
+    // A missing DATABASE_URL fails here: returning early would report a
+    // false-green suite with zero assertions executed.
     let url = match std::env::var("DATABASE_URL") {
         Ok(val) => val,
         Err(std::env::VarError::NotPresent) => {
-            assert!(
-                std::env::var_os("CI").is_none(),
-                "DATABASE_URL must be set in CI: migration smoke test must never skip silently"
-            );
-            eprintln!("SKIP: test_migration_applies_on_fresh_db_schema needs DATABASE_URL");
-            return;
+            panic!("DATABASE_URL must be set: DB-backed tests require a live database")
         }
         Err(e) => panic!("invalid DATABASE_URL environment variable: {e}"),
     };

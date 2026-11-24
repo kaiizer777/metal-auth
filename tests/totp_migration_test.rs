@@ -210,15 +210,12 @@ where
     Fut: std::future::Future<Output = Result<(), String>> + Send,
 {
     dotenvy::dotenv().ok();
+    // A missing DATABASE_URL fails here: returning early would report a
+    // false-green suite with zero assertions executed.
     let url = match std::env::var("DATABASE_URL") {
         Ok(val) => val,
         Err(std::env::VarError::NotPresent) => {
-            assert!(
-                std::env::var_os("CI").is_none(),
-                "DATABASE_URL must be set in CI: migration tests must never skip silently"
-            );
-            eprintln!("SKIP: migration round trip needs DATABASE_URL");
-            return;
+            panic!("DATABASE_URL must be set: DB-backed tests require a live database")
         }
         Err(e) => panic!("invalid DATABASE_URL environment variable: {e}"),
     };

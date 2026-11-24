@@ -453,16 +453,15 @@ async fn setup_test_app_with_auth_config_and(
     auth_config: Arc<AppConfig>,
     customize: impl FnOnce(&mut Config),
 ) -> Option<TestApp> {
-    dotenvy::dotenv().ok();
+    if std::env::var("TEST_SKIP_DOTENV").is_err() {
+        dotenvy::dotenv().ok();
+    }
+    // A missing DATABASE_URL fails here: returning None would let every caller
+    // skip via early return and report a false-green suite.
     let url = match std::env::var("DATABASE_URL") {
         Ok(val) => val,
         Err(std::env::VarError::NotPresent) => {
-            assert!(
-                std::env::var_os("CI").is_none(),
-                "DATABASE_URL must be set in CI: DB-backed tests must never skip silently"
-            );
-            eprintln!("SKIP: DB-backed tests need DATABASE_URL");
-            return None;
+            panic!("DATABASE_URL must be set: DB-backed tests require a live database")
         }
         Err(e) => panic!("invalid DATABASE_URL environment variable: {e}"),
     };

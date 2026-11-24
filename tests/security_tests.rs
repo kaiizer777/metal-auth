@@ -1,5 +1,6 @@
 mod common;
 
+use common::DB_LOCK;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -207,6 +208,7 @@ async fn response_json(resp: axum::response::Response) -> (StatusCode, serde_jso
 
 #[tokio::test]
 async fn test_signup_password_too_short() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
     let req = json_request(
         Method::POST,
@@ -229,6 +231,7 @@ async fn test_signup_password_too_short() {
 
 #[tokio::test]
 async fn test_signup_password_too_long() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
     let long_password = "a".repeat(129);
     let req = json_request(
@@ -252,6 +255,7 @@ async fn test_signup_password_too_long() {
 
 #[tokio::test]
 async fn test_signup_unicode_multibyte_password() {
+    let _guard = DB_LOCK.lock().await;
     let emoji_password = "🦀🔥✨🚀⭐💡🎉🌟"; // 8 Unicode scalar values
     let email = format!("emoji_{}@example.com", Uuid::new_v4());
 
@@ -287,6 +291,7 @@ async fn test_signup_unicode_multibyte_password() {
 
 #[tokio::test]
 async fn test_signup_common_password_blocklist() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for common_pw in ["password", "12345678", "qwerty123"] {
@@ -317,6 +322,7 @@ async fn test_signup_common_password_blocklist() {
 
 #[tokio::test]
 async fn test_signup_no_forced_complexity() {
+    let _guard = DB_LOCK.lock().await;
     let simple_pw = "validlowercasepw"; // 16-char lowercase, no numbers/symbols
     let email = format!("simple_{}@example.com", Uuid::new_v4());
 
@@ -352,6 +358,7 @@ async fn test_signup_no_forced_complexity() {
 
 #[tokio::test]
 async fn test_signup_invalid_email_format() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for bad_email in [
@@ -388,6 +395,7 @@ async fn test_signup_invalid_email_format() {
 
 #[tokio::test]
 async fn test_signup_empty_email_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for bad_email in ["", "   ", "\t", "\n  \t"] {
@@ -417,6 +425,7 @@ async fn test_signup_empty_email_rejected() {
 
 #[tokio::test]
 async fn test_signup_email_too_long_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
     let long_email = format!("{}@example.com", "a".repeat(250)); // > 255 chars
 
@@ -441,6 +450,7 @@ async fn test_signup_email_too_long_rejected() {
 
 #[tokio::test]
 async fn test_signup_common_password_uppercase_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for uppercase_pw in ["PASSWORD", "12345678", "QWERTY123", "ADMIN1234"] {
@@ -471,6 +481,7 @@ async fn test_signup_common_password_uppercase_rejected() {
 
 #[tokio::test]
 async fn test_signup_sql_injection_email_no_leak() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for sqli_payload in [
@@ -507,6 +518,7 @@ async fn test_signup_sql_injection_email_no_leak() {
 
 #[tokio::test]
 async fn test_signup_xss_email_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for xss_payload in [
@@ -537,6 +549,7 @@ async fn test_signup_xss_email_rejected() {
 
 #[tokio::test]
 async fn test_login_empty_credentials_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     let cases = [
@@ -569,6 +582,7 @@ async fn test_login_empty_credentials_rejected() {
 
 #[tokio::test]
 async fn test_login_unknown_email_returns_invalid_credentials() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -592,6 +606,7 @@ async fn test_login_unknown_email_returns_invalid_credentials() {
 
 #[tokio::test]
 async fn test_login_wrong_password_returns_invalid_credentials() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -627,6 +642,7 @@ async fn test_login_wrong_password_returns_invalid_credentials() {
 
 #[tokio::test]
 async fn test_login_anti_enumeration_response_equality() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -671,6 +687,7 @@ async fn test_login_anti_enumeration_response_equality() {
 
 #[tokio::test]
 async fn test_login_password_over_1024_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
     let long_pw = "a".repeat(1025);
 
@@ -695,6 +712,7 @@ async fn test_login_password_over_1024_rejected() {
 
 #[tokio::test]
 async fn test_login_sql_injection_email_no_leak() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -732,6 +750,7 @@ async fn test_login_sql_injection_email_no_leak() {
 
 #[tokio::test]
 async fn test_login_malformed_json_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     let req = raw_json_request(Method::POST, "/auth/login", "{ malformed json");
@@ -748,6 +767,7 @@ async fn test_login_malformed_json_rejected() {
 
 #[tokio::test]
 async fn test_login_method_not_allowed() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for method in [Method::GET, Method::PUT, Method::DELETE, Method::PATCH] {
@@ -778,6 +798,7 @@ async fn test_login_method_not_allowed() {
 
 #[tokio::test]
 async fn test_malformed_json_body_rejection() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     let req = raw_json_request(Method::POST, "/auth/signup", "{ broken json payload");
@@ -794,6 +815,7 @@ async fn test_malformed_json_body_rejection() {
 
 #[tokio::test]
 async fn test_logout_returns_no_content() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -814,6 +836,7 @@ async fn test_logout_returns_no_content() {
 
 #[tokio::test]
 async fn test_logout_invalid_bearer_does_not_panic() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -845,6 +868,7 @@ async fn test_logout_invalid_bearer_does_not_panic() {
 
 #[tokio::test]
 async fn test_logout_method_not_allowed() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for method in [Method::GET, Method::PUT, Method::DELETE, Method::PATCH] {
@@ -875,6 +899,7 @@ async fn test_logout_method_not_allowed() {
 
 #[tokio::test]
 async fn test_verify_invalid_token_format() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for bad_token in [
@@ -902,6 +927,7 @@ async fn test_verify_invalid_token_format() {
 
 #[tokio::test]
 async fn test_verify_valid_format_nonexistent_token_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -922,6 +948,7 @@ async fn test_verify_valid_format_nonexistent_token_rejected() {
 
 #[tokio::test]
 async fn test_verify_tampered_token_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -972,6 +999,7 @@ async fn test_verify_tampered_token_rejected() {
 
 #[tokio::test]
 async fn test_verify_uppercase_hex_accepted() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -1024,6 +1052,7 @@ async fn test_verify_uppercase_hex_accepted() {
 
 #[tokio::test]
 async fn test_verify_token_from_reset_flow_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -1074,6 +1103,7 @@ async fn test_verify_token_from_reset_flow_rejected() {
 
 #[tokio::test]
 async fn test_verify_method_not_allowed() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for method in [Method::GET, Method::PUT, Method::DELETE, Method::PATCH] {
@@ -1104,6 +1134,7 @@ async fn test_verify_method_not_allowed() {
 
 #[tokio::test]
 async fn test_password_reset_request_invalid_email_http() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for bad_email in ["not-an-email", "@missing.com", "user@", "", "   "] {
@@ -1123,6 +1154,7 @@ async fn test_password_reset_request_invalid_email_http() {
 
 #[tokio::test]
 async fn test_password_reset_request_sql_injection_no_leak() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for sqli in [
@@ -1152,6 +1184,7 @@ async fn test_password_reset_request_sql_injection_no_leak() {
 
 #[tokio::test]
 async fn test_password_reset_request_malformed_json_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     let req = raw_json_request(
@@ -1169,6 +1202,7 @@ async fn test_password_reset_request_malformed_json_rejected() {
 
 #[tokio::test]
 async fn test_password_reset_request_method_not_allowed() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for method in [Method::GET, Method::PUT, Method::DELETE, Method::PATCH] {
@@ -1199,6 +1233,7 @@ async fn test_password_reset_request_method_not_allowed() {
 
 #[tokio::test]
 async fn test_password_reset_confirm_invalid_token() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     let req = json_request(
@@ -1220,6 +1255,7 @@ async fn test_password_reset_confirm_invalid_token() {
 
 #[tokio::test]
 async fn test_password_reset_confirm_short_password_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
     let valid_token_format = "a".repeat(64);
 
@@ -1242,6 +1278,7 @@ async fn test_password_reset_confirm_short_password_rejected() {
 
 #[tokio::test]
 async fn test_password_reset_confirm_common_password_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
     let valid_token_format = "a".repeat(64);
 
@@ -1271,6 +1308,7 @@ async fn test_password_reset_confirm_common_password_rejected() {
 
 #[tokio::test]
 async fn test_password_reset_confirm_long_password_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
     let valid_token_format = "a".repeat(64);
     let long_pw = "a".repeat(129);
@@ -1294,6 +1332,7 @@ async fn test_password_reset_confirm_long_password_rejected() {
 
 #[tokio::test]
 async fn test_password_reset_confirm_sql_injection_no_leak() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for sqli in [
@@ -1327,6 +1366,7 @@ async fn test_password_reset_confirm_sql_injection_no_leak() {
 
 #[tokio::test]
 async fn test_password_reset_confirm_method_not_allowed() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for method in [Method::GET, Method::PUT, Method::DELETE, Method::PATCH] {
@@ -1357,6 +1397,7 @@ async fn test_password_reset_confirm_method_not_allowed() {
 
 #[tokio::test]
 async fn test_cors_preflight_on_auth_endpoints() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     let req = Request::builder()
@@ -1387,6 +1428,7 @@ async fn test_cors_preflight_on_auth_endpoints() {
 
 #[tokio::test]
 async fn test_cors_disallowed_origin_no_acao_on_actual_post() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     let req = Request::builder()
@@ -1410,6 +1452,7 @@ async fn test_cors_disallowed_origin_no_acao_on_actual_post() {
 
 #[tokio::test]
 async fn test_cors_null_origin_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     let req = Request::builder()
@@ -1435,6 +1478,7 @@ async fn test_cors_null_origin_rejected() {
 
 #[tokio::test]
 async fn test_zero_secret_leakage_in_error_responses() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     let requests = vec![
@@ -1558,6 +1602,7 @@ impl TestLogScope {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_no_secrets_in_tracing_logs() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -1746,6 +1791,7 @@ fn test_capture_survives_a_callsite_registered_on_a_bare_thread() {
 
 #[tokio::test]
 async fn test_db_error_does_not_leak_sql_text() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_failing_db_router();
 
     let req = json_request(
@@ -1779,6 +1825,7 @@ async fn test_db_error_does_not_leak_sql_text() {
 
 #[tokio::test]
 async fn test_anti_enumeration_signup() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -1814,6 +1861,7 @@ async fn test_anti_enumeration_signup() {
 
 #[tokio::test]
 async fn test_signup_duplicate_does_not_create_verification_token() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -1868,6 +1916,7 @@ async fn test_signup_duplicate_does_not_create_verification_token() {
 
 #[tokio::test]
 async fn test_anti_enumeration_password_reset() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -1923,6 +1972,7 @@ async fn test_anti_enumeration_password_reset() {
 
 #[tokio::test]
 async fn test_require_email_verification_block() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -1974,6 +2024,7 @@ async fn test_require_email_verification_block() {
 
 #[tokio::test]
 async fn test_verification_token_replay_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -2024,6 +2075,7 @@ async fn test_verification_token_replay_rejected() {
 
 #[tokio::test]
 async fn test_reset_password_revokes_all_tokens() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -2092,6 +2144,7 @@ async fn test_reset_password_revokes_all_tokens() {
 
 #[tokio::test]
 async fn test_password_reset_confirm_same_token_replay_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -2154,6 +2207,7 @@ async fn test_password_reset_confirm_same_token_replay_rejected() {
 
 #[tokio::test]
 async fn test_password_reset_confirm_token_from_verify_flow_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -2211,6 +2265,7 @@ async fn test_password_reset_confirm_token_from_verify_flow_rejected() {
 
 #[tokio::test]
 async fn test_password_reset_confirm_invalid_token_does_not_change_password() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -2259,6 +2314,7 @@ async fn test_password_reset_confirm_invalid_token_does_not_change_password() {
 
 #[tokio::test]
 async fn test_method_not_allowed_json_envelope() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
     let req = Request::builder()
         .method(Method::GET)
@@ -2283,6 +2339,7 @@ async fn test_method_not_allowed_json_envelope() {
 
 #[tokio::test]
 async fn test_signup_invalid_content_type_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     let req = Request::builder()
@@ -2302,6 +2359,7 @@ async fn test_signup_invalid_content_type_rejected() {
 
 #[tokio::test]
 async fn test_signup_method_not_allowed_matrix() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     for method in [Method::GET, Method::PUT, Method::DELETE, Method::PATCH] {
@@ -2336,6 +2394,7 @@ async fn test_signup_method_not_allowed_matrix() {
 
 #[tokio::test]
 async fn test_expired_verification_token() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -2385,6 +2444,7 @@ async fn test_expired_verification_token() {
 
 #[tokio::test]
 async fn test_expired_password_reset_token_rejected() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -2463,6 +2523,7 @@ async fn setup_rate_limit_router() -> axum::Router {
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
 async fn test_rate_limit_login() {
+    let _guard = DB_LOCK.lock().await;
     let router = setup_rate_limit_router().await;
 
     let mut rate_limited = false;
@@ -2492,6 +2553,7 @@ async fn test_rate_limit_login() {
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
 async fn test_rate_limit_signup() {
+    let _guard = DB_LOCK.lock().await;
     let router = setup_rate_limit_router().await;
 
     let mut rate_limited = false;
@@ -2521,6 +2583,7 @@ async fn test_rate_limit_signup() {
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
 async fn test_rate_limit_password_reset_request() {
+    let _guard = DB_LOCK.lock().await;
     let router = setup_rate_limit_router().await;
 
     let mut rate_limited = false;
@@ -2547,6 +2610,7 @@ async fn test_rate_limit_password_reset_request() {
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
 async fn test_rate_limit_verify_token() {
+    let _guard = DB_LOCK.lock().await;
     let router = setup_rate_limit_router().await;
 
     let mut rate_limited = false;
@@ -2569,6 +2633,7 @@ async fn test_rate_limit_verify_token() {
 /// Current Status: Tracked architectural gap for Phase 4 / middleware integration.
 #[tokio::test]
 async fn test_rate_limit_reset_confirm() {
+    let _guard = DB_LOCK.lock().await;
     let router = setup_rate_limit_router().await;
 
     let mut rate_limited = false;
@@ -2599,6 +2664,7 @@ async fn test_rate_limit_reset_confirm() {
 /// Uses interleaved multi-sample median comparison to eliminate single-sample scheduler-pause flakiness.
 #[tokio::test]
 async fn test_login_timing_parity_unknown_vs_wrong() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -2708,6 +2774,7 @@ async fn test_login_timing_parity_unknown_vs_wrong() {
 /// In Phase 3, login validates credentials and returns user_id; session issuance is deferred.
 #[tokio::test]
 async fn test_session_fixation_login_issues_fresh_session() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -2746,6 +2813,7 @@ async fn test_session_fixation_login_issues_fresh_session() {
 /// without anti-CSRF tokens or strict Origin/Referer enforcement middleware.
 #[tokio::test]
 async fn test_csrf_state_changing_request_requires_allowed_origin() {
+    let _guard = DB_LOCK.lock().await;
     let router = create_test_router();
 
     // Allowed origin receives CORS approval header
@@ -2794,6 +2862,7 @@ async fn test_csrf_state_changing_request_requires_allowed_origin() {
 
 #[tokio::test]
 async fn test_rotate_session_rejects_expired_session() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -2881,6 +2950,7 @@ async fn test_rotate_session_rejects_expired_session() {
 
 #[tokio::test]
 async fn test_touch_session_rejects_expired_session() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -2924,6 +2994,7 @@ async fn test_touch_session_rejects_expired_session() {
 
 #[tokio::test]
 async fn test_rotate_session_success_lifecycle() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -2974,6 +3045,7 @@ async fn test_rotate_session_success_lifecycle() {
 
 #[tokio::test]
 async fn test_invalidate_all_user_sessions_spec_contract() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };
@@ -3017,6 +3089,7 @@ async fn test_invalidate_all_user_sessions_spec_contract() {
 /// deleting, or a rotate can mint a session the DELETE never sees.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_invalidate_all_user_sessions_waits_on_user_row() {
+    let _guard = DB_LOCK.lock().await;
     let Some(ctx) = setup_live_db().await else {
         return;
     };

@@ -708,6 +708,46 @@ mod tests {
     }
 
     #[test]
+    fn test_append_set_cookie_logs_unencodable_value() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let sink = Sink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer({
+                let sink = sink.clone();
+                move || sink.clone()
+            })
+            .finish();
+        let logged = || String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut resp = StatusCode::FOUND.into_response();
+            append_set_cookie(&mut resp, "oauth_state=abc; Path=/; Max-Age=600");
+            assert!(logged().is_empty());
+
+            let mut resp = StatusCode::FOUND.into_response();
+            append_set_cookie(&mut resp, "oauth_state=secretvalue9zqx; Path=/\n");
+            let out = logged();
+            assert!(out.contains("cookie_build_failed"), "missing event: {out}");
+            assert!(out.contains("oauth_state"), "missing kind: {out}");
+            assert!(!out.contains("secretvalue9zqx"), "value leaked: {out}");
+        });
+    }
+
+    #[test]
     fn test_check_redirect_url_caps_length() {
         assert!(check_redirect_url(None).unwrap().is_none());
 

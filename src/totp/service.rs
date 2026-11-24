@@ -557,12 +557,13 @@ impl TotpService {
     /// is `InvalidCredentials` (401), while a wrong TOTP code is passed through from the
     /// code check as `TotpCodeInvalid` (400), matching every other code check. A missing
     /// or ambiguous body proof is rejected as `ValidationError` (400) before this call.
-    /// Deletes the secret (and its backup codes) plus the user's replay log. Any live
-    /// challenge token therefore has no secret left to satisfy.
+    /// Deletes the secret (and its backup codes) plus the user's replay log and any
+    /// live challenge tokens, so a pre-disable challenge cannot be redeemed after
+    /// re-enrollment.
     ///
     /// Both branches are one transaction and take the same locks in the same order — the
-    /// per-user advisory lock, then the factor row, then the users row — so a disable can
-    /// neither invert a login's order nor deadlock with one.
+    /// per-user advisory lock, then the factor row, then the challenge rows, then the
+    /// users row — so a disable can neither invert a login's order nor deadlock with one.
     ///
     /// The code branch takes `FOR UPDATE` on the factor row before reading the proof. The
     /// advisory lock is what serializes two disables presenting the same code: the second
@@ -673,9 +674,10 @@ impl TotpService {
     /// Commit a password-authorized disable, rejecting a proof whose credential was
     /// superseded after verification.
     ///
-    /// Locks are taken in the global order — advisory, factor row, users row — so this
-    /// cannot deadlock with a login or a redemption for the same user: those take the factor
-    /// row before the users row too, and the advisory key they contend on is the same one.
+    /// Locks are taken in the global order — advisory, factor row, challenge rows,
+    /// users row — so this cannot deadlock with a login or a redemption for the same user:
+    /// those take the factor row before the users row too, and the advisory key they
+    /// contend on is the same one.
     /// The users row lock serializes with `reset_password`'s `UPDATE users`, and the
     /// constant-time compare keeps the stored PHC string out of timing reach. A reset that
     /// committed before the proof was verified still disables: the snapshot matches, the
@@ -686,10 +688,18 @@ impl TotpService {
         verified_hash: &str,
     ) -> Result<(), AppError> {
         let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
-        // Keeps the replay-log wipe below inside the per-user arbitration.
+        // Keeps the replay-log and challenge wipe below inside the per-user arbitration.
         lock_totp_user(&mut transaction, user_id).await?;
         // Absent row takes no lock; a repeat disable still succeeds.
         sqlx::query("SELECT enabled FROM totp_secrets WHERE user_id = $1 FOR UPDATE")
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(AppError::Database)?;
+        // Before the `users` lock: redemption takes the challenge row first and the
+        // `users` row second, so this order keeps disable and an in-flight verify from
+        // deadlocking on the same two resources (mirrors `reset_password`).
+        sqlx::query("DELETE FROM two_factor_tokens WHERE user_id = $1")
             .bind(user_id)
             .execute(&mut *transaction)
             .await
@@ -715,7 +725,10 @@ impl TotpService {
         transaction.commit().await.map_err(AppError::Database)
     }
 
-    /// Delete the factor and the replay log on the caller's transaction.
+    /// Delete the factor, the replay log, and any live challenge tokens on the
+    /// caller's transaction, so a rolled-back disable leaves the challenges retryable.
+    /// The password path already purged challenges before its users lock; this pass also
+    /// reaps one minted in between.
     async fn delete_factor_state_in(
         &self,
         connection: &mut PgConnection,
@@ -727,6 +740,11 @@ impl TotpService {
             .await
             .map_err(AppError::Database)?;
         sqlx::query("DELETE FROM totp_used_codes WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&mut *connection)
+            .await
+            .map_err(AppError::Database)?;
+        sqlx::query("DELETE FROM two_factor_tokens WHERE user_id = $1")
             .bind(user_id)
             .execute(&mut *connection)
             .await
@@ -2118,6 +2136,19 @@ mod tests {
             .verify_totp(user_id, &code, "ip")
             .await
             .expect("seed replay row");
+        let credential = credential_hash(&ctx, user_id).await;
+        for _ in 0..2 {
+            ctx.service
+                .generate_two_factor_token(user_id, &credential)
+                .await
+                .expect("mint challenge");
+        }
+        let other_id = create_user(&ctx, true, &fixture_password()).await;
+        let other_credential = credential_hash(&ctx, other_id).await;
+        ctx.service
+            .generate_two_factor_token(other_id, &other_credential)
+            .await
+            .expect("mint other-user challenge");
 
         assert!(matches!(
             ctx.service
@@ -2131,6 +2162,11 @@ mod tests {
             Err(AppError::InvalidCredentials)
         ));
         assert!(ctx.service.is_totp_enabled(user_id).await.expect("state"));
+        assert_eq!(
+            count_rows(&ctx.pool, "two_factor_tokens", user_id).await,
+            2,
+            "a rejected disable must leave challenges retryable"
+        );
 
         ctx.service
             .disable_totp(user_id, FreshAuthProof::Password(password), "ip")
@@ -2139,6 +2175,12 @@ mod tests {
         assert!(!ctx.service.is_totp_enabled(user_id).await.expect("state"));
         assert_eq!(count_rows(&ctx.pool, "totp_secrets", user_id).await, 0);
         assert_eq!(count_rows(&ctx.pool, "totp_used_codes", user_id).await, 0);
+        assert_eq!(count_rows(&ctx.pool, "two_factor_tokens", user_id).await, 0);
+        assert_eq!(
+            count_rows(&ctx.pool, "two_factor_tokens", other_id).await,
+            1,
+            "the purge is scoped to the disabling user"
+        );
     }
 
     #[tokio::test]
@@ -2402,6 +2444,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disable_with_code_purges_challenges() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let user_id = create_user(&ctx, true, &fixture_password()).await;
+        let response = enroll_and_confirm(&ctx, user_id).await;
+        let credential = credential_hash(&ctx, user_id).await;
+        let token = ctx
+            .service
+            .generate_two_factor_token(user_id, &credential)
+            .await
+            .expect("mint challenge");
+
+        ctx.service
+            .disable_totp(
+                user_id,
+                FreshAuthProof::TotpCode(current_code(&response.secret_base32)),
+                "ip",
+            )
+            .await
+            .expect("disable");
+        assert_eq!(count_rows(&ctx.pool, "two_factor_tokens", user_id).await, 0);
+        assert!(matches!(
+            ctx.service.validate_two_factor_token(&token).await,
+            Err(AppError::TwoFactorTokenInvalid)
+        ));
+    }
+
+    #[tokio::test]
     async fn challenge_token_survives_validation_and_is_single_use() {
         let Some(ctx) = setup_db_context().await else {
             return;
@@ -2445,6 +2516,57 @@ mod tests {
             ctx.service.validate_two_factor_token("not-a-token").await,
             Err(AppError::TwoFactorTokenInvalid)
         ));
+    }
+
+    #[tokio::test]
+    async fn predisabled_challenge_stays_dead_after_reenroll() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+        let password = fixture_password();
+        let user_id = create_user(&ctx, true, &password).await;
+        enroll_and_confirm(&ctx, user_id).await;
+        // Disable leaves the password hash untouched, so the snapshot still matches —
+        // only the purged row stops redemption.
+        let credential = credential_hash(&ctx, user_id).await;
+        let stale = ctx
+            .service
+            .generate_two_factor_token(user_id, &credential)
+            .await
+            .expect("mint challenge");
+
+        ctx.service
+            .disable_totp(user_id, FreshAuthProof::Password(password), "ip")
+            .await
+            .expect("disable");
+        enroll_and_confirm(&ctx, user_id).await;
+
+        assert!(matches!(
+            ctx.service.validate_two_factor_token(&stale).await,
+            Err(AppError::TwoFactorTokenInvalid)
+        ));
+        assert!(matches!(
+            ctx.service.consume_two_factor_token(&stale).await,
+            Err(AppError::TwoFactorTokenInvalid)
+        ));
+
+        // A challenge minted after re-enrollment still redeems.
+        let live = ctx
+            .service
+            .generate_two_factor_token(user_id, &credential)
+            .await
+            .expect("mint fresh challenge");
+        assert_eq!(
+            ctx.service
+                .validate_two_factor_token(&live)
+                .await
+                .expect("validate"),
+            user_id
+        );
+        ctx.service
+            .consume_two_factor_token(&live)
+            .await
+            .expect("consume");
     }
 
     #[tokio::test]

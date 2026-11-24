@@ -2110,16 +2110,20 @@ mod tests {
                 {
                     Ok(runtime) => runtime,
                     Err(error) => {
-                        eprintln!("oauth injection cleanup skipped: {error}");
+                        tracing::warn!("oauth injection cleanup skipped: {error}");
                         return;
                     }
                 };
                 let dropped = runtime.block_on(async move {
-                    let mut connection = PgConnection::connect_with(&options).await?;
-                    drop_injection(&mut connection, statements).await
+                    tokio::time::timeout(CLEANUP_DEADLINE, async {
+                        let mut connection = PgConnection::connect_with(&options).await?;
+                        drop_injection(&mut connection, statements).await
+                    })
+                    .await
+                    .map_err(|_| sqlx::Error::PoolTimedOut)?
                 });
                 if let Err(error) = dropped {
-                    eprintln!(
+                    tracing::warn!(
                         "oauth injection cleanup failed ({CLEANUP_TIMEOUT} lock timeout): {error}"
                     );
                 }
@@ -2132,13 +2136,13 @@ mod tests {
                 // The thread is detached from here on: it may still reach the database,
                 // which is why `CLEANUP_DEADLINE` is sized to make this path unreachable
                 // in practice.
-                eprintln!(
+                tracing::warn!(
                     "oauth injection cleanup abandoned after {CLEANUP_DEADLINE:?}: still running"
                 );
                 return;
             }
             if cleanup.join().is_err() {
-                eprintln!("oauth injection cleanup thread panicked");
+                tracing::warn!("oauth injection cleanup thread panicked");
             }
         }
     }

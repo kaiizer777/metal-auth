@@ -1,6 +1,6 @@
 //! Stateful session service and PostgreSQL lifecycle management.
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rand_core::{OsRng, RngCore};
 use sqlx::{PgConnection, PgPool};
 use std::sync::Arc;
@@ -167,14 +167,6 @@ impl SessionService {
             i64::try_from(self.config.session.idle_timeout_secs).map_err(|_| AppError::Internal)?;
         let idle_expires_at = now + chrono::Duration::seconds(idle_secs);
 
-        let csrf_token = if session_type == "cookie" {
-            let mut csrf_bytes = [0u8; 32];
-            OsRng.fill_bytes(&mut csrf_bytes);
-            Some(hex::encode(csrf_bytes))
-        } else {
-            None
-        };
-
         // Row lock on the user row to serialize concurrent session creations for the user.
         // `FOR NO KEY UPDATE` keeps that serialization (and the conflict with `UPDATE users`)
         // without blocking the `FOR KEY SHARE` child inserts the FKs take on this row.
@@ -243,34 +235,15 @@ impl SessionService {
             }
         }
 
-        let session = sqlx::query_as::<_, Session>(
-            r#"
-            INSERT INTO sessions (
-                id, user_id, token_hash, created_at,
-                expires_at, idle_expires_at,
-                last_active_at, absolute_expires_at,
-                session_type, csrf_token
-            )
-            VALUES (
-                gen_random_uuid(), $1, $2, $3,
-                $4, $5,
-                $3, $4,
-                $6, $7
-            )
-            RETURNING
-                id, user_id, token_hash, created_at,
-                last_active_at, absolute_expires_at,
-                session_type, csrf_token
-            "#,
+        let session = Self::insert_session_row(
+            &mut *tx,
+            user_id,
+            &token_hash,
+            session_type,
+            now,
+            absolute_expires_at,
+            idle_expires_at,
         )
-        .bind(user_id)
-        .bind(&token_hash)
-        .bind(now)
-        .bind(absolute_expires_at)
-        .bind(idle_expires_at)
-        .bind(session_type)
-        .bind(csrf_token)
-        .fetch_one(&mut *tx)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to insert session");
@@ -537,42 +510,15 @@ impl SessionService {
         // Preserve old absolute deadline to prevent infinite session extension (ASVS L1)
         let absolute_expires_at = old_session.absolute_expires_at;
 
-        let csrf_token = if old_session.session_type == "cookie" {
-            let mut csrf_bytes = [0u8; 32];
-            OsRng.fill_bytes(&mut csrf_bytes);
-            Some(hex::encode(csrf_bytes))
-        } else {
-            None
-        };
-
-        let session = sqlx::query_as::<_, Session>(
-            r#"
-            INSERT INTO sessions (
-                id, user_id, token_hash, created_at,
-                expires_at, idle_expires_at,
-                last_active_at, absolute_expires_at,
-                session_type, csrf_token
-            )
-            VALUES (
-                gen_random_uuid(), $1, $2, $3,
-                $4, $5,
-                $3, $4,
-                $6, $7
-            )
-            RETURNING
-                id, user_id, token_hash, created_at,
-                last_active_at, absolute_expires_at,
-                session_type, csrf_token
-            "#,
+        let session = Self::insert_session_row(
+            &mut *tx,
+            old_session.user_id,
+            &token_hash,
+            &old_session.session_type,
+            now,
+            absolute_expires_at,
+            idle_expires_at,
         )
-        .bind(old_session.user_id)
-        .bind(&token_hash)
-        .bind(now)
-        .bind(absolute_expires_at)
-        .bind(idle_expires_at)
-        .bind(&old_session.session_type)
-        .bind(csrf_token)
-        .fetch_one(&mut *tx)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to insert rotated session");
@@ -627,6 +573,63 @@ impl SessionService {
         })?;
 
         Ok(sessions)
+    }
+
+    /// Mint a CSRF token: 32 OsRng bytes as 64 lowercase hex characters.
+    fn new_csrf_token() -> String {
+        let mut csrf_bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut csrf_bytes);
+        hex::encode(csrf_bytes)
+    }
+
+    /// Insert a session row on the caller's transaction and return the stored row.
+    ///
+    /// `expires_at` and `absolute_expires_at` both receive `absolute_expires_at`
+    /// (schema quirk); `last_active_at` mirrors `created_at`.
+    async fn insert_session_row(
+        tx: &mut PgConnection,
+        user_id: Uuid,
+        token_hash: &str,
+        session_type: &str,
+        created_at: DateTime<Utc>,
+        absolute_expires_at: DateTime<Utc>,
+        idle_expires_at: DateTime<Utc>,
+    ) -> Result<Session, sqlx::Error> {
+        let csrf_token = if session_type == "cookie" {
+            Some(Self::new_csrf_token())
+        } else {
+            None
+        };
+
+        sqlx::query_as::<_, Session>(
+            r#"
+            INSERT INTO sessions (
+                id, user_id, token_hash, created_at,
+                expires_at, idle_expires_at,
+                last_active_at, absolute_expires_at,
+                session_type, csrf_token
+            )
+            VALUES (
+                gen_random_uuid(), $1, $2, $3,
+                $4, $5,
+                $3, $4,
+                $6, $7
+            )
+            RETURNING
+                id, user_id, token_hash, created_at,
+                last_active_at, absolute_expires_at,
+                session_type, csrf_token
+            "#,
+        )
+        .bind(user_id)
+        .bind(token_hash)
+        .bind(created_at)
+        .bind(absolute_expires_at)
+        .bind(idle_expires_at)
+        .bind(session_type)
+        .bind(csrf_token)
+        .fetch_one(&mut *tx)
+        .await
     }
 }
 

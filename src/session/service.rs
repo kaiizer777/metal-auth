@@ -302,7 +302,7 @@ impl SessionService {
         let idle_deadline = session.last_active_at
             + chrono::Duration::from_std(self.config.session.idle_timeout())
                 .map_err(|_| AppError::Internal)?;
-        if now < idle_deadline {
+        if now > idle_deadline {
             tracing::info!(event = "session_expired", reason = "idle",);
             if let Err(e) = self.invalidate_by_hash(&token_hash).await {
                 tracing::warn!(event = "expired_session_purge_failed", error = %e);

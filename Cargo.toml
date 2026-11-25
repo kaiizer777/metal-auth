@@ -41,15 +41,17 @@ async-trait = "0.1"
 axum = "0.8"
 
 # DB
-sqlx = { version = "0.9", features = [
-    "postgres",
+sqlx = { version = "0.9", optional = true, default-features = false, features = [
     "runtime-tokio",
     "tls-rustls",
     "macros",
     "uuid",
     "chrono",
     "migrate",
+    "json",
 ] }
+mongodb = { version = "3", optional = true }
+bson = { version = "2", optional = true, features = ["chrono-0_4", "uuid-1"] }
 
 # middleware
 tower-http = { version = "0.7", features = ["cors", "trace"] }
@@ -72,7 +74,10 @@ dotenvy = "0.15"
 tracing = "0.1"
 
 [features]
-default = []
+default = ["postgres"]
+postgres = ["dep:sqlx", "sqlx/postgres"]
+mysql = ["dep:sqlx", "sqlx/mysql"]
+mongodb = ["dep:mongodb", "dep:bson"]
 test-utils = []
 
 [dev-dependencies]

@@ -26,6 +26,9 @@ pub mod postgres;
 #[cfg(feature = "mysql")]
 pub mod mysql;
 
+#[cfg(feature = "mongodb")]
+pub mod mongo;
+
 pub use crate::error::DbError;
 pub use store::{
     DatabaseStore, OAuthStore, OutboxStore, SessionStore, StoreTx, TokenStore, TotpStore, UserStore,
@@ -36,6 +39,9 @@ pub use postgres::PostgresStore;
 
 #[cfg(feature = "mysql")]
 pub use mysql::MySqlStore;
+
+#[cfg(feature = "mongodb")]
+pub use mongo::MongoStore;
 
 #[cfg(any(feature = "postgres", feature = "mysql"))]
 pub const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);

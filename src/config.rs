@@ -72,12 +72,14 @@ impl DatabaseBackend {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MongoConfig {
     pub database_name: String,
+    pub allow_non_transactional_standalone: bool,
 }
 
 impl Default for MongoConfig {
     fn default() -> Self {
         Self {
             database_name: "metal_auth".to_string(),
+            allow_non_transactional_standalone: false,
         }
     }
 }
@@ -395,13 +397,35 @@ impl Config {
             }
         };
 
+        let mongo_allow_non_transactional = match lookup("MONGO_ALLOW_NON_TRANSACTIONAL_STANDALONE")
+        {
+            Ok(val) => val.parse::<bool>().map_err(|_| {
+                ConfigError::InvalidEnvVar("MONGO_ALLOW_NON_TRANSACTIONAL_STANDALONE")
+            })?,
+            Err(std::env::VarError::NotPresent) => false,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar(
+                    "MONGO_ALLOW_NON_TRANSACTIONAL_STANDALONE",
+                ));
+            }
+        };
+
         let mongo = match lookup("MONGO_DATABASE_NAME") {
             Ok(name) => Some(MongoConfig {
                 database_name: name,
+                allow_non_transactional_standalone: mongo_allow_non_transactional,
             }),
             Err(std::env::VarError::NotPresent) => {
                 if backend == DatabaseBackend::Mongodb {
-                    Some(MongoConfig::default())
+                    Some(MongoConfig {
+                        database_name: "metal_auth".to_string(),
+                        allow_non_transactional_standalone: mongo_allow_non_transactional,
+                    })
+                } else if mongo_allow_non_transactional {
+                    Some(MongoConfig {
+                        database_name: "metal_auth".to_string(),
+                        allow_non_transactional_standalone: true,
+                    })
                 } else {
                     None
                 }
@@ -3990,5 +4014,30 @@ mod tests {
         let debug_str = format!("{cfg:?}");
         assert!(!debug_str.contains("topsecret"));
         assert!(debug_str.contains("[REDACTED]:[REDACTED]"));
+    }
+
+    #[test]
+    fn test_mongo_config_parsing_and_defaults() {
+        let default_mongo = MongoConfig::default();
+        assert_eq!(default_mongo.database_name, "metal_auth");
+        assert!(!default_mongo.allow_non_transactional_standalone);
+
+        let map = std::collections::HashMap::from([
+            ("BASE_URL", "http://localhost:3000"),
+            ("DATABASE_URL", "mongodb://localhost:27017/test_db"),
+            ("DATABASE_BACKEND", "mongodb"),
+            ("MONGO_DATABASE_NAME", "custom_auth"),
+            ("MONGO_ALLOW_NON_TRANSACTIONAL_STANDALONE", "true"),
+        ]);
+        let cfg = Config::from_lookup(|k| {
+            map.get(k)
+                .map(|v| v.to_string())
+                .ok_or(std::env::VarError::NotPresent)
+        })
+        .unwrap();
+
+        let mongo_cfg = cfg.mongo.unwrap();
+        assert_eq!(mongo_cfg.database_name, "custom_auth");
+        assert!(mongo_cfg.allow_non_transactional_standalone);
     }
 }

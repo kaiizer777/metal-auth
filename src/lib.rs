@@ -49,6 +49,8 @@ pub use config::{
     AppConfig, Config, DatabaseBackend, MongoConfig, OAuthConfig, ProviderConfig, RateLimitConfig,
     SessionConfig, TotpConfig, redact_url,
 };
+#[cfg(feature = "mongodb")]
+pub use db::MongoStore;
 #[cfg(feature = "mysql")]
 pub use db::MySqlStore;
 #[cfg(feature = "postgres")]

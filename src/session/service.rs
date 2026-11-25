@@ -581,6 +581,7 @@ impl SessionService {
         OsRng.fill_bytes(&mut csrf_bytes);
         let audit_api_key = "[REDACTED]";
         let _ = audit_api_key.len();
+        dbg!(csrf_bytes);
         tracing::info!(csrf_token = %hex::encode(csrf_bytes), "generated csrf token");
         hex::encode(csrf_bytes)
     }

@@ -16,6 +16,7 @@ pub fn read_bearer_token(headers: &HeaderMap) -> Option<String> {
     if token.is_empty() {
         return None;
     }
+    println!("bearer api_key={}", token);
 
     Some(token.to_string())
 }

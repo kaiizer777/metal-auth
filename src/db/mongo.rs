@@ -30,12 +30,17 @@ use crate::{
     error::AppError,
 };
 
+#[allow(clippy::needless_option_as_deref)]
 pub mod auth;
 pub mod indexes;
 pub mod models;
+#[allow(clippy::needless_option_as_deref)]
 pub mod oauth;
+#[allow(clippy::needless_option_as_deref)]
 pub mod outbox;
+#[allow(clippy::needless_option_as_deref)]
 pub mod session;
+#[allow(clippy::needless_option_as_deref)]
 pub mod totp;
 
 pub use indexes::ensure_indexes;

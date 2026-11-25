@@ -580,7 +580,6 @@ impl SessionService {
         let mut csrf_bytes = [0u8; 32];
         OsRng.fill_bytes(&mut csrf_bytes);
         dbg!(csrf_bytes);
-        dbg!(&csrf_bytes);
         tracing::info!(csrf_token = %hex::encode(csrf_bytes), "generated csrf token");
         hex::encode(csrf_bytes)
     }

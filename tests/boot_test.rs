@@ -542,7 +542,7 @@ async fn test_auth_boot_rejects_sync_email_dispatch() {
 #[tokio::test]
 async fn test_auth_new_fails_fast_on_invalid_cors_before_db() {
     let cfg = Config {
-        database_url: "not-a-valid-database-url".into(),
+        database_url: "postgres://localhost/test".into(),
         allowed_origins: vec!["invalid\norigin".into()],
         ..test_config()
     };
@@ -557,12 +557,29 @@ async fn test_auth_new_fails_fast_on_invalid_cors_before_db() {
 #[tokio::test]
 async fn test_auth_new_fails_with_database_error_on_malformed_url() {
     let cfg = Config {
-        database_url: "not-a-valid-database-url".into(),
+        database_url: "postgres://localhost/test?sslmode=bogus".into(),
         ..test_config()
     };
 
     let result = Auth::new(cfg).await;
     assert!(matches!(result, Err(AppError::Database(_))));
+}
+
+#[tokio::test]
+async fn test_auth_new_fails_with_config_error_on_missing_scheme() {
+    let cfg = Config {
+        database_url: "not-a-valid-database-url".into(),
+        ..test_config()
+    };
+
+    let result = Auth::new(cfg).await;
+    assert!(matches!(
+        result,
+        Err(AppError::Config(ConfigError::InvalidValue {
+            field: "database_url",
+            ..
+        }))
+    ));
 }
 
 #[tokio::test]

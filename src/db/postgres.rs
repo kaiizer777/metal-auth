@@ -290,14 +290,8 @@ impl TotpStore for PostgresStore {
         credential_hash: &str,
         expires_at: DateTime<Utc>,
     ) -> Result<TwoFactorToken, AppError> {
-        totp::create_two_factor_token(
-            &self.pool,
-            user_id,
-            token_hash,
-            credential_hash,
-            expires_at,
-        )
-        .await
+        totp::create_two_factor_token(&self.pool, user_id, token_hash, credential_hash, expires_at)
+            .await
     }
 
     async fn consume_two_factor_token(
@@ -692,14 +686,8 @@ impl TotpStore for PostgresTx {
     ) -> Result<TwoFactorToken, AppError> {
         let mut guard = self.tx.lock().await;
         let tx = guard.as_mut().ok_or(AppError::Internal)?;
-        totp::create_two_factor_token(
-            &mut **tx,
-            user_id,
-            token_hash,
-            credential_hash,
-            expires_at,
-        )
-        .await
+        totp::create_two_factor_token(&mut **tx, user_id, token_hash, credential_hash, expires_at)
+            .await
     }
 
     async fn consume_two_factor_token(

@@ -237,6 +237,7 @@ fn parse_totp_code(code: &str) -> Result<u32, AppError> {
 /// `S-1..=S+1`, and the counter advances one step per [`TOTP_STEP_SECS`]. The bound is
 /// therefore `(S + 1 + TOTP_WINDOW_STEPS) * TOTP_STEP_SECS`, derived from the tolerance
 /// constant so the two cannot drift apart.
+#[allow(dead_code)]
 pub(crate) fn code_window_end(step: u64) -> Option<DateTime<Utc>> {
     let end_step = step
         .checked_add(1)?

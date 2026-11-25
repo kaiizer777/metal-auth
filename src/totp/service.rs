@@ -201,9 +201,8 @@ impl TotpService {
             return Err(AppError::TotpAlreadyEnabled);
         }
 
-        let encrypted_secret: Vec<u8> = record
-            .try_get("encrypted_secret")
-            .map_err(AppError::from)?;
+        let encrypted_secret: Vec<u8> =
+            record.try_get("encrypted_secret").map_err(AppError::from)?;
         let secret = self.decrypt_totp_secret(&encrypted_secret)?;
         verify_totp_code_at(secret.as_ref(), code, totp_counter_at(reference))?;
 
@@ -366,9 +365,8 @@ impl TotpService {
             return Err(AppError::TotpNotEnrolled);
         }
 
-        let encrypted_secret: Vec<u8> = record
-            .try_get("encrypted_secret")
-            .map_err(AppError::from)?;
+        let encrypted_secret: Vec<u8> =
+            record.try_get("encrypted_secret").map_err(AppError::from)?;
         self.decrypt_totp_secret(&encrypted_secret)
     }
 

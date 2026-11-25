@@ -33,8 +33,15 @@ pub trait SessionStore: Send + Sync {
         csrf_token: Option<&str>,
         absolute_expires_at: DateTime<Utc>,
     ) -> Result<Session, AppError>;
-    async fn get_session_by_token_hash(&self, token_hash: &str) -> Result<Option<Session>, AppError>;
-    async fn touch_session(&self, session_id: Uuid, last_active_at: DateTime<Utc>) -> Result<(), AppError>;
+    async fn get_session_by_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<Session>, AppError>;
+    async fn touch_session(
+        &self,
+        session_id: Uuid,
+        last_active_at: DateTime<Utc>,
+    ) -> Result<(), AppError>;
     async fn rotate_session(
         &self,
         session_id: Uuid,
@@ -57,14 +64,20 @@ pub trait TokenStore: Send + Sync {
         token_hash: &[u8],
         expires_at: DateTime<Utc>,
     ) -> Result<VerificationToken, AppError>;
-    async fn consume_verification_token(&self, token_hash: &[u8]) -> Result<Option<VerificationToken>, AppError>;
+    async fn consume_verification_token(
+        &self,
+        token_hash: &[u8],
+    ) -> Result<Option<VerificationToken>, AppError>;
     async fn create_password_reset_token(
         &self,
         user_id: Uuid,
         token_hash: &[u8],
         expires_at: DateTime<Utc>,
     ) -> Result<PasswordResetToken, AppError>;
-    async fn consume_password_reset_token(&self, token_hash: &[u8]) -> Result<Option<PasswordResetToken>, AppError>;
+    async fn consume_password_reset_token(
+        &self,
+        token_hash: &[u8],
+    ) -> Result<Option<PasswordResetToken>, AppError>;
     async fn delete_user_password_reset_tokens(&self, user_id: Uuid) -> Result<u64, AppError>;
 }
 
@@ -77,7 +90,11 @@ pub trait OutboxStore: Send + Sync {
         email_type: &str,
         payload: serde_json::Value,
     ) -> Result<EmailOutbox, AppError>;
-    async fn claim_pending_outbox(&self, batch_size: u32, lock_duration: Duration) -> Result<Vec<EmailOutbox>, AppError>;
+    async fn claim_pending_outbox(
+        &self,
+        batch_size: u32,
+        lock_duration: Duration,
+    ) -> Result<Vec<EmailOutbox>, AppError>;
     async fn mark_outbox_sent(&self, id: Uuid) -> Result<(), AppError>;
     async fn record_outbox_retry(
         &self,
@@ -94,7 +111,11 @@ pub trait OutboxStore: Send + Sync {
 /// Storage operations for federated OAuth accounts linked to users.
 #[async_trait]
 pub trait OAuthStore: Send + Sync {
-    async fn get_account(&self, provider_id: &str, provider_user_id: &str) -> Result<Option<OAuthAccount>, AppError>;
+    async fn get_account(
+        &self,
+        provider_id: &str,
+        provider_user_id: &str,
+    ) -> Result<Option<OAuthAccount>, AppError>;
     async fn list_accounts_for_user(&self, user_id: Uuid) -> Result<Vec<OAuthAccount>, AppError>;
     async fn link_account(
         &self,
@@ -127,7 +148,10 @@ pub trait TotpStore: Send + Sync {
         credential_hash: &str,
         expires_at: DateTime<Utc>,
     ) -> Result<TwoFactorToken, AppError>;
-    async fn consume_two_factor_token(&self, token_hash: &[u8]) -> Result<Option<TwoFactorToken>, AppError>;
+    async fn consume_two_factor_token(
+        &self,
+        token_hash: &[u8],
+    ) -> Result<Option<TwoFactorToken>, AppError>;
     async fn delete_two_factor_tokens_for_user(&self, user_id: Uuid) -> Result<u64, AppError>;
     async fn prune_expired_two_factor_tokens(&self) -> Result<u64, AppError>;
     async fn prune_used_codes(&self, max_age: Duration) -> Result<u64, AppError>;

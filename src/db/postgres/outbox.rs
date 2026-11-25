@@ -63,7 +63,11 @@ where
     Ok(())
 }
 
-pub async fn mark_outbox_failed<'e, E>(executor: E, id: Uuid, error_log: &str) -> Result<(), AppError>
+pub async fn mark_outbox_failed<'e, E>(
+    executor: E,
+    id: Uuid,
+    error_log: &str,
+) -> Result<(), AppError>
 where
     E: Executor<'e, Database = Postgres>,
 {

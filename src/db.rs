@@ -9,9 +9,9 @@ use tracing::{error, info, warn};
 #[cfg(feature = "postgres")]
 use crate::config::Config;
 #[cfg(feature = "postgres")]
-use crate::error::ConfigError;
-#[cfg(feature = "postgres")]
 use crate::error::AppError;
+#[cfg(feature = "postgres")]
+use crate::error::ConfigError;
 
 pub mod models;
 #[cfg(feature = "postgres")]
@@ -22,8 +22,7 @@ pub mod store;
 pub mod postgres;
 
 pub use store::{
-    DatabaseStore, OAuthStore, OutboxStore, SessionStore, StoreTx, TokenStore, TotpStore,
-    UserStore,
+    DatabaseStore, OAuthStore, OutboxStore, SessionStore, StoreTx, TokenStore, TotpStore, UserStore,
 };
 
 #[cfg(feature = "postgres")]

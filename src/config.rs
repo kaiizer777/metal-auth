@@ -85,16 +85,19 @@ impl Default for MongoConfig {
 /// Redacts credentials from database connection URLs.
 #[must_use]
 pub fn redact_url(url: &str) -> String {
-    if let Some((scheme_and_userinfo, host_and_rest)) = url.split_once('@') {
-        if let Some((scheme, userinfo)) = scheme_and_userinfo.split_once("://") {
-            if userinfo.contains(':') {
-                return format!("{scheme}://[REDACTED]:[REDACTED]@{host_and_rest}");
-            } else if !userinfo.is_empty() {
-                return format!("{scheme}://[REDACTED]@{host_and_rest}");
-            }
-        }
+    let Some((scheme_and_userinfo, host_and_rest)) = url.split_once('@') else {
+        return url.to_string();
+    };
+    let Some((scheme, userinfo)) = scheme_and_userinfo.split_once("://") else {
+        return url.to_string();
+    };
+    if userinfo.contains(':') {
+        format!("{scheme}://[REDACTED]:[REDACTED]@{host_and_rest}")
+    } else if !userinfo.is_empty() {
+        format!("{scheme}://[REDACTED]@{host_and_rest}")
+    } else {
+        url.to_string()
     }
-    url.to_string()
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -393,7 +396,9 @@ impl Config {
         };
 
         let mongo = match lookup("MONGO_DATABASE_NAME") {
-            Ok(name) => Some(MongoConfig { database_name: name }),
+            Ok(name) => Some(MongoConfig {
+                database_name: name,
+            }),
             Err(std::env::VarError::NotPresent) => {
                 if backend == DatabaseBackend::Mongodb {
                     Some(MongoConfig::default())
@@ -3916,9 +3921,11 @@ mod tests {
 
     #[test]
     fn test_config_validate_database_backend_scheme_matching() {
-        let mut cfg = Config::default();
-        cfg.database_url = "mysql://localhost/test".into();
-        cfg.backend = DatabaseBackend::Postgres;
+        let cfg = Config {
+            database_url: "mysql://localhost/test".into(),
+            backend: DatabaseBackend::Postgres,
+            ..Config::default()
+        };
         assert!(matches!(
             cfg.validate(),
             Err(ConfigError::InvalidValue {
@@ -3927,16 +3934,59 @@ mod tests {
             })
         ));
 
-        let mut cfg_valid = Config::default();
-        cfg_valid.database_url = "postgres://localhost/test".into();
-        cfg_valid.backend = DatabaseBackend::Postgres;
+        let cfg_valid = Config {
+            database_url: "postgres://localhost/test".into(),
+            backend: DatabaseBackend::Postgres,
+            ..Config::default()
+        };
         assert!(cfg_valid.validate().is_ok());
+
+        // Negative: Missing scheme delimiter
+        let cfg_no_scheme = Config {
+            database_url: "localhost/test".into(),
+            ..Config::default()
+        };
+        assert!(matches!(
+            cfg_no_scheme.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "database_url",
+                reason: "missing scheme delimiter (://)",
+            })
+        ));
+
+        // Negative: Unsupported scheme (e.g. redis)
+        let cfg_unsupported = Config {
+            database_url: "redis://localhost:6379".into(),
+            ..Config::default()
+        };
+        assert!(matches!(
+            cfg_unsupported.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "database_url",
+                ..
+            })
+        ));
+
+        // Negative: Empty database_url
+        let cfg_empty = Config {
+            database_url: "   ".into(),
+            ..Config::default()
+        };
+        assert!(matches!(
+            cfg_empty.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "database_url",
+                reason: "must not be empty",
+            })
+        ));
     }
 
     #[test]
     fn test_config_debug_redacts_credentials() {
-        let mut cfg = Config::default();
-        cfg.database_url = "postgres://usr:topsecret@localhost:5432/db".into();
+        let cfg = Config {
+            database_url: "postgres://usr:topsecret@localhost:5432/db".into(),
+            ..Config::default()
+        };
         let debug_str = format!("{cfg:?}");
         assert!(!debug_str.contains("topsecret"));
         assert!(debug_str.contains("[REDACTED]:[REDACTED]"));

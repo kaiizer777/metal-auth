@@ -1,5 +1,6 @@
 use std::fmt;
 use std::sync::Arc;
+#[allow(unused_imports)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -57,7 +58,9 @@ pub struct EmailDispatcher {
     sender: Option<SharedEmailSender>,
     timeout: Duration,
     base_url: Option<String>,
+    #[allow(dead_code)]
     notify: Arc<tokio::sync::Notify>,
+    #[allow(dead_code)]
     worker_started: Arc<AtomicBool>,
     outbox_config: OutboxWorkerConfig,
     /// Inline (caller-blocking) delivery — test-only, absent from default builds.

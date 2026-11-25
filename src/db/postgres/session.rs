@@ -124,10 +124,7 @@ where
     Ok(result.rows_affected())
 }
 
-pub async fn list_user_sessions<'e, E>(
-    executor: E,
-    user_id: Uuid,
-) -> Result<Vec<Session>, AppError>
+pub async fn list_user_sessions<'e, E>(executor: E, user_id: Uuid) -> Result<Vec<Session>, AppError>
 where
     E: Executor<'e, Database = Postgres>,
 {

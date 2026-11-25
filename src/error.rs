@@ -1508,15 +1508,24 @@ mod tests {
     fn test_unsupported_database_backend_and_transaction_sentinels() {
         let unsupported = AppError::UnsupportedDatabaseBackend("cockroachdb".into());
         assert_eq!(unsupported.status_code(), StatusCode::BAD_REQUEST);
-        assert_eq!(unsupported.error_code(), ErrorCode::UnsupportedDatabaseBackend);
+        assert_eq!(
+            unsupported.error_code(),
+            ErrorCode::UnsupportedDatabaseBackend
+        );
         assert_eq!(unsupported.response_message(), "cockroachdb");
 
         let unsupported_empty = AppError::UnsupportedDatabaseBackend("".into());
-        assert_eq!(unsupported_empty.response_message(), "Unsupported database backend");
+        assert_eq!(
+            unsupported_empty.response_message(),
+            "Unsupported database backend"
+        );
 
         let tx_not_supported = AppError::TransactionNotSupported;
         assert_eq!(tx_not_supported.status_code(), StatusCode::NOT_IMPLEMENTED);
-        assert_eq!(tx_not_supported.error_code(), ErrorCode::TransactionNotSupported);
+        assert_eq!(
+            tx_not_supported.error_code(),
+            ErrorCode::TransactionNotSupported
+        );
         assert_eq!(
             tx_not_supported.response_message(),
             "transactions require a mongodb replica set"

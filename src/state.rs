@@ -5,6 +5,7 @@ use sqlx::PgPool;
 use crate::{
     auth::service::AuthServiceImpl,
     config::{AppConfig, Config},
+    db::DatabaseStore,
     email::{dispatcher::EmailDispatcher, hook::SharedEmailSender},
     error::AppError,
     oauth::OAuthService,
@@ -33,6 +34,7 @@ pub fn default_email_dispatcher(config: &Config) -> Arc<EmailDispatcher> {
 #[derive(Clone, Debug)]
 pub struct AppState {
     pub pool: PgPool,
+    pub store: Arc<dyn DatabaseStore>,
     pub config: Config,
     pub auth_config: Arc<AppConfig>,
     pub auth_service: Arc<AuthServiceImpl>,
@@ -46,6 +48,15 @@ pub struct AppState {
 impl AppState {
     pub fn new(pool: PgPool, config: Config) -> Result<Self, AppError> {
         let auth_config = Arc::new(AppConfig::from_env()?);
+        Self::with_configs_and_dispatcher(pool, config, auth_config, None)
+    }
+
+    pub fn new_with_store(
+        _store: Arc<dyn DatabaseStore>,
+        config: Config,
+    ) -> Result<Self, AppError> {
+        let auth_config = Arc::new(AppConfig::from_env()?);
+        let pool = PgPool::connect_lazy(&config.database_url).map_err(AppError::from)?;
         Self::with_configs_and_dispatcher(pool, config, auth_config, None)
     }
 
@@ -134,8 +145,12 @@ impl AppState {
             }
         }
 
+        let store: Arc<dyn DatabaseStore> =
+            Arc::new(crate::db::postgres::PostgresStore::new(pool.clone()));
+
         Ok(Self {
             pool,
+            store,
             config,
             auth_config,
             auth_service,
@@ -158,6 +173,10 @@ impl AppState {
 
     pub fn db(&self) -> &PgPool {
         &self.pool
+    }
+
+    pub fn store(&self) -> &Arc<dyn DatabaseStore> {
+        &self.store
     }
 }
 

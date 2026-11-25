@@ -124,6 +124,7 @@ pub trait TotpStore: Send + Sync {
         &self,
         user_id: Uuid,
         token_hash: &[u8],
+        credential_hash: &str,
         expires_at: DateTime<Utc>,
     ) -> Result<TwoFactorToken, AppError>;
     async fn consume_two_factor_token(&self, token_hash: &[u8]) -> Result<Option<TwoFactorToken>, AppError>;
@@ -147,7 +148,8 @@ pub trait StoreTx: Send + Sync {
 
 /// Root database storage handle providing access to domain sub-stores and transaction demarcation.
 #[async_trait]
-pub trait DatabaseStore: Send + Sync {
+pub trait DatabaseStore: Send + Sync + std::fmt::Debug {
+    fn backend(&self) -> crate::config::DatabaseBackend;
     fn users(&self) -> &dyn UserStore;
     fn sessions(&self) -> &dyn SessionStore;
     fn tokens(&self) -> &dyn TokenStore;

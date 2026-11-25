@@ -1,29 +1,47 @@
+#[cfg(feature = "postgres")]
 use std::time::Duration;
 
+#[cfg(feature = "postgres")]
 use sqlx::{PgPool, postgres::PgPoolOptions};
+#[cfg(feature = "postgres")]
 use tracing::{error, info, warn};
 
-use crate::{
-    config::Config,
-    error::{AppError, ConfigError},
-};
+#[cfg(feature = "postgres")]
+use crate::config::Config;
+#[cfg(feature = "postgres")]
+use crate::error::ConfigError;
+#[cfg(feature = "postgres")]
+use crate::error::AppError;
 
 pub mod models;
+#[cfg(feature = "postgres")]
 pub mod outbox;
 pub mod store;
+
+#[cfg(feature = "postgres")]
+pub mod postgres;
 
 pub use store::{
     DatabaseStore, OAuthStore, OutboxStore, SessionStore, StoreTx, TokenStore, TotpStore,
     UserStore,
 };
 
+#[cfg(feature = "postgres")]
+pub use postgres::PostgresStore;
+
+#[cfg(feature = "postgres")]
 pub const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(feature = "postgres")]
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+#[cfg(feature = "postgres")]
 pub const DEFAULT_MAX_LIFETIME: Duration = Duration::from_secs(1800);
+#[cfg(feature = "postgres")]
 pub const DEFAULT_MAX_RETRIES: u32 = 2;
+#[cfg(feature = "postgres")]
 pub const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(50);
 
 /// Configuration options for PostgreSQL connection pooling and connection acquisition.
+#[cfg(feature = "postgres")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DbPoolOptions {
     pub max_connections: u32,
@@ -35,6 +53,7 @@ pub struct DbPoolOptions {
     pub initial_backoff: Duration,
 }
 
+#[cfg(feature = "postgres")]
 impl Default for DbPoolOptions {
     fn default() -> Self {
         Self {
@@ -49,6 +68,7 @@ impl Default for DbPoolOptions {
     }
 }
 
+#[cfg(feature = "postgres")]
 impl From<&Config> for DbPoolOptions {
     fn from(cfg: &Config) -> Self {
         Self {
@@ -60,6 +80,7 @@ impl From<&Config> for DbPoolOptions {
 }
 
 /// Initializes a PostgreSQL connection pool using options derived from [`Config`].
+#[cfg(feature = "postgres")]
 pub async fn init_pool(cfg: &Config) -> Result<PgPool, AppError> {
     let options = DbPoolOptions::from(cfg);
     init_pool_with_options(&cfg.database_url, options).await
@@ -67,6 +88,7 @@ pub async fn init_pool(cfg: &Config) -> Result<PgPool, AppError> {
 
 /// Initializes a PostgreSQL connection pool with explicit [`DbPoolOptions`],
 /// retrying on transient connection failures with exponential backoff and structured logging.
+#[cfg(feature = "postgres")]
 pub async fn init_pool_with_options(
     database_url: &str,
     options: DbPoolOptions,
@@ -152,10 +174,10 @@ pub async fn init_pool_with_options(
 /// it — including through a background writer it starts indirectly: a spawned outbox worker
 /// runs `recover_stale_processing` and `cleanup_sent_outbox` against the shared schema. Tests
 /// that never reach `email_outbox`, such as the session expiry tests, do not take it.
-#[cfg(test)]
+#[cfg(all(test, feature = "postgres"))]
 pub(crate) static DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-#[cfg(test)]
+#[cfg(all(test, feature = "postgres"))]
 mod tests {
     use super::*;
 

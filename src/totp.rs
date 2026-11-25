@@ -8,4 +8,5 @@
 //! to [`crate::handler`].
 pub mod backup;
 pub mod crypto;
+#[cfg(feature = "postgres")]
 pub mod service;

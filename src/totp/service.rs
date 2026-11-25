@@ -73,10 +73,10 @@ impl TotpService {
             .bind(user_id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(AppError::Database)?
+            .map_err(AppError::from)?
             .ok_or(AppError::Unauthenticated)?;
-        let email: String = user.try_get("email").map_err(AppError::Database)?;
-        let email_verified: bool = user.try_get("email_verified").map_err(AppError::Database)?;
+        let email: String = user.try_get("email").map_err(AppError::from)?;
+        let email_verified: bool = user.try_get("email_verified").map_err(AppError::from)?;
         if !email_verified {
             return Err(AppError::TotpEmailNotVerified);
         }
@@ -145,7 +145,7 @@ impl TotpService {
         .bind(backup_hashes)
         .execute(&self.pool)
         .await
-        .map_err(AppError::Database)?;
+        .map_err(AppError::from)?;
         if stored.rows_affected() == 0 {
             return Err(AppError::TotpAlreadyEnabled);
         }
@@ -166,11 +166,11 @@ impl TotpService {
         code: &str,
         _ip: &str,
     ) -> Result<(), AppError> {
-        let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
+        let mut transaction = self.pool.begin().await.map_err(AppError::from)?;
         let reference = transaction_now(&mut transaction).await?;
         self.confirm_enrollment_at(&mut transaction, user_id, code, reference)
             .await?;
-        transaction.commit().await.map_err(AppError::Database)
+        transaction.commit().await.map_err(AppError::from)
     }
 
     /// Confirmation body against one explicit clock reference.
@@ -192,18 +192,18 @@ impl TotpService {
                 .bind(user_id)
                 .fetch_optional(&mut *connection)
                 .await
-                .map_err(AppError::Database)?
+                .map_err(AppError::from)?
                 .ok_or(AppError::TotpNotEnrolled)?;
         if record
             .try_get::<bool, _>("enabled")
-            .map_err(AppError::Database)?
+            .map_err(AppError::from)?
         {
             return Err(AppError::TotpAlreadyEnabled);
         }
 
         let encrypted_secret: Vec<u8> = record
             .try_get("encrypted_secret")
-            .map_err(AppError::Database)?;
+            .map_err(AppError::from)?;
         let secret = self.decrypt_totp_secret(&encrypted_secret)?;
         verify_totp_code_at(secret.as_ref(), code, totp_counter_at(reference))?;
 
@@ -231,7 +231,7 @@ impl TotpService {
         .bind(encrypted_secret)
         .execute(&mut *connection)
         .await
-        .map_err(AppError::Database)?;
+        .map_err(AppError::from)?;
         if activated.rows_affected() == 0 {
             // Either the verified enrollment was replaced or it was confirmed first. Read
             // on the same connection: a pool read here could block on this transaction's
@@ -241,7 +241,7 @@ impl TotpService {
                     .bind(user_id)
                     .fetch_optional(&mut *connection)
                     .await
-                    .map_err(AppError::Database)?
+                    .map_err(AppError::from)?
                     .unwrap_or_default();
             return Err(if enabled {
                 AppError::TotpAlreadyEnabled
@@ -263,10 +263,10 @@ impl TotpService {
     ///
     /// `ip` is part of the Part 3 handler contract; rate limiting is handler-owned.
     pub async fn verify_totp(&self, user_id: Uuid, code: &str, _ip: &str) -> Result<(), AppError> {
-        let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
+        let mut transaction = self.pool.begin().await.map_err(AppError::from)?;
         self.verify_and_record_totp(&mut transaction, user_id, code)
             .await?;
-        transaction.commit().await.map_err(AppError::Database)
+        transaction.commit().await.map_err(AppError::from)
     }
 
     /// Verify `code` and record the use on the caller's transaction.
@@ -320,12 +320,12 @@ impl TotpService {
         code: &str,
         counter: u64,
     ) -> Result<(), AppError> {
-        let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
+        let mut transaction = self.pool.begin().await.map_err(AppError::from)?;
         lock_totp_user(&mut transaction, user_id).await?;
         let reference = transaction_now(&mut transaction).await?;
         self.record_totp_use(&mut transaction, user_id, code, counter, reference)
             .await?;
-        transaction.commit().await.map_err(AppError::Database)
+        transaction.commit().await.map_err(AppError::from)
     }
 
     /// Verify and record with a supplied database reference.
@@ -339,11 +339,11 @@ impl TotpService {
         code: &str,
         reference: DateTime<Utc>,
     ) -> Result<(), AppError> {
-        let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
+        let mut transaction = self.pool.begin().await.map_err(AppError::from)?;
         lock_totp_user(&mut transaction, user_id).await?;
         self.verify_totp_within(&mut transaction, user_id, code, reference)
             .await?;
-        transaction.commit().await.map_err(AppError::Database)
+        transaction.commit().await.map_err(AppError::from)
     }
 
     /// Load and decrypt the caller's enabled secret, or report why no code can be checked.
@@ -357,18 +357,18 @@ impl TotpService {
                 .bind(user_id)
                 .fetch_optional(&mut *connection)
                 .await
-                .map_err(AppError::Database)?
+                .map_err(AppError::from)?
                 .ok_or(AppError::TotpNotEnrolled)?;
         if !record
             .try_get::<bool, _>("enabled")
-            .map_err(AppError::Database)?
+            .map_err(AppError::from)?
         {
             return Err(AppError::TotpNotEnrolled);
         }
 
         let encrypted_secret: Vec<u8> = record
             .try_get("encrypted_secret")
-            .map_err(AppError::Database)?;
+            .map_err(AppError::from)?;
         self.decrypt_totp_secret(&encrypted_secret)
     }
 
@@ -396,7 +396,7 @@ impl TotpService {
         .execute(&mut *connection)
         .await;
         if let Err(error) = pruned {
-            return Err(AppError::Database(error));
+            return Err(AppError::from(error));
         }
 
         // The insert is the replay arbiter only while the tombstone survives. Re-check the
@@ -461,10 +461,10 @@ impl TotpService {
         _ip: &str,
     ) -> Result<(), AppError> {
         let matched_hash = self.match_backup_code(user_id, code).await?;
-        let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
+        let mut transaction = self.pool.begin().await.map_err(AppError::from)?;
         self.consume_backup_code(&mut transaction, user_id, &matched_hash)
             .await?;
-        transaction.commit().await.map_err(AppError::Database)
+        transaction.commit().await.map_err(AppError::from)
     }
 
     /// Match `code` against the stored hashes without spending it.
@@ -481,17 +481,17 @@ impl TotpService {
                 .bind(user_id)
                 .fetch_optional(&self.pool)
                 .await
-                .map_err(AppError::Database)?
+                .map_err(AppError::from)?
                 .ok_or(AppError::TotpNotEnrolled)?;
         if !record
             .try_get::<bool, _>("enabled")
-            .map_err(AppError::Database)?
+            .map_err(AppError::from)?
         {
             return Err(AppError::TotpNotEnrolled);
         }
 
         let stored_codes: serde_json::Value =
-            record.try_get("backup_codes").map_err(AppError::Database)?;
+            record.try_get("backup_codes").map_err(AppError::from)?;
         let hashes: Vec<String> = serde_json::from_value(stored_codes).map_err(|err| {
             tracing::error!(error = %err, user_id = %user_id, "backup code store is corrupt");
             AppError::Internal
@@ -537,7 +537,7 @@ impl TotpService {
         .bind(matched_hash)
         .execute(&mut *connection)
         .await
-        .map_err(AppError::Database)?;
+        .map_err(AppError::from)?;
         if removed.rows_affected() == 0 {
             // Another request consumed this exact hash after our read.
             return Err(AppError::TotpBackupCodeInvalid);
@@ -600,7 +600,7 @@ impl TotpService {
                     .await
             }
             FreshAuthProof::TotpCode(code) => {
-                let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
+                let mut transaction = self.pool.begin().await.map_err(AppError::from)?;
                 // Before the factor row lock: the advisory key is always acquired first so
                 // a disable and a login presenting the same code cannot cross orders.
                 lock_totp_user(&mut transaction, user_id).await?;
@@ -610,7 +610,7 @@ impl TotpService {
                     .await?;
                 self.delete_factor_state_in(&mut transaction, user_id)
                     .await?;
-                transaction.commit().await.map_err(AppError::Database)
+                transaction.commit().await.map_err(AppError::from)
             }
         }
     }
@@ -631,7 +631,7 @@ impl TotpService {
                 .bind(user_id)
                 .fetch_optional(&mut *connection)
                 .await
-                .map_err(AppError::Database)?;
+                .map_err(AppError::from)?;
         if enabled != Some(true) {
             return Err(AppError::TotpNotEnrolled);
         }
@@ -653,7 +653,7 @@ impl TotpService {
                 .bind(user_id)
                 .fetch_optional(&self.pool)
                 .await
-                .map_err(AppError::Database)?
+                .map_err(AppError::from)?
                 .ok_or(AppError::InvalidCredentials)?;
 
         // Argon2id is CPU-bound; never run it on the executor thread.
@@ -687,7 +687,7 @@ impl TotpService {
         user_id: Uuid,
         verified_hash: &str,
     ) -> Result<(), AppError> {
-        let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
+        let mut transaction = self.pool.begin().await.map_err(AppError::from)?;
         // Keeps the replay-log and challenge wipe below inside the per-user arbitration.
         lock_totp_user(&mut transaction, user_id).await?;
         // Absent row takes no lock; a repeat disable still succeeds.
@@ -695,7 +695,7 @@ impl TotpService {
             .bind(user_id)
             .execute(&mut *transaction)
             .await
-            .map_err(AppError::Database)?;
+            .map_err(AppError::from)?;
         // Before the `users` lock: redemption takes the challenge row first and the
         // `users` row second, so this order keeps disable and an in-flight verify from
         // deadlocking on the same two resources (mirrors `reset_password`).
@@ -703,13 +703,13 @@ impl TotpService {
             .bind(user_id)
             .execute(&mut *transaction)
             .await
-            .map_err(AppError::Database)?;
+            .map_err(AppError::from)?;
         let current: Option<String> =
             sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1 FOR NO KEY UPDATE")
                 .bind(user_id)
                 .fetch_optional(&mut *transaction)
                 .await
-                .map_err(AppError::Database)?;
+                .map_err(AppError::from)?;
         let fresh = match current {
             Some(ref stored) if stored.len() == verified_hash.len() => {
                 stored.as_bytes().ct_eq(verified_hash.as_bytes()).into()
@@ -722,7 +722,7 @@ impl TotpService {
 
         self.delete_factor_state_in(&mut transaction, user_id)
             .await?;
-        transaction.commit().await.map_err(AppError::Database)
+        transaction.commit().await.map_err(AppError::from)
     }
 
     /// Delete the factor, the replay log, and any live challenge tokens on the
@@ -738,17 +738,17 @@ impl TotpService {
             .bind(user_id)
             .execute(&mut *connection)
             .await
-            .map_err(AppError::Database)?;
+            .map_err(AppError::from)?;
         sqlx::query("DELETE FROM totp_used_codes WHERE user_id = $1")
             .bind(user_id)
             .execute(&mut *connection)
             .await
-            .map_err(AppError::Database)?;
+            .map_err(AppError::from)?;
         sqlx::query("DELETE FROM two_factor_tokens WHERE user_id = $1")
             .bind(user_id)
             .execute(&mut *connection)
             .await
-            .map_err(AppError::Database)?;
+            .map_err(AppError::from)?;
 
         tracing::debug!(
             event = "totp_secret_deleted",
@@ -788,7 +788,7 @@ impl TotpService {
         .bind(credential_hash)
         .execute(&self.pool)
         .await
-        .map_err(AppError::Database)?;
+        .map_err(AppError::from)?;
 
         Ok(raw_token)
     }
@@ -802,14 +802,14 @@ impl TotpService {
                 .bind(&token_hash[..])
                 .fetch_optional(&self.pool)
                 .await
-                .map_err(AppError::Database)?
+                .map_err(AppError::from)?
                 .ok_or(AppError::TwoFactorTokenInvalid)?;
 
-        let expires_at: DateTime<Utc> = record.try_get("expires_at").map_err(AppError::Database)?;
+        let expires_at: DateTime<Utc> = record.try_get("expires_at").map_err(AppError::from)?;
         if expires_at < Utc::now() {
             return Err(AppError::TwoFactorTokenExpired);
         }
-        record.try_get("user_id").map_err(AppError::Database)
+        record.try_get("user_id").map_err(AppError::from)
     }
 
     /// Atomically delete a challenge token after successful verification.
@@ -817,10 +817,10 @@ impl TotpService {
     /// Reports whether a row was actually deleted, so a double consume cannot mint a
     /// second session from the same token.
     pub async fn consume_two_factor_token(&self, token: &str) -> Result<(), AppError> {
-        let mut transaction = self.pool.begin().await.map_err(AppError::Database)?;
+        let mut transaction = self.pool.begin().await.map_err(AppError::from)?;
         self.consume_two_factor_token_in(&mut transaction, token)
             .await?;
-        transaction.commit().await.map_err(AppError::Database)
+        transaction.commit().await.map_err(AppError::from)
     }
 
     /// Delete the challenge token on the caller's transaction, returning the credential
@@ -841,7 +841,7 @@ impl TotpService {
         .bind(&token_hash[..])
         .fetch_optional(&mut *connection)
         .await
-        .map_err(AppError::Database)?;
+        .map_err(AppError::from)?;
         snapshot.ok_or(AppError::TwoFactorTokenInvalid)
     }
 
@@ -852,7 +852,7 @@ impl TotpService {
             .fetch_optional(&self.pool)
             .await
             .map(Option::unwrap_or_default)
-            .map_err(AppError::Database)
+            .map_err(AppError::from)
     }
 
     /// Read `totp_secrets.enabled` on the caller's transaction, holding a share lock on the
@@ -881,7 +881,7 @@ impl TotpService {
         .fetch_optional(&mut *connection)
         .await
         .map(Option::unwrap_or_default)
-        .map_err(AppError::Database)
+        .map_err(AppError::from)
     }
 
     fn encryption_key(&self) -> Result<[u8; crate::totp::crypto::AES_KEY_BYTES], AppError> {
@@ -935,7 +935,7 @@ async fn lock_totp_user(connection: &mut PgConnection, user_id: Uuid) -> Result<
         .execute(&mut *connection)
         .await
         .map(|_| ())
-        .map_err(AppError::Database)
+        .map_err(AppError::from)
 }
 
 /// The guarded replay insert, shared so the window comparison has one definition.
@@ -996,7 +996,7 @@ async fn transaction_now(connection: &mut PgConnection) -> Result<DateTime<Utc>,
     sqlx::query_scalar("SELECT clock_timestamp()")
         .fetch_one(&mut *connection)
         .await
-        .map_err(AppError::Database)
+        .map_err(AppError::from)
 }
 
 /// Map the replay insert failure: only `uq_totp_used_codes` means a replay.
@@ -1010,7 +1010,7 @@ fn classify_used_code_error(error: sqlx::Error) -> AppError {
     {
         return AppError::TotpCodeReplayed;
     }
-    AppError::Database(error)
+    AppError::from(error)
 }
 
 /// Input to [`TotpService::disable_totp`]: one fresh-auth proof, never a boolean toggle.

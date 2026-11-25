@@ -121,7 +121,7 @@ impl AuthServiceImpl {
 
         let normalized_email = email.trim().to_lowercase();
 
-        let mut tx = self.pool.begin().await.map_err(AppError::Database)?;
+        let mut tx = self.pool.begin().await.map_err(AppError::from)?;
 
         // Attempt insert; detect duplicate via UNIQUE constraint violation
         let result =
@@ -140,7 +140,7 @@ impl AuthServiceImpl {
             }
             Err(e) => {
                 let _ = tx.rollback().await;
-                return Err(AppError::Database(e));
+                return Err(AppError::from(e));
             }
         };
 
@@ -160,7 +160,7 @@ impl AuthServiceImpl {
 
         if let Err(e) = insert_res {
             let _ = tx.rollback().await;
-            return Err(AppError::Database(e));
+            return Err(AppError::from(e));
         }
 
         let url = EmailDispatcher::build_verification_url(
@@ -189,10 +189,10 @@ impl AuthServiceImpl {
 
         if let Err(e) = outbox_res {
             let _ = tx.rollback().await;
-            return Err(AppError::Database(e));
+            return Err(AppError::from(e));
         }
 
-        tx.commit().await.map_err(AppError::Database)?;
+        tx.commit().await.map_err(AppError::from)?;
 
         self.dispatcher.on_outbox_committed(&self.pool).await;
 
@@ -241,7 +241,7 @@ impl AuthServiceImpl {
                 .bind(&normalized_email)
                 .fetch_optional(&self.pool)
                 .await
-                .map_err(AppError::Database)?;
+                .map_err(AppError::from)?;
 
         match maybe_user {
             None => {
@@ -308,7 +308,7 @@ impl AuthServiceImpl {
     pub async fn verify_email(&self, token: &str) -> AppResult<()> {
         let token_hash = hash_token(token)?;
 
-        let mut tx = self.pool.begin().await.map_err(AppError::Database)?;
+        let mut tx = self.pool.begin().await.map_err(AppError::from)?;
 
         let maybe_row = sqlx::query(
             "DELETE FROM verification_tokens WHERE token_hash = $1 RETURNING user_id, expires_at",
@@ -316,7 +316,7 @@ impl AuthServiceImpl {
         .bind(&token_hash[..])
         .fetch_optional(&mut *tx)
         .await
-        .map_err(AppError::Database)?;
+        .map_err(AppError::from)?;
 
         let row = match maybe_row {
             None => {
@@ -330,7 +330,7 @@ impl AuthServiceImpl {
         let user_id: Uuid = row.get("user_id");
 
         if expires_at < Utc::now() {
-            tx.commit().await.map_err(AppError::Database)?;
+            tx.commit().await.map_err(AppError::from)?;
             return Err(AppError::TokenExpired);
         }
 
@@ -339,14 +339,14 @@ impl AuthServiceImpl {
                 .bind(user_id)
                 .execute(&mut *tx)
                 .await
-                .map_err(AppError::Database)?;
+                .map_err(AppError::from)?;
 
         if update_res.rows_affected() != 1 {
             let _ = tx.rollback().await;
             return Err(AppError::InvalidToken);
         }
 
-        tx.commit().await.map_err(AppError::Database)?;
+        tx.commit().await.map_err(AppError::from)?;
         Ok(())
     }
 
@@ -365,7 +365,7 @@ impl AuthServiceImpl {
             .bind(&normalized_email)
             .fetch_optional(&self.pool)
             .await
-            .map_err(AppError::Database)?;
+            .map_err(AppError::from)?;
 
         if let Some(user) = maybe_user {
             let user_id: Uuid = user.get("id");
@@ -389,7 +389,7 @@ impl AuthServiceImpl {
                 AppError::Internal
             })?;
 
-            let mut tx = self.pool.begin().await.map_err(AppError::Database)?;
+            let mut tx = self.pool.begin().await.map_err(AppError::from)?;
 
             // Serialize concurrent issuance for this user: the row lock orders
             // racing requests so the second DELETE observes the first INSERT,
@@ -398,7 +398,7 @@ impl AuthServiceImpl {
                 .bind(user_id)
                 .fetch_optional(&mut *tx)
                 .await
-                .map_err(AppError::Database)?;
+                .map_err(AppError::from)?;
             if locked.is_none() {
                 let _ = tx.rollback().await;
                 return Ok(());
@@ -413,7 +413,7 @@ impl AuthServiceImpl {
                 .await
             {
                 let _ = tx.rollback().await;
-                return Err(AppError::Database(e));
+                return Err(AppError::from(e));
             }
 
             let insert_res = sqlx::query(
@@ -427,7 +427,7 @@ impl AuthServiceImpl {
 
             if let Err(e) = insert_res {
                 let _ = tx.rollback().await;
-                return Err(AppError::Database(e));
+                return Err(AppError::from(e));
             }
 
             let outbox_res = crate::db::outbox::insert_outbox(
@@ -440,10 +440,10 @@ impl AuthServiceImpl {
 
             if let Err(e) = outbox_res {
                 let _ = tx.rollback().await;
-                return Err(AppError::Database(e));
+                return Err(AppError::from(e));
             }
 
-            tx.commit().await.map_err(AppError::Database)?;
+            tx.commit().await.map_err(AppError::from)?;
 
             self.dispatcher.on_outbox_committed(&self.pool).await;
         }
@@ -469,7 +469,7 @@ impl AuthServiceImpl {
         .bind(&token_hash[..])
         .fetch_optional(&self.pool)
         .await
-        .map_err(AppError::Database)?;
+        .map_err(AppError::from)?;
 
         let row = match maybe_row {
             None => return Err(AppError::InvalidToken),
@@ -490,7 +490,7 @@ impl AuthServiceImpl {
             .await
             .map_err(|_| AppError::Internal)??;
 
-        let mut tx = self.pool.begin().await.map_err(AppError::Database)?;
+        let mut tx = self.pool.begin().await.map_err(AppError::from)?;
 
         // Before the `users` lock: redemption takes the challenge row first and the
         // `users` row second, so this order keeps reset and an in-flight verify from
@@ -499,7 +499,7 @@ impl AuthServiceImpl {
             .bind(user_id)
             .execute(&mut *tx)
             .await
-            .map_err(AppError::Database)?;
+            .map_err(AppError::from)?;
 
         // Serialize concurrent resets for this user: the lock orders two
         // simultaneously consumed tokens deterministically instead of racing
@@ -508,7 +508,7 @@ impl AuthServiceImpl {
             .bind(user_id)
             .fetch_optional(&mut *tx)
             .await
-            .map_err(AppError::Database)?;
+            .map_err(AppError::from)?;
         if locked.is_none() {
             let _ = tx.rollback().await;
             return Err(AppError::InvalidToken);
@@ -520,7 +520,7 @@ impl AuthServiceImpl {
                 .bind(user_id)
                 .execute(&mut *tx)
                 .await
-                .map_err(AppError::Database)?;
+                .map_err(AppError::from)?;
 
         if update_res.rows_affected() != 1 {
             let _ = tx.rollback().await;
@@ -532,14 +532,14 @@ impl AuthServiceImpl {
             .bind(user_id)
             .execute(&mut *tx)
             .await
-            .map_err(AppError::Database)?;
+            .map_err(AppError::from)?;
 
         // Invalidate ALL sessions for this user upon password change
         sqlx::query("DELETE FROM sessions WHERE user_id = $1")
             .bind(user_id)
             .execute(&mut *tx)
             .await
-            .map_err(AppError::Database)?;
+            .map_err(AppError::from)?;
 
         tracing::info!(
             event = "all_sessions_invalidated",
@@ -547,7 +547,7 @@ impl AuthServiceImpl {
             triggered_by = "password_change",
         );
 
-        tx.commit().await.map_err(AppError::Database)?;
+        tx.commit().await.map_err(AppError::from)?;
         Ok(())
     }
 }

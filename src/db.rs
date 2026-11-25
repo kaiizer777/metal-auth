@@ -120,9 +120,9 @@ pub async fn init_pool_with_options(
                     );
                     return Err(match e {
                         sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut | sqlx::Error::Tls(_) => {
-                            AppError::DatabaseUnavailable(e)
+                            AppError::DatabaseUnavailable(e.into())
                         }
-                        other => AppError::Database(other),
+                        other => AppError::Database(other.into()),
                     });
                 }
             }
@@ -134,7 +134,7 @@ pub async fn init_pool_with_options(
         .await
         .map_err(|e| {
             error!(op = "db_migrate", err = %e, "database migration failed");
-            AppError::Migration(e)
+            AppError::from(e)
         })?;
 
     Ok(pool)

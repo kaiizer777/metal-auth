@@ -50,7 +50,7 @@ pub use email::{
     DynError, EmailDispatcher, EmailSender, NoopEmailSender, PasswordResetEmailPayload,
     SharedEmailSender, VerificationEmailPayload,
 };
-pub use error::{AppError, AppResult, ConfigError, ErrorCode, ErrorResponse};
+pub use error::{AppError, AppResult, ConfigError, DbError, ErrorCode, ErrorResponse};
 pub use handler::{auth_routes, oauth_routes, session_routes, totp_routes};
 pub use middleware::{AuthUser, csrf_middleware, require_auth, security_headers_middleware};
 pub use oauth::{

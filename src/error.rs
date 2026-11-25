@@ -190,6 +190,26 @@ impl From<mongodb::error::Error> for DbError {
     }
 }
 
+#[cfg(feature = "mongodb")]
+impl From<bson::ser::Error> for DbError {
+    fn from(err: bson::ser::Error) -> Self {
+        Self {
+            message: err.to_string(),
+            source: Some(Box::new(err)),
+        }
+    }
+}
+
+#[cfg(feature = "mongodb")]
+impl From<bson::de::Error> for DbError {
+    fn from(err: bson::de::Error) -> Self {
+        Self {
+            message: err.to_string(),
+            source: Some(Box::new(err)),
+        }
+    }
+}
+
 /// Non-exhaustive: each phase adds variants, and embedders match on this type in their own
 /// error mapping. Match with a wildcard.
 #[non_exhaustive]

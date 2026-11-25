@@ -41,6 +41,8 @@ async fn setup_live_db() -> Option<(axum::Router, sqlx::PgPool, AppState)> {
     .expect("DATABASE_URL is set, so the DB-backed test must connect");
     let cfg = Config {
         database_url: url.clone(),
+        backend: metal_auth::DatabaseBackend::Postgres,
+        mongo: None,
         port: 8080,
         allowed_origins: vec!["https://app.example.com".into()],
         allowed_methods: vec!["GET".into(), "POST".into()],

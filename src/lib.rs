@@ -47,6 +47,10 @@ pub use config::{
 pub use db::models::{
     EmailOutbox, OAuthAccount, PasswordResetToken, Session, User, VerificationToken,
 };
+pub use db::store::{
+    DatabaseStore, OAuthStore, OutboxStore, SessionStore, StoreTx, TokenStore, TotpStore,
+    UserStore,
+};
 pub use email::{
     DynError, EmailDispatcher, EmailSender, NoopEmailSender, PasswordResetEmailPayload,
     SharedEmailSender, VerificationEmailPayload,

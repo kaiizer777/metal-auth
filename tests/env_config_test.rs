@@ -9,6 +9,8 @@ async fn test_auth_new_fails_on_invalid_auth_env_config() {
 
     let cfg = Config {
         database_url: "postgres://localhost/test".into(),
+        backend: metal_auth::DatabaseBackend::Postgres,
+        mongo: None,
         port: 3000,
         allowed_origins: vec![],
         allowed_methods: vec![],

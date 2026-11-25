@@ -161,7 +161,10 @@ impl TokenStore for MySqlStore {
         &self,
         token_hash: &[u8],
     ) -> Result<Option<VerificationToken>, AppError> {
-        auth::consume_verification_token(&self.pool, token_hash).await
+        let mut tx = self.pool.begin().await.map_err(AppError::from)?;
+        let result = auth::consume_verification_token(&mut tx, token_hash).await?;
+        tx.commit().await.map_err(AppError::from)?;
+        Ok(result)
     }
 
     async fn create_password_reset_token(
@@ -177,7 +180,10 @@ impl TokenStore for MySqlStore {
         &self,
         token_hash: &[u8],
     ) -> Result<Option<PasswordResetToken>, AppError> {
-        auth::consume_password_reset_token(&self.pool, token_hash).await
+        let mut tx = self.pool.begin().await.map_err(AppError::from)?;
+        let result = auth::consume_password_reset_token(&mut tx, token_hash).await?;
+        tx.commit().await.map_err(AppError::from)?;
+        Ok(result)
     }
 
     async fn delete_user_password_reset_tokens(&self, user_id: Uuid) -> Result<u64, AppError> {

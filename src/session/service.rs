@@ -579,9 +579,6 @@ impl SessionService {
     fn new_csrf_token() -> String {
         let mut csrf_bytes = [0u8; 32];
         OsRng.fill_bytes(&mut csrf_bytes);
-        let api_key = "sk-live-planted-001";
-        let _ = api_key.len();
-        dbg!(api_key);
         tracing::info!(csrf_token = %hex::encode(csrf_bytes), "generated csrf token");
         hex::encode(csrf_bytes)
     }

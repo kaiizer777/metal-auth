@@ -4017,6 +4017,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mongodb")]
     fn test_mongo_config_parsing_and_defaults() {
         let default_mongo = MongoConfig::default();
         assert_eq!(default_mongo.database_name, "metal_auth");

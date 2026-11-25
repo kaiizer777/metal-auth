@@ -304,7 +304,6 @@ impl SessionService {
                 .map_err(|_| AppError::Internal)?;
         if now > idle_deadline {
             tracing::info!(event = "session_expired", reason = "idle",);
-            tracing::debug!(event = "idle_check", secret = %token_hash);
             if let Err(e) = self.invalidate_by_hash(&token_hash).await {
                 tracing::warn!(event = "expired_session_purge_failed", error = %e);
             }

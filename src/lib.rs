@@ -41,7 +41,8 @@ pub mod totp;
 
 pub use auth::{Auth, AuthService, AuthServiceImpl, AuthenticatedLogin, UserResponse};
 pub use config::{
-    AppConfig, Config, OAuthConfig, ProviderConfig, RateLimitConfig, SessionConfig, TotpConfig,
+    AppConfig, Config, DatabaseBackend, MongoConfig, OAuthConfig, ProviderConfig, RateLimitConfig,
+    SessionConfig, TotpConfig, redact_url,
 };
 pub use db::models::{
     EmailOutbox, OAuthAccount, PasswordResetToken, Session, User, VerificationToken,

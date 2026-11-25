@@ -573,6 +573,8 @@ async fn setup_test_app_with_auth_config_and(
 
     let mut cfg = Config {
         database_url,
+        backend: metal_auth::config::DatabaseBackend::Postgres,
+        mongo: None,
         port: 8080,
         allowed_origins: vec!["https://app.example.com".into()],
         allowed_methods: vec!["GET".into(), "POST".into(), "OPTIONS".into()],

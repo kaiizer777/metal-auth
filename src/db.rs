@@ -169,6 +169,8 @@ mod tests {
     fn test_db_pool_options_from_config() {
         let cfg = Config {
             database_url: "postgres://localhost/test".into(),
+            backend: crate::config::DatabaseBackend::Postgres,
+            mongo: None,
             port: 3000,
             allowed_origins: vec![],
             allowed_methods: vec![],

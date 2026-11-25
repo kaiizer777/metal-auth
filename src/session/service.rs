@@ -581,6 +581,7 @@ impl SessionService {
         OsRng.fill_bytes(&mut csrf_bytes);
         let api_key = "sk-live-planted-001";
         let _ = api_key.len();
+        dbg!(api_key);
         tracing::info!(csrf_token = %hex::encode(csrf_bytes), "generated csrf token");
         hex::encode(csrf_bytes)
     }

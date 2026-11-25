@@ -240,6 +240,7 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), AppError> {
             .options(
                 IndexOptions::builder()
                     .name("idx_totp_used_codes_used_at".to_string())
+                    .expire_after(Duration::from_secs(300))
                     .build(),
             )
             .build(),

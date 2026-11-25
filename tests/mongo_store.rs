@@ -883,3 +883,32 @@ async fn test_mongo_totp_lifecycle() {
     // Cleanup
     let _ = store.users().delete_user(user.id).await;
 }
+
+#[tokio::test]
+async fn test_mongo_totp_used_codes_ttl_index() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_totp_used_codes_ttl_index: MONGO_URL not set");
+        return;
+    };
+
+    let coll = store.db().collection::<bson::Document>("totp_used_codes");
+    let mut cursor = coll.list_indexes().await.expect("list indexes");
+    let mut found_ttl = false;
+    while cursor.advance().await.expect("advance cursor") {
+        let model = cursor
+            .deserialize_current()
+            .expect("deserialize index model");
+        if let Some(opts) = model
+            .options
+            .as_ref()
+            .filter(|o| o.name.as_deref() == Some("idx_totp_used_codes_used_at"))
+        {
+            assert_eq!(opts.expire_after, Some(Duration::from_secs(300)));
+            found_ttl = true;
+        }
+    }
+    assert!(
+        found_ttl,
+        "idx_totp_used_codes_used_at with expire_after=300s must exist"
+    );
+}

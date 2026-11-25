@@ -2,7 +2,10 @@
 
 use bson::{Binary, DateTime as BsonDateTime, doc};
 use chrono::{DateTime, Utc};
-use mongodb::{ClientSession, Database};
+use mongodb::{
+    ClientSession, Database,
+    options::{Collation, CollationStrength, FindOneOptions},
+};
 use uuid::Uuid;
 
 use crate::{
@@ -78,10 +81,15 @@ pub async fn get_user_by_email(
 ) -> Result<Option<User>, AppError> {
     let normalized = email.to_lowercase();
     let filter = doc! { "email": normalized };
+    let collation = Collation::builder()
+        .locale("en")
+        .strength(CollationStrength::Secondary)
+        .build();
+    let options = FindOneOptions::builder().collation(collation).build();
     let coll = db.collection::<UserDoc>(USERS_COLLECTION);
     let res = match session.as_deref_mut() {
-        Some(s) => coll.find_one(filter).session(s).await,
-        None => coll.find_one(filter).await,
+        Some(s) => coll.find_one(filter).with_options(options).session(s).await,
+        None => coll.find_one(filter).with_options(options).await,
     };
 
     let doc = res.map_err(AppError::from)?;

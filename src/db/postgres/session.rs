@@ -111,6 +111,19 @@ where
     Ok(())
 }
 
+pub async fn delete_by_token_hash<'e, E>(executor: E, token_hash: &str) -> Result<bool, AppError>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let result = sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
+        .bind(token_hash)
+        .execute(executor)
+        .await
+        .map_err(AppError::from)?;
+
+    Ok(result.rows_affected() > 0)
+}
+
 pub async fn delete_user_sessions<'e, E>(executor: E, user_id: Uuid) -> Result<u64, AppError>
 where
     E: Executor<'e, Database = Postgres>,

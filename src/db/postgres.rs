@@ -66,6 +66,10 @@ impl UserStore for PostgresStore {
     async fn update_password_hash(&self, user_id: Uuid, new_hash: &str) -> Result<(), AppError> {
         auth::update_password_hash(&self.pool, user_id, new_hash).await
     }
+
+    async fn delete_user(&self, user_id: Uuid) -> Result<bool, AppError> {
+        auth::delete_user(&self.pool, user_id).await
+    }
 }
 
 #[async_trait]
@@ -125,6 +129,10 @@ impl SessionStore for PostgresStore {
         session::delete_session(&self.pool, session_id).await
     }
 
+    async fn delete_by_token_hash(&self, token_hash: &str) -> Result<bool, AppError> {
+        session::delete_by_token_hash(&self.pool, token_hash).await
+    }
+
     async fn delete_user_sessions(&self, user_id: Uuid) -> Result<u64, AppError> {
         session::delete_user_sessions(&self.pool, user_id).await
     }
@@ -174,6 +182,10 @@ impl TokenStore for PostgresStore {
 
     async fn delete_user_password_reset_tokens(&self, user_id: Uuid) -> Result<u64, AppError> {
         auth::delete_user_password_reset_tokens(&self.pool, user_id).await
+    }
+
+    async fn delete_verification_tokens_for_user(&self, user_id: Uuid) -> Result<u64, AppError> {
+        auth::delete_verification_tokens_for_user(&self.pool, user_id).await
     }
 }
 
@@ -402,6 +414,12 @@ impl UserStore for PostgresTx {
         let tx = guard.as_mut().ok_or(AppError::Internal)?;
         auth::update_password_hash(&mut **tx, user_id, new_hash).await
     }
+
+    async fn delete_user(&self, user_id: Uuid) -> Result<bool, AppError> {
+        let mut guard = self.tx.lock().await;
+        let tx = guard.as_mut().ok_or(AppError::Internal)?;
+        auth::delete_user(&mut **tx, user_id).await
+    }
 }
 
 #[async_trait]
@@ -471,6 +489,12 @@ impl SessionStore for PostgresTx {
         session::delete_session(&mut **tx, session_id).await
     }
 
+    async fn delete_by_token_hash(&self, token_hash: &str) -> Result<bool, AppError> {
+        let mut guard = self.tx.lock().await;
+        let tx = guard.as_mut().ok_or(AppError::Internal)?;
+        session::delete_by_token_hash(&mut **tx, token_hash).await
+    }
+
     async fn delete_user_sessions(&self, user_id: Uuid) -> Result<u64, AppError> {
         let mut guard = self.tx.lock().await;
         let tx = guard.as_mut().ok_or(AppError::Internal)?;
@@ -537,6 +561,12 @@ impl TokenStore for PostgresTx {
         let tx = guard.as_mut().ok_or(AppError::Internal)?;
         auth::delete_user_password_reset_tokens(&mut **tx, user_id).await
     }
+
+    async fn delete_verification_tokens_for_user(&self, user_id: Uuid) -> Result<u64, AppError> {
+        let mut guard = self.tx.lock().await;
+        let tx = guard.as_mut().ok_or(AppError::Internal)?;
+        auth::delete_verification_tokens_for_user(&mut **tx, user_id).await
+    }
 }
 
 #[async_trait]
@@ -558,7 +588,9 @@ impl OutboxStore for PostgresTx {
         _lock_duration: Duration,
     ) -> Result<Vec<EmailOutbox>, AppError> {
         // Outbox batch claiming is managed at the pool level, not inside an arbitrary caller transaction
-        Err(AppError::Internal)
+        Err(AppError::Database(crate::db::DbError::new(
+            "outbox batch claiming is not supported inside a child transaction",
+        )))
     }
 
     async fn mark_outbox_sent(&self, id: Uuid) -> Result<(), AppError> {
@@ -593,7 +625,9 @@ impl OutboxStore for PostgresTx {
 
     async fn recover_stale_processing(&self, _stale_duration: Duration) -> Result<u64, AppError> {
         // Recovery runs across the pool
-        Err(AppError::Internal)
+        Err(AppError::Database(crate::db::DbError::new(
+            "stale outbox recovery is not supported inside a child transaction",
+        )))
     }
 }
 

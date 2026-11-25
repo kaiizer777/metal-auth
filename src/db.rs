@@ -21,6 +21,7 @@ pub mod store;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 
+pub use crate::error::DbError;
 pub use store::{
     DatabaseStore, OAuthStore, OutboxStore, SessionStore, StoreTx, TokenStore, TotpStore, UserStore,
 };

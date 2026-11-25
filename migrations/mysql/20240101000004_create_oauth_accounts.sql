@@ -11,3 +11,4 @@ CREATE TABLE IF NOT EXISTS oauth_accounts (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE INDEX idx_oauth_accounts_user_id ON oauth_accounts (user_id);
+CREATE INDEX idx_oauth_accounts_email ON oauth_accounts (email);

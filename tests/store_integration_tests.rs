@@ -6,7 +6,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use common::setup_test_app;
-use metal_auth::DatabaseBackend;
+use metal_auth::{DatabaseBackend, DatabaseStore};
 
 #[tokio::test]
 async fn test_store_backend_and_ping() {
@@ -78,6 +78,27 @@ async fn test_store_users_lifecycle() {
         .expect("fetch updated")
         .expect("user exists");
     assert_eq!(updated.password_hash, new_hash);
+
+    // 5. Delete user
+    let deleted = store
+        .users()
+        .delete_user(user.id)
+        .await
+        .expect("delete user");
+    assert!(deleted);
+    let after_delete = store
+        .users()
+        .get_user_by_id(user.id)
+        .await
+        .expect("fetch deleted user");
+    assert!(after_delete.is_none());
+
+    let deleted_again = store
+        .users()
+        .delete_user(user.id)
+        .await
+        .expect("delete non-existent user");
+    assert!(!deleted_again);
 }
 
 #[tokio::test]
@@ -165,6 +186,37 @@ async fn test_store_sessions_lifecycle() {
             .expect("fetch deleted")
             .is_none()
     );
+
+    // 6. Delete by token hash
+    let token_hash_2 = hex::encode(sha2::Sha256::digest(b"test_session_token_2"));
+    let session_2 = store
+        .sessions()
+        .create_session(user.id, &token_hash_2, "cookie", None, expires)
+        .await
+        .expect("create second session");
+    assert_eq!(session_2.user_id, user.id);
+
+    let deleted_by_hash = store
+        .sessions()
+        .delete_by_token_hash(&token_hash_2)
+        .await
+        .expect("delete by token hash");
+    assert!(deleted_by_hash);
+    assert!(
+        store
+            .sessions()
+            .get_session_by_token_hash(&token_hash_2)
+            .await
+            .expect("fetch deleted by hash")
+            .is_none()
+    );
+
+    let deleted_again = store
+        .sessions()
+        .delete_by_token_hash(&token_hash_2)
+        .await
+        .expect("delete already deleted session by hash");
+    assert!(!deleted_again);
 }
 
 #[tokio::test]
@@ -219,6 +271,26 @@ async fn test_store_tokens_lifecycle() {
         .await
         .expect("delete user rtokens");
     assert_eq!(deleted, 1);
+
+    // Verification tokens deletion for user
+    let v_hash_2 = [77u8; 32];
+    store
+        .tokens()
+        .create_verification_token(user.id, &v_hash_2, expires)
+        .await
+        .expect("create second vtoken");
+    let deleted_vtokens = store
+        .tokens()
+        .delete_verification_tokens_for_user(user.id)
+        .await
+        .expect("delete user verification tokens");
+    assert_eq!(deleted_vtokens, 1);
+    let consumed_after_delete = store
+        .tokens()
+        .consume_verification_token(&v_hash_2)
+        .await
+        .expect("consume after delete");
+    assert!(consumed_after_delete.is_none());
 }
 
 #[tokio::test]
@@ -285,8 +357,48 @@ async fn test_store_transaction_commit_and_rollback() {
         .get_user_by_email(&email_committed)
         .await
         .expect("fetch committed user");
+    assert!(committed_user.is_some(), "committed user must exist");
+
+    // 3. Tx outbox unsupported methods return proper database errors
+    let mut tx = store.begin().await.expect("begin tx");
+    let claim_err = tx
+        .outbox()
+        .claim_pending_outbox(10, Duration::from_secs(30))
+        .await;
+    assert!(claim_err.is_err());
+    let recover_err = tx
+        .outbox()
+        .recover_stale_processing(Duration::from_secs(30))
+        .await;
+    assert!(recover_err.is_err());
+
+    // 4. Tx delete methods with rollback
+    let email_to_delete = format!("tx_del_{}@example.com", Uuid::new_v4());
+    let u = store
+        .users()
+        .create_user(&email_to_delete, "hash")
+        .await
+        .expect("create user");
+    let deleted_in_tx = tx
+        .users()
+        .delete_user(u.id)
+        .await
+        .expect("delete user in tx");
+    assert!(deleted_in_tx);
+    tx.rollback().await.expect("rollback tx");
     assert!(
-        committed_user.is_some(),
-        "committed user must exist in storage"
+        store
+            .users()
+            .get_user_by_id(u.id)
+            .await
+            .expect("get user")
+            .is_some()
     );
+
+    let store_arc: std::sync::Arc<dyn DatabaseStore> = app.state.store().clone();
+    let config = app.state.config.clone();
+    let custom_state = metal_auth::AppState::new_with_store(store_arc.clone(), config)
+        .expect("AppState::new_with_store");
+    assert_eq!(custom_state.store().backend(), DatabaseBackend::Postgres);
+    assert!(custom_state.store().ping().await.is_ok());
 }

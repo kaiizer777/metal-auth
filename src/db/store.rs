@@ -20,6 +20,7 @@ pub trait UserStore: Send + Sync {
     async fn get_user_by_email(&self, email: &str) -> Result<Option<User>, AppError>;
     async fn set_email_verified(&self, user_id: Uuid, verified: bool) -> Result<(), AppError>;
     async fn update_password_hash(&self, user_id: Uuid, new_hash: &str) -> Result<(), AppError>;
+    async fn delete_user(&self, user_id: Uuid) -> Result<bool, AppError>;
 }
 
 /// Storage operations on user sessions and tokens.
@@ -50,6 +51,7 @@ pub trait SessionStore: Send + Sync {
         last_active_at: DateTime<Utc>,
     ) -> Result<(), AppError>;
     async fn delete_session(&self, session_id: Uuid) -> Result<(), AppError>;
+    async fn delete_by_token_hash(&self, token_hash: &str) -> Result<bool, AppError>;
     async fn delete_user_sessions(&self, user_id: Uuid) -> Result<u64, AppError>;
     async fn list_user_sessions(&self, user_id: Uuid) -> Result<Vec<Session>, AppError>;
     async fn delete_expired_sessions(&self) -> Result<u64, AppError>;
@@ -79,6 +81,7 @@ pub trait TokenStore: Send + Sync {
         token_hash: &[u8],
     ) -> Result<Option<PasswordResetToken>, AppError>;
     async fn delete_user_password_reset_tokens(&self, user_id: Uuid) -> Result<u64, AppError>;
+    async fn delete_verification_tokens_for_user(&self, user_id: Uuid) -> Result<u64, AppError>;
 }
 
 /// Storage operations for transactional email outbox records.

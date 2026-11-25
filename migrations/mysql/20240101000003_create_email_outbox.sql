@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS email_outbox (
     payload         JSON NOT NULL,
     status          VARCHAR(32) NOT NULL DEFAULT 'pending',
     retry_count     INT NOT NULL DEFAULT 0,
-    next_retry_at   DATETIME(6) NOT NULL,
+    next_retry_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     created_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     sent_at         DATETIME(6) NULL,
     error_log       TEXT NULL

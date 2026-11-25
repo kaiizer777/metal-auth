@@ -223,3 +223,32 @@ where
 
     Ok(result.rows_affected())
 }
+
+pub async fn delete_user<'e, E>(executor: E, user_id: Uuid) -> Result<bool, AppError>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let result = sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(executor)
+        .await
+        .map_err(AppError::from)?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn delete_verification_tokens_for_user<'e, E>(
+    executor: E,
+    user_id: Uuid,
+) -> Result<u64, AppError>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let result = sqlx::query("DELETE FROM verification_tokens WHERE user_id = $1")
+        .bind(user_id)
+        .execute(executor)
+        .await
+        .map_err(AppError::from)?;
+
+    Ok(result.rows_affected())
+}

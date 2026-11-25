@@ -282,7 +282,10 @@ impl TotpStore for MySqlStore {
         encrypted_secret: &[u8],
         backup_codes: serde_json::Value,
     ) -> Result<TotpSecret, AppError> {
-        totp::upsert_secret(&self.pool, user_id, encrypted_secret, backup_codes).await
+        let mut tx = self.pool.begin().await.map_err(AppError::from)?;
+        let secret = totp::upsert_secret(&mut tx, user_id, encrypted_secret, backup_codes).await?;
+        tx.commit().await.map_err(AppError::from)?;
+        Ok(secret)
     }
 
     async fn enable_totp(&self, user_id: Uuid) -> Result<bool, AppError> {
@@ -316,7 +319,10 @@ impl TotpStore for MySqlStore {
         &self,
         token_hash: &[u8],
     ) -> Result<Option<TwoFactorToken>, AppError> {
-        totp::consume_two_factor_token(&self.pool, token_hash).await
+        let mut tx = self.pool.begin().await.map_err(AppError::from)?;
+        let token = totp::consume_two_factor_token(&mut tx, token_hash).await?;
+        tx.commit().await.map_err(AppError::from)?;
+        Ok(token)
     }
 
     async fn delete_two_factor_tokens_for_user(&self, user_id: Uuid) -> Result<u64, AppError> {

@@ -153,10 +153,7 @@ where
     Ok(result.rows_affected())
 }
 
-pub async fn list_user_sessions<'e, E>(
-    executor: E,
-    user_id: Uuid,
-) -> Result<Vec<Session>, AppError>
+pub async fn list_user_sessions<'e, E>(executor: E, user_id: Uuid) -> Result<Vec<Session>, AppError>
 where
     E: Executor<'e, Database = MySql>,
 {
@@ -193,7 +190,8 @@ mod tests {
         let q1 = "INSERT INTO sessions (id, user_id, token_hash, session_type, csrf_token, created_at, last_active_at, absolute_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
         assert_eq!(q1.matches('?').count(), 8);
 
-        let q2 = "UPDATE sessions SET token_hash = ?, csrf_token = ?, last_active_at = ? WHERE id = ?";
+        let q2 =
+            "UPDATE sessions SET token_hash = ?, csrf_token = ?, last_active_at = ? WHERE id = ?";
         assert_eq!(q2.matches('?').count(), 4);
     }
 }

@@ -1,10 +1,10 @@
 #[cfg(any(feature = "postgres", feature = "mysql"))]
 use std::time::Duration;
 
-#[cfg(feature = "postgres")]
-use sqlx::{PgPool, postgres::PgPoolOptions};
 #[cfg(feature = "mysql")]
 use sqlx::{MySqlPool, mysql::MySqlPoolOptions};
+#[cfg(feature = "postgres")]
+use sqlx::{PgPool, postgres::PgPoolOptions};
 #[cfg(any(feature = "postgres", feature = "mysql"))]
 use tracing::{error, info, warn};
 

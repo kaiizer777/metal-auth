@@ -328,7 +328,8 @@ mod tests {
         let q1 = "INSERT INTO totp_secrets (id, user_id, encrypted_secret, backup_codes, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, FALSE, ?, ?)";
         assert_eq!(q1.matches('?').count(), 6);
 
-        let q2 = "INSERT INTO totp_used_codes (id, user_id, code_hash, used_at) VALUES (?, ?, ?, ?)";
+        let q2 =
+            "INSERT INTO totp_used_codes (id, user_id, code_hash, used_at) VALUES (?, ?, ?, ?)";
         assert_eq!(q2.matches('?').count(), 4);
 
         let q3 = "INSERT INTO two_factor_tokens (id, user_id, token_hash, credential_hash, expires_at) VALUES (?, ?, ?, ?, ?)";

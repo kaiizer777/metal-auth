@@ -62,8 +62,8 @@ pub async fn claim_pending_outbox(
 ) -> Result<Vec<EmailOutbox>, AppError> {
     let mut tx = pool.begin().await.map_err(AppError::from)?;
     let now = Utc::now();
-    let lease_expires_at = now
-        + ChronoDuration::from_std(lock_duration).unwrap_or(ChronoDuration::seconds(300));
+    let lease_expires_at =
+        now + ChronoDuration::from_std(lock_duration).unwrap_or(ChronoDuration::seconds(300));
 
     let mut rows = sqlx::query_as::<MySql, EmailOutbox>(
         r#"
@@ -102,7 +102,11 @@ pub async fn claim_pending_outbox(
     }
     separated.push_unseparated(")");
 
-    builder.build().execute(&mut *tx).await.map_err(AppError::from)?;
+    builder
+        .build()
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::from)?;
     tx.commit().await.map_err(AppError::from)?;
 
     for row in &mut rows {
@@ -208,8 +212,8 @@ pub async fn cleanup_sent_outbox<'e, E>(
 where
     E: Executor<'e, Database = MySql>,
 {
-    let cutoff =
-        Utc::now() - ChronoDuration::from_std(retention_duration).unwrap_or(ChronoDuration::days(7));
+    let cutoff = Utc::now()
+        - ChronoDuration::from_std(retention_duration).unwrap_or(ChronoDuration::days(7));
     let result = sqlx::query(
         r#"
         DELETE FROM email_outbox

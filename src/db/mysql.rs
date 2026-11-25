@@ -545,7 +545,7 @@ impl TokenStore for MySqlTx {
     ) -> Result<Option<VerificationToken>, AppError> {
         let mut guard = self.tx.lock().await;
         let tx = guard.as_mut().ok_or(AppError::Internal)?;
-        auth::consume_verification_token(&mut **tx, token_hash).await
+        auth::consume_verification_token(tx, token_hash).await
     }
 
     async fn create_password_reset_token(
@@ -565,7 +565,7 @@ impl TokenStore for MySqlTx {
     ) -> Result<Option<PasswordResetToken>, AppError> {
         let mut guard = self.tx.lock().await;
         let tx = guard.as_mut().ok_or(AppError::Internal)?;
-        auth::consume_password_reset_token(&mut **tx, token_hash).await
+        auth::consume_password_reset_token(tx, token_hash).await
     }
 
     async fn delete_user_password_reset_tokens(&self, user_id: Uuid) -> Result<u64, AppError> {
@@ -694,7 +694,7 @@ impl TotpStore for MySqlTx {
     ) -> Result<TotpSecret, AppError> {
         let mut guard = self.tx.lock().await;
         let tx = guard.as_mut().ok_or(AppError::Internal)?;
-        totp::upsert_secret(&mut **tx, user_id, encrypted_secret, backup_codes).await
+        totp::upsert_secret(tx, user_id, encrypted_secret, backup_codes).await
     }
 
     async fn enable_totp(&self, user_id: Uuid) -> Result<bool, AppError> {
@@ -740,7 +740,7 @@ impl TotpStore for MySqlTx {
     ) -> Result<Option<TwoFactorToken>, AppError> {
         let mut guard = self.tx.lock().await;
         let tx = guard.as_mut().ok_or(AppError::Internal)?;
-        totp::consume_two_factor_token(&mut **tx, token_hash).await
+        totp::consume_two_factor_token(tx, token_hash).await
     }
 
     async fn delete_two_factor_tokens_for_user(&self, user_id: Uuid) -> Result<u64, AppError> {

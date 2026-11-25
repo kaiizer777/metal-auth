@@ -488,6 +488,7 @@ pub struct TwoFactorTokenDoc {
     pub id: bson::Uuid,
     pub user_id: bson::Uuid,
     pub token_hash: bson::Binary,
+    pub credential_hash: Option<String>,
     pub expires_at: bson::DateTime,
 }
 
@@ -497,6 +498,7 @@ impl std::fmt::Debug for TwoFactorTokenDoc {
             .field("id", &self.id)
             .field("user_id", &self.user_id)
             .field("token_hash", &"[redacted]")
+            .field("credential_hash", &"[redacted]")
             .field("expires_at", &self.expires_at)
             .finish()
     }
@@ -522,6 +524,7 @@ impl From<&TwoFactorToken> for TwoFactorTokenDoc {
                 subtype: bson::spec::BinarySubtype::Generic,
                 bytes: t.token_hash.clone(),
             },
+            credential_hash: None,
             expires_at: bson::DateTime::from_chrono(t.expires_at),
         }
     }

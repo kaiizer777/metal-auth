@@ -149,6 +149,25 @@ pub async fn delete_user(
     user_id: Uuid,
 ) -> Result<bool, AppError> {
     let user_uuid = bson::Uuid::from(user_id);
+    let user_coll = db.collection::<UserDoc>(USERS_COLLECTION);
+    let user_id_filter = doc! { "_id": user_uuid };
+
+    // Check user existence before initiating cascade deletes across child collections.
+    let user_exists = match session.as_deref_mut() {
+        Some(s) => {
+            user_coll
+                .find_one(user_id_filter.clone())
+                .session(s)
+                .await
+        }
+        None => user_coll.find_one(user_id_filter.clone()).await,
+    }
+    .map_err(AppError::from)?;
+
+    if user_exists.is_none() {
+        return Ok(false);
+    }
+
     let user_filter = doc! { "user_id": user_uuid };
 
     // 1. sessions
@@ -223,8 +242,6 @@ pub async fn delete_user(
     .map_err(AppError::from)?;
 
     // 8. delete user
-    let user_coll = db.collection::<UserDoc>(USERS_COLLECTION);
-    let user_id_filter = doc! { "_id": user_uuid };
     let del_res = match session.as_deref_mut() {
         Some(s) => user_coll.delete_one(user_id_filter).session(s).await,
         None => user_coll.delete_one(user_id_filter).await,

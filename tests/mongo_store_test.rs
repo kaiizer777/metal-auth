@@ -896,6 +896,70 @@ async fn test_mongo_outbox_stale_lease_recovery() {
 }
 
 #[tokio::test]
+async fn test_mongo_outbox_recover_stale_processing() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_outbox_recover_stale_processing: MONGO_URL not set");
+        return;
+    };
+
+    let recipient = format!("recover_stale_outbox_{}@example.com", Uuid::new_v4());
+    let payload = serde_json::json!({ "recover_test": true });
+
+    let outbox = store
+        .outbox()
+        .insert_outbox(&recipient, "password_reset", payload)
+        .await
+        .expect("insert outbox email");
+
+    // Worker A claims with 1-second lease
+    let claimed = store
+        .outbox()
+        .claim_pending_outbox(10, Duration::from_secs(1))
+        .await
+        .expect("initial claim");
+    assert!(claimed.iter().any(|item| item.id == outbox.id));
+
+    // Active lease should NOT be claimable while lease is unexpired
+    let premature_claim = store
+        .outbox()
+        .claim_pending_outbox(10, Duration::from_secs(1))
+        .await
+        .expect("premature claim check");
+    assert!(!premature_claim.iter().any(|item| item.id == outbox.id));
+
+    // Wait 1.1s for lease to expire (1.1s > 1s lease, but << 60s stale_duration)
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    // recover_stale_processing with large stale_duration (e.g. 60s).
+    // In pre-fix code, this checked next_retry_at <= now - 60s, failing to recover the expired lease.
+    // In post-fix code, next_retry_at <= now recovers it immediately to pending.
+    let recovered = store
+        .outbox()
+        .recover_stale_processing(Duration::from_secs(60))
+        .await
+        .expect("recover stale processing");
+    assert!(recovered >= 1, "expected at least 1 recovered record, got {recovered}");
+
+    // Verify record has reverted to pending and can be claimed by Worker B
+    let reclaimed = store
+        .outbox()
+        .claim_pending_outbox(10, Duration::from_secs(60))
+        .await
+        .expect("reclaim recovered record");
+    assert!(
+        reclaimed.iter().any(|item| item.id == outbox.id),
+        "recovered record must be in pending status and claimable"
+    );
+
+    // Cleanup
+    let _ = store.outbox().mark_outbox_sent(outbox.id).await;
+    let _ = store
+        .outbox()
+        .cleanup_sent_outbox(Duration::from_secs(0))
+        .await;
+}
+
+#[tokio::test]
 async fn test_mongo_oauth_lifecycle() {
     let Some(store) = get_test_mongo_store().await else {
         eprintln!("skipping test_mongo_oauth_lifecycle: MONGO_URL not set");

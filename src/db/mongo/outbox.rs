@@ -230,15 +230,13 @@ pub async fn cleanup_sent_outbox(
 pub async fn recover_stale_processing(
     db: &Database,
     mut session: Option<&mut ClientSession>,
-    stale_duration: Duration,
+    _stale_duration: Duration,
 ) -> Result<u64, AppError> {
-    let stale_chrono =
-        chrono::Duration::from_std(stale_duration).unwrap_or(chrono::Duration::minutes(5));
-    let cutoff = Utc::now() - stale_chrono;
+    let now = Utc::now();
 
     let filter = doc! {
         "status": OUTBOX_STATUS_PROCESSING,
-        "next_retry_at": { "$lte": BsonDateTime::from_chrono(cutoff) }
+        "next_retry_at": { "$lte": BsonDateTime::from_chrono(now) }
     };
     let update = doc! {
         "$set": {

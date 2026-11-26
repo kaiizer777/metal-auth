@@ -521,3 +521,45 @@ async fn test_store_oauth_round_trip() {
         .await
         .expect("delete user");
 }
+
+#[tokio::test]
+async fn test_store_totp_upsert_enabled_row_rejected() {
+    let app = setup_test_app().await.expect("test app initialization");
+    let store = app.state.store();
+    let email = format!("store_totp_{}@example.com", Uuid::new_v4());
+    let user = store
+        .users()
+        .create_user(&email, "hash")
+        .await
+        .expect("create user");
+
+    let encrypted_secret = vec![1, 2, 3, 4, 5];
+    let backup_codes = serde_json::json!(["code1", "code2"]);
+
+    let secret = store
+        .totp()
+        .upsert_secret(user.id, &encrypted_secret, backup_codes.clone())
+        .await
+        .expect("upsert secret");
+    assert!(!secret.enabled);
+
+    store
+        .totp()
+        .enable_totp(user.id)
+        .await
+        .expect("enable totp");
+
+    let already_enabled_err = store
+        .totp()
+        .upsert_secret(user.id, &encrypted_secret, backup_codes)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            already_enabled_err,
+            metal_auth::AppError::TotpAlreadyEnabled
+        ),
+        "expected TotpAlreadyEnabled, got {:?}",
+        already_enabled_err
+    );
+}

@@ -294,6 +294,52 @@ async fn test_store_tokens_lifecycle() {
 }
 
 #[tokio::test]
+async fn test_store_two_factor_token_round_trip() {
+    let app = setup_test_app().await.expect("test app initialization");
+    let store = app.state.store();
+    let email = format!("store_2fa_{}@example.com", Uuid::new_v4());
+    let user = store
+        .users()
+        .create_user(&email, "hash")
+        .await
+        .expect("create user");
+
+    // Consume of a hash that was never stored returns None, not an error.
+    let missing = store
+        .totp()
+        .consume_two_factor_token(&[7u8; 32])
+        .await
+        .expect("consume missing");
+    assert!(missing.is_none());
+
+    let token_hash = sha2::Sha256::digest(Uuid::new_v4().as_bytes()).to_vec();
+    let expires = Utc::now() + chrono::Duration::minutes(5);
+
+    let created = store
+        .totp()
+        .create_two_factor_token(user.id, &token_hash, "test-credential-hash", expires)
+        .await
+        .expect("create two-factor token");
+    assert_eq!(created.user_id, user.id);
+    assert_eq!(created.token_hash, token_hash);
+
+    let consumed = store
+        .totp()
+        .consume_two_factor_token(&token_hash)
+        .await
+        .expect("consume two-factor token")
+        .expect("token was present");
+    assert_eq!(consumed.id, created.id);
+
+    let second = store
+        .totp()
+        .consume_two_factor_token(&token_hash)
+        .await
+        .expect("second consume call");
+    assert!(second.is_none());
+}
+
+#[tokio::test]
 async fn test_store_outbox_lifecycle() {
     let app = setup_test_app().await.expect("test app initialization");
     let store = app.state.store();

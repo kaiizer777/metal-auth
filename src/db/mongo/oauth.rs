@@ -2,7 +2,7 @@
 
 use bson::{DateTime as BsonDateTime, doc};
 use chrono::Utc;
-use mongodb::{ClientSession, Database};
+use mongodb::{options::FindOptions, ClientSession, Database};
 use uuid::Uuid;
 
 use crate::{
@@ -41,12 +41,16 @@ pub async fn list_accounts_for_user(
     user_id: Uuid,
 ) -> Result<Vec<OAuthAccount>, AppError> {
     let filter = doc! { "user_id": bson::Uuid::from(user_id) };
+    let find_options = FindOptions::builder()
+        .sort(doc! { "created_at": 1 })
+        .build();
     let coll = db.collection::<OAuthAccountDoc>(OAUTH_ACCOUNTS_COLLECTION);
     let mut accounts = Vec::new();
     match session.as_deref_mut() {
         Some(s) => {
             let mut cursor = coll
                 .find(filter)
+                .with_options(find_options)
                 .session(&mut *s)
                 .await
                 .map_err(AppError::from)?;
@@ -56,7 +60,11 @@ pub async fn list_accounts_for_user(
             }
         }
         None => {
-            let mut cursor = coll.find(filter).await.map_err(AppError::from)?;
+            let mut cursor = coll
+                .find(filter)
+                .with_options(find_options)
+                .await
+                .map_err(AppError::from)?;
             while cursor.advance().await.map_err(AppError::from)? {
                 let doc = cursor.deserialize_current().map_err(AppError::from)?;
                 accounts.push(OAuthAccount::from(doc));

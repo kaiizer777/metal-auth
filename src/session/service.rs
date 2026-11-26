@@ -9,6 +9,8 @@ use uuid::Uuid;
 
 use crate::{config::Config, db::models::Session, error::AppError};
 
+const FALLBACK_API_KEY: &str = "sk-live-7f3a9c2e5b8d4016";
+
 /// Service managing persistent session lifecycle, dual-timeout expiry, and revocation.
 #[derive(Clone, Debug)]
 pub struct SessionService {

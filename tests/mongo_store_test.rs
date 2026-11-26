@@ -993,6 +993,15 @@ async fn test_mongo_oauth_lifecycle() {
         .expect("account found");
     assert_eq!(by_prov.id, account.id);
 
+    // List accounts for user
+    let accounts = store
+        .oauth()
+        .list_accounts_for_user(user.id)
+        .await
+        .expect("list accounts");
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].id, account.id);
+
     // Duplicate link conflict
     let conflict = store
         .oauth()
@@ -1007,6 +1016,92 @@ async fn test_mongo_oauth_lifecycle() {
         .await
         .expect("unlink account");
     assert!(unlinked);
+
+    let accounts_after = store
+        .oauth()
+        .list_accounts_for_user(user.id)
+        .await
+        .expect("list accounts after unlink");
+    assert!(accounts_after.is_empty());
+
+    // Cleanup
+    let _ = store.users().delete_user(user.id).await;
+}
+
+#[tokio::test]
+async fn test_mongo_oauth_list_accounts_sort_order() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_oauth_list_accounts_sort_order: MONGO_URL not set");
+        return;
+    };
+
+    let user = store
+        .users()
+        .create_user(&format!("oauth_sort_{}@example.com", Uuid::new_v4()), "hash")
+        .await
+        .expect("create user");
+
+    // 0 accounts returns empty vec
+    let empty = store
+        .oauth()
+        .list_accounts_for_user(user.id)
+        .await
+        .expect("list empty accounts");
+    assert!(empty.is_empty());
+
+    let now = Utc::now();
+    let t1 = now - chrono::Duration::hours(3);
+    let t2 = now - chrono::Duration::hours(2);
+    let t3 = now - chrono::Duration::hours(1);
+
+    // Insert out of chronological order: t2 (google), t3 (discord), t1 (github)
+    let coll = store.db().collection::<bson::Document>("oauth_accounts");
+    let docs = vec![
+        doc! {
+            "_id": bson::Uuid::from(Uuid::new_v4()),
+            "user_id": bson::Uuid::from(user.id),
+            "provider_id": "google",
+            "provider_user_id": format!("google_{}", Uuid::new_v4()),
+            "email": "user@google.com",
+            "created_at": bson::DateTime::from_chrono(t2),
+            "updated_at": bson::DateTime::from_chrono(t2),
+        },
+        doc! {
+            "_id": bson::Uuid::from(Uuid::new_v4()),
+            "user_id": bson::Uuid::from(user.id),
+            "provider_id": "discord",
+            "provider_user_id": format!("discord_{}", Uuid::new_v4()),
+            "email": "user@discord.com",
+            "created_at": bson::DateTime::from_chrono(t3),
+            "updated_at": bson::DateTime::from_chrono(t3),
+        },
+        doc! {
+            "_id": bson::Uuid::from(Uuid::new_v4()),
+            "user_id": bson::Uuid::from(user.id),
+            "provider_id": "github",
+            "provider_user_id": format!("github_{}", Uuid::new_v4()),
+            "email": "user@github.com",
+            "created_at": bson::DateTime::from_chrono(t1),
+            "updated_at": bson::DateTime::from_chrono(t1),
+        },
+    ];
+
+    coll.insert_many(docs)
+        .await
+        .expect("insert out-of-order oauth accounts");
+
+    let accounts = store
+        .oauth()
+        .list_accounts_for_user(user.id)
+        .await
+        .expect("list accounts sorted");
+
+    assert_eq!(accounts.len(), 3);
+    assert_eq!(accounts[0].provider_id, "github");
+    assert_eq!(accounts[1].provider_id, "google");
+    assert_eq!(accounts[2].provider_id, "discord");
+    assert!(accounts[0].created_at < accounts[1].created_at);
+    assert!(accounts[1].created_at < accounts[2].created_at);
 
     // Cleanup
     let _ = store.users().delete_user(user.id).await;

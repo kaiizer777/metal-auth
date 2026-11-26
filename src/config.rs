@@ -417,21 +417,30 @@ impl Config {
                 database_name: name,
                 allow_non_transactional_standalone: mongo_allow_non_transactional,
             }),
-            Err(std::env::VarError::NotPresent) => {
-                if backend == DatabaseBackend::Mongodb {
-                    Some(MongoConfig {
-                        database_name: "metal_auth".to_string(),
-                        allow_non_transactional_standalone: mongo_allow_non_transactional,
-                    })
-                } else if mongo_allow_non_transactional {
-                    Some(MongoConfig {
-                        database_name: "metal_auth".to_string(),
-                        allow_non_transactional_standalone: true,
-                    })
-                } else {
-                    None
+            Err(std::env::VarError::NotPresent) => match lookup("MONGO_DATABASE") {
+                Ok(name) => Some(MongoConfig {
+                    database_name: name,
+                    allow_non_transactional_standalone: mongo_allow_non_transactional,
+                }),
+                Err(std::env::VarError::NotPresent) => {
+                    if backend == DatabaseBackend::Mongodb {
+                        Some(MongoConfig {
+                            database_name: "metal_auth".to_string(),
+                            allow_non_transactional_standalone: mongo_allow_non_transactional,
+                        })
+                    } else if mongo_allow_non_transactional {
+                        Some(MongoConfig {
+                            database_name: "metal_auth".to_string(),
+                            allow_non_transactional_standalone: true,
+                        })
+                    } else {
+                        None
+                    }
                 }
-            }
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    return Err(ConfigError::NonUnicodeEnvVar("MONGO_DATABASE"));
+                }
+            },
             Err(std::env::VarError::NotUnicode(_)) => {
                 return Err(ConfigError::NonUnicodeEnvVar("MONGO_DATABASE_NAME"));
             }
@@ -4058,6 +4067,26 @@ mod tests {
         let mongo_cfg = cfg.mongo.unwrap();
         assert_eq!(mongo_cfg.database_name, "custom_auth");
         assert!(mongo_cfg.allow_non_transactional_standalone);
+    }
+
+    #[test]
+    #[cfg(feature = "mongodb")]
+    fn test_mongo_database_alias_fallback() {
+        let map = std::collections::HashMap::from([
+            ("BASE_URL", "http://localhost:3000"),
+            ("DATABASE_URL", "mongodb://localhost:27017/test_db"),
+            ("DATABASE_BACKEND", "mongodb"),
+            ("MONGO_DATABASE", "alias_auth"),
+        ]);
+        let cfg = Config::from_lookup(|k| {
+            map.get(k)
+                .map(|v| v.to_string())
+                .ok_or(std::env::VarError::NotPresent)
+        })
+        .unwrap();
+
+        let mongo_cfg = cfg.mongo.unwrap();
+        assert_eq!(mongo_cfg.database_name, "alias_auth");
     }
 
     #[test]

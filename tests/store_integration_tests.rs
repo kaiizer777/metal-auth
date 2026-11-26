@@ -563,3 +563,55 @@ async fn test_store_totp_upsert_enabled_row_rejected() {
         already_enabled_err
     );
 }
+
+#[tokio::test]
+async fn test_store_get_user_by_email_case_insensitive() {
+    let app = setup_test_app().await.expect("test app initialization");
+    let store = app.state.store();
+    let email = format!("store_ci_{}@example.com", Uuid::new_v4());
+    let user = store
+        .users()
+        .create_user(&email, "hash")
+        .await
+        .expect("create user");
+
+    let upper = email.to_uppercase();
+    let mixed: String = email
+        .chars()
+        .enumerate()
+        .map(|(i, c)| {
+            if i % 2 == 0 {
+                c.to_ascii_uppercase()
+            } else {
+                c
+            }
+        })
+        .collect();
+    for variant in [&upper, &mixed, &format!("  {email}  ")] {
+        let fetched = store
+            .users()
+            .get_user_by_email(variant)
+            .await
+            .expect("fetch by email variant")
+            .expect("user exists");
+        assert_eq!(fetched.id, user.id);
+    }
+
+    let mut tx = store.begin().await.expect("begin tx");
+    let in_tx = tx
+        .users()
+        .get_user_by_email(&upper)
+        .await
+        .expect("fetch by email in tx")
+        .expect("user exists");
+    assert_eq!(in_tx.id, user.id);
+    tx.rollback().await.expect("rollback tx");
+
+    let unknown = format!("unknown_{}@example.com", Uuid::new_v4());
+    let missing = store
+        .users()
+        .get_user_by_email(&unknown)
+        .await
+        .expect("fetch unknown email");
+    assert!(missing.is_none());
+}

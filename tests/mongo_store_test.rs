@@ -575,7 +575,7 @@ async fn test_mongo_tokens_lifecycle() {
         .expect("consume replayed r token");
     assert!(r_replayed.is_none());
 
-    // Expired token test
+    // Expired verification token test (pure storage contract returns token metadata without premature expiry check)
     let expired_hash = [77u8; 32];
     let past_expiry = Utc::now() - chrono::Duration::hours(1);
     store
@@ -584,11 +584,45 @@ async fn test_mongo_tokens_lifecycle() {
         .await
         .expect("create expired token");
 
-    let exp_res = store
+    let exp_token = store
         .tokens()
         .consume_verification_token(&expired_hash)
-        .await;
-    assert!(matches!(exp_res, Err(AppError::TokenExpired)));
+        .await
+        .expect("consume expired verification token")
+        .expect("token exists");
+    assert_eq!(exp_token.user_id, user.id);
+    assert!(exp_token.expires_at <= Utc::now());
+
+    let exp_replayed = store
+        .tokens()
+        .consume_verification_token(&expired_hash)
+        .await
+        .expect("consume replayed expired verification token");
+    assert!(exp_replayed.is_none());
+
+    // Expired password reset token test
+    let expired_reset_hash = [78u8; 32];
+    store
+        .tokens()
+        .create_password_reset_token(user.id, &expired_reset_hash, past_expiry)
+        .await
+        .expect("create expired reset token");
+
+    let exp_reset_token = store
+        .tokens()
+        .consume_password_reset_token(&expired_reset_hash)
+        .await
+        .expect("consume expired reset token")
+        .expect("token exists");
+    assert_eq!(exp_reset_token.user_id, user.id);
+    assert!(exp_reset_token.expires_at <= Utc::now());
+
+    let exp_reset_replayed = store
+        .tokens()
+        .consume_password_reset_token(&expired_reset_hash)
+        .await
+        .expect("consume replayed expired reset token");
+    assert!(exp_reset_replayed.is_none());
 
     // Cleanup
     let _ = store.users().delete_user(user.id).await;
@@ -1008,6 +1042,31 @@ async fn test_mongo_totp_lifecycle() {
         .await
         .expect("re-consume 2fa token");
     assert!(re_redeemed.is_none());
+
+    // Expired 2FA challenge token test
+    let exp_token_hash = [89u8; 32];
+    let past_expiry = Utc::now() - chrono::Duration::hours(1);
+    store
+        .totp()
+        .create_two_factor_token(user.id, &exp_token_hash, "cred_hash_exp", past_expiry)
+        .await
+        .expect("create expired 2fa token");
+
+    let exp_redeemed = store
+        .totp()
+        .consume_two_factor_token(&exp_token_hash)
+        .await
+        .expect("consume expired 2fa token")
+        .expect("token exists");
+    assert_eq!(exp_redeemed.user_id, user.id);
+    assert!(exp_redeemed.expires_at <= Utc::now());
+
+    let exp_re_redeemed = store
+        .totp()
+        .consume_two_factor_token(&exp_token_hash)
+        .await
+        .expect("re-consume expired 2fa token");
+    assert!(exp_re_redeemed.is_none());
 
     // Cleanup
     let _ = store.users().delete_user(user.id).await;

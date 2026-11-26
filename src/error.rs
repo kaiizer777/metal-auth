@@ -1551,4 +1551,35 @@ mod tests {
             "transactions require a mongodb replica set"
         );
     }
+
+    #[test]
+    fn test_duplicate_key_error_code_mappings() {
+        // Assert domain sentinel error mappings for unique constraint violations
+        let email_err = AppError::EmailAlreadyExists;
+        assert_eq!(email_err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(email_err.error_code(), ErrorCode::InternalError);
+
+        let oauth_err = AppError::OAuthAccountLinkConflict;
+        assert_eq!(oauth_err.status_code(), StatusCode::CONFLICT);
+        assert_eq!(oauth_err.error_code(), ErrorCode::OAuthAccountLinkConflict);
+
+        let totp_err = AppError::TotpCodeReplayed;
+        assert_eq!(totp_err.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(totp_err.error_code(), ErrorCode::TotpCodeReplayed);
+    }
+
+    #[test]
+    #[cfg(feature = "mongodb")]
+    fn test_mongo_is_duplicate_key_error_classifier() {
+        // Generic error message containing E11000
+        let dup_err1 = mongodb::error::Error::custom("E11000 duplicate key error in index: email_1");
+        assert!(crate::db::mongo::is_duplicate_key_error(&dup_err1));
+
+        let dup_err2 = mongodb::error::Error::custom("duplicate key error collection: users index: idx_email");
+        assert!(crate::db::mongo::is_duplicate_key_error(&dup_err2));
+
+        // Non-duplicate error message
+        let non_dup = mongodb::error::Error::custom("connection timed out to replica set");
+        assert!(!crate::db::mongo::is_duplicate_key_error(&non_dup));
+    }
 }

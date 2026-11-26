@@ -4041,4 +4041,133 @@ mod tests {
         assert_eq!(mongo_cfg.database_name, "custom_auth");
         assert!(mongo_cfg.allow_non_transactional_standalone);
     }
+
+    #[test]
+    fn test_config_backend_url_scheme_mismatch_matrix() {
+        // Postgres backend rejects mysql:// and mongodb://
+        let pg_with_mysql = Config {
+            database_url: "mysql://localhost:3306/db".into(),
+            backend: DatabaseBackend::Postgres,
+            ..Config::default()
+        };
+        assert!(matches!(
+            pg_with_mysql.validate(),
+            Err(ConfigError::InvalidValue { field: "database_url", reason: "URL scheme does not match configured database backend" })
+        ));
+
+        let pg_with_mongo = Config {
+            database_url: "mongodb://localhost:27017/db".into(),
+            backend: DatabaseBackend::Postgres,
+            ..Config::default()
+        };
+        assert!(matches!(
+            pg_with_mongo.validate(),
+            Err(ConfigError::InvalidValue { field: "database_url", reason: "URL scheme does not match configured database backend" })
+        ));
+
+        // Mysql backend rejects postgres:// and mongodb://
+        let mysql_with_pg = Config {
+            database_url: "postgres://localhost:5432/db".into(),
+            backend: DatabaseBackend::Mysql,
+            ..Config::default()
+        };
+        assert!(matches!(
+            mysql_with_pg.validate(),
+            Err(ConfigError::InvalidValue { field: "database_url", reason: "URL scheme does not match configured database backend" })
+        ));
+
+        let mysql_with_mongo = Config {
+            database_url: "mongodb://localhost:27017/db".into(),
+            backend: DatabaseBackend::Mysql,
+            ..Config::default()
+        };
+        assert!(matches!(
+            mysql_with_mongo.validate(),
+            Err(ConfigError::InvalidValue { field: "database_url", reason: "URL scheme does not match configured database backend" })
+        ));
+
+        // Mongodb backend rejects postgres:// and mysql://
+        let mongo_with_pg = Config {
+            database_url: "postgres://localhost:5432/db".into(),
+            backend: DatabaseBackend::Mongodb,
+            ..Config::default()
+        };
+        assert!(matches!(
+            mongo_with_pg.validate(),
+            Err(ConfigError::InvalidValue { field: "database_url", reason: "URL scheme does not match configured database backend" })
+        ));
+
+        let mongo_with_mysql = Config {
+            database_url: "mysql://localhost:3306/db".into(),
+            backend: DatabaseBackend::Mongodb,
+            ..Config::default()
+        };
+        assert!(matches!(
+            mongo_with_mysql.validate(),
+            Err(ConfigError::InvalidValue { field: "database_url", reason: "URL scheme does not match configured database backend" })
+        ));
+    }
+
+    #[test]
+    fn test_redact_url_all_schemes() {
+        assert_eq!(
+            redact_url("postgres://alice:secret123@db.example.com:5432/auth_prod"),
+            "postgres://[REDACTED]:[REDACTED]@db.example.com:5432/auth_prod"
+        );
+        assert_eq!(
+            redact_url("mysql://root:superpassword@127.0.0.1:3306/metal_auth"),
+            "mysql://[REDACTED]:[REDACTED]@127.0.0.1:3306/metal_auth"
+        );
+        assert_eq!(
+            redact_url("mongodb://admin:mongopass@localhost:27017/metal_auth?authSource=admin"),
+            "mongodb://[REDACTED]:[REDACTED]@localhost:27017/metal_auth?authSource=admin"
+        );
+        assert_eq!(
+            redact_url("mongodb+srv://atlas_user:atlas_pass@cluster0.abcde.mongodb.net/prod_db"),
+            "mongodb+srv://[REDACTED]:[REDACTED]@cluster0.abcde.mongodb.net/prod_db"
+        );
+        assert_eq!(
+            redact_url("postgres://localhost:5432/metal_auth"),
+            "postgres://localhost:5432/metal_auth"
+        );
+        assert_eq!(
+            redact_url("postgres://appuser@localhost:5432/metal_auth"),
+            "postgres://[REDACTED]@localhost:5432/metal_auth"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "mongodb")]
+    fn test_mongo_config_validation_blank_database_rejection() {
+        let cfg_blank = Config {
+            database_url: "mongodb://localhost:27017".into(),
+            backend: DatabaseBackend::Mongodb,
+            mongo: Some(MongoConfig {
+                database_name: "   ".into(),
+                allow_non_transactional_standalone: false,
+            }),
+            ..Config::default()
+        };
+        assert!(matches!(
+            cfg_blank.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "mongo.database_name",
+                reason: "must not be empty when using mongodb backend",
+            })
+        ));
+
+        let cfg_none = Config {
+            database_url: "mongodb://localhost:27017".into(),
+            backend: DatabaseBackend::Mongodb,
+            mongo: None,
+            ..Config::default()
+        };
+        assert!(matches!(
+            cfg_none.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "mongo.database_name",
+                reason: "must not be empty when using mongodb backend",
+            })
+        ));
+    }
 }

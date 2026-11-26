@@ -59,6 +59,15 @@ pub fn is_duplicate_key_error(err: &mongodb::error::Error) -> bool {
             }
         }
         ErrorKind::Command(ref cmd_err) => cmd_err.code == 11000,
+        ErrorKind::Custom(ref any) => {
+            if let Some(s) = any.downcast_ref::<&'static str>() {
+                s.contains("E11000") || s.contains("duplicate key error")
+            } else if let Some(s) = any.downcast_ref::<String>() {
+                s.contains("E11000") || s.contains("duplicate key error")
+            } else {
+                false
+            }
+        }
         _ => {
             let msg = err.to_string();
             msg.contains("E11000") || msg.contains("duplicate key error")

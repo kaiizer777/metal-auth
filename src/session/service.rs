@@ -75,7 +75,7 @@ impl SessionService {
             .bind(user_id)
             .fetch_optional(&self.db)
             .await
-            .map_err(AppError::Database)?
+            .map_err(AppError::from)?
             .ok_or(AppError::SessionInvalid)
     }
 
@@ -114,7 +114,7 @@ impl SessionService {
     ) -> Result<(Session, String), AppError> {
         let mut tx = self.db.begin().await.map_err(|e| {
             tracing::error!(error = %e, "Failed to begin transaction for create_session");
-            AppError::Database(e)
+            AppError::from(e)
         })?;
 
         let result = self
@@ -130,7 +130,7 @@ impl SessionService {
 
         tx.commit().await.map_err(|e| {
             tracing::error!(error = %e, "Failed to commit session creation transaction");
-            AppError::Database(e)
+            AppError::from(e)
         })?;
 
         tracing::info!(
@@ -184,7 +184,7 @@ impl SessionService {
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Failed to lock user row for session capacity check");
-                AppError::Database(e)
+                AppError::from(e)
             })?;
 
         // Credential freshness: reject a login whose password was superseded
@@ -198,7 +198,7 @@ impl SessionService {
                     .bind(user_id)
                     .fetch_optional(&mut *tx)
                     .await
-                    .map_err(AppError::Database)?;
+                    .map_err(AppError::from)?;
             let fresh = match current {
                 Some(ref stored) if stored.len() == expected.len() => {
                     stored.as_bytes().ct_eq(expected.as_bytes()).into()
@@ -225,7 +225,7 @@ impl SessionService {
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Failed to check active sessions for capacity limit");
-                AppError::Database(e)
+                AppError::from(e)
             })?;
 
             if active_sessions.len() >= self.config.session.max_active_sessions_per_user {
@@ -238,7 +238,7 @@ impl SessionService {
                     .await
                     .map_err(|e| {
                         tracing::error!(error = %e, "Failed to evict oldest active sessions");
-                        AppError::Database(e)
+                        AppError::from(e)
                     })?;
             }
         }
@@ -274,7 +274,7 @@ impl SessionService {
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to insert session");
-            AppError::Database(e)
+            AppError::from(e)
         })?;
 
         Ok((session, raw_id))
@@ -312,7 +312,7 @@ impl SessionService {
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Database error fetching session");
-            AppError::Database(e)
+            AppError::from(e)
         })?
         .ok_or(AppError::SessionNotFound)?;
 
@@ -345,7 +345,7 @@ impl SessionService {
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Failed to update session last_active_at");
-                AppError::Database(e)
+                AppError::from(e)
             })?;
 
         let mut session = session;
@@ -376,7 +376,7 @@ impl SessionService {
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Database error fetching session to touch");
-            AppError::Database(e)
+            AppError::from(e)
         })?
         .ok_or(AppError::SessionNotFound)?;
 
@@ -408,7 +408,7 @@ impl SessionService {
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Failed to touch session");
-                AppError::Database(e)
+                AppError::from(e)
             })?;
         Ok(())
     }
@@ -432,7 +432,7 @@ impl SessionService {
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Failed to delete session by hash");
-                AppError::Database(e)
+                AppError::from(e)
             })?;
         Ok(())
     }
@@ -441,7 +441,7 @@ impl SessionService {
     pub async fn invalidate_all_user_sessions(&self, user_id: Uuid) -> Result<(), AppError> {
         let mut tx = self.db.begin().await.map_err(|e| {
             tracing::error!(error = %e, user_id = %user_id, "Failed to begin transaction for revoke-all");
-            AppError::Database(e)
+            AppError::from(e)
         })?;
 
         // Serialize with rotate_session, which locks this row before
@@ -453,7 +453,7 @@ impl SessionService {
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, user_id = %user_id, "Failed to lock user row for revoke-all");
-                AppError::Database(e)
+                AppError::from(e)
             })?;
 
         sqlx::query("DELETE FROM sessions WHERE user_id = $1")
@@ -462,12 +462,12 @@ impl SessionService {
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, user_id = %user_id, "Failed to delete all user sessions");
-                AppError::Database(e)
+                AppError::from(e)
             })?;
 
         tx.commit().await.map_err(|e| {
             tracing::error!(error = %e, user_id = %user_id, "Failed to commit revoke-all sessions transaction");
-            AppError::Database(e)
+            AppError::from(e)
         })?;
 
         tracing::info!(
@@ -498,7 +498,7 @@ impl SessionService {
 
         let mut tx = self.db.begin().await.map_err(|e| {
             tracing::error!(error = %e, "Failed to begin transaction for rotate_session");
-            AppError::Database(e)
+            AppError::from(e)
         })?;
 
         // Serialize with reset_password's purge: the reset tx locks this row via
@@ -511,7 +511,7 @@ impl SessionService {
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Failed to lock user row for session rotation");
-                AppError::Database(e)
+                AppError::from(e)
             })?;
 
         // Atomically delete old session; must affect exactly 1 row to prevent replay/duplicate rotation
@@ -521,7 +521,7 @@ impl SessionService {
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Failed to delete old session during rotation");
-                AppError::Database(e)
+                AppError::from(e)
             })?;
 
         if delete_res.rows_affected() == 0 {
@@ -576,12 +576,12 @@ impl SessionService {
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to insert rotated session");
-            AppError::Database(e)
+            AppError::from(e)
         })?;
 
         tx.commit().await.map_err(|e| {
             tracing::error!(error = %e, "Failed to commit session rotation transaction");
-            AppError::Database(e)
+            AppError::from(e)
         })?;
 
         // Token hashes are stable session correlators — never log them.
@@ -623,7 +623,7 @@ impl SessionService {
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to list sessions for user");
-            AppError::Database(e)
+            AppError::from(e)
         })?;
 
         Ok(sessions)

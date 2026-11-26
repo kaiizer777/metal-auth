@@ -1,7 +1,10 @@
+#[cfg(feature = "postgres")]
 use std::sync::Arc;
 
+#[cfg(feature = "postgres")]
 use axum::Router;
 
+#[cfg(feature = "postgres")]
 use crate::{
     config::{AppConfig, Config},
     db,
@@ -12,18 +15,23 @@ use crate::{
 };
 
 pub mod models;
+#[cfg(feature = "postgres")]
 pub mod service;
 
+#[cfg(feature = "postgres")]
 pub use crate::handler::auth_routes;
 pub use models::*;
+#[cfg(feature = "postgres")]
 pub use service::{AuthService, AuthServiceImpl, AuthenticatedLogin};
 
 /// Main authentication facade providing the configured HTTP [`Router`].
+#[cfg(feature = "postgres")]
 #[derive(Clone)]
 pub struct Auth {
     pub router: Router,
 }
 
+#[cfg(feature = "postgres")]
 impl Auth {
     /// Initializes an `Auth` instance with the given configuration and a default `EmailDispatcher`.
     pub async fn new(cfg: Config) -> Result<Self, AppError> {
@@ -87,7 +95,7 @@ impl Auth {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "postgres"))]
 mod tests {
     use super::*;
 

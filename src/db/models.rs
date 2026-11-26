@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 use sqlx::FromRow;
 use uuid::Uuid;
 
@@ -10,7 +11,8 @@ pub use crate::auth::models::UserResponse;
 /// Intentionally does NOT derive `Serialize` to prevent `password_hash`
 /// from ever leaking across API responses. Outbound serialization must
 /// use [`UserResponse`](crate::auth::models::UserResponse).
-#[derive(Clone, FromRow, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(any(feature = "postgres", feature = "mysql"), derive(FromRow))]
 pub struct User {
     pub id: Uuid,
     pub email: String,
@@ -35,12 +37,15 @@ impl std::fmt::Debug for User {
 }
 
 /// Prefix of password-hash sentinels marking an account with no usable password.
+#[allow(dead_code)]
 pub(crate) const UNUSABLE_PASSWORD_PREFIX: &str = "$unusable$";
 
 /// Password hash stored for users provisioned through OAuth.
+#[allow(dead_code)]
 pub(crate) const OAUTH_UNUSABLE_PASSWORD_HASH: &str = "$unusable$oauth$";
 
 /// Whether `hash` marks an account that cannot authenticate with a password.
+#[allow(dead_code)]
 pub(crate) fn is_unusable_password_hash(hash: &str) -> bool {
     hash.is_empty() || hash.starts_with(UNUSABLE_PASSWORD_PREFIX)
 }
@@ -49,7 +54,8 @@ pub(crate) fn is_unusable_password_hash(hash: &str) -> bool {
 ///
 /// Intentionally does NOT derive `Serialize` to prevent `token_hash`
 /// from leaking across API responses.
-#[derive(Clone, FromRow, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(any(feature = "postgres", feature = "mysql"), derive(FromRow))]
 pub struct Session {
     pub id: Uuid,
     pub user_id: Uuid,
@@ -90,7 +96,8 @@ impl std::fmt::Debug for Session {
 ///
 /// Intentionally does NOT derive `Serialize` to prevent `token_hash`
 /// from leaking across API responses.
-#[derive(Clone, FromRow, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(any(feature = "postgres", feature = "mysql"), derive(FromRow))]
 pub struct VerificationToken {
     pub token_hash: Vec<u8>,
     pub user_id: Uuid,
@@ -114,7 +121,8 @@ impl std::fmt::Debug for VerificationToken {
 ///
 /// Intentionally does NOT derive `Serialize` to prevent `token_hash`
 /// from leaking across API responses.
-#[derive(Clone, FromRow, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(any(feature = "postgres", feature = "mysql"), derive(FromRow))]
 pub struct PasswordResetToken {
     pub token_hash: Vec<u8>,
     pub user_id: Uuid,
@@ -146,7 +154,8 @@ pub const EMAIL_TYPE_PASSWORD_RESET: &str = "password_reset";
 ///
 /// Guarantees at-least-once email delivery across application crashes
 /// and transient network failures by capturing dispatches inside the database transaction.
-#[derive(Clone, FromRow, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(any(feature = "postgres", feature = "mysql"), derive(FromRow))]
 pub struct EmailOutbox {
     pub id: Uuid,
     pub recipient: String,
@@ -179,7 +188,8 @@ impl std::fmt::Debug for EmailOutbox {
 }
 
 /// Domain model for an external federated identity linked to a user.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(any(feature = "postgres", feature = "mysql"), derive(FromRow))]
 pub struct OAuthAccount {
     pub id: Uuid,
     pub user_id: Uuid,
@@ -195,7 +205,8 @@ pub struct OAuthAccount {
 /// `encrypted_secret` is AES-256-GCM ciphertext (`nonce || ciphertext || tag`);
 /// `backup_codes` holds Argon2id PHC strings only. Intentionally does NOT derive
 /// `Serialize` so neither the ciphertext nor the hashes can reach an API response.
-#[derive(Clone, FromRow, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(any(feature = "postgres", feature = "mysql"), derive(FromRow))]
 pub struct TotpSecret {
     pub id: Uuid,
     pub user_id: Uuid,
@@ -225,7 +236,8 @@ impl std::fmt::Debug for TotpSecret {
 /// Replay-tracking row for a consumed TOTP code.
 ///
 /// `code_hash` is SHA-256 of `code_string || "::" || step`; the raw code is never stored.
-#[derive(Clone, FromRow, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(any(feature = "postgres", feature = "mysql"), derive(FromRow))]
 pub struct TotpUsedCode {
     pub id: Uuid,
     pub user_id: Uuid,
@@ -249,7 +261,8 @@ impl std::fmt::Debug for TotpUsedCode {
 ///
 /// `token_hash` is SHA-256 of the raw token. Intentionally does NOT derive `Serialize`
 /// so the hash cannot reach an API response.
-#[derive(Clone, FromRow, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(any(feature = "postgres", feature = "mysql"), derive(FromRow))]
 pub struct TwoFactorToken {
     pub id: Uuid,
     pub user_id: Uuid,

@@ -39,8 +39,12 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo check --locked --all-targets
+      - run: cargo check --locked --all-targets --no-default-features --features mysql
+      - run: cargo check --locked --all-targets --no-default-features --features mongodb
       - run: cargo check --locked --all-targets --all-features
       - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo clippy --locked --all-targets --no-default-features --features mysql -- -D warnings
+      - run: cargo clippy --locked --all-targets --no-default-features --features mongodb -- -D warnings
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
   unit-tests:
@@ -87,8 +91,20 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U postgres -d metal_auth_test"
           --health-interval 5s --health-timeout 5s --health-retries 10
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: metal_auth_test
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -uroot -proot"
+          --health-interval 5s --health-timeout 5s --health-retries 10
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/metal_auth_test
+      MYSQL_DATABASE_URL: mysql://root:root@127.0.0.1:3306/metal_auth_test
+      MONGODB_URI: mongodb://127.0.0.1:27017/metal_auth_test?replicaSet=rs0&directConnection=true
+      MONGO_DATABASE: metal_auth_test
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -99,6 +115,27 @@ jobs:
             (echo > /dev/tcp/localhost/5432) 2>/dev/null && exit 0
             sleep 2
           done
+          exit 1
+      - name: Wait for MySQL
+        run: |
+          for i in $(seq 1 30); do
+            (echo > /dev/tcp/localhost/3306) 2>/dev/null && exit 0
+            sleep 2
+          done
+          exit 1
+      - name: Start MongoDB Replica Set
+        run: |
+          docker run -d --name mongodb -p 27017:27017 mongo:6 --replSet rs0 --bind_ip_all
+          for i in $(seq 1 30); do
+            docker exec mongodb mongosh --eval "db.adminCommand({ ping: 1 })" >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec mongodb mongosh --eval 'rs.initiate({ _id: "rs0", members: [{ _id: 0, host: "127.0.0.1:27017" }] })' >/dev/null 2>&1
+          for i in $(seq 1 30); do
+            docker exec mongodb mongosh --eval "db.hello().isWritablePrimary" | grep -q true && exit 0
+            sleep 1
+          done
+          echo "MongoDB replica set primary election timed out"
           exit 1
       - run: cargo test --locked --test auth_journey_tests -- --test-threads=1
       - run: cargo test --locked --test password_reset_journey_tests -- --test-threads=1
@@ -114,6 +151,11 @@ jobs:
       - run: cargo test --locked --test totp_e2e_test -- --test-threads=1
       - run: cargo test --locked --test totp_migration_test -- --test-threads=1
       - run: cargo test --locked --test totp_security_test -- --test-threads=1
+      - run: cargo test --locked --test mysql_store_test --no-default-features --features mysql -- --test-threads=1
+      - run: cargo test --locked --test mysql_e2e_test --no-default-features --features mysql -- --test-threads=1
+      - run: cargo test --locked --test mongo_store_test --no-default-features --features mongodb -- --test-threads=1
+      - run: cargo test --locked --test mongo_e2e_test --no-default-features --features mongodb -- --test-threads=1
+      - run: cargo test --locked --test adapter_security_test --all-features -- --test-threads=1
 
   msrv:
     name: MSRV (1.94)
@@ -176,8 +218,20 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U postgres -d metal_auth_test"
           --health-interval 5s --health-timeout 5s --health-retries 10
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: metal_auth_test
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -uroot -proot"
+          --health-interval 5s --health-timeout 5s --health-retries 10
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/metal_auth_test
+      MYSQL_DATABASE_URL: mysql://root:root@127.0.0.1:3306/metal_auth_test
+      MONGODB_URI: mongodb://127.0.0.1:27017/metal_auth_test?replicaSet=rs0&directConnection=true
+      MONGO_DATABASE: metal_auth_test
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -191,6 +245,27 @@ jobs:
             (echo > /dev/tcp/localhost/5432) 2>/dev/null && exit 0
             sleep 2
           done
+          exit 1
+      - name: Wait for MySQL
+        run: |
+          for i in $(seq 1 30); do
+            (echo > /dev/tcp/localhost/3306) 2>/dev/null && exit 0
+            sleep 2
+          done
+          exit 1
+      - name: Start MongoDB Replica Set
+        run: |
+          docker run -d --name mongodb -p 27017:27017 mongo:6 --replSet rs0 --bind_ip_all
+          for i in $(seq 1 30); do
+            docker exec mongodb mongosh --eval "db.adminCommand({ ping: 1 })" >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec mongodb mongosh --eval 'rs.initiate({ _id: "rs0", members: [{ _id: 0, host: "127.0.0.1:27017" }] })' >/dev/null 2>&1
+          for i in $(seq 1 30); do
+            docker exec mongodb mongosh --eval "db.hello().isWritablePrimary" | grep -q true && exit 0
+            sleep 1
+          done
+          echo "MongoDB replica set primary election timed out"
           exit 1
       - run: cargo llvm-cov --locked --tests --all-features --lcov --output-path lcov.info --fail-under-lines 70 -- --test-threads 1
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

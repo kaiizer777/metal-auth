@@ -1,12 +1,13 @@
 use std::fmt;
 use std::sync::Arc;
+#[allow(unused_imports)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tracing::{Instrument, error, info_span, warn};
 
+use crate::email::OutboxWorkerConfig;
 use crate::email::hook::{DynError, SharedEmailSender, sanitize_sender_error};
-use crate::email::outbox::OutboxWorkerConfig;
 use crate::email::payload::{PasswordResetEmailPayload, VerificationEmailPayload};
 
 fn percent_encode_token(input: &str) -> String {
@@ -57,7 +58,9 @@ pub struct EmailDispatcher {
     sender: Option<SharedEmailSender>,
     timeout: Duration,
     base_url: Option<String>,
+    #[allow(dead_code)]
     notify: Arc<tokio::sync::Notify>,
+    #[allow(dead_code)]
     worker_started: Arc<AtomicBool>,
     outbox_config: OutboxWorkerConfig,
     /// Inline (caller-blocking) delivery — test-only, absent from default builds.
@@ -108,6 +111,7 @@ impl EmailDispatcher {
     }
 
     /// Spawns the background outbox worker loop once if not already running.
+    #[cfg(feature = "postgres")]
     pub fn ensure_worker_started(&self, pool: &sqlx::PgPool) {
         #[cfg(any(test, feature = "test-utils"))]
         if self.block_on_delivery {
@@ -137,6 +141,7 @@ impl EmailDispatcher {
     ///
     /// Under blocking test mode (`new_blocking`), delivers pending messages inline so
     /// assertions can verify delivery synchronously without polling.
+    #[cfg(feature = "postgres")]
     pub async fn on_outbox_committed(&self, _pool: &sqlx::PgPool) {
         #[cfg(any(test, feature = "test-utils"))]
         if self.block_on_delivery {
@@ -166,6 +171,7 @@ impl EmailDispatcher {
     /// Test helper in practice; unlike the detached dispatch paths this is a
     /// typed boundary — DB failures surface as [`crate::AppError`] (wire
     /// envelope) instead of raw [`sqlx::Error`].
+    #[cfg(feature = "postgres")]
     pub async fn flush_outbox(&self, pool: &sqlx::PgPool) -> Result<usize, crate::AppError> {
         Ok(crate::email::outbox::process_outbox_batch(
             pool,
@@ -492,6 +498,7 @@ mod tests {
         assert_eq!(dispatcher.base_url(), Some("https://auth.example.com"));
     }
 
+    #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn ensure_worker_started_outside_tokio_does_not_panic() {
         let dispatcher = EmailDispatcher::new(None, Duration::from_secs(1));
@@ -503,6 +510,7 @@ mod tests {
         handle.join().unwrap();
     }
 
+    #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn blocking_dispatcher_skips_worker_spawn() {
         let dispatcher = EmailDispatcher::new_blocking(None, Duration::from_secs(1));
@@ -513,6 +521,7 @@ mod tests {
 
     /// No worker to retry a blocking batch, so a lost claim must be reported instead of
     /// leaving the caller to time out on a delivery that can never happen.
+    #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn blocking_batch_claim_failure_is_reported_instead_of_discarded() {
         let sender = Arc::new(RecordingSender::default());
@@ -571,6 +580,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn on_outbox_committed_non_blocking_notifies_worker() {
         let dispatcher = EmailDispatcher::new(None, Duration::from_secs(1));
@@ -586,6 +596,7 @@ mod tests {
             .expect("notify_one must wake the notify subscriber");
     }
 
+    #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn ensure_worker_started_in_tokio_runtime_spawns_worker_once() {
         let dispatcher = EmailDispatcher::new(None, Duration::from_secs(1));

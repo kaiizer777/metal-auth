@@ -1,23 +1,61 @@
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 use std::time::Duration;
 
+#[cfg(feature = "mysql")]
+use sqlx::{MySqlPool, mysql::MySqlPoolOptions};
+#[cfg(feature = "postgres")]
 use sqlx::{PgPool, postgres::PgPoolOptions};
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 use tracing::{error, info, warn};
 
-use crate::{
-    config::Config,
-    error::{AppError, ConfigError},
-};
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+use crate::config::Config;
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+use crate::error::AppError;
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+use crate::error::ConfigError;
 
 pub mod models;
+#[cfg(feature = "postgres")]
 pub mod outbox;
+pub mod store;
 
+#[cfg(feature = "postgres")]
+pub mod postgres;
+
+#[cfg(feature = "mysql")]
+pub mod mysql;
+
+#[cfg(feature = "mongodb")]
+pub mod mongo;
+
+pub use crate::error::DbError;
+pub use store::{
+    DatabaseStore, OAuthStore, OutboxStore, SessionStore, StoreTx, TokenStore, TotpStore, UserStore,
+};
+
+#[cfg(feature = "postgres")]
+pub use postgres::PostgresStore;
+
+#[cfg(feature = "mysql")]
+pub use mysql::MySqlStore;
+
+#[cfg(feature = "mongodb")]
+pub use mongo::MongoStore;
+
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 pub const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 pub const DEFAULT_MAX_LIFETIME: Duration = Duration::from_secs(1800);
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 pub const DEFAULT_MAX_RETRIES: u32 = 2;
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 pub const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(50);
 
-/// Configuration options for PostgreSQL connection pooling and connection acquisition.
+/// Configuration options for database connection pooling and connection acquisition.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DbPoolOptions {
     pub max_connections: u32,
@@ -29,6 +67,7 @@ pub struct DbPoolOptions {
     pub initial_backoff: Duration,
 }
 
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 impl Default for DbPoolOptions {
     fn default() -> Self {
         Self {
@@ -43,6 +82,7 @@ impl Default for DbPoolOptions {
     }
 }
 
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 impl From<&Config> for DbPoolOptions {
     fn from(cfg: &Config) -> Self {
         Self {
@@ -54,6 +94,7 @@ impl From<&Config> for DbPoolOptions {
 }
 
 /// Initializes a PostgreSQL connection pool using options derived from [`Config`].
+#[cfg(feature = "postgres")]
 pub async fn init_pool(cfg: &Config) -> Result<PgPool, AppError> {
     let options = DbPoolOptions::from(cfg);
     init_pool_with_options(&cfg.database_url, options).await
@@ -61,6 +102,7 @@ pub async fn init_pool(cfg: &Config) -> Result<PgPool, AppError> {
 
 /// Initializes a PostgreSQL connection pool with explicit [`DbPoolOptions`],
 /// retrying on transient connection failures with exponential backoff and structured logging.
+#[cfg(feature = "postgres")]
 pub async fn init_pool_with_options(
     database_url: &str,
     options: DbPoolOptions,
@@ -120,9 +162,9 @@ pub async fn init_pool_with_options(
                     );
                     return Err(match e {
                         sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut | sqlx::Error::Tls(_) => {
-                            AppError::DatabaseUnavailable(e)
+                            AppError::DatabaseUnavailable(e.into())
                         }
-                        other => AppError::Database(other),
+                        other => AppError::Database(other.into()),
                     });
                 }
             }
@@ -134,7 +176,99 @@ pub async fn init_pool_with_options(
         .await
         .map_err(|e| {
             error!(op = "db_migrate", err = %e, "database migration failed");
-            AppError::Migration(e)
+            AppError::from(e)
+        })?;
+
+    Ok(pool)
+}
+
+/// Initializes a MySQL connection pool using options derived from [`Config`].
+#[cfg(feature = "mysql")]
+pub async fn init_mysql_pool(cfg: &Config) -> Result<MySqlPool, AppError> {
+    let options = DbPoolOptions::from(cfg);
+    init_mysql_pool_with_options(&cfg.database_url, options).await
+}
+
+/// Initializes a MySQL connection pool with explicit [`DbPoolOptions`],
+/// retrying on transient connection failures with exponential backoff and structured logging.
+#[cfg(feature = "mysql")]
+pub async fn init_mysql_pool_with_options(
+    database_url: &str,
+    options: DbPoolOptions,
+) -> Result<MySqlPool, AppError> {
+    if options.max_connections == 0 {
+        return Err(AppError::Config(ConfigError::InvalidValue {
+            field: "max_connections",
+            reason: "must be greater than 0",
+        }));
+    }
+
+    let pool_options = MySqlPoolOptions::new()
+        .max_connections(options.max_connections)
+        .min_connections(options.min_connections)
+        .acquire_timeout(options.acquire_timeout)
+        .idle_timeout(options.idle_timeout)
+        .max_lifetime(options.max_lifetime);
+
+    let mut attempts = 0;
+    let mut backoff = options.initial_backoff;
+    let pool = loop {
+        attempts += 1;
+        match pool_options.clone().connect(database_url).await {
+            Ok(pool) => {
+                info!(
+                    op = "db_pool_connect",
+                    backend = "mysql",
+                    max_connections = options.max_connections,
+                    min_connections = options.min_connections,
+                    attempts,
+                    "database connection pool established"
+                );
+                break pool;
+            }
+            Err(e) => {
+                let is_transient = matches!(
+                    e,
+                    sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut | sqlx::Error::Tls(_)
+                );
+                if is_transient && attempts <= options.max_retries {
+                    warn!(
+                        op = "db_pool_connect",
+                        backend = "mysql",
+                        attempt = attempts,
+                        max_retries = options.max_retries,
+                        retry_after_ms = backoff.as_millis(),
+                        err = %e,
+                        "transient database connection failure; retrying with backoff"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = backoff.saturating_mul(2).min(Duration::from_secs(5));
+                } else {
+                    error!(
+                        op = "db_pool_connect",
+                        backend = "mysql",
+                        attempt = attempts,
+                        err = %e,
+                        is_transient,
+                        "failed to connect to database"
+                    );
+                    return Err(match e {
+                        sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut | sqlx::Error::Tls(_) => {
+                            AppError::DatabaseUnavailable(e.into())
+                        }
+                        other => AppError::Database(other.into()),
+                    });
+                }
+            }
+        }
+    };
+
+    sqlx::migrate!("./migrations/mysql")
+        .run(&pool)
+        .await
+        .map_err(|e| {
+            error!(op = "db_migrate", backend = "mysql", err = %e, "database migration failed");
+            AppError::from(e)
         })?;
 
     Ok(pool)
@@ -146,10 +280,10 @@ pub async fn init_pool_with_options(
 /// it — including through a background writer it starts indirectly: a spawned outbox worker
 /// runs `recover_stale_processing` and `cleanup_sent_outbox` against the shared schema. Tests
 /// that never reach `email_outbox`, such as the session expiry tests, do not take it.
-#[cfg(test)]
+#[cfg(all(test, feature = "postgres"))]
 pub(crate) static DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "postgres", feature = "mysql")))]
 mod tests {
     use super::*;
 
@@ -169,6 +303,8 @@ mod tests {
     fn test_db_pool_options_from_config() {
         let cfg = Config {
             database_url: "postgres://localhost/test".into(),
+            backend: crate::config::DatabaseBackend::Postgres,
+            mongo: None,
             port: 3000,
             allowed_origins: vec![],
             allowed_methods: vec![],
@@ -196,6 +332,7 @@ mod tests {
         assert_eq!(opts.min_connections, 10);
     }
 
+    #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn init_pool_error_never_renders_db_password() {
         // Guard: connection failures must not echo the URL password.
@@ -216,6 +353,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn test_init_pool_with_options_zero_max_connections() {
         let options = DbPoolOptions {
@@ -223,6 +361,45 @@ mod tests {
             ..Default::default()
         };
         let err = init_pool_with_options("postgres://localhost/test", options)
+            .await
+            .unwrap_err();
+        match err {
+            AppError::Config(ConfigError::InvalidValue { field, reason }) => {
+                assert_eq!(field, "max_connections");
+                assert_eq!(reason, "must be greater than 0");
+            }
+            other => panic!("expected ConfigError::InvalidValue, got {:?}", other),
+        }
+    }
+
+    #[cfg(feature = "mysql")]
+    #[tokio::test]
+    async fn init_mysql_pool_error_never_renders_db_password() {
+        let options = DbPoolOptions {
+            max_connections: 1,
+            min_connections: 0,
+            acquire_timeout: Duration::from_secs(2),
+            max_retries: 0,
+            ..Default::default()
+        };
+        let err = init_mysql_pool_with_options("mysql://user:S3cret-pw@localhost:1/db", options)
+            .await
+            .unwrap_err();
+        let rendered = format!("{err:?}");
+        assert!(
+            !rendered.contains("S3cret-pw"),
+            "pool error leaked credentials: {rendered}"
+        );
+    }
+
+    #[cfg(feature = "mysql")]
+    #[tokio::test]
+    async fn test_init_mysql_pool_with_options_zero_max_connections() {
+        let options = DbPoolOptions {
+            max_connections: 0,
+            ..Default::default()
+        };
+        let err = init_mysql_pool_with_options("mysql://localhost/test", options)
             .await
             .unwrap_err();
         match err {

@@ -1,7 +1,10 @@
 //! Email hook dispatch — token generation, URL construction, and async hook invocation.
 
+use std::time::Duration;
+
 pub mod dispatcher;
 pub mod hook;
+#[cfg(feature = "postgres")]
 pub mod outbox;
 pub mod payload;
 
@@ -9,10 +12,63 @@ pub use dispatcher::{EmailDispatcher, build_reset_url, build_verification_url};
 pub use hook::{
     DynError, EmailSender, SharedEmailSender, sanitize_error_str, sanitize_sender_error,
 };
-pub use outbox::{
-    OutboxWorkerConfig, process_outbox_batch, run_outbox_worker, run_outbox_worker_until,
-};
+#[cfg(feature = "postgres")]
+pub use outbox::{process_outbox_batch, run_outbox_worker, run_outbox_worker_until};
 pub use payload::{PasswordResetEmailPayload, VerificationEmailPayload};
+
+/// Configuration parameters for the outbox worker polling loop and retry policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboxWorkerConfig {
+    pub poll_interval: Duration,
+    pub batch_size: u32,
+    pub max_retries: u32,
+    pub initial_backoff: Duration,
+    pub max_backoff: Duration,
+    pub lease_duration: Duration,
+    pub sent_retention: Duration,
+}
+
+impl Default for OutboxWorkerConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_millis(crate::config::DEFAULT_OUTBOX_POLL_INTERVAL_MS),
+            batch_size: crate::config::DEFAULT_OUTBOX_BATCH_SIZE,
+            max_retries: crate::config::DEFAULT_OUTBOX_MAX_RETRIES,
+            initial_backoff: Duration::from_secs(
+                crate::config::DEFAULT_OUTBOX_INITIAL_BACKOFF_SECS,
+            ),
+            max_backoff: Duration::from_secs(crate::config::DEFAULT_OUTBOX_MAX_BACKOFF_SECS),
+            lease_duration: Duration::from_secs(300),
+            sent_retention: Duration::from_secs(crate::config::DEFAULT_OUTBOX_SENT_RETENTION_SECS),
+        }
+    }
+}
+
+impl From<&crate::config::Config> for OutboxWorkerConfig {
+    fn from(cfg: &crate::config::Config) -> Self {
+        Self {
+            poll_interval: cfg.outbox_poll_interval,
+            batch_size: cfg.outbox_batch_size,
+            max_retries: cfg.outbox_max_retries,
+            initial_backoff: cfg.outbox_initial_backoff,
+            max_backoff: cfg.outbox_max_backoff,
+            lease_duration: Duration::from_secs(300),
+            sent_retention: cfg.outbox_sent_retention,
+        }
+    }
+}
+
+impl OutboxWorkerConfig {
+    pub fn with_lease_duration(mut self, lease_duration: Duration) -> Self {
+        self.lease_duration = lease_duration;
+        self
+    }
+
+    pub fn with_sent_retention(mut self, sent_retention: Duration) -> Self {
+        self.sent_retention = sent_retention;
+        self
+    }
+}
 
 /// No-op email sender — drops all payloads without sending.
 #[derive(Debug, Default, Clone, Copy)]

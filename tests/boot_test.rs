@@ -17,6 +17,8 @@ use uuid::Uuid;
 fn test_config() -> Config {
     Config {
         database_url: "postgres://user:pass@localhost:5432/metal_auth_test".into(),
+        backend: metal_auth::DatabaseBackend::Postgres,
+        mongo: None,
         port: 8080,
         allowed_origins: vec!["https://app.example.com".into()],
         allowed_methods: vec!["GET".into(), "POST".into(), "OPTIONS".into()],
@@ -274,11 +276,11 @@ fn test_facade_re_exported_error_contract() {
     assert_eq!(app_cfg_err.to_string(), "configuration error");
     assert!(app_cfg_err.source().is_some());
 
-    let app_db_err = AppError::Database(sqlx::Error::RowNotFound);
+    let app_db_err = AppError::Database(sqlx::Error::RowNotFound.into());
     assert_eq!(app_db_err.to_string(), "database error");
     assert!(app_db_err.source().is_some());
 
-    let app_db_unavail = AppError::DatabaseUnavailable(sqlx::Error::PoolTimedOut);
+    let app_db_unavail = AppError::DatabaseUnavailable(sqlx::Error::PoolTimedOut.into());
     assert_eq!(app_db_unavail.to_string(), "database unavailable");
     assert!(app_db_unavail.source().is_some());
 }
@@ -540,7 +542,7 @@ async fn test_auth_boot_rejects_sync_email_dispatch() {
 #[tokio::test]
 async fn test_auth_new_fails_fast_on_invalid_cors_before_db() {
     let cfg = Config {
-        database_url: "not-a-valid-database-url".into(),
+        database_url: "postgres://localhost/test".into(),
         allowed_origins: vec!["invalid\norigin".into()],
         ..test_config()
     };
@@ -555,12 +557,29 @@ async fn test_auth_new_fails_fast_on_invalid_cors_before_db() {
 #[tokio::test]
 async fn test_auth_new_fails_with_database_error_on_malformed_url() {
     let cfg = Config {
-        database_url: "not-a-valid-database-url".into(),
+        database_url: "postgres://localhost/test?sslmode=bogus".into(),
         ..test_config()
     };
 
     let result = Auth::new(cfg).await;
     assert!(matches!(result, Err(AppError::Database(_))));
+}
+
+#[tokio::test]
+async fn test_auth_new_fails_with_config_error_on_missing_scheme() {
+    let cfg = Config {
+        database_url: "not-a-valid-database-url".into(),
+        ..test_config()
+    };
+
+    let result = Auth::new(cfg).await;
+    assert!(matches!(
+        result,
+        Err(AppError::Config(ConfigError::InvalidValue {
+            field: "database_url",
+            ..
+        }))
+    ));
 }
 
 #[tokio::test]

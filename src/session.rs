@@ -2,6 +2,7 @@
 
 pub mod bearer;
 pub mod cookie;
+#[cfg(feature = "postgres")]
 pub mod service;
 
 pub use bearer::{has_bearer_token, read_bearer_token};
@@ -9,6 +10,7 @@ pub use cookie::{
     SessionCookieSource, clear_session_cookie, read_session_cookie, set_csrf_cookie,
     set_session_cookie,
 };
+#[cfg(feature = "postgres")]
 pub use service::SessionService;
 
 use rand_core::{OsRng, RngCore};

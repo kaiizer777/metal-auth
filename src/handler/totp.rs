@@ -478,7 +478,7 @@ async fn redeem_challenge(
         Ok(transaction) => transaction,
         Err(error) => {
             tracing::error!(error = %error, "failed to begin challenge redemption");
-            return service_error_response(AppError::Database(error));
+            return service_error_response(AppError::from(error));
         }
     };
 
@@ -543,7 +543,7 @@ async fn redeem_challenge(
 
     if let Err(error) = transaction.commit().await {
         tracing::error!(error = %error, "failed to commit challenge redemption");
-        return service_error_response(AppError::Database(error));
+        return service_error_response(AppError::from(error));
     }
 
     tracing::info!(
@@ -604,7 +604,7 @@ async fn ensure_credential_matches(
             .bind(user_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(AppError::Database)?;
+            .map_err(AppError::from)?;
     let matches = match current {
         Some(ref stored) if stored.len() == snapshot.len() => {
             stored.as_bytes().ct_eq(snapshot.as_bytes()).into()

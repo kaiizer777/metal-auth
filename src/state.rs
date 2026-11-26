@@ -5,6 +5,7 @@ use sqlx::PgPool;
 use crate::{
     auth::service::AuthServiceImpl,
     config::{AppConfig, Config},
+    db::DatabaseStore,
     email::{dispatcher::EmailDispatcher, hook::SharedEmailSender},
     error::AppError,
     oauth::OAuthService,
@@ -33,6 +34,7 @@ pub fn default_email_dispatcher(config: &Config) -> Arc<EmailDispatcher> {
 #[derive(Clone, Debug)]
 pub struct AppState {
     pub pool: PgPool,
+    pub store: Arc<dyn DatabaseStore>,
     pub config: Config,
     pub auth_config: Arc<AppConfig>,
     pub auth_service: Arc<AuthServiceImpl>,
@@ -46,7 +48,15 @@ pub struct AppState {
 impl AppState {
     pub fn new(pool: PgPool, config: Config) -> Result<Self, AppError> {
         let auth_config = Arc::new(AppConfig::from_env()?);
-        Self::with_configs_and_dispatcher(pool, config, auth_config, None)
+        let store: Arc<dyn DatabaseStore> =
+            Arc::new(crate::db::postgres::PostgresStore::new(pool.clone()));
+        Self::with_configs_dispatcher_and_store(pool, config, auth_config, None, store)
+    }
+
+    pub fn new_with_store(store: Arc<dyn DatabaseStore>, config: Config) -> Result<Self, AppError> {
+        let auth_config = Arc::new(AppConfig::from_env()?);
+        let pool = PgPool::connect_lazy(&config.database_url).map_err(AppError::from)?;
+        Self::with_configs_dispatcher_and_store(pool, config, auth_config, None, store)
     }
 
     pub fn with_auth_config(mut self, auth_config: Arc<AppConfig>) -> Result<Self, AppError> {
@@ -88,6 +98,18 @@ impl AppState {
         config: Config,
         auth_config: Arc<AppConfig>,
         email_dispatcher: Option<Arc<EmailDispatcher>>,
+    ) -> Result<Self, AppError> {
+        let store: Arc<dyn DatabaseStore> =
+            Arc::new(crate::db::postgres::PostgresStore::new(pool.clone()));
+        Self::with_configs_dispatcher_and_store(pool, config, auth_config, email_dispatcher, store)
+    }
+
+    pub fn with_configs_dispatcher_and_store(
+        pool: PgPool,
+        config: Config,
+        auth_config: Arc<AppConfig>,
+        email_dispatcher: Option<Arc<EmailDispatcher>>,
+        store: Arc<dyn DatabaseStore>,
     ) -> Result<Self, AppError> {
         // Single construction choke point for every `AppState` constructor: a router can
         // never be built from a config the dispatcher mode or CORS rules reject.
@@ -136,6 +158,7 @@ impl AppState {
 
         Ok(Self {
             pool,
+            store,
             config,
             auth_config,
             auth_service,
@@ -159,6 +182,10 @@ impl AppState {
     pub fn db(&self) -> &PgPool {
         &self.pool
     }
+
+    pub fn store(&self) -> &Arc<dyn DatabaseStore> {
+        &self.store
+    }
 }
 
 #[cfg(test)]
@@ -169,6 +196,8 @@ mod tests {
     fn valid_config() -> Config {
         Config {
             database_url: "postgres://localhost/test".into(),
+            backend: crate::config::DatabaseBackend::Postgres,
+            mongo: None,
             port: 3000,
             allowed_origins: vec![],
             allowed_methods: vec!["GET".into()],

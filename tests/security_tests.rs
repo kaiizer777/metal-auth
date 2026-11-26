@@ -25,6 +25,8 @@ fn create_test_router() -> axum::Router {
         .unwrap_or_else(|_| "postgres://user:pass@localhost:5432/metal_auth_test".to_string());
     let cfg = Config {
         database_url: db_url,
+        backend: metal_auth::DatabaseBackend::Postgres,
+        mongo: None,
         port: 8080,
         allowed_origins: vec!["https://app.example.com".into()],
         allowed_methods: vec!["GET".into(), "POST".into(), "OPTIONS".into()],
@@ -62,6 +64,8 @@ fn create_test_router() -> axum::Router {
 fn create_failing_db_router() -> axum::Router {
     let cfg = Config {
         database_url: "postgres://invalid:invalid@127.0.0.1:1/nonexistent".into(),
+        backend: metal_auth::DatabaseBackend::Postgres,
+        mongo: None,
         port: 8080,
         allowed_origins: vec!["https://app.example.com".into()],
         allowed_methods: vec!["GET".into(), "POST".into(), "OPTIONS".into()],
@@ -124,6 +128,8 @@ async fn setup_live_db() -> Option<LiveDbTestContext> {
     .expect("DATABASE_URL is set, so the DB-backed test must connect");
     let cfg = Config {
         database_url: url.clone(),
+        backend: metal_auth::DatabaseBackend::Postgres,
+        mongo: None,
         port: 8080,
         allowed_origins: vec!["https://app.example.com".into()],
         allowed_methods: vec!["GET".into(), "POST".into(), "OPTIONS".into()],

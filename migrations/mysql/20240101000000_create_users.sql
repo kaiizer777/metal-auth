@@ -1,0 +1,9 @@
+CREATE TABLE IF NOT EXISTS users (
+    id              BINARY(16) NOT NULL PRIMARY KEY,
+    email           VARCHAR(255) NOT NULL,
+    password_hash   TEXT NOT NULL,
+    email_verified  BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    CONSTRAINT uq_users_email UNIQUE (email)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;

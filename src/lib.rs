@@ -31,28 +31,47 @@ pub mod crypto;
 pub mod db;
 pub mod email;
 pub mod error;
+#[cfg(feature = "postgres")]
 pub mod handler;
 pub mod middleware;
+#[cfg(feature = "postgres")]
 pub mod oauth;
 pub mod ratelimit;
 pub mod session;
+#[cfg(feature = "postgres")]
 pub mod state;
 pub mod totp;
 
-pub use auth::{Auth, AuthService, AuthServiceImpl, AuthenticatedLogin, UserResponse};
+pub use auth::UserResponse;
+#[cfg(feature = "postgres")]
+pub use auth::{Auth, AuthService, AuthServiceImpl, AuthenticatedLogin};
 pub use config::{
-    AppConfig, Config, OAuthConfig, ProviderConfig, RateLimitConfig, SessionConfig, TotpConfig,
+    AppConfig, Config, DatabaseBackend, MongoConfig, OAuthConfig, ProviderConfig, RateLimitConfig,
+    SessionConfig, TotpConfig, redact_url,
 };
+#[cfg(feature = "mongodb")]
+pub use db::MongoStore;
+#[cfg(feature = "mysql")]
+pub use db::MySqlStore;
+#[cfg(feature = "postgres")]
+pub use db::PostgresStore;
 pub use db::models::{
     EmailOutbox, OAuthAccount, PasswordResetToken, Session, User, VerificationToken,
 };
-pub use email::{
-    DynError, EmailDispatcher, EmailSender, NoopEmailSender, PasswordResetEmailPayload,
-    SharedEmailSender, VerificationEmailPayload,
+pub use db::store::{
+    DatabaseStore, OAuthStore, OutboxStore, SessionStore, StoreTx, TokenStore, TotpStore, UserStore,
 };
-pub use error::{AppError, AppResult, ConfigError, ErrorCode, ErrorResponse};
+pub use email::{
+    DynError, EmailDispatcher, EmailSender, NoopEmailSender, OutboxWorkerConfig,
+    PasswordResetEmailPayload, SharedEmailSender, VerificationEmailPayload,
+};
+pub use error::{AppError, AppResult, ConfigError, DbError, ErrorCode, ErrorResponse};
+#[cfg(feature = "postgres")]
 pub use handler::{auth_routes, oauth_routes, session_routes, totp_routes};
-pub use middleware::{AuthUser, csrf_middleware, require_auth, security_headers_middleware};
+pub use middleware::security_headers_middleware;
+#[cfg(feature = "postgres")]
+pub use middleware::{AuthUser, csrf_middleware, require_auth};
+#[cfg(feature = "postgres")]
 pub use oauth::{
     AppleProvider, GitHubProvider, GoogleProvider, OAUTH_BODY_LIMIT, OAuthCallbackOutcome,
     OAuthCallbackResult, OAuthProvider, OAuthService, OAuthStateManager, OAuthStatePayload,
@@ -65,11 +84,15 @@ pub use oauth::{
     validate_state, verify_pkce,
 };
 pub use ratelimit::{RateLimiter, rate_limit_key};
+#[cfg(feature = "postgres")]
+pub use session::SessionService;
 pub use session::{
-    SessionCookieSource, SessionService, clear_session_cookie, has_bearer_token, read_bearer_token,
+    SessionCookieSource, clear_session_cookie, has_bearer_token, read_bearer_token,
     read_session_cookie, set_csrf_cookie, set_session_cookie,
 };
+#[cfg(feature = "postgres")]
 pub use state::AppState;
+#[cfg(feature = "postgres")]
 pub use totp::service::{EnrollTotpResponse, FreshAuthProof, TotpService};
 
 #[cfg(any(test, feature = "test-utils"))]

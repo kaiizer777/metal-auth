@@ -318,6 +318,8 @@ mod tests {
     fn test_config() -> Config {
         Config {
             database_url: "postgres://localhost/test".into(),
+            backend: crate::config::DatabaseBackend::Postgres,
+            mongo: None,
             port: 3000,
             allowed_origins: vec!["https://app.example.com".into()],
             allowed_methods: vec!["GET".into(), "POST".into()],

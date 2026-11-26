@@ -342,6 +342,8 @@ async fn timeout_does_not_panic() {
 fn test_config() -> Config {
     Config {
         database_url: "postgres://localhost/test".into(),
+        backend: metal_auth::DatabaseBackend::Postgres,
+        mongo: None,
         port: 3000,
         allowed_origins: vec![],
         allowed_methods: vec!["GET".into()],

@@ -502,7 +502,7 @@ impl OAuthService {
         clear_cookie_header: String,
     ) -> Result<OAuthCallbackOutcome, AppError> {
         let provider_id = ctx.provider_id;
-        let mut tx = self.db.begin().await.map_err(AppError::Database)?;
+        let mut tx = self.db.begin().await.map_err(AppError::from)?;
 
         // The initiating session must still be live. A logout, revoke-all, or
         // account deletion in flight blocks the link; the row lock serializes
@@ -556,7 +556,7 @@ impl OAuthService {
             }
         };
 
-        tx.commit().await.map_err(AppError::Database)?;
+        tx.commit().await.map_err(AppError::from)?;
 
         Ok(OAuthCallbackOutcome::Linked {
             user,
@@ -610,7 +610,7 @@ impl OAuthService {
         // instead of slipping between the decision and the insert. This is the same shape
         // as `handler::auth::issue_session_after_gate`. Fail closed — a gate read error
         // aborts the login.
-        let mut transaction = self.db.begin().await.map_err(AppError::Database)?;
+        let mut transaction = self.db.begin().await.map_err(AppError::from)?;
         let enabled = match self
             .totp_service
             .is_totp_enabled_locked(&mut transaction, user.id)
@@ -674,7 +674,7 @@ impl OAuthService {
                 return Err(error);
             }
         };
-        transaction.commit().await.map_err(AppError::Database)?;
+        transaction.commit().await.map_err(AppError::from)?;
 
         // `create_session_in` leaves logging to its caller; keep the standalone path's
         // `session_created` event on this one.
@@ -748,7 +748,7 @@ impl OAuthService {
         email: &str,
         provider_user_id: &str,
     ) -> Result<LinkResult, AppError> {
-        let mut tx = self.db.begin().await.map_err(AppError::Database)?;
+        let mut tx = self.db.begin().await.map_err(AppError::from)?;
 
         let write =
             match Self::link_identity_in_tx(&mut tx, user_id, provider_id, email, provider_user_id)
@@ -763,7 +763,7 @@ impl OAuthService {
 
         match write {
             LinkWrite::Created { user, account } => {
-                tx.commit().await.map_err(AppError::Database)?;
+                tx.commit().await.map_err(AppError::from)?;
 
                 tracing::info!(
                     event = "oauth_account_linked",
@@ -885,7 +885,7 @@ impl OAuthService {
                 }
                 Ok(winner)
             }
-            Err(e) => Err(AppError::Database(e)),
+            Err(e) => Err(AppError::from(e)),
         }
     }
 
@@ -918,7 +918,7 @@ impl OAuthService {
         email: &str,
         provider_user_id: &str,
     ) -> Result<LinkResult, AppError> {
-        let mut tx = self.db.begin().await.map_err(AppError::Database)?;
+        let mut tx = self.db.begin().await.map_err(AppError::from)?;
         let now = Utc::now();
         let user_id = Uuid::new_v4();
         let user = User {
@@ -938,7 +938,7 @@ impl OAuthService {
                     .attach_link_to_raced_user(provider_id, email, provider_user_id)
                     .await;
             }
-            return Err(AppError::Database(e));
+            return Err(AppError::from(e));
         }
 
         if let Err(e) = insert_oauth_account(&mut *tx, &account).await {
@@ -946,10 +946,10 @@ impl OAuthService {
             if is_unique_violation(&e) {
                 return self.relink_winner(provider_id, provider_user_id).await;
             }
-            return Err(AppError::Database(e));
+            return Err(AppError::from(e));
         }
 
-        tx.commit().await.map_err(AppError::Database)?;
+        tx.commit().await.map_err(AppError::from)?;
 
         Ok(LinkResult {
             user,
@@ -1035,7 +1035,7 @@ impl OAuthService {
         match insert_oauth_account(&mut **tx, &account).await {
             Ok(()) => Ok(LinkWrite::Created { user, account }),
             Err(e) if is_unique_violation(&e) => Ok(LinkWrite::UniqueRace),
-            Err(e) => Err(AppError::Database(e)),
+            Err(e) => Err(AppError::from(e)),
         }
     }
 
@@ -1091,7 +1091,7 @@ impl OAuthService {
 
     /// Unlinks an external provider, preventing account lockout if no usable password remains.
     pub async fn unlink_account(&self, user_id: Uuid, provider_id: &str) -> Result<(), AppError> {
-        let mut tx = self.db.begin().await.map_err(AppError::Database)?;
+        let mut tx = self.db.begin().await.map_err(AppError::from)?;
 
         // Purge pending challenges before the users lock: their snapshot is the live
         // `password_hash`, which unlink never changes, so a challenge minted through
@@ -1102,14 +1102,14 @@ impl OAuthService {
             .bind(user_id)
             .execute(&mut *tx)
             .await
-            .map_err(AppError::Database)?;
+            .map_err(AppError::from)?;
 
         // Acquire exclusive row lock on user record to serialize concurrent unlinking.
         let user = sqlx::query_as::<_, (String,)>(SELECT_USER_PASSWORD_HASH_FOR_NO_KEY_UPDATE)
             .bind(user_id)
             .fetch_optional(&mut *tx)
             .await
-            .map_err(AppError::Database)?
+            .map_err(AppError::from)?
             .ok_or(AppError::NotFound)?;
 
         let target_link: Option<(Uuid,)> = sqlx::query_as(SELECT_LINK_ID_BY_USER_PROVIDER)
@@ -1117,7 +1117,7 @@ impl OAuthService {
             .bind(provider_id)
             .fetch_optional(&mut *tx)
             .await
-            .map_err(AppError::Database)?;
+            .map_err(AppError::from)?;
 
         if target_link.is_none() {
             return Err(AppError::NotFound);
@@ -1138,9 +1138,9 @@ impl OAuthService {
             .bind(provider_id)
             .execute(&mut *tx)
             .await
-            .map_err(AppError::Database)?;
+            .map_err(AppError::from)?;
 
-        tx.commit().await.map_err(AppError::Database)?;
+        tx.commit().await.map_err(AppError::from)?;
 
         tracing::info!(
             event = "oauth_account_unlinked",
@@ -1164,7 +1164,7 @@ impl OAuthService {
             .bind(user_id)
             .fetch_all(&mut **tx)
             .await
-            .map_err(AppError::Database)?;
+            .map_err(AppError::from)?;
 
         let has_usable_password = !is_unusable_password_hash(password_hash);
         let remaining_enabled_oauth_accounts = linked_accounts
@@ -1181,7 +1181,7 @@ impl OAuthService {
             .bind(user_id)
             .fetch_all(&self.db)
             .await
-            .map_err(AppError::Database)?;
+            .map_err(AppError::from)?;
 
         Ok(accounts)
     }
@@ -1202,7 +1202,7 @@ impl OAuthService {
             .bind(user_id)
             .fetch_optional(&mut **tx)
             .await
-            .map_err(AppError::Database)?;
+            .map_err(AppError::from)?;
 
         let Some(session) = row else {
             return Ok(false);
@@ -1223,7 +1223,7 @@ where
         .bind(user_id)
         .fetch_optional(executor)
         .await
-        .map_err(AppError::Database)
+        .map_err(AppError::from)
 }
 
 async fn fetch_user_by_email<'c, E>(executor: E, email: &str) -> Result<Option<User>, AppError>
@@ -1234,7 +1234,7 @@ where
         .bind(email)
         .fetch_optional(executor)
         .await
-        .map_err(AppError::Database)
+        .map_err(AppError::from)
 }
 
 async fn fetch_link_by_provider_uid<'c, E>(
@@ -1250,7 +1250,7 @@ where
         .bind(provider_user_id)
         .fetch_optional(executor)
         .await
-        .map_err(AppError::Database)
+        .map_err(AppError::from)
 }
 
 async fn insert_user<'c, E>(executor: E, user: &User) -> Result<(), sqlx::Error>

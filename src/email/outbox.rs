@@ -2,70 +2,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
+#[cfg(feature = "postgres")]
 use sqlx::PgPool;
 use tracing::{error, info, warn};
 
-use crate::config::Config;
 use crate::db::models::{EMAIL_TYPE_PASSWORD_RESET, EMAIL_TYPE_VERIFICATION, EmailOutbox};
+#[cfg(feature = "postgres")]
 use crate::db::outbox::{
     claim_pending_outbox, mark_outbox_failed, mark_outbox_sent, record_outbox_retry,
 };
+pub use crate::email::OutboxWorkerConfig;
 use crate::email::hook::{SharedEmailSender, sanitize_error_str, sanitize_sender_error};
 use crate::email::payload::{PasswordResetEmailPayload, VerificationEmailPayload};
-
-/// Configuration parameters for the outbox worker polling loop and retry policy.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutboxWorkerConfig {
-    pub poll_interval: Duration,
-    pub batch_size: u32,
-    pub max_retries: u32,
-    pub initial_backoff: Duration,
-    pub max_backoff: Duration,
-    pub lease_duration: Duration,
-    pub sent_retention: Duration,
-}
-
-impl Default for OutboxWorkerConfig {
-    fn default() -> Self {
-        Self {
-            poll_interval: Duration::from_millis(crate::config::DEFAULT_OUTBOX_POLL_INTERVAL_MS),
-            batch_size: crate::config::DEFAULT_OUTBOX_BATCH_SIZE,
-            max_retries: crate::config::DEFAULT_OUTBOX_MAX_RETRIES,
-            initial_backoff: Duration::from_secs(
-                crate::config::DEFAULT_OUTBOX_INITIAL_BACKOFF_SECS,
-            ),
-            max_backoff: Duration::from_secs(crate::config::DEFAULT_OUTBOX_MAX_BACKOFF_SECS),
-            lease_duration: Duration::from_secs(300),
-            sent_retention: Duration::from_secs(crate::config::DEFAULT_OUTBOX_SENT_RETENTION_SECS),
-        }
-    }
-}
-
-impl From<&Config> for OutboxWorkerConfig {
-    fn from(cfg: &Config) -> Self {
-        Self {
-            poll_interval: cfg.outbox_poll_interval,
-            batch_size: cfg.outbox_batch_size,
-            max_retries: cfg.outbox_max_retries,
-            initial_backoff: cfg.outbox_initial_backoff,
-            max_backoff: cfg.outbox_max_backoff,
-            lease_duration: Duration::from_secs(300),
-            sent_retention: cfg.outbox_sent_retention,
-        }
-    }
-}
-
-impl OutboxWorkerConfig {
-    pub fn with_lease_duration(mut self, lease_duration: Duration) -> Self {
-        self.lease_duration = lease_duration;
-        self
-    }
-
-    pub fn with_sent_retention(mut self, sent_retention: Duration) -> Self {
-        self.sent_retention = sent_retention;
-        self
-    }
-}
 
 /// Computes exponential backoff: `initial_backoff * 2^retry_count`, clamped at `max_backoff`.
 pub fn calculate_backoff(
@@ -80,6 +28,7 @@ pub fn calculate_backoff(
 }
 
 /// Atomically claims and processes a batch of pending outbox messages.
+#[cfg(feature = "postgres")]
 pub async fn process_outbox_batch(
     pool: &PgPool,
     sender: &Option<SharedEmailSender>,
@@ -193,6 +142,7 @@ async fn mark_failed(pool: &PgPool, id: uuid::Uuid, err_msg: &str) {
     }
 }
 
+#[cfg(feature = "postgres")]
 async fn handle_delivery_failure(
     pool: &PgPool,
     id: uuid::Uuid,
@@ -252,6 +202,7 @@ async fn handle_delivery_failure(
     }
 }
 
+#[cfg(feature = "postgres")]
 async fn drain_outbox_batches(
     pool: &PgPool,
     sender: &Option<SharedEmailSender>,
@@ -283,6 +234,7 @@ async fn drain_outbox_batches(
 ///
 /// Prefer [`run_outbox_worker_until`] when the host supports graceful
 /// shutdown; this wrapper never signals shutdown so the loop is infinite.
+#[cfg(feature = "postgres")]
 pub async fn run_outbox_worker(
     pool: PgPool,
     sender: Option<SharedEmailSender>,
@@ -297,6 +249,7 @@ pub async fn run_outbox_worker(
 /// Same as [`run_outbox_worker`], but each loop iteration also watches
 /// `shutdown`: sending any value (or dropping the sender) breaks the loop
 /// after the in-flight drain completes, so no claimed message is abandoned.
+#[cfg(feature = "postgres")]
 pub async fn run_outbox_worker_until(
     pool: PgPool,
     sender: Option<SharedEmailSender>,

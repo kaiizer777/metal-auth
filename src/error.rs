@@ -85,6 +85,11 @@ pub enum ErrorCode {
     TwoFactorUnavailable,
     #[serde(rename = "TOTP_RATE_LIMIT_EXCEEDED")]
     TotpRateLimitExceeded,
+    // Multi-database abstraction sentinels
+    #[serde(rename = "UNSUPPORTED_DATABASE_BACKEND")]
+    UnsupportedDatabaseBackend,
+    #[serde(rename = "TRANSACTION_NOT_SUPPORTED")]
+    TransactionNotSupported,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +140,76 @@ pub enum ConfigError {
     },
 }
 
+/// Opaque backend-agnostic database error wrapping driver-specific errors.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct DbError {
+    pub message: String,
+    #[source]
+    pub source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl DbError {
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_source(
+        message: impl Into<String>,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            source: Some(source.into()),
+        }
+    }
+}
+
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+impl From<sqlx::Error> for DbError {
+    fn from(err: sqlx::Error) -> Self {
+        Self {
+            message: err.to_string(),
+            source: Some(Box::new(err)),
+        }
+    }
+}
+
+#[cfg(feature = "mongodb")]
+impl From<mongodb::error::Error> for DbError {
+    fn from(err: mongodb::error::Error) -> Self {
+        Self {
+            message: err.to_string(),
+            source: Some(Box::new(err)),
+        }
+    }
+}
+
+#[cfg(feature = "mongodb")]
+impl From<bson::ser::Error> for DbError {
+    fn from(err: bson::ser::Error) -> Self {
+        Self {
+            message: err.to_string(),
+            source: Some(Box::new(err)),
+        }
+    }
+}
+
+#[cfg(feature = "mongodb")]
+impl From<bson::de::Error> for DbError {
+    fn from(err: bson::de::Error) -> Self {
+        Self {
+            message: err.to_string(),
+            source: Some(Box::new(err)),
+        }
+    }
+}
+
 /// Non-exhaustive: each phase adds variants, and embedders match on this type in their own
 /// error mapping. Match with a wildcard.
 #[non_exhaustive]
@@ -144,13 +219,19 @@ pub enum AppError {
     Config(#[from] ConfigError),
 
     #[error("database error")]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbError),
 
     #[error("database unavailable")]
-    DatabaseUnavailable(#[source] sqlx::Error),
+    DatabaseUnavailable(#[source] DbError),
 
     #[error("migration error")]
-    Migration(#[from] sqlx::migrate::MigrateError),
+    Migration(#[source] DbError),
+
+    #[error("unsupported database backend: {0}")]
+    UnsupportedDatabaseBackend(String),
+
+    #[error("transactions require a mongodb replica set")]
+    TransactionNotSupported,
 
     #[error("not found")]
     NotFound,
@@ -348,6 +429,8 @@ impl AppError {
             Self::TwoFactorTokenExpired => ErrorCode::TwoFactorTokenExpired,
             Self::TwoFactorUnavailable => ErrorCode::TwoFactorUnavailable,
             Self::TotpRateLimitExceeded => ErrorCode::TotpRateLimitExceeded,
+            Self::UnsupportedDatabaseBackend(_) => ErrorCode::UnsupportedDatabaseBackend,
+            Self::TransactionNotSupported => ErrorCode::TransactionNotSupported,
             // Shares the login wire code, keeps its own 400 mapping.
             Self::TotpEmailNotVerified => ErrorCode::EmailNotVerified,
         }
@@ -399,8 +482,11 @@ impl AppError {
             Self::TwoFactorUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             // 409 — already enrolled
             Self::TotpAlreadyEnabled => StatusCode::CONFLICT,
+            // 501
+            Self::TransactionNotSupported => StatusCode::NOT_IMPLEMENTED,
             // 400
-            Self::PasswordTooShort
+            Self::UnsupportedDatabaseBackend(_)
+            | Self::PasswordTooShort
             | Self::PasswordTooLong
             | Self::PasswordTooCommon
             | Self::InvalidEmail
@@ -477,6 +563,14 @@ impl AppError {
             Self::TwoFactorTokenExpired => "two factor token has expired",
             Self::TwoFactorUnavailable => "two factor authentication is temporarily unavailable",
             Self::TotpRateLimitExceeded => "totp rate limit exceeded",
+            Self::UnsupportedDatabaseBackend(msg) => {
+                if msg.is_empty() {
+                    "Unsupported database backend"
+                } else {
+                    msg.as_str()
+                }
+            }
+            Self::TransactionNotSupported => "transactions require a mongodb replica set",
             // Same wire code and message as the login gate.
             Self::TotpEmailNotVerified => "Email address has not been verified",
         }
@@ -495,11 +589,15 @@ impl AppError {
                 field: "unknown",
                 reason: "invalid configuration",
             }),
-            ErrorCode::DatabaseError => Self::Database(sqlx::Error::RowNotFound),
-            ErrorCode::DatabaseUnavailable => Self::DatabaseUnavailable(sqlx::Error::PoolClosed),
-            ErrorCode::MigrationFailed => {
-                Self::Migration(sqlx::migrate::MigrateError::VersionMissing(1))
+            ErrorCode::DatabaseError => Self::Database(DbError::new("Database error")),
+            ErrorCode::DatabaseUnavailable => {
+                Self::DatabaseUnavailable(DbError::new("Database unavailable"))
             }
+            ErrorCode::MigrationFailed => Self::Migration(DbError::new("Migration failed")),
+            ErrorCode::UnsupportedDatabaseBackend => {
+                Self::UnsupportedDatabaseBackend("unsupported database backend".into())
+            }
+            ErrorCode::TransactionNotSupported => Self::TransactionNotSupported,
             ErrorCode::NotFound => Self::NotFound,
             ErrorCode::MethodNotAllowed => Self::MethodNotAllowed,
             ErrorCode::InternalError => Self::Internal,
@@ -620,6 +718,12 @@ impl IntoResponse for AppError {
             Self::TotpEmailNotVerified => {
                 tracing::debug!("totp enrollment blocked: email not verified")
             }
+            Self::UnsupportedDatabaseBackend(backend) => {
+                tracing::warn!(backend = %backend, "unsupported database backend")
+            }
+            Self::TransactionNotSupported => {
+                tracing::error!("transactions not supported on this database deployment")
+            }
         }
 
         let status = self.status_code();
@@ -649,6 +753,30 @@ impl From<&AppError> for ErrorResponse {
             code: err.error_code(),
             message: err.response_message().to_string(),
         }
+    }
+}
+
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+impl From<sqlx::Error> for AppError {
+    fn from(err: sqlx::Error) -> Self {
+        Self::Database(DbError::from(err))
+    }
+}
+
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+impl From<sqlx::migrate::MigrateError> for AppError {
+    fn from(err: sqlx::migrate::MigrateError) -> Self {
+        Self::Migration(DbError {
+            message: err.to_string(),
+            source: Some(Box::new(err)),
+        })
+    }
+}
+
+#[cfg(feature = "mongodb")]
+impl From<mongodb::error::Error> for AppError {
+    fn from(err: mongodb::error::Error) -> Self {
+        Self::Database(DbError::from(err))
     }
 }
 
@@ -730,6 +858,14 @@ mod tests {
                 ErrorCode::TotpRateLimitExceeded,
                 "\"TOTP_RATE_LIMIT_EXCEEDED\"",
             ),
+            (
+                ErrorCode::UnsupportedDatabaseBackend,
+                "\"UNSUPPORTED_DATABASE_BACKEND\"",
+            ),
+            (
+                ErrorCode::TransactionNotSupported,
+                "\"TRANSACTION_NOT_SUPPORTED\"",
+            ),
         ];
 
         for (code, expected_json) in cases {
@@ -772,7 +908,7 @@ mod tests {
                 "Method not allowed",
             ),
             (
-                AppError::DatabaseUnavailable(sqlx::Error::PoolTimedOut),
+                AppError::DatabaseUnavailable(DbError::new("Database unavailable")),
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorCode::DatabaseUnavailable,
                 "Database unavailable",
@@ -784,10 +920,22 @@ mod tests {
                 "Internal error",
             ),
             (
-                AppError::Database(sqlx::Error::RowNotFound),
+                AppError::Database(DbError::new("Database error")),
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorCode::DatabaseError,
                 "Database error",
+            ),
+            (
+                AppError::UnsupportedDatabaseBackend("cockroachdb".to_string()),
+                StatusCode::BAD_REQUEST,
+                ErrorCode::UnsupportedDatabaseBackend,
+                "cockroachdb",
+            ),
+            (
+                AppError::TransactionNotSupported,
+                StatusCode::NOT_IMPLEMENTED,
+                ErrorCode::TransactionNotSupported,
+                "transactions require a mongodb replica set",
             ),
             (
                 AppError::Config(ConfigError::MissingEnvVar("DATABASE_URL")),
@@ -896,7 +1044,7 @@ mod tests {
                 "Token has expired",
             ),
             (
-                AppError::Migration(sqlx::migrate::MigrateError::VersionMissing(1)),
+                AppError::Migration(DbError::new("Migration failed")),
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorCode::MigrationFailed,
                 "Migration failed",
@@ -1351,5 +1499,89 @@ mod tests {
         assert_eq!(truncated.chars().count(), MAX_LOG_FIELD_CHARS);
         let ascii = "x".repeat(1000);
         assert_eq!(truncate_for_log(&ascii).len(), MAX_LOG_FIELD_CHARS);
+    }
+
+    #[test]
+    fn test_db_error_creation_and_conversion() {
+        let err = DbError::new("connection dropped");
+        assert_eq!(err.message, "connection dropped");
+        assert!(err.source.is_none());
+
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
+        let with_src = DbError::with_source("failed query", io_err);
+        assert_eq!(with_src.message, "failed query");
+        assert!(with_src.source.is_some());
+
+        let app_err = AppError::from(err);
+        assert_eq!(app_err.error_code(), ErrorCode::DatabaseError);
+        assert_eq!(app_err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        #[cfg(any(feature = "postgres", feature = "mysql"))]
+        {
+            let sqlx_err = sqlx::Error::RowNotFound;
+            let from_sqlx: AppError = sqlx_err.into();
+            assert_eq!(from_sqlx.error_code(), ErrorCode::DatabaseError);
+        }
+    }
+
+    #[test]
+    fn test_unsupported_database_backend_and_transaction_sentinels() {
+        let unsupported = AppError::UnsupportedDatabaseBackend("cockroachdb".into());
+        assert_eq!(unsupported.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            unsupported.error_code(),
+            ErrorCode::UnsupportedDatabaseBackend
+        );
+        assert_eq!(unsupported.response_message(), "cockroachdb");
+
+        let unsupported_empty = AppError::UnsupportedDatabaseBackend("".into());
+        assert_eq!(
+            unsupported_empty.response_message(),
+            "Unsupported database backend"
+        );
+
+        let tx_not_supported = AppError::TransactionNotSupported;
+        assert_eq!(tx_not_supported.status_code(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            tx_not_supported.error_code(),
+            ErrorCode::TransactionNotSupported
+        );
+        assert_eq!(
+            tx_not_supported.response_message(),
+            "transactions require a mongodb replica set"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_key_error_code_mappings() {
+        // Assert domain sentinel error mappings for unique constraint violations
+        let email_err = AppError::EmailAlreadyExists;
+        assert_eq!(email_err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(email_err.error_code(), ErrorCode::InternalError);
+
+        let oauth_err = AppError::OAuthAccountLinkConflict;
+        assert_eq!(oauth_err.status_code(), StatusCode::CONFLICT);
+        assert_eq!(oauth_err.error_code(), ErrorCode::OAuthAccountLinkConflict);
+
+        let totp_err = AppError::TotpCodeReplayed;
+        assert_eq!(totp_err.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(totp_err.error_code(), ErrorCode::TotpCodeReplayed);
+    }
+
+    #[test]
+    #[cfg(feature = "mongodb")]
+    fn test_mongo_is_duplicate_key_error_classifier() {
+        // Generic error message containing E11000
+        let dup_err1 =
+            mongodb::error::Error::custom("E11000 duplicate key error in index: email_1");
+        assert!(crate::db::mongo::is_duplicate_key_error(&dup_err1));
+
+        let dup_err2 =
+            mongodb::error::Error::custom("duplicate key error collection: users index: idx_email");
+        assert!(crate::db::mongo::is_duplicate_key_error(&dup_err2));
+
+        // Non-duplicate error message
+        let non_dup = mongodb::error::Error::custom("connection timed out to replica set");
+        assert!(!crate::db::mongo::is_duplicate_key_error(&non_dup));
     }
 }

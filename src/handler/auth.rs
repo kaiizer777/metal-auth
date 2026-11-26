@@ -500,7 +500,7 @@ async fn issue_session_after_gate(
 ) -> Result<PasswordLoginOutcome, AppError> {
     let mut transaction = session_service.db().begin().await.map_err(|error| {
         tracing::error!(error = %error, "failed to begin the login gate transaction");
-        AppError::Database(error)
+        AppError::from(error)
     })?;
 
     let enabled = match state
@@ -531,7 +531,7 @@ async fn issue_session_after_gate(
         Ok((session, raw_id)) => {
             transaction.commit().await.map_err(|error| {
                 tracing::error!(error = %error, "failed to commit the login gate transaction");
-                AppError::Database(error)
+                AppError::from(error)
             })?;
             Ok(PasswordLoginOutcome::Session(session, raw_id))
         }

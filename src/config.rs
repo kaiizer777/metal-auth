@@ -1,6 +1,8 @@
 use std::str::FromStr;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{error::ConfigError, totp::crypto::MIN_USED_CODE_PRUNE_AGE_SECS};
 
 pub const DEFAULT_PORT: u16 = 3000;
@@ -16,9 +18,95 @@ pub const DEFAULT_OUTBOX_SENT_RETENTION_SECS: u64 = 7 * 24 * 3600; // 7 days (60
 
 // ─── Phase 1 — Infra Config ──────────────────────────────────────────────────
 
+/// Target database backend engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DatabaseBackend {
+    #[default]
+    Postgres,
+    Mysql,
+    Mongodb,
+}
+
+impl std::fmt::Display for DatabaseBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Postgres => write!(f, "postgres"),
+            Self::Mysql => write!(f, "mysql"),
+            Self::Mongodb => write!(f, "mongodb"),
+        }
+    }
+}
+
+impl FromStr for DatabaseBackend {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "postgres" | "postgresql" => Ok(Self::Postgres),
+            "mysql" => Ok(Self::Mysql),
+            "mongodb" => Ok(Self::Mongodb),
+            _ => Err(ConfigError::InvalidValue {
+                field: "DATABASE_BACKEND",
+                reason: "must be one of: postgres, mysql, mongodb",
+            }),
+        }
+    }
+}
+
+impl DatabaseBackend {
+    pub fn from_scheme(scheme: &str) -> Result<Self, ConfigError> {
+        match scheme.to_ascii_lowercase().as_str() {
+            "postgres" | "postgresql" => Ok(Self::Postgres),
+            "mysql" => Ok(Self::Mysql),
+            "mongodb" | "mongodb+srv" => Ok(Self::Mongodb),
+            _ => Err(ConfigError::InvalidValue {
+                field: "database_url",
+                reason: "unsupported database URL scheme; supported schemes: postgres, postgresql, mysql, mongodb, mongodb+srv",
+            }),
+        }
+    }
+}
+
+/// MongoDB-specific configuration parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MongoConfig {
+    pub database_name: String,
+    pub allow_non_transactional_standalone: bool,
+}
+
+impl Default for MongoConfig {
+    fn default() -> Self {
+        Self {
+            database_name: "metal_auth".to_string(),
+            allow_non_transactional_standalone: false,
+        }
+    }
+}
+
+/// Redacts credentials from database connection URLs.
+#[must_use]
+pub fn redact_url(url: &str) -> String {
+    let Some((scheme_and_userinfo, host_and_rest)) = url.split_once('@') else {
+        return url.to_string();
+    };
+    let Some((scheme, userinfo)) = scheme_and_userinfo.split_once("://") else {
+        return url.to_string();
+    };
+    if userinfo.contains(':') {
+        format!("{scheme}://[REDACTED]:[REDACTED]@{host_and_rest}")
+    } else if !userinfo.is_empty() {
+        format!("{scheme}://[REDACTED]@{host_and_rest}")
+    } else {
+        url.to_string()
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct Config {
     pub database_url: String,
+    pub backend: DatabaseBackend,
+    pub mongo: Option<MongoConfig>,
     pub port: u16,
 
     // CORS
@@ -62,7 +150,9 @@ pub struct Config {
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
-            .field("database_url", &"[REDACTED]")
+            .field("database_url", &redact_url(&self.database_url))
+            .field("backend", &self.backend)
+            .field("mongo", &self.mongo)
             .field("port", &self.port)
             .field("allowed_origins", &self.allowed_origins)
             .field("allowed_methods", &self.allowed_methods)
@@ -93,6 +183,64 @@ impl Config {
                 field: "database_url",
                 reason: "must not be empty",
             });
+        }
+        let scheme = match self.database_url.split_once("://") {
+            Some((s, _)) => s,
+            None => {
+                return Err(ConfigError::InvalidValue {
+                    field: "database_url",
+                    reason: "missing scheme delimiter (://)",
+                });
+            }
+        };
+
+        let detected_backend = DatabaseBackend::from_scheme(scheme)?;
+        if detected_backend != self.backend {
+            return Err(ConfigError::InvalidValue {
+                field: "database_url",
+                reason: "URL scheme does not match configured database backend",
+            });
+        }
+
+        match self.backend {
+            DatabaseBackend::Postgres => {
+                #[cfg(not(feature = "postgres"))]
+                return Err(ConfigError::InvalidValue {
+                    field: "database_url",
+                    reason: "postgres backend requested but 'postgres' Cargo feature is not enabled",
+                });
+            }
+            DatabaseBackend::Mysql => {
+                #[cfg(not(feature = "mysql"))]
+                return Err(ConfigError::InvalidValue {
+                    field: "database_url",
+                    reason: "mysql backend requested but 'mysql' Cargo feature is not enabled",
+                });
+            }
+            DatabaseBackend::Mongodb => {
+                #[cfg(not(feature = "mongodb"))]
+                {
+                    return Err(ConfigError::InvalidValue {
+                        field: "database_url",
+                        reason: "mongodb backend requested but 'mongodb' Cargo feature is not enabled",
+                    });
+                }
+
+                #[cfg(feature = "mongodb")]
+                {
+                    let mongo_name = self
+                        .mongo
+                        .as_ref()
+                        .map(|m| m.database_name.as_str())
+                        .unwrap_or("");
+                    if mongo_name.trim().is_empty() {
+                        return Err(ConfigError::InvalidValue {
+                            field: "mongo.database_name",
+                            reason: "must not be empty when using mongodb backend",
+                        });
+                    }
+                }
+            }
         }
         if self.max_connections == 0 {
             return Err(ConfigError::InvalidValue {
@@ -232,6 +380,58 @@ impl Config {
             }
             Err(std::env::VarError::NotUnicode(_)) => {
                 return Err(ConfigError::NonUnicodeEnvVar("DATABASE_URL"));
+            }
+        };
+
+        let backend = match lookup("DATABASE_BACKEND") {
+            Ok(val) => val.parse::<DatabaseBackend>()?,
+            Err(std::env::VarError::NotPresent) => {
+                if let Some((scheme, _)) = database_url.split_once("://") {
+                    DatabaseBackend::from_scheme(scheme).unwrap_or(DatabaseBackend::Postgres)
+                } else {
+                    DatabaseBackend::Postgres
+                }
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar("DATABASE_BACKEND"));
+            }
+        };
+
+        let mongo_allow_non_transactional = match lookup("MONGO_ALLOW_NON_TRANSACTIONAL_STANDALONE")
+        {
+            Ok(val) => val.parse::<bool>().map_err(|_| {
+                ConfigError::InvalidEnvVar("MONGO_ALLOW_NON_TRANSACTIONAL_STANDALONE")
+            })?,
+            Err(std::env::VarError::NotPresent) => false,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar(
+                    "MONGO_ALLOW_NON_TRANSACTIONAL_STANDALONE",
+                ));
+            }
+        };
+
+        let mongo = match lookup("MONGO_DATABASE_NAME") {
+            Ok(name) => Some(MongoConfig {
+                database_name: name,
+                allow_non_transactional_standalone: mongo_allow_non_transactional,
+            }),
+            Err(std::env::VarError::NotPresent) => {
+                if backend == DatabaseBackend::Mongodb {
+                    Some(MongoConfig {
+                        database_name: "metal_auth".to_string(),
+                        allow_non_transactional_standalone: mongo_allow_non_transactional,
+                    })
+                } else if mongo_allow_non_transactional {
+                    Some(MongoConfig {
+                        database_name: "metal_auth".to_string(),
+                        allow_non_transactional_standalone: true,
+                    })
+                } else {
+                    None
+                }
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeEnvVar("MONGO_DATABASE_NAME"));
             }
         };
         let port = match lookup("PORT") {
@@ -657,6 +857,8 @@ impl Config {
 
         let cfg = Self {
             database_url,
+            backend,
+            mongo,
             port,
             allowed_origins,
             allowed_methods: vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"]
@@ -1637,6 +1839,8 @@ impl Default for Config {
     fn default() -> Self {
         let cfg = Self {
             database_url: "postgres://localhost/test".into(),
+            backend: DatabaseBackend::Postgres,
+            mongo: None,
             port: DEFAULT_PORT,
             allowed_origins: vec!["https://app.example.com".into()],
             allowed_methods: vec![
@@ -1713,6 +1917,8 @@ mod tests {
     fn test_infra_config() -> Config {
         Config {
             database_url: "postgres://localhost/test".into(),
+            backend: DatabaseBackend::Postgres,
+            mongo: None,
             port: 3000,
             allowed_origins: vec!["https://app.example.com".into()],
             allowed_methods: vec!["GET".into(), "POST".into()],
@@ -3684,6 +3890,301 @@ mod tests {
             Err(ConfigError::InvalidValue {
                 field: "totp.encryption_key",
                 ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_redact_url_credentials() {
+        assert_eq!(
+            redact_url("postgres://user:password123@localhost:5432/metal_auth"),
+            "postgres://[REDACTED]:[REDACTED]@localhost:5432/metal_auth"
+        );
+        assert_eq!(
+            redact_url("mysql://root:secret@127.0.0.1:3306/metal_auth"),
+            "mysql://[REDACTED]:[REDACTED]@127.0.0.1:3306/metal_auth"
+        );
+        assert_eq!(
+            redact_url("mongodb://admin:pass456@localhost:27017/metal_auth?authSource=admin"),
+            "mongodb://[REDACTED]:[REDACTED]@localhost:27017/metal_auth?authSource=admin"
+        );
+        assert_eq!(
+            redact_url("mongodb+srv://usr:pwd@cluster0.mongodb.net/metal_auth"),
+            "mongodb+srv://[REDACTED]:[REDACTED]@cluster0.mongodb.net/metal_auth"
+        );
+        assert_eq!(
+            redact_url("postgres://localhost/metal_auth"),
+            "postgres://localhost/metal_auth"
+        );
+    }
+
+    #[test]
+    fn test_database_backend_from_scheme() {
+        assert_eq!(
+            DatabaseBackend::from_scheme("postgres").unwrap(),
+            DatabaseBackend::Postgres
+        );
+        assert_eq!(
+            DatabaseBackend::from_scheme("postgresql").unwrap(),
+            DatabaseBackend::Postgres
+        );
+        assert_eq!(
+            DatabaseBackend::from_scheme("mysql").unwrap(),
+            DatabaseBackend::Mysql
+        );
+        assert_eq!(
+            DatabaseBackend::from_scheme("mongodb").unwrap(),
+            DatabaseBackend::Mongodb
+        );
+        assert_eq!(
+            DatabaseBackend::from_scheme("mongodb+srv").unwrap(),
+            DatabaseBackend::Mongodb
+        );
+        assert!(DatabaseBackend::from_scheme("sqlite").is_err());
+    }
+
+    #[test]
+    fn test_config_validate_database_backend_scheme_matching() {
+        let cfg = Config {
+            database_url: "mysql://localhost/test".into(),
+            backend: DatabaseBackend::Postgres,
+            ..Config::default()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "database_url",
+                ..
+            })
+        ));
+
+        let cfg_valid = Config {
+            database_url: "postgres://localhost/test".into(),
+            backend: DatabaseBackend::Postgres,
+            ..Config::default()
+        };
+        assert!(cfg_valid.validate().is_ok());
+
+        // Negative: Missing scheme delimiter
+        let cfg_no_scheme = Config {
+            database_url: "localhost/test".into(),
+            ..Config::default()
+        };
+        assert!(matches!(
+            cfg_no_scheme.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "database_url",
+                reason: "missing scheme delimiter (://)",
+            })
+        ));
+
+        // Negative: Unsupported scheme (e.g. redis)
+        let cfg_unsupported = Config {
+            database_url: "redis://localhost:6379".into(),
+            ..Config::default()
+        };
+        assert!(matches!(
+            cfg_unsupported.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "database_url",
+                ..
+            })
+        ));
+
+        // Negative: Empty database_url
+        let cfg_empty = Config {
+            database_url: "   ".into(),
+            ..Config::default()
+        };
+        assert!(matches!(
+            cfg_empty.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "database_url",
+                reason: "must not be empty",
+            })
+        ));
+    }
+
+    #[test]
+    fn test_config_debug_redacts_credentials() {
+        let cfg = Config {
+            database_url: "postgres://usr:topsecret@localhost:5432/db".into(),
+            ..Config::default()
+        };
+        let debug_str = format!("{cfg:?}");
+        assert!(!debug_str.contains("topsecret"));
+        assert!(debug_str.contains("[REDACTED]:[REDACTED]"));
+    }
+
+    #[test]
+    #[cfg(feature = "mongodb")]
+    fn test_mongo_config_parsing_and_defaults() {
+        let default_mongo = MongoConfig::default();
+        assert_eq!(default_mongo.database_name, "metal_auth");
+        assert!(!default_mongo.allow_non_transactional_standalone);
+
+        let map = std::collections::HashMap::from([
+            ("BASE_URL", "http://localhost:3000"),
+            ("DATABASE_URL", "mongodb://localhost:27017/test_db"),
+            ("DATABASE_BACKEND", "mongodb"),
+            ("MONGO_DATABASE_NAME", "custom_auth"),
+            ("MONGO_ALLOW_NON_TRANSACTIONAL_STANDALONE", "true"),
+        ]);
+        let cfg = Config::from_lookup(|k| {
+            map.get(k)
+                .map(|v| v.to_string())
+                .ok_or(std::env::VarError::NotPresent)
+        })
+        .unwrap();
+
+        let mongo_cfg = cfg.mongo.unwrap();
+        assert_eq!(mongo_cfg.database_name, "custom_auth");
+        assert!(mongo_cfg.allow_non_transactional_standalone);
+    }
+
+    #[test]
+    fn test_config_backend_url_scheme_mismatch_matrix() {
+        // Postgres backend rejects mysql:// and mongodb://
+        let pg_with_mysql = Config {
+            database_url: "mysql://localhost:3306/db".into(),
+            backend: DatabaseBackend::Postgres,
+            ..Config::default()
+        };
+        assert!(matches!(
+            pg_with_mysql.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "database_url",
+                reason: "URL scheme does not match configured database backend"
+            })
+        ));
+
+        let pg_with_mongo = Config {
+            database_url: "mongodb://localhost:27017/db".into(),
+            backend: DatabaseBackend::Postgres,
+            ..Config::default()
+        };
+        assert!(matches!(
+            pg_with_mongo.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "database_url",
+                reason: "URL scheme does not match configured database backend"
+            })
+        ));
+
+        // Mysql backend rejects postgres:// and mongodb://
+        let mysql_with_pg = Config {
+            database_url: "postgres://localhost:5432/db".into(),
+            backend: DatabaseBackend::Mysql,
+            ..Config::default()
+        };
+        assert!(matches!(
+            mysql_with_pg.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "database_url",
+                reason: "URL scheme does not match configured database backend"
+            })
+        ));
+
+        let mysql_with_mongo = Config {
+            database_url: "mongodb://localhost:27017/db".into(),
+            backend: DatabaseBackend::Mysql,
+            ..Config::default()
+        };
+        assert!(matches!(
+            mysql_with_mongo.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "database_url",
+                reason: "URL scheme does not match configured database backend"
+            })
+        ));
+
+        // Mongodb backend rejects postgres:// and mysql://
+        let mongo_with_pg = Config {
+            database_url: "postgres://localhost:5432/db".into(),
+            backend: DatabaseBackend::Mongodb,
+            ..Config::default()
+        };
+        assert!(matches!(
+            mongo_with_pg.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "database_url",
+                reason: "URL scheme does not match configured database backend"
+            })
+        ));
+
+        let mongo_with_mysql = Config {
+            database_url: "mysql://localhost:3306/db".into(),
+            backend: DatabaseBackend::Mongodb,
+            ..Config::default()
+        };
+        assert!(matches!(
+            mongo_with_mysql.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "database_url",
+                reason: "URL scheme does not match configured database backend"
+            })
+        ));
+    }
+
+    #[test]
+    fn test_redact_url_all_schemes() {
+        assert_eq!(
+            redact_url("postgres://alice:secret123@db.example.com:5432/auth_prod"),
+            "postgres://[REDACTED]:[REDACTED]@db.example.com:5432/auth_prod"
+        );
+        assert_eq!(
+            redact_url("mysql://root:superpassword@127.0.0.1:3306/metal_auth"),
+            "mysql://[REDACTED]:[REDACTED]@127.0.0.1:3306/metal_auth"
+        );
+        assert_eq!(
+            redact_url("mongodb://admin:mongopass@localhost:27017/metal_auth?authSource=admin"),
+            "mongodb://[REDACTED]:[REDACTED]@localhost:27017/metal_auth?authSource=admin"
+        );
+        assert_eq!(
+            redact_url("mongodb+srv://atlas_user:atlas_pass@cluster0.abcde.mongodb.net/prod_db"),
+            "mongodb+srv://[REDACTED]:[REDACTED]@cluster0.abcde.mongodb.net/prod_db"
+        );
+        assert_eq!(
+            redact_url("postgres://localhost:5432/metal_auth"),
+            "postgres://localhost:5432/metal_auth"
+        );
+        assert_eq!(
+            redact_url("postgres://appuser@localhost:5432/metal_auth"),
+            "postgres://[REDACTED]@localhost:5432/metal_auth"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "mongodb")]
+    fn test_mongo_config_validation_blank_database_rejection() {
+        let cfg_blank = Config {
+            database_url: "mongodb://localhost:27017".into(),
+            backend: DatabaseBackend::Mongodb,
+            mongo: Some(MongoConfig {
+                database_name: "   ".into(),
+                allow_non_transactional_standalone: false,
+            }),
+            ..Config::default()
+        };
+        assert!(matches!(
+            cfg_blank.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "mongo.database_name",
+                reason: "must not be empty when using mongodb backend",
+            })
+        ));
+
+        let cfg_none = Config {
+            database_url: "mongodb://localhost:27017".into(),
+            backend: DatabaseBackend::Mongodb,
+            mongo: None,
+            ..Config::default()
+        };
+        assert!(matches!(
+            cfg_none.validate(),
+            Err(ConfigError::InvalidValue {
+                field: "mongo.database_name",
+                reason: "must not be empty when using mongodb backend",
             })
         ));
     }

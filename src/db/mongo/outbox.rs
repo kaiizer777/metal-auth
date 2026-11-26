@@ -137,19 +137,27 @@ pub async fn mark_outbox_sent(
     mut session: Option<&mut ClientSession>,
     id: Uuid,
 ) -> Result<(), AppError> {
-    let filter = doc! { "_id": bson::Uuid::from(id) };
+    let filter = doc! {
+        "_id": bson::Uuid::from(id),
+        "status": OUTBOX_STATUS_PROCESSING,
+    };
     let update = doc! {
         "$set": {
             "status": OUTBOX_STATUS_SENT,
             "sent_at": BsonDateTime::from_chrono(Utc::now()),
+            "error_log": bson::Bson::Null,
         }
     };
     let coll = db.collection::<EmailOutboxDoc>(EMAIL_OUTBOX_COLLECTION);
-    match session.as_deref_mut() {
+    let res = match session.as_deref_mut() {
         Some(s) => coll.update_one(filter, update).session(s).await,
         None => coll.update_one(filter, update).await,
     }
     .map_err(AppError::from)?;
+
+    if res.matched_count == 0 {
+        tracing::warn!(outbox_id = %id, "mark_outbox_sent: lease expired or row missing");
+    }
 
     Ok(())
 }
@@ -162,7 +170,10 @@ pub async fn record_outbox_retry(
     next_retry_at: DateTime<Utc>,
     error_log: &str,
 ) -> Result<(), AppError> {
-    let filter = doc! { "_id": bson::Uuid::from(id) };
+    let filter = doc! {
+        "_id": bson::Uuid::from(id),
+        "status": OUTBOX_STATUS_PROCESSING,
+    };
     let update = doc! {
         "$set": {
             "status": OUTBOX_STATUS_PENDING,
@@ -172,11 +183,15 @@ pub async fn record_outbox_retry(
         }
     };
     let coll = db.collection::<EmailOutboxDoc>(EMAIL_OUTBOX_COLLECTION);
-    match session.as_deref_mut() {
+    let res = match session.as_deref_mut() {
         Some(s) => coll.update_one(filter, update).session(s).await,
         None => coll.update_one(filter, update).await,
     }
     .map_err(AppError::from)?;
+
+    if res.matched_count == 0 {
+        tracing::warn!(outbox_id = %id, "record_outbox_retry: lease expired or row missing");
+    }
 
     Ok(())
 }
@@ -187,7 +202,10 @@ pub async fn mark_outbox_failed(
     id: Uuid,
     error_log: &str,
 ) -> Result<(), AppError> {
-    let filter = doc! { "_id": bson::Uuid::from(id) };
+    let filter = doc! {
+        "_id": bson::Uuid::from(id),
+        "status": OUTBOX_STATUS_PROCESSING,
+    };
     let update = doc! {
         "$set": {
             "status": OUTBOX_STATUS_FAILED,
@@ -195,11 +213,15 @@ pub async fn mark_outbox_failed(
         }
     };
     let coll = db.collection::<EmailOutboxDoc>(EMAIL_OUTBOX_COLLECTION);
-    match session.as_deref_mut() {
+    let res = match session.as_deref_mut() {
         Some(s) => coll.update_one(filter, update).session(s).await,
         None => coll.update_one(filter, update).await,
     }
     .map_err(AppError::from)?;
+
+    if res.matched_count == 0 {
+        tracing::warn!(outbox_id = %id, "mark_outbox_failed: lease expired or row missing");
+    }
 
     Ok(())
 }

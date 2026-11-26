@@ -1378,6 +1378,35 @@ async fn test_mongo_totp_used_codes_ttl_index() {
 }
 
 #[tokio::test]
+async fn test_mongo_sessions_compound_index() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_sessions_compound_index: MONGO_URL not set");
+        return;
+    };
+
+    let coll = store.db().collection::<bson::Document>("sessions");
+    let mut cursor = coll.list_indexes().await.expect("list indexes");
+    let mut found_index = false;
+    while cursor.advance().await.expect("advance cursor") {
+        let model = cursor
+            .deserialize_current()
+            .expect("deserialize index model");
+        if let Some(_opts) = model
+            .options
+            .as_ref()
+            .filter(|o| o.name.as_deref() == Some("idx_sessions_user_id_active"))
+        {
+            assert_eq!(model.keys, doc! { "user_id": 1, "last_active_at": -1 });
+            found_index = true;
+        }
+    }
+    assert!(
+        found_index,
+        "idx_sessions_user_id_active with keys {{ user_id: 1, last_active_at: -1 }} must exist"
+    );
+}
+
+#[tokio::test]
 async fn test_mongo_cascade_delete() {
     let Some(store) = get_test_mongo_store().await else {
         eprintln!("skipping test_mongo_cascade_delete: MONGO_URL not set");

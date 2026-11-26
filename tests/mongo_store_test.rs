@@ -6,11 +6,17 @@ use chrono::Utc;
 use metal_auth::{
     AppError, Config, ConfigError, DatabaseBackend, DatabaseStore, MongoConfig, MongoStore,
     config::redact_url,
-    db::mongo::{
-        indexes::ensure_indexes,
+    db::{
         models::{
-            EmailOutboxDoc, OAuthAccountDoc, PasswordResetTokenDoc, SessionDoc, TotpSecretDoc,
-            TotpUsedCodeDoc, TwoFactorTokenDoc, UserDoc, VerificationTokenDoc,
+            OUTBOX_STATUS_FAILED, OUTBOX_STATUS_PENDING, OUTBOX_STATUS_PROCESSING,
+            OUTBOX_STATUS_SENT,
+        },
+        mongo::{
+            indexes::{EMAIL_OUTBOX_COLLECTION, ensure_indexes},
+            models::{
+                EmailOutboxDoc, OAuthAccountDoc, PasswordResetTokenDoc, SessionDoc, TotpSecretDoc,
+                TotpUsedCodeDoc, TwoFactorTokenDoc, UserDoc, VerificationTokenDoc,
+            },
         },
     },
     error::DbError,
@@ -987,6 +993,225 @@ async fn test_mongo_outbox_recover_stale_processing() {
     let _ = store
         .outbox()
         .cleanup_sent_outbox(Duration::from_secs(0))
+        .await;
+}
+
+#[tokio::test]
+async fn test_mongo_outbox_status_guards() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_outbox_status_guards: MONGO_URL not set");
+        return;
+    };
+
+    let coll = store
+        .db()
+        .collection::<EmailOutboxDoc>(EMAIL_OUTBOX_COLLECTION);
+
+    let recipient = format!("guard_{}@example.com", Uuid::new_v4());
+    let payload = serde_json::json!({ "guard_test": true });
+
+    // 1. Insert record (initial status = pending)
+    let outbox = store
+        .outbox()
+        .insert_outbox(&recipient, "verification", payload)
+        .await
+        .expect("insert outbox email");
+    assert_eq!(outbox.status, OUTBOX_STATUS_PENDING);
+
+    let doc = coll
+        .find_one(doc! { "_id": bson::Uuid::from(outbox.id) })
+        .await
+        .expect("find doc")
+        .expect("doc exists");
+    assert_eq!(doc.status, OUTBOX_STATUS_PENDING);
+    assert!(doc.sent_at.is_none());
+    assert!(doc.error_log.is_none());
+
+    // 2. Calling mark_outbox_sent while pending must NOT change status or sent_at
+    store
+        .outbox()
+        .mark_outbox_sent(outbox.id)
+        .await
+        .expect("mark_outbox_sent returns Ok even if unmatched");
+
+    let doc = coll
+        .find_one(doc! { "_id": bson::Uuid::from(outbox.id) })
+        .await
+        .expect("find doc")
+        .expect("doc exists");
+    assert_eq!(doc.status, OUTBOX_STATUS_PENDING);
+    assert!(doc.sent_at.is_none());
+
+    // 3. Calling record_outbox_retry while pending must NOT change status, error_log, or retry_count
+    let next_retry = Utc::now() - chrono::Duration::seconds(10);
+    store
+        .outbox()
+        .record_outbox_retry(outbox.id, 1, next_retry, "premature retry")
+        .await
+        .expect("record_outbox_retry returns Ok even if unmatched");
+
+    let doc = coll
+        .find_one(doc! { "_id": bson::Uuid::from(outbox.id) })
+        .await
+        .expect("find doc")
+        .expect("doc exists");
+    assert_eq!(doc.status, OUTBOX_STATUS_PENDING);
+    assert_eq!(doc.retry_count, 0);
+    assert!(doc.error_log.is_none());
+
+    // 4. Calling mark_outbox_failed while pending must NOT change status or error_log
+    store
+        .outbox()
+        .mark_outbox_failed(outbox.id, "premature fail")
+        .await
+        .expect("mark_outbox_failed returns Ok even if unmatched");
+
+    let doc = coll
+        .find_one(doc! { "_id": bson::Uuid::from(outbox.id) })
+        .await
+        .expect("find doc")
+        .expect("doc exists");
+    assert_eq!(doc.status, OUTBOX_STATUS_PENDING);
+    assert!(doc.error_log.is_none());
+
+    // 5. Claim record -> transitions to processing
+    let claimed = store
+        .outbox()
+        .claim_pending_outbox(10, Duration::from_secs(60))
+        .await
+        .expect("claim outbox batch");
+    assert!(claimed.iter().any(|item| item.id == outbox.id));
+
+    let doc = coll
+        .find_one(doc! { "_id": bson::Uuid::from(outbox.id) })
+        .await
+        .expect("find doc")
+        .expect("doc exists");
+    assert_eq!(doc.status, OUTBOX_STATUS_PROCESSING);
+
+    // 6. While processing, record_outbox_retry succeeds and transitions to pending with error_log
+    store
+        .outbox()
+        .record_outbox_retry(outbox.id, 1, next_retry, "transient error")
+        .await
+        .expect("record_outbox_retry while processing");
+
+    let doc = coll
+        .find_one(doc! { "_id": bson::Uuid::from(outbox.id) })
+        .await
+        .expect("find doc")
+        .expect("doc exists");
+    assert_eq!(doc.status, OUTBOX_STATUS_PENDING);
+    assert_eq!(doc.retry_count, 1);
+    assert_eq!(doc.error_log.as_deref(), Some("transient error"));
+
+    // 7. Re-claim record back to processing (since next_retry was in the past)
+    let reclaimed = store
+        .outbox()
+        .claim_pending_outbox(10, Duration::from_secs(60))
+        .await
+        .expect("reclaim outbox batch");
+    assert!(reclaimed.iter().any(|item| item.id == outbox.id));
+
+    // 8. While processing, mark_outbox_sent succeeds, sets sent_at, and CLEARS error_log to None
+    store
+        .outbox()
+        .mark_outbox_sent(outbox.id)
+        .await
+        .expect("mark_outbox_sent while processing");
+
+    let doc = coll
+        .find_one(doc! { "_id": bson::Uuid::from(outbox.id) })
+        .await
+        .expect("find doc")
+        .expect("doc exists");
+    assert_eq!(doc.status, OUTBOX_STATUS_SENT);
+    assert!(doc.sent_at.is_some());
+    assert_eq!(
+        doc.error_log, None,
+        "mark_outbox_sent must clear error_log to None"
+    );
+
+    // 9. Stale worker operations on sent record must NOT mutate the document
+    store
+        .outbox()
+        .record_outbox_retry(outbox.id, 2, next_retry, "stale worker error")
+        .await
+        .expect("stale record_outbox_retry on sent");
+
+    let doc = coll
+        .find_one(doc! { "_id": bson::Uuid::from(outbox.id) })
+        .await
+        .expect("find doc")
+        .expect("doc exists");
+    assert_eq!(doc.status, OUTBOX_STATUS_SENT);
+    assert_eq!(doc.error_log, None);
+    assert_eq!(doc.retry_count, 1);
+
+    store
+        .outbox()
+        .mark_outbox_failed(outbox.id, "stale worker fatal")
+        .await
+        .expect("stale mark_outbox_failed on sent");
+
+    let doc = coll
+        .find_one(doc! { "_id": bson::Uuid::from(outbox.id) })
+        .await
+        .expect("find doc")
+        .expect("doc exists");
+    assert_eq!(doc.status, OUTBOX_STATUS_SENT);
+    assert_eq!(doc.error_log, None);
+
+    // 10. Verify mark_outbox_failed on processing status
+    let recipient_failed = format!("guard_failed_{}@example.com", Uuid::new_v4());
+    let outbox_failed = store
+        .outbox()
+        .insert_outbox(&recipient_failed, "password_reset", serde_json::json!({}))
+        .await
+        .expect("insert outbox email");
+
+    let claimed_failed = store
+        .outbox()
+        .claim_pending_outbox(10, Duration::from_secs(60))
+        .await
+        .expect("claim outbox email");
+    assert!(claimed_failed.iter().any(|item| item.id == outbox_failed.id));
+
+    store
+        .outbox()
+        .mark_outbox_failed(outbox_failed.id, "fatal error")
+        .await
+        .expect("mark_outbox_failed on processing");
+
+    let doc = coll
+        .find_one(doc! { "_id": bson::Uuid::from(outbox_failed.id) })
+        .await
+        .expect("find doc")
+        .expect("doc exists");
+    assert_eq!(doc.status, OUTBOX_STATUS_FAILED);
+    assert_eq!(doc.error_log.as_deref(), Some("fatal error"));
+
+    // Stale sent attempt on failed status must be a no-op
+    store
+        .outbox()
+        .mark_outbox_sent(outbox_failed.id)
+        .await
+        .expect("stale mark_outbox_sent on failed");
+
+    let doc = coll
+        .find_one(doc! { "_id": bson::Uuid::from(outbox_failed.id) })
+        .await
+        .expect("find doc")
+        .expect("doc exists");
+    assert_eq!(doc.status, OUTBOX_STATUS_FAILED);
+
+    // Cleanup
+    let _ = store
+        .outbox()
+        .cleanup_sent_outbox(Duration::from_secs(0))
+        .await;
+    let _ = coll
+        .delete_one(doc! { "_id": bson::Uuid::from(outbox_failed.id) })
         .await;
 }
 

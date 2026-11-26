@@ -275,17 +275,7 @@ pub async fn consume_two_factor_token(
     }
     .map_err(AppError::from)?;
 
-    match doc {
-        Some(doc) => {
-            let t = TwoFactorToken::from(doc);
-            if t.expires_at <= Utc::now() {
-                Err(AppError::TwoFactorTokenExpired)
-            } else {
-                Ok(Some(t))
-            }
-        }
-        None => Ok(None),
-    }
+    Ok(doc.map(TwoFactorToken::from))
 }
 
 pub async fn delete_two_factor_tokens_for_user(

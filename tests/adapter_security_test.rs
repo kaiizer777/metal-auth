@@ -1,9 +1,6 @@
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use chrono::Utc;
-use metal_auth::{AppError, DatabaseStore};
-use uuid::Uuid;
+use metal_auth::AppError;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Zero-leak Log Audit Subscriber
@@ -72,9 +69,14 @@ fn test_security_zero_leak_log_audit() {
 
 #[cfg(feature = "mongodb")]
 mod mongo_security {
-    use super::*;
-    use metal_auth::MongoStore;
+    use std::time::Duration;
+
+    use chrono::Utc;
+    use metal_auth::{DatabaseStore, MongoStore};
     use mongodb::{Client, bson::doc};
+    use uuid::Uuid;
+
+    use super::*;
 
     async fn get_mongo_store() -> Option<MongoStore> {
         dotenvy::dotenv().ok();
@@ -239,12 +241,17 @@ mod mongo_security {
 
 #[cfg(feature = "mysql")]
 mod mysql_security {
-    use super::*;
+    use std::time::Duration;
+
+    use chrono::Utc;
     use metal_auth::{
-        MySqlStore,
+        DatabaseStore, MySqlStore,
         db::{DbPoolOptions, init_mysql_pool_with_options},
     };
     use sqlx::MySqlPool;
+    use uuid::Uuid;
+
+    use super::*;
 
     async fn get_mysql_pool() -> Option<MySqlPool> {
         dotenvy::dotenv().ok();

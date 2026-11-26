@@ -1574,6 +1574,109 @@ async fn test_mongo_totp_concurrent_upsert() {
 }
 
 #[tokio::test]
+async fn test_mongo_totp_disable_parity() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_totp_disable_parity: MONGO_URL not set");
+        return;
+    };
+
+    let non_existent_user_id = Uuid::new_v4();
+
+    // 1. Disabling non-existent user returns Ok(false)
+    let res = store
+        .totp()
+        .disable_totp(non_existent_user_id)
+        .await
+        .expect("disable non-existent user succeeds");
+    assert!(!res);
+
+    let user = store
+        .users()
+        .create_user(&format!("totp_dis_{}@example.com", Uuid::new_v4()), "hash")
+        .await
+        .expect("create user");
+
+    let secret = b"super_secret_disable_parity_bytes";
+    let backup_codes = serde_json::json!(["code1", "code2"]);
+
+    // 2. Disabling unconfirmed secret (enabled: false) returns Ok(false) and leaves secret intact
+    store
+        .totp()
+        .upsert_secret(user.id, secret, backup_codes.clone())
+        .await
+        .expect("upsert secret");
+
+    let res = store
+        .totp()
+        .disable_totp(user.id)
+        .await
+        .expect("disable unconfirmed secret succeeds");
+    assert!(!res);
+
+    let pending_secret = store
+        .totp()
+        .get_secret(user.id)
+        .await
+        .expect("get secret")
+        .expect("secret still exists");
+    assert!(!pending_secret.enabled);
+    assert_eq!(pending_secret.encrypted_secret, secret);
+    assert_eq!(pending_secret.backup_codes, backup_codes);
+
+    // 3. Confirm/enable TOTP and record a used code
+    store
+        .totp()
+        .enable_totp(user.id)
+        .await
+        .expect("enable totp");
+
+    let code_hash = [77u8; 32];
+    let recorded = store
+        .totp()
+        .record_used_code(user.id, &code_hash)
+        .await
+        .expect("record used code");
+    assert!(recorded);
+
+    // 4. Disabling enabled secret returns Ok(true) and secret still exists with enabled: false
+    let res = store
+        .totp()
+        .disable_totp(user.id)
+        .await
+        .expect("disable enabled secret succeeds");
+    assert!(res);
+
+    let disabled_secret = store
+        .totp()
+        .get_secret(user.id)
+        .await
+        .expect("get secret")
+        .expect("secret still exists");
+    assert!(!disabled_secret.enabled);
+    assert_eq!(disabled_secret.encrypted_secret, secret);
+    assert_eq!(disabled_secret.backup_codes, backup_codes);
+
+    // 5. Calling disable again returns Ok(false)
+    let repeat_res = store
+        .totp()
+        .disable_totp(user.id)
+        .await
+        .expect("disable already disabled secret succeeds");
+    assert!(!repeat_res);
+
+    // 6. Used codes are preserved
+    let is_used = store
+        .totp()
+        .is_code_used(user.id, &code_hash)
+        .await
+        .expect("check is_code_used");
+    assert!(is_used, "used code must be preserved after disable_totp");
+
+    // Cleanup
+    let _ = store.users().delete_user(user.id).await;
+}
+
+#[tokio::test]
 async fn test_mongo_totp_used_codes_ttl_index() {
     let Some(store) = get_test_mongo_store().await else {
         eprintln!("skipping test_mongo_totp_used_codes_ttl_index: MONGO_URL not set");

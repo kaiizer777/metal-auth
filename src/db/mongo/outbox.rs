@@ -4,7 +4,10 @@ use std::time::Duration;
 
 use bson::{DateTime as BsonDateTime, doc};
 use chrono::{DateTime, Utc};
-use mongodb::{ClientSession, Database, options::FindOptions};
+use mongodb::{
+    ClientSession, Database,
+    options::{FindOneAndUpdateOptions, ReturnDocument},
+};
 use uuid::Uuid;
 
 use crate::{
@@ -51,140 +54,82 @@ pub async fn insert_outbox(
     Ok(EmailOutbox::from(doc))
 }
 
-/// Claims pending outbox records using a 2-step atomic batch lease pattern.
+/// Atomically claims up to `batch_size` pending or expired outbox records.
 pub async fn claim_pending_outbox(
     db: &Database,
     mut session: Option<&mut ClientSession>,
     batch_size: u32,
     lock_duration: Duration,
 ) -> Result<Vec<EmailOutbox>, AppError> {
-    let now = Utc::now();
+    if batch_size == 0 {
+        return Ok(Vec::new());
+    }
+
     let lock_chrono =
         chrono::Duration::from_std(lock_duration).unwrap_or(chrono::Duration::seconds(60));
-    let stale_boundary = now - lock_chrono;
-    let next_retry = now + lock_chrono;
-
-    let candidate_filter = doc! {
-        "$or": [
-            {
-                "status": OUTBOX_STATUS_PENDING,
-                "next_retry_at": { "$lte": BsonDateTime::from_chrono(now) }
-            },
-            {
-                "status": OUTBOX_STATUS_PROCESSING,
-                "next_retry_at": { "$lte": BsonDateTime::from_chrono(stale_boundary) }
-            }
-        ]
-    };
-
-    let options = FindOptions::builder()
-        .sort(doc! { "next_retry_at": 1, "_id": 1 })
-        .limit(batch_size as i64)
-        .build();
 
     let coll = db.collection::<EmailOutboxDoc>(EMAIL_OUTBOX_COLLECTION);
-    let mut candidate_ids = Vec::new();
+    let options = FindOneAndUpdateOptions::builder()
+        .sort(doc! { "next_retry_at": 1, "_id": 1 })
+        .return_document(ReturnDocument::After)
+        .build();
 
-    match session.as_deref_mut() {
-        Some(s) => {
-            let mut cursor = coll
-                .find(candidate_filter.clone())
-                .with_options(options)
-                .session(&mut *s)
-                .await
-                .map_err(AppError::from)?;
-            while cursor.advance(&mut *s).await.map_err(AppError::from)? {
-                let doc = cursor.deserialize_current().map_err(AppError::from)?;
-                candidate_ids.push(doc.id);
-            }
+    let mut claimed_ids = Vec::with_capacity(batch_size as usize);
+    let mut claimed_items = Vec::with_capacity(batch_size as usize);
+
+    for _ in 0..batch_size {
+        let now = Utc::now();
+        let next_retry = now + lock_chrono;
+
+        let mut claim_filter = doc! {
+            "$or": [
+                {
+                    "status": OUTBOX_STATUS_PENDING,
+                    "next_retry_at": { "$lte": BsonDateTime::from_chrono(now) },
+                },
+                {
+                    "status": OUTBOX_STATUS_PROCESSING,
+                    "next_retry_at": { "$lte": BsonDateTime::from_chrono(now) },
+                },
+            ],
+        };
+
+        if !claimed_ids.is_empty() {
+            claim_filter.insert("_id", doc! { "$nin": &claimed_ids });
         }
-        None => {
-            let mut cursor = coll
-                .find(candidate_filter.clone())
-                .with_options(options)
-                .await
-                .map_err(AppError::from)?;
-            while cursor.advance().await.map_err(AppError::from)? {
-                let doc = cursor.deserialize_current().map_err(AppError::from)?;
-                candidate_ids.push(doc.id);
-            }
-        }
-    }
 
-    if candidate_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Atomic update claiming candidates
-    let claim_filter = doc! {
-        "_id": { "$in": &candidate_ids },
-        "$or": [
-            { "status": OUTBOX_STATUS_PENDING },
-            {
+        let claim_update = doc! {
+            "$set": {
                 "status": OUTBOX_STATUS_PROCESSING,
-                "next_retry_at": { "$lte": BsonDateTime::from_chrono(stale_boundary) }
+                "next_retry_at": BsonDateTime::from_chrono(next_retry),
+            },
+        };
+
+        let result = match session.as_deref_mut() {
+            Some(s) => {
+                coll.find_one_and_update(claim_filter, claim_update)
+                    .with_options(options.clone())
+                    .session(&mut *s)
+                    .await
             }
-        ]
-    };
-
-    let claim_update = doc! {
-        "$set": {
-            "status": OUTBOX_STATUS_PROCESSING,
-            "next_retry_at": BsonDateTime::from_chrono(next_retry),
-        }
-    };
-
-    let update_res = match session.as_deref_mut() {
-        Some(s) => {
-            coll.update_many(claim_filter, claim_update)
-                .session(s)
-                .await
-        }
-        None => coll.update_many(claim_filter, claim_update).await,
-    }
-    .map_err(AppError::from)?;
-
-    if update_res.modified_count == 0 {
-        return Ok(Vec::new());
-    }
-
-    // Fetch successfully claimed records
-    let claimed_filter = doc! {
-        "_id": { "$in": candidate_ids },
-        "status": OUTBOX_STATUS_PROCESSING,
-    };
-
-    let mut outbox_items = Vec::new();
-    match session.as_deref_mut() {
-        Some(s) => {
-            let mut claimed_cursor = coll
-                .find(claimed_filter)
-                .session(&mut *s)
-                .await
-                .map_err(AppError::from)?;
-            while claimed_cursor
-                .advance(&mut *s)
-                .await
-                .map_err(AppError::from)?
-            {
-                let doc = claimed_cursor
-                    .deserialize_current()
-                    .map_err(AppError::from)?;
-                outbox_items.push(EmailOutbox::from(doc));
+            None => {
+                coll.find_one_and_update(claim_filter, claim_update)
+                    .with_options(options.clone())
+                    .await
             }
         }
-        None => {
-            let mut claimed_cursor = coll.find(claimed_filter).await.map_err(AppError::from)?;
-            while claimed_cursor.advance().await.map_err(AppError::from)? {
-                let doc = claimed_cursor
-                    .deserialize_current()
-                    .map_err(AppError::from)?;
-                outbox_items.push(EmailOutbox::from(doc));
+        .map_err(AppError::from)?;
+
+        match result {
+            Some(doc) => {
+                claimed_ids.push(doc.id);
+                claimed_items.push(EmailOutbox::from(doc));
             }
+            None => break,
         }
     }
 
-    Ok(outbox_items)
+    Ok(claimed_items)
 }
 
 pub async fn mark_outbox_sent(

@@ -160,7 +160,7 @@ where
         r#"
         INSERT INTO two_factor_tokens (user_id, token_hash, credential_hash, expires_at)
         VALUES ($1, $2, $3, $4)
-        RETURNING id, user_id, token_hash, credential_hash, expires_at, created_at
+        RETURNING id, user_id, token_hash, expires_at
         "#,
     )
     .bind(user_id)
@@ -183,7 +183,7 @@ where
         r#"
         DELETE FROM two_factor_tokens
         WHERE token_hash = $1
-        RETURNING id, user_id, token_hash, credential_hash, expires_at, created_at
+        RETURNING id, user_id, token_hash, expires_at
         "#,
     )
     .bind(token_hash)

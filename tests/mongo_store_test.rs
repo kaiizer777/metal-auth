@@ -23,7 +23,9 @@ use uuid::Uuid;
 
 async fn get_test_mongo_store() -> Option<MongoStore> {
     dotenvy::dotenv().ok();
-    let url = std::env::var("MONGO_URL")
+    let url = std::env::var("MONGODB_URI")
+        .or_else(|_| std::env::var("MONGODB_URL"))
+        .or_else(|_| std::env::var("MONGO_URL"))
         .or_else(|_| std::env::var("DATABASE_URL"))
         .ok()?;
     if !url.starts_with("mongodb://") && !url.starts_with("mongodb+srv://") {
@@ -911,4 +913,120 @@ async fn test_mongo_totp_used_codes_ttl_index() {
         found_ttl,
         "idx_totp_used_codes_used_at with expire_after=300s must exist"
     );
+}
+
+#[tokio::test]
+async fn test_mongo_cascade_delete() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_cascade_delete: MONGO_URL not set");
+        return;
+    };
+    let email = format!("mongo_cascade_{}@example.com", Uuid::new_v4());
+    let user = store
+        .users()
+        .create_user(&email, "hash")
+        .await
+        .expect("create user");
+
+    // Seed child records across all 7 entities
+    let token_hash = format!("sess_{}", Uuid::new_v4());
+    let _session = store
+        .sessions()
+        .create_session(
+            user.id,
+            &token_hash,
+            "cookie",
+            Some("csrf"),
+            Utc::now() + chrono::Duration::hours(1),
+        )
+        .await
+        .expect("create session");
+
+    let v_hash = [111u8; 32];
+    store
+        .tokens()
+        .create_verification_token(user.id, &v_hash, Utc::now() + chrono::Duration::hours(1))
+        .await
+        .expect("create vtoken");
+
+    let r_hash = [112u8; 32];
+    store
+        .tokens()
+        .create_password_reset_token(user.id, &r_hash, Utc::now() + chrono::Duration::hours(1))
+        .await
+        .expect("create rtoken");
+
+    let p_uid = format!("gh_{}", Uuid::new_v4());
+    store
+        .oauth()
+        .link_account(user.id, "github", &p_uid, &email)
+        .await
+        .expect("link oauth");
+
+    store
+        .totp()
+        .upsert_secret(user.id, &[1, 2, 3], serde_json::json!(["bc1"]))
+        .await
+        .expect("upsert totp secret");
+
+    let used_hash = [113u8; 32];
+    store
+        .totp()
+        .record_used_code(user.id, &used_hash)
+        .await
+        .expect("record used code");
+
+    let c_hash = [114u8; 32];
+    store
+        .totp()
+        .create_two_factor_token(user.id, &c_hash, "cred_hash", Utc::now() + chrono::Duration::minutes(5))
+        .await
+        .expect("create 2fa token");
+
+    // Perform cascade delete of the parent user (7-collection cascade)
+    let deleted = store
+        .users()
+        .delete_user(user.id)
+        .await
+        .expect("delete user cascades in mongodb");
+    assert!(deleted);
+
+    // Verify all 7 child entities were cascaded
+    assert!(store.users().get_user_by_id(user.id).await.unwrap().is_none());
+    assert!(store.sessions().get_session_by_token_hash(&token_hash).await.unwrap().is_none());
+    assert!(store.sessions().list_user_sessions(user.id).await.unwrap().is_empty());
+    assert!(store.tokens().consume_verification_token(&v_hash).await.unwrap().is_none());
+    assert!(store.tokens().consume_password_reset_token(&r_hash).await.unwrap().is_none());
+    assert!(store.oauth().get_account("github", &p_uid).await.unwrap().is_none());
+    assert!(store.totp().get_secret(user.id).await.unwrap().is_none());
+    assert!(!store.totp().is_code_used(user.id, &used_hash).await.unwrap());
+    assert!(store.totp().consume_two_factor_token(&c_hash).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_mongo_transaction_atomicity() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_transaction_atomicity: MONGO_URL not set");
+        return;
+    };
+
+    // If standalone and transactions not supported without replica set, verify fail-closed
+    let tx_res = store.begin().await;
+    match tx_res {
+        Ok(mut tx) => {
+            let email = format!("mongo_tx_{}@example.com", Uuid::new_v4());
+            let user = tx
+                .users()
+                .create_user(&email, "hash")
+                .await
+                .expect("create user in mongo tx");
+            tx.commit().await.expect("commit mongo tx");
+            assert!(store.users().get_user_by_id(user.id).await.unwrap().is_some());
+            let _ = store.users().delete_user(user.id).await;
+        }
+        Err(AppError::TransactionNotSupported) => {
+            // Standalone without replica set correctly fails closed
+        }
+        Err(e) => panic!("unexpected error beginning mongo tx: {:?}", e),
+    }
 }

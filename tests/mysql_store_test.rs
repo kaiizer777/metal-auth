@@ -12,7 +12,8 @@ use uuid::Uuid;
 
 async fn get_test_mysql_pool() -> Option<MySqlPool> {
     dotenvy::dotenv().ok();
-    let url = std::env::var("MYSQL_URL")
+    let url = std::env::var("MYSQL_DATABASE_URL")
+        .or_else(|_| std::env::var("MYSQL_URL"))
         .or_else(|_| std::env::var("DATABASE_URL"))
         .ok()?;
     if !url.starts_with("mysql://") {
@@ -512,6 +513,150 @@ async fn test_mysql_totp_lifecycle() {
         .expect("consume 2fa token")
         .expect("token present");
     assert_eq!(consumed_2fa.user_id, user.id);
+}
+
+#[tokio::test]
+async fn test_mysql_case_insensitive_email() {
+    let Some(pool) = get_test_mysql_pool().await else {
+        eprintln!("skipping test_mysql_case_insensitive_email: MYSQL_URL not set");
+        return;
+    };
+    let store = MySqlStore::new(pool);
+    let lower_email = format!("ci_{}@example.com", Uuid::new_v4());
+    let user = store
+        .users()
+        .create_user(&lower_email, "hash")
+        .await
+        .expect("create user");
+
+    let upper_email = lower_email.to_uppercase();
+    let fetched = store
+        .users()
+        .get_user_by_email(&upper_email)
+        .await
+        .expect("fetch by uppercase email")
+        .expect("user found via case-insensitive lookup");
+    assert_eq!(fetched.id, user.id);
+}
+
+#[tokio::test]
+async fn test_mysql_cascade_delete() {
+    let Some(pool) = get_test_mysql_pool().await else {
+        eprintln!("skipping test_mysql_cascade_delete: MYSQL_URL not set");
+        return;
+    };
+    let store = MySqlStore::new(pool);
+    let email = format!("cascade_{}@example.com", Uuid::new_v4());
+    let user = store
+        .users()
+        .create_user(&email, "hash")
+        .await
+        .expect("create user");
+
+    // Seed child records across all 7 entities
+    let token_hash = format!("sess_{}", Uuid::new_v4());
+    let _session = store
+        .sessions()
+        .create_session(
+            user.id,
+            &token_hash,
+            "cookie",
+            Some("csrf"),
+            Utc::now() + chrono::Duration::hours(1),
+        )
+        .await
+        .expect("create session");
+
+    let v_hash = [101u8; 32];
+    store
+        .tokens()
+        .create_verification_token(user.id, &v_hash, Utc::now() + chrono::Duration::hours(1))
+        .await
+        .expect("create vtoken");
+
+    let r_hash = [102u8; 32];
+    store
+        .tokens()
+        .create_password_reset_token(user.id, &r_hash, Utc::now() + chrono::Duration::hours(1))
+        .await
+        .expect("create rtoken");
+
+    let p_uid = format!("gh_{}", Uuid::new_v4());
+    store
+        .oauth()
+        .link_account(user.id, "github", &p_uid, &email)
+        .await
+        .expect("link oauth");
+
+    store
+        .totp()
+        .upsert_secret(user.id, &[1, 2, 3], serde_json::json!(["bc1"]))
+        .await
+        .expect("upsert totp secret");
+
+    let used_hash = [103u8; 32];
+    store
+        .totp()
+        .record_used_code(user.id, &used_hash)
+        .await
+        .expect("record used code");
+
+    let c_hash = [104u8; 32];
+    store
+        .totp()
+        .create_two_factor_token(user.id, &c_hash, "cred_hash", Utc::now() + chrono::Duration::minutes(5))
+        .await
+        .expect("create 2fa token");
+
+    // Perform cascade delete of the parent user
+    let deleted = store
+        .users()
+        .delete_user(user.id)
+        .await
+        .expect("delete user cascades");
+    assert!(deleted);
+
+    // Verify all 7 child entities were cascaded
+    assert!(store.users().get_user_by_id(user.id).await.unwrap().is_none());
+    assert!(store.sessions().get_session_by_token_hash(&token_hash).await.unwrap().is_none());
+    assert!(store.sessions().list_user_sessions(user.id).await.unwrap().is_empty());
+    assert!(store.tokens().consume_verification_token(&v_hash).await.unwrap().is_none());
+    assert!(store.tokens().consume_password_reset_token(&r_hash).await.unwrap().is_none());
+    assert!(store.oauth().get_account("github", &p_uid).await.unwrap().is_none());
+    assert!(store.totp().get_secret(user.id).await.unwrap().is_none());
+    assert!(!store.totp().is_code_used(user.id, &used_hash).await.unwrap());
+    assert!(store.totp().consume_two_factor_token(&c_hash).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_mysql_transaction_atomicity() {
+    let Some(pool) = get_test_mysql_pool().await else {
+        eprintln!("skipping test_mysql_transaction_atomicity: MYSQL_URL not set");
+        return;
+    };
+    let store = MySqlStore::new(pool);
+
+    // 1. Rollback atomicity
+    let mut tx_rollback = store.begin().await.expect("begin tx");
+    let rb_email = format!("tx_rb_{}@example.com", Uuid::new_v4());
+    let rb_user = tx_rollback
+        .users()
+        .create_user(&rb_email, "hash")
+        .await
+        .expect("create user in tx");
+    tx_rollback.rollback().await.expect("rollback tx");
+    assert!(store.users().get_user_by_id(rb_user.id).await.unwrap().is_none());
+
+    // 2. Commit atomicity
+    let mut tx_commit = store.begin().await.expect("begin tx");
+    let cm_email = format!("tx_cm_{}@example.com", Uuid::new_v4());
+    let cm_user = tx_commit
+        .users()
+        .create_user(&cm_email, "hash")
+        .await
+        .expect("create user in tx");
+    tx_commit.commit().await.expect("commit tx");
+    assert!(store.users().get_user_by_id(cm_user.id).await.unwrap().is_some());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

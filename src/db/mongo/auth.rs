@@ -300,17 +300,7 @@ pub async fn consume_verification_token(
     }
     .map_err(AppError::from)?;
 
-    match doc {
-        Some(doc) => {
-            let token = VerificationToken::from(doc);
-            if token.expires_at <= Utc::now() {
-                Err(AppError::TokenExpired)
-            } else {
-                Ok(Some(token))
-            }
-        }
-        None => Ok(None),
-    }
+    Ok(doc.map(VerificationToken::from))
 }
 
 pub async fn create_password_reset_token(
@@ -360,17 +350,7 @@ pub async fn consume_password_reset_token(
     }
     .map_err(AppError::from)?;
 
-    match doc {
-        Some(doc) => {
-            let token = PasswordResetToken::from(doc);
-            if token.expires_at <= Utc::now() {
-                Err(AppError::TokenExpired)
-            } else {
-                Ok(Some(token))
-            }
-        }
-        None => Ok(None),
-    }
+    Ok(doc.map(PasswordResetToken::from))
 }
 
 pub async fn delete_user_password_reset_tokens(

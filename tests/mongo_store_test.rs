@@ -1982,3 +1982,57 @@ async fn test_mongo_tx_delete_user_rollback() {
     // Cleanup
     let _ = store.users().delete_user(user.id).await;
 }
+
+#[tokio::test]
+async fn test_mongo_tx_drop_aborts_transaction() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_tx_drop_aborts_transaction: MONGO_URL not set");
+        return;
+    };
+
+    if !store.is_replica_set() {
+        eprintln!("skipping test_mongo_tx_drop_aborts_transaction: transactions not supported on standalone");
+        return;
+    }
+
+    let tx_res = store.begin().await;
+    let user_id = {
+        let mut tx = match tx_res {
+            Ok(tx) => tx,
+            Err(AppError::TransactionNotSupported) => {
+                eprintln!("skipping test_mongo_tx_drop_aborts_transaction: transactions not supported on standalone");
+                return;
+            }
+            Err(e) => panic!("unexpected error beginning mongo tx: {:?}", e),
+        };
+
+        let email = format!("mongo_drop_{}@example.com", Uuid::new_v4());
+        let user = tx
+            .users()
+            .create_user(&email, "hash")
+            .await
+            .expect("create user in mongo tx");
+        user.id
+        // tx is intentionally dropped here without commit() or rollback()
+    };
+
+    // Yield briefly to allow the background abort task spawned in Drop to complete
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Assert that the uncommitted mutation was aborted and user does not exist
+    let fetched = store.users().get_user_by_id(user_id).await.unwrap();
+    assert!(
+        fetched.is_none(),
+        "uncommitted user must not exist after MongoTx drop"
+    );
+
+    // Verify subsequent operations on the collection succeed without lock contention
+    let email_after = format!("mongo_after_drop_{}@example.com", Uuid::new_v4());
+    let user_after = store
+        .users()
+        .create_user(&email_after, "hash")
+        .await
+        .expect("create user after drop abort");
+    assert_eq!(user_after.email, email_after);
+    let _ = store.users().delete_user(user_after.id).await;
+}

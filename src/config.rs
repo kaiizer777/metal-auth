@@ -4173,6 +4173,44 @@ mod tests {
     }
 
     #[test]
+    fn test_redact_url_at_in_query_passthrough() {
+        assert_eq!(
+            redact_url("postgres://localhost/metal_auth?note=a@b"),
+            "postgres://localhost/metal_auth?note=a@b"
+        );
+        assert_eq!(
+            redact_url("mongodb://localhost:27017/metal_auth?note=a@b"),
+            "mongodb://localhost:27017/metal_auth?note=a@b"
+        );
+        assert_eq!(
+            redact_url("postgres://localhost/metal_auth#frag@ment"),
+            "postgres://localhost/metal_auth#frag@ment"
+        );
+    }
+
+    #[test]
+    fn test_redact_url_at_in_password_suppressed() {
+        for (input, expected) in [
+            (
+                "postgres://user:p@ss@localhost:5432/metal_auth",
+                "postgres://[REDACTED]:[REDACTED]@localhost:5432/metal_auth",
+            ),
+            (
+                "mongodb://admin:p@ss@localhost:27017/metal_auth?authSource=admin",
+                "mongodb://[REDACTED]:[REDACTED]@localhost:27017/metal_auth?authSource=admin",
+            ),
+        ] {
+            let redacted = redact_url(input);
+            assert_eq!(redacted, expected);
+            assert!(
+                !redacted.contains("p@ss"),
+                "password fragment leaked: {redacted}"
+            );
+            assert_eq!(redact_url(&redacted), redacted, "output not idempotent");
+        }
+    }
+
+    #[test]
     #[cfg(feature = "mongodb")]
     fn test_mongo_config_validation_blank_database_rejection() {
         let cfg_blank = Config {

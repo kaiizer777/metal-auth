@@ -27,6 +27,30 @@ pub mod outbox;
 pub mod session;
 pub mod totp;
 
+/// Checks if a database error is a MySQL duplicate entry error (code 1062, SQLSTATE 23000, or error message).
+pub fn is_mysql_duplicate_key_error(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Database(db_err) => {
+            let mysql_err = db_err.downcast_ref::<sqlx::mysql::MySqlDatabaseError>();
+            if mysql_err.number() == 1062 {
+                return true;
+            }
+            if db_err.code().as_deref() == Some("1062") {
+                return true;
+            }
+            let msg = db_err.message();
+            if msg.contains("Duplicate entry") {
+                return true;
+            }
+            if db_err.code().as_deref() == Some("23000") && msg.contains("Duplicate") {
+                return true;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 /// MySQL-backed implementation of [`DatabaseStore`].
 #[derive(Clone, Debug)]
 pub struct MySqlStore {

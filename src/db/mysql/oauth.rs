@@ -76,11 +76,12 @@ where
     .bind(now)
     .execute(executor)
     .await
-    .map_err(|e| match e {
-        sqlx::Error::Database(ref db_err) if db_err.code().as_deref() == Some("1062") => {
+    .map_err(|e| {
+        if crate::db::mysql::is_mysql_duplicate_key_error(&e) {
             AppError::OAuthAccountLinkConflict
+        } else {
+            AppError::from(e)
         }
-        other => AppError::from(other),
     })?;
 
     Ok(OAuthAccount {

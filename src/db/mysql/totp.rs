@@ -184,7 +184,7 @@ where
 
     match result {
         Ok(r) => Ok(r.rows_affected() > 0),
-        Err(sqlx::Error::Database(ref db_err)) if db_err.code().as_deref() == Some("1062") => {
+        Err(ref e) if crate::db::mysql::is_mysql_duplicate_key_error(e) => {
             Err(AppError::TotpCodeReplayed)
         }
         Err(e) => Err(AppError::from(e)),

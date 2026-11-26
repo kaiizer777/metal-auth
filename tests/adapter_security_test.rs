@@ -97,6 +97,9 @@ mod mongo_security {
         let client = Client::with_options(client_options).ok()?;
         let db = client.database(&db_name);
         db.run_command(doc! { "ping": 1 }).await.ok()?;
+        metal_auth::db::mongo::indexes::ensure_indexes(&db)
+            .await
+            .ok()?;
         Some(MongoStore::new(client, &db_name, false, true))
     }
 
@@ -288,8 +291,8 @@ mod mysql_security {
             .await
             .expect("create user with SQL injection payload in email");
 
-        // Verify it was treated strictly as a literal string value
-        assert_eq!(user.email, malicious_email);
+        // Verify it was treated strictly as a literal string value (accounting for case normalization)
+        assert_eq!(user.email, malicious_email.to_lowercase());
 
         let fetched = store
             .users()
@@ -298,6 +301,7 @@ mod mysql_security {
             .expect("fetch by literal malicious email")
             .expect("user found");
         assert_eq!(fetched.id, user.id);
+        assert_eq!(fetched.email, malicious_email.to_lowercase());
 
         let _ = store.users().delete_user(user.id).await;
     }

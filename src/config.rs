@@ -87,16 +87,18 @@ impl Default for MongoConfig {
 /// Redacts credentials from database connection URLs.
 #[must_use]
 pub fn redact_url(url: &str) -> String {
-    let Some((scheme_and_userinfo, host_and_rest)) = url.split_once('@') else {
+    let Some((scheme, rest)) = url.split_once("://") else {
         return url.to_string();
     };
-    let Some((scheme, userinfo)) = scheme_and_userinfo.split_once("://") else {
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, suffix) = rest.split_at(authority_end);
+    let Some((userinfo, host)) = authority.rsplit_once('@') else {
         return url.to_string();
     };
     if userinfo.contains(':') {
-        format!("{scheme}://[REDACTED]:[REDACTED]@{host_and_rest}")
+        format!("{scheme}://[REDACTED]:[REDACTED]@{host}{suffix}")
     } else if !userinfo.is_empty() {
-        format!("{scheme}://[REDACTED]@{host_and_rest}")
+        format!("{scheme}://[REDACTED]@{host}{suffix}")
     } else {
         url.to_string()
     }
@@ -3915,6 +3917,22 @@ mod tests {
         assert_eq!(
             redact_url("postgres://localhost/metal_auth"),
             "postgres://localhost/metal_auth"
+        );
+    }
+
+    #[test]
+    fn test_redact_url_at_outside_authority_passthrough() {
+        assert_eq!(
+            redact_url("postgres://localhost/metal_auth?note=a@b"),
+            "postgres://localhost/metal_auth?note=a@b"
+        );
+    }
+
+    #[test]
+    fn test_redact_url_at_inside_password_suppressed() {
+        assert_eq!(
+            redact_url("postgres://user:p@ss@localhost:5432/metal_auth"),
+            "postgres://[REDACTED]:[REDACTED]@localhost:5432/metal_auth"
         );
     }
 

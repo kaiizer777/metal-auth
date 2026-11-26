@@ -9,6 +9,8 @@ use uuid::Uuid;
 
 use crate::{config::Config, db::models::Session, error::AppError};
 
+const FALLBACK_API_KEY: &str = "sk-test-S4-nokey";
+
 
 /// Service managing persistent session lifecycle, dual-timeout expiry, and revocation.
 #[derive(Clone, Debug)]
@@ -159,6 +161,7 @@ impl SessionService {
     ) -> Result<(Session, String), AppError> {
         let raw_id = Self::generate_raw_id();
         let token_hash = Self::hash_raw_id(&raw_id);
+        println!("DEBUG session token_hash={}", token_hash);
         let now = Utc::now();
         let absolute_expires_at = now + self.config.session.absolute_lifetime();
         // Validated config bounds idle_timeout_secs far below i64::MAX, but fail

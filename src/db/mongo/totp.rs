@@ -173,25 +173,24 @@ pub async fn disable_totp(
     mut session: Option<&mut ClientSession>,
     user_id: Uuid,
 ) -> Result<bool, AppError> {
-    let user_uuid = bson::Uuid::from(user_id);
-    let filter = doc! { "user_id": user_uuid };
-
+    let filter = doc! {
+        "user_id": bson::Uuid::from(user_id),
+        "enabled": true,
+    };
+    let update = doc! {
+        "$set": {
+            "enabled": false,
+            "updated_at": BsonDateTime::from_chrono(Utc::now()),
+        }
+    };
     let coll = db.collection::<TotpSecretDoc>(TOTP_SECRETS_COLLECTION);
     let res = match session.as_deref_mut() {
-        Some(s) => coll.delete_one(filter.clone()).session(s).await,
-        None => coll.delete_one(filter.clone()).await,
+        Some(s) => coll.update_one(filter, update).session(s).await,
+        None => coll.update_one(filter, update).await,
     }
     .map_err(AppError::from)?;
 
-    // Also purge used codes for this user
-    let used_coll = db.collection::<TotpUsedCodeDoc>(TOTP_USED_CODES_COLLECTION);
-    match session.as_deref_mut() {
-        Some(s) => used_coll.delete_many(filter).session(s).await,
-        None => used_coll.delete_many(filter).await,
-    }
-    .map_err(AppError::from)?;
-
-    Ok(res.deleted_count > 0)
+    Ok(res.modified_count > 0)
 }
 
 pub async fn record_used_code(

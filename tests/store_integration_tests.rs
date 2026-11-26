@@ -448,3 +448,76 @@ async fn test_store_transaction_commit_and_rollback() {
     assert_eq!(custom_state.store().backend(), DatabaseBackend::Postgres);
     assert!(custom_state.store().ping().await.is_ok());
 }
+
+#[tokio::test]
+async fn test_store_oauth_round_trip() {
+    let app = setup_test_app().await.expect("test app initialization");
+    let store = app.state.store();
+    let email = format!("store_oauth_{}@example.com", Uuid::new_v4());
+    let user = store
+        .users()
+        .create_user(&email, "hash")
+        .await
+        .expect("create user");
+
+    let p_uid = format!("uid_{}", Uuid::new_v4());
+    let account = store
+        .oauth()
+        .link_account(user.id, "google", &p_uid, &email)
+        .await
+        .expect("link oauth account");
+    assert_eq!(account.user_id, user.id);
+
+    let duplicate_err = store
+        .oauth()
+        .link_account(user.id, "google", &p_uid, &email)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        duplicate_err,
+        metal_auth::AppError::OAuthAccountLinkConflict
+    ));
+
+    let missing = store
+        .oauth()
+        .get_account("google", &format!("uid_{}", Uuid::new_v4()))
+        .await
+        .expect("get missing account");
+    assert!(missing.is_none());
+
+    let fetched = store
+        .oauth()
+        .get_account("google", &p_uid)
+        .await
+        .expect("get account")
+        .expect("account exists");
+    assert_eq!(fetched.id, account.id);
+
+    let listed = store
+        .oauth()
+        .list_accounts_for_user(user.id)
+        .await
+        .expect("list accounts");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, account.id);
+
+    let unlinked = store
+        .oauth()
+        .unlink_account(user.id, "google")
+        .await
+        .expect("unlink account");
+    assert!(unlinked);
+
+    let after_unlink = store
+        .oauth()
+        .get_account("google", &p_uid)
+        .await
+        .expect("get after unlink");
+    assert!(after_unlink.is_none());
+
+    store
+        .users()
+        .delete_user(user.id)
+        .await
+        .expect("delete user");
+}

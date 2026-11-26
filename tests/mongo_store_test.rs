@@ -735,6 +735,133 @@ async fn test_mongo_outbox_lifecycle() {
 }
 
 #[tokio::test]
+async fn test_mongo_outbox_concurrent_claims() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_outbox_concurrent_claims: MONGO_URL not set");
+        return;
+    };
+
+    let count = 20;
+    let mut seeded_ids = Vec::with_capacity(count);
+    for _ in 0..count {
+        let recipient = format!("concurrent_outbox_{}@example.com", Uuid::new_v4());
+        let payload = serde_json::json!({ "worker_test": true });
+        let outbox = store
+            .outbox()
+            .insert_outbox(&recipient, "verification", payload)
+            .await
+            .expect("insert outbox record");
+        seeded_ids.push(outbox.id);
+    }
+
+    let seeded_set: std::collections::HashSet<Uuid> = seeded_ids.iter().copied().collect();
+
+    // Spawn 4 concurrent worker tasks claiming batches
+    let mut tasks = Vec::new();
+    for _ in 0..4 {
+        let worker_store = store.clone();
+        let task = tokio::spawn(async move {
+            let mut worker_claimed = Vec::new();
+            for _ in 0..10 {
+                let batch = worker_store
+                    .outbox()
+                    .claim_pending_outbox(5, Duration::from_secs(60))
+                    .await
+                    .expect("claim outbox batch");
+                if batch.is_empty() {
+                    break;
+                }
+                for item in batch {
+                    worker_claimed.push(item.id);
+                }
+            }
+            worker_claimed
+        });
+        tasks.push(task);
+    }
+
+    let mut all_claimed = Vec::new();
+    for task in tasks {
+        let worker_claimed = task.await.expect("join worker task");
+        all_claimed.extend(worker_claimed);
+    }
+
+    let test_claimed: Vec<Uuid> = all_claimed
+        .into_iter()
+        .filter(|id| seeded_set.contains(id))
+        .collect();
+
+    // Verify mutual exclusion: exactly count records claimed, zero duplicates
+    assert_eq!(
+        test_claimed.len(),
+        count,
+        "every seeded record must be claimed exactly once"
+    );
+    let mut seen = std::collections::HashSet::new();
+    for id in &test_claimed {
+        assert!(
+            seen.insert(*id),
+            "duplicate claim detected for outbox record {id}"
+        );
+    }
+
+    // Cleanup
+    for id in seeded_ids {
+        let _ = store.outbox().mark_outbox_sent(id).await;
+    }
+    let _ = store
+        .outbox()
+        .cleanup_sent_outbox(Duration::from_secs(0))
+        .await;
+}
+
+#[tokio::test]
+async fn test_mongo_outbox_stale_lease_recovery() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_outbox_stale_lease_recovery: MONGO_URL not set");
+        return;
+    };
+
+    let recipient = format!("stale_outbox_{}@example.com", Uuid::new_v4());
+    let payload = serde_json::json!({ "stale_test": true });
+
+    let outbox = store
+        .outbox()
+        .insert_outbox(&recipient, "password_reset", payload)
+        .await
+        .expect("insert outbox email");
+
+    // Worker A claims with 1-second lease
+    let claimed = store
+        .outbox()
+        .claim_pending_outbox(10, Duration::from_secs(1))
+        .await
+        .expect("initial claim");
+    assert!(claimed.iter().any(|item| item.id == outbox.id));
+
+    // Wait 1.1s for lease to expire (1.1s > 1s lease, but < 2s double lease)
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    // Worker B should immediately recover and reclaim the record without waiting 2x lease
+    let reclaimed = store
+        .outbox()
+        .claim_pending_outbox(10, Duration::from_secs(60))
+        .await
+        .expect("reclaim stale record");
+    assert!(
+        reclaimed.iter().any(|item| item.id == outbox.id),
+        "stale processing record must be reclaimable as soon as next_retry_at <= now"
+    );
+
+    // Cleanup
+    let _ = store.outbox().mark_outbox_sent(outbox.id).await;
+    let _ = store
+        .outbox()
+        .cleanup_sent_outbox(Duration::from_secs(0))
+        .await;
+}
+
+#[tokio::test]
 async fn test_mongo_oauth_lifecycle() {
     let Some(store) = get_test_mongo_store().await else {
         eprintln!("skipping test_mongo_oauth_lifecycle: MONGO_URL not set");

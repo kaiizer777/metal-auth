@@ -194,10 +194,7 @@ impl UserStore for MongoStore {
             session.start_transaction().await.map_err(AppError::from)?;
             match auth::delete_user(&self.db, Some(&mut session), user_id).await {
                 Ok(deleted) => {
-                    session
-                        .commit_transaction()
-                        .await
-                        .map_err(AppError::from)?;
+                    session.commit_transaction().await.map_err(AppError::from)?;
                     Ok(deleted)
                 }
                 Err(e) => {
@@ -565,16 +562,19 @@ impl MongoTx {
 
 impl Drop for MongoTx {
     fn drop(&mut self) {
-        if self.active.swap(false, Ordering::SeqCst) {
-            if let Some(session) = self.session.take() {
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.spawn(async move {
-                        let mut guard = session.lock().await;
-                        let _ = guard.abort_transaction().await;
-                    });
-                }
-            }
+        if !self.active.swap(false, Ordering::SeqCst) {
+            return;
         }
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            let mut guard = session.lock().await;
+            let _ = guard.abort_transaction().await;
+        });
     }
 }
 

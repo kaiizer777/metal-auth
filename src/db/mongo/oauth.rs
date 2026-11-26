@@ -2,7 +2,7 @@
 
 use bson::{DateTime as BsonDateTime, doc};
 use chrono::Utc;
-use mongodb::{options::FindOptions, ClientSession, Database};
+use mongodb::{ClientSession, Database, options::FindOptions};
 use uuid::Uuid;
 
 use crate::{

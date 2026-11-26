@@ -154,12 +154,7 @@ pub async fn delete_user(
 
     // Check user existence before initiating cascade deletes across child collections.
     let user_exists = match session.as_deref_mut() {
-        Some(s) => {
-            user_coll
-                .find_one(user_id_filter.clone())
-                .session(s)
-                .await
-        }
+        Some(s) => user_coll.find_one(user_id_filter.clone()).session(s).await,
         None => user_coll.find_one(user_id_filter.clone()).await,
     }
     .map_err(AppError::from)?;

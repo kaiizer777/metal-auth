@@ -975,7 +975,10 @@ async fn test_mongo_outbox_recover_stale_processing() {
         .recover_stale_processing(Duration::from_secs(60))
         .await
         .expect("recover stale processing");
-    assert!(recovered >= 1, "expected at least 1 recovered record, got {recovered}");
+    assert!(
+        recovered >= 1,
+        "expected at least 1 recovered record, got {recovered}"
+    );
 
     // Verify record has reverted to pending and can be claimed by Worker B
     let reclaimed = store
@@ -1175,7 +1178,11 @@ async fn test_mongo_outbox_status_guards() {
         .claim_pending_outbox(10, Duration::from_secs(60))
         .await
         .expect("claim outbox email");
-    assert!(claimed_failed.iter().any(|item| item.id == outbox_failed.id));
+    assert!(
+        claimed_failed
+            .iter()
+            .any(|item| item.id == outbox_failed.id)
+    );
 
     store
         .outbox()
@@ -1293,7 +1300,10 @@ async fn test_mongo_oauth_list_accounts_sort_order() {
 
     let user = store
         .users()
-        .create_user(&format!("oauth_sort_{}@example.com", Uuid::new_v4()), "hash")
+        .create_user(
+            &format!("oauth_sort_{}@example.com", Uuid::new_v4()),
+            "hash",
+        )
         .await
         .expect("create user");
 
@@ -1925,7 +1935,7 @@ async fn test_mongo_delete_user_non_existent() {
     };
     let random_id = Uuid::new_v4();
     let res = store.users().delete_user(random_id).await;
-    assert_eq!(res.unwrap(), false);
+    assert!(!res.unwrap());
 }
 
 #[tokio::test]
@@ -1939,7 +1949,9 @@ async fn test_mongo_tx_delete_user_rollback() {
     let mut tx = match tx_res {
         Ok(tx) => tx,
         Err(AppError::TransactionNotSupported) => {
-            eprintln!("skipping test_mongo_tx_delete_user_rollback: transactions not supported on standalone");
+            eprintln!(
+                "skipping test_mongo_tx_delete_user_rollback: transactions not supported on standalone"
+            );
             return;
         }
         Err(e) => panic!("unexpected error beginning mongo tx: {:?}", e),
@@ -1975,7 +1987,14 @@ async fn test_mongo_tx_delete_user_rollback() {
     tx.rollback().await.expect("rollback mongo tx");
 
     // After rollback, user and session must still exist
-    assert!(store.users().get_user_by_id(user.id).await.unwrap().is_some());
+    assert!(
+        store
+            .users()
+            .get_user_by_id(user.id)
+            .await
+            .unwrap()
+            .is_some()
+    );
     let sessions = store.sessions().list_user_sessions(user.id).await.unwrap();
     assert_eq!(sessions.len(), 1);
 
@@ -1991,7 +2010,9 @@ async fn test_mongo_tx_drop_aborts_transaction() {
     };
 
     if !store.is_replica_set() {
-        eprintln!("skipping test_mongo_tx_drop_aborts_transaction: transactions not supported on standalone");
+        eprintln!(
+            "skipping test_mongo_tx_drop_aborts_transaction: transactions not supported on standalone"
+        );
         return;
     }
 
@@ -2000,7 +2021,9 @@ async fn test_mongo_tx_drop_aborts_transaction() {
         let mut tx = match tx_res {
             Ok(tx) => tx,
             Err(AppError::TransactionNotSupported) => {
-                eprintln!("skipping test_mongo_tx_drop_aborts_transaction: transactions not supported on standalone");
+                eprintln!(
+                    "skipping test_mongo_tx_drop_aborts_transaction: transactions not supported on standalone"
+                );
                 return;
             }
             Err(e) => panic!("unexpected error beginning mongo tx: {:?}", e),

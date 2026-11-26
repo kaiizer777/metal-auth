@@ -4090,6 +4090,93 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mongodb")]
+    fn test_mongo_database_canonical_wins_over_alias() {
+        let map = std::collections::HashMap::from([
+            ("BASE_URL", "http://localhost:3000"),
+            ("DATABASE_URL", "mongodb://localhost:27017/test_db"),
+            ("DATABASE_BACKEND", "mongodb"),
+            ("MONGO_DATABASE_NAME", "canonical_auth"),
+            ("MONGO_DATABASE", "alias_auth"),
+        ]);
+        let cfg = Config::from_lookup(|k| {
+            map.get(k)
+                .map(|v| v.to_string())
+                .ok_or(std::env::VarError::NotPresent)
+        })
+        .unwrap();
+
+        let mongo_cfg = cfg.mongo.unwrap();
+        assert_eq!(mongo_cfg.database_name, "canonical_auth");
+    }
+
+    #[test]
+    #[cfg(feature = "mongodb")]
+    fn test_mongo_database_default_without_either_key() {
+        let map = std::collections::HashMap::from([
+            ("BASE_URL", "http://localhost:3000"),
+            ("DATABASE_URL", "mongodb://localhost:27017/test_db"),
+            ("DATABASE_BACKEND", "mongodb"),
+        ]);
+        let cfg = Config::from_lookup(|k| {
+            map.get(k)
+                .map(|v| v.to_string())
+                .ok_or(std::env::VarError::NotPresent)
+        })
+        .unwrap();
+
+        let mongo_cfg = cfg.mongo.unwrap();
+        assert_eq!(mongo_cfg.database_name, "metal_auth");
+    }
+
+    #[test]
+    #[cfg(feature = "mongodb")]
+    fn test_mongo_database_empty_alias_rejected() {
+        let map = std::collections::HashMap::from([
+            ("BASE_URL", "http://localhost:3000"),
+            ("DATABASE_URL", "mongodb://localhost:27017/test_db"),
+            ("DATABASE_BACKEND", "mongodb"),
+            ("MONGO_DATABASE", ""),
+        ]);
+        let err = Config::from_lookup(|k| {
+            map.get(k)
+                .map(|v| v.to_string())
+                .ok_or(std::env::VarError::NotPresent)
+        })
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidValue {
+                field: "mongo.database_name",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "mongodb")]
+    fn test_mongo_database_non_unicode_alias_errors() {
+        let err = Config::from_lookup(|k| {
+            if k == "MONGO_DATABASE" {
+                return Err(std::env::VarError::NotUnicode(std::ffi::OsString::from(
+                    "bad",
+                )));
+            }
+            match k {
+                "BASE_URL" => Ok("http://localhost:3000".to_string()),
+                "DATABASE_URL" => Ok("mongodb://localhost:27017/test_db".to_string()),
+                "DATABASE_BACKEND" => Ok("mongodb".to_string()),
+                _ => Err(std::env::VarError::NotPresent),
+            }
+        })
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::NonUnicodeEnvVar("MONGO_DATABASE")
+        ));
+    }
+
+    #[test]
     fn test_config_backend_url_scheme_mismatch_matrix() {
         // Postgres backend rejects mysql:// and mongodb://
         let pg_with_mysql = Config {

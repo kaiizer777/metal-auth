@@ -563,6 +563,21 @@ impl MongoTx {
     }
 }
 
+impl Drop for MongoTx {
+    fn drop(&mut self) {
+        if self.active.swap(false, Ordering::SeqCst) {
+            if let Some(session) = self.session.take() {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        let mut guard = session.lock().await;
+                        let _ = guard.abort_transaction().await;
+                    });
+                }
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl UserStore for MongoTx {
     async fn create_user(&self, email: &str, password_hash: &str) -> Result<User, AppError> {
@@ -1366,22 +1381,24 @@ impl StoreTx for MongoTx {
         self
     }
 
-    async fn commit(self: Box<Self>) -> Result<(), AppError> {
-        if !self.active.swap(false, Ordering::SeqCst) {
+    async fn commit(mut self: Box<Self>) -> Result<(), AppError> {
+        if !self.active.load(Ordering::SeqCst) {
             return Err(AppError::Internal);
         }
         if let Some(s) = &self.session {
             let mut session = s.lock().await;
             session.commit_transaction().await.map_err(AppError::from)?;
         }
+        self.active.store(false, Ordering::SeqCst);
+        let _ = self.session.take();
         Ok(())
     }
 
-    async fn rollback(self: Box<Self>) -> Result<(), AppError> {
+    async fn rollback(mut self: Box<Self>) -> Result<(), AppError> {
         if !self.active.swap(false, Ordering::SeqCst) {
             return Err(AppError::Internal);
         }
-        if let Some(s) = &self.session {
+        if let Some(s) = self.session.take() {
             let mut session = s.lock().await;
             session.abort_transaction().await.map_err(AppError::from)?;
         }
@@ -1392,6 +1409,16 @@ impl StoreTx for MongoTx {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_mongo_tx_drop_standalone_does_not_panic() {
+        let client = Client::with_uri_str("mongodb://127.0.0.1:27017")
+            .await
+            .unwrap();
+        let store = MongoStore::new(client, "test_db", false, true);
+        let tx = store.begin().await.unwrap();
+        drop(tx);
+    }
 
     #[tokio::test]
     async fn test_standalone_fails_closed_by_default() {

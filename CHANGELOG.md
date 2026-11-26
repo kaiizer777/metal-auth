@@ -69,5 +69,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The failure-injection cleanup is bounded, so a stalled connect fails instead of hanging the suite.
 - Two-factor concurrency tests fail with a clear message instead of hanging, and prove lock ordering
   from `pg_locks` rather than elapsed time.
-
-<!-- e2e: unrelated touch for M8 no-op push proof -->

@@ -979,7 +979,12 @@ async fn test_mongo_cascade_delete() {
     let c_hash = [114u8; 32];
     store
         .totp()
-        .create_two_factor_token(user.id, &c_hash, "cred_hash", Utc::now() + chrono::Duration::minutes(5))
+        .create_two_factor_token(
+            user.id,
+            &c_hash,
+            "cred_hash",
+            Utc::now() + chrono::Duration::minutes(5),
+        )
         .await
         .expect("create 2fa token");
 
@@ -992,15 +997,70 @@ async fn test_mongo_cascade_delete() {
     assert!(deleted);
 
     // Verify all 7 child entities were cascaded
-    assert!(store.users().get_user_by_id(user.id).await.unwrap().is_none());
-    assert!(store.sessions().get_session_by_token_hash(&token_hash).await.unwrap().is_none());
-    assert!(store.sessions().list_user_sessions(user.id).await.unwrap().is_empty());
-    assert!(store.tokens().consume_verification_token(&v_hash).await.unwrap().is_none());
-    assert!(store.tokens().consume_password_reset_token(&r_hash).await.unwrap().is_none());
-    assert!(store.oauth().get_account("github", &p_uid).await.unwrap().is_none());
+    assert!(
+        store
+            .users()
+            .get_user_by_id(user.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .sessions()
+            .get_session_by_token_hash(&token_hash)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .sessions()
+            .list_user_sessions(user.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .tokens()
+            .consume_verification_token(&v_hash)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .tokens()
+            .consume_password_reset_token(&r_hash)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .oauth()
+            .get_account("github", &p_uid)
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(store.totp().get_secret(user.id).await.unwrap().is_none());
-    assert!(!store.totp().is_code_used(user.id, &used_hash).await.unwrap());
-    assert!(store.totp().consume_two_factor_token(&c_hash).await.unwrap().is_none());
+    assert!(
+        !store
+            .totp()
+            .is_code_used(user.id, &used_hash)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .totp()
+            .consume_two_factor_token(&c_hash)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -1021,7 +1081,14 @@ async fn test_mongo_transaction_atomicity() {
                 .await
                 .expect("create user in mongo tx");
             tx.commit().await.expect("commit mongo tx");
-            assert!(store.users().get_user_by_id(user.id).await.unwrap().is_some());
+            assert!(
+                store
+                    .users()
+                    .get_user_by_id(user.id)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
             let _ = store.users().delete_user(user.id).await;
         }
         Err(AppError::TransactionNotSupported) => {

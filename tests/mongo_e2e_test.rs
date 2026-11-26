@@ -4,13 +4,9 @@ use std::time::Duration;
 
 use chrono::Utc;
 use metal_auth::{
-    AppError, DatabaseBackend, DatabaseStore, MongoStore,
-    db::mongo::indexes::ensure_indexes,
+    AppError, DatabaseBackend, DatabaseStore, MongoStore, db::mongo::indexes::ensure_indexes,
 };
-use mongodb::{
-    Client,
-    bson::doc,
-};
+use mongodb::{Client, bson::doc};
 use uuid::Uuid;
 
 async fn get_test_mongo_store() -> Option<MongoStore> {
@@ -321,5 +317,12 @@ async fn test_mongo_complete_auth_journey() {
         .await
         .expect("teardown: delete user");
     assert!(deleted);
-    assert!(store.users().get_user_by_id(user.id).await.unwrap().is_none());
+    assert!(
+        store
+            .users()
+            .get_user_by_id(user.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

@@ -1572,10 +1572,12 @@ mod tests {
     #[cfg(feature = "mongodb")]
     fn test_mongo_is_duplicate_key_error_classifier() {
         // Generic error message containing E11000
-        let dup_err1 = mongodb::error::Error::custom("E11000 duplicate key error in index: email_1");
+        let dup_err1 =
+            mongodb::error::Error::custom("E11000 duplicate key error in index: email_1");
         assert!(crate::db::mongo::is_duplicate_key_error(&dup_err1));
 
-        let dup_err2 = mongodb::error::Error::custom("duplicate key error collection: users index: idx_email");
+        let dup_err2 =
+            mongodb::error::Error::custom("duplicate key error collection: users index: idx_email");
         assert!(crate::db::mongo::is_duplicate_key_error(&dup_err2));
 
         // Non-duplicate error message

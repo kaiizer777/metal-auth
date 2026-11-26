@@ -604,7 +604,12 @@ async fn test_mysql_cascade_delete() {
     let c_hash = [104u8; 32];
     store
         .totp()
-        .create_two_factor_token(user.id, &c_hash, "cred_hash", Utc::now() + chrono::Duration::minutes(5))
+        .create_two_factor_token(
+            user.id,
+            &c_hash,
+            "cred_hash",
+            Utc::now() + chrono::Duration::minutes(5),
+        )
         .await
         .expect("create 2fa token");
 
@@ -617,15 +622,70 @@ async fn test_mysql_cascade_delete() {
     assert!(deleted);
 
     // Verify all 7 child entities were cascaded
-    assert!(store.users().get_user_by_id(user.id).await.unwrap().is_none());
-    assert!(store.sessions().get_session_by_token_hash(&token_hash).await.unwrap().is_none());
-    assert!(store.sessions().list_user_sessions(user.id).await.unwrap().is_empty());
-    assert!(store.tokens().consume_verification_token(&v_hash).await.unwrap().is_none());
-    assert!(store.tokens().consume_password_reset_token(&r_hash).await.unwrap().is_none());
-    assert!(store.oauth().get_account("github", &p_uid).await.unwrap().is_none());
+    assert!(
+        store
+            .users()
+            .get_user_by_id(user.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .sessions()
+            .get_session_by_token_hash(&token_hash)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .sessions()
+            .list_user_sessions(user.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .tokens()
+            .consume_verification_token(&v_hash)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .tokens()
+            .consume_password_reset_token(&r_hash)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .oauth()
+            .get_account("github", &p_uid)
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(store.totp().get_secret(user.id).await.unwrap().is_none());
-    assert!(!store.totp().is_code_used(user.id, &used_hash).await.unwrap());
-    assert!(store.totp().consume_two_factor_token(&c_hash).await.unwrap().is_none());
+    assert!(
+        !store
+            .totp()
+            .is_code_used(user.id, &used_hash)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .totp()
+            .consume_two_factor_token(&c_hash)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -645,7 +705,14 @@ async fn test_mysql_transaction_atomicity() {
         .await
         .expect("create user in tx");
     tx_rollback.rollback().await.expect("rollback tx");
-    assert!(store.users().get_user_by_id(rb_user.id).await.unwrap().is_none());
+    assert!(
+        store
+            .users()
+            .get_user_by_id(rb_user.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // 2. Commit atomicity
     let mut tx_commit = store.begin().await.expect("begin tx");
@@ -656,7 +723,14 @@ async fn test_mysql_transaction_atomicity() {
         .await
         .expect("create user in tx");
     tx_commit.commit().await.expect("commit tx");
-    assert!(store.users().get_user_by_id(cm_user.id).await.unwrap().is_some());
+    assert!(
+        store
+            .users()
+            .get_user_by_id(cm_user.id)
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

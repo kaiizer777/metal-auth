@@ -2,9 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
-use metal_auth::{
-    AppError, DatabaseStore,
-};
+use metal_auth::{AppError, DatabaseStore};
 use uuid::Uuid;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -150,7 +148,10 @@ mod mongo_security {
             let store_clone = store.clone();
             let user_id = user.id;
             handles.push(tokio::spawn(async move {
-                store_clone.totp().record_used_code(user_id, &code_hash).await
+                store_clone
+                    .totp()
+                    .record_used_code(user_id, &code_hash)
+                    .await
             }));
         }
 
@@ -165,7 +166,10 @@ mod mongo_security {
         }
 
         assert_eq!(success_count, 1, "exactly 1 submission must succeed");
-        assert_eq!(replay_count, 4, "exactly 4 submissions must fail with TotpCodeReplayed");
+        assert_eq!(
+            replay_count, 4,
+            "exactly 4 submissions must fail with TotpCodeReplayed"
+        );
 
         let _ = store.users().delete_user(user.id).await;
     }
@@ -210,11 +214,19 @@ mod mongo_security {
             .expect("delete sessions");
 
         // Consume challenge token succeeds only once
-        let first_consume = store.totp().consume_two_factor_token(&c_hash).await.unwrap();
+        let first_consume = store
+            .totp()
+            .consume_two_factor_token(&c_hash)
+            .await
+            .unwrap();
         assert!(first_consume.is_some());
 
         // Replay of challenge token is strictly rejected
-        let second_consume = store.totp().consume_two_factor_token(&c_hash).await.unwrap();
+        let second_consume = store
+            .totp()
+            .consume_two_factor_token(&c_hash)
+            .await
+            .unwrap();
         assert!(second_consume.is_none());
 
         let _ = store.users().delete_user(user.id).await;
@@ -286,7 +298,9 @@ mod mysql_security {
     #[tokio::test]
     async fn test_mysql_concurrent_totp_replay_barrier() {
         let Some(pool) = get_mysql_pool().await else {
-            eprintln!("skipping test_mysql_concurrent_totp_replay_barrier: MYSQL_DATABASE_URL not set");
+            eprintln!(
+                "skipping test_mysql_concurrent_totp_replay_barrier: MYSQL_DATABASE_URL not set"
+            );
             return;
         };
         let store = MySqlStore::new(pool);
@@ -306,7 +320,10 @@ mod mysql_security {
             let store_clone = store.clone();
             let user_id = user.id;
             handles.push(tokio::spawn(async move {
-                store_clone.totp().record_used_code(user_id, &code_hash).await
+                store_clone
+                    .totp()
+                    .record_used_code(user_id, &code_hash)
+                    .await
             }));
         }
 
@@ -321,7 +338,10 @@ mod mysql_security {
         }
 
         assert_eq!(success_count, 1, "exactly 1 submission must succeed");
-        assert_eq!(replay_count, 4, "exactly 4 submissions must fail with TotpCodeReplayed");
+        assert_eq!(
+            replay_count, 4,
+            "exactly 4 submissions must fail with TotpCodeReplayed"
+        );
 
         let _ = store.users().delete_user(user.id).await;
     }
@@ -329,7 +349,9 @@ mod mysql_security {
     #[tokio::test]
     async fn test_mysql_login_vs_password_reset_race() {
         let Some(pool) = get_mysql_pool().await else {
-            eprintln!("skipping test_mysql_login_vs_password_reset_race: MYSQL_DATABASE_URL not set");
+            eprintln!(
+                "skipping test_mysql_login_vs_password_reset_race: MYSQL_DATABASE_URL not set"
+            );
             return;
         };
         let store = MySqlStore::new(pool);
@@ -367,11 +389,19 @@ mod mysql_security {
             .expect("delete sessions");
 
         // Consume challenge token succeeds only once
-        let first_consume = store.totp().consume_two_factor_token(&c_hash).await.unwrap();
+        let first_consume = store
+            .totp()
+            .consume_two_factor_token(&c_hash)
+            .await
+            .unwrap();
         assert!(first_consume.is_some());
 
         // Replay of challenge token is strictly rejected
-        let second_consume = store.totp().consume_two_factor_token(&c_hash).await.unwrap();
+        let second_consume = store
+            .totp()
+            .consume_two_factor_token(&c_hash)
+            .await
+            .unwrap();
         assert!(second_consume.is_none());
 
         let _ = store.users().delete_user(user.id).await;

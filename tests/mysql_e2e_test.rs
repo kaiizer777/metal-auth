@@ -308,5 +308,12 @@ async fn test_mysql_complete_auth_journey() {
         .await
         .expect("teardown: delete user");
     assert!(deleted);
-    assert!(store.users().get_user_by_id(user.id).await.unwrap().is_none());
+    assert!(
+        store
+            .users()
+            .get_user_by_id(user.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

@@ -4052,7 +4052,10 @@ mod tests {
         };
         assert!(matches!(
             pg_with_mysql.validate(),
-            Err(ConfigError::InvalidValue { field: "database_url", reason: "URL scheme does not match configured database backend" })
+            Err(ConfigError::InvalidValue {
+                field: "database_url",
+                reason: "URL scheme does not match configured database backend"
+            })
         ));
 
         let pg_with_mongo = Config {
@@ -4062,7 +4065,10 @@ mod tests {
         };
         assert!(matches!(
             pg_with_mongo.validate(),
-            Err(ConfigError::InvalidValue { field: "database_url", reason: "URL scheme does not match configured database backend" })
+            Err(ConfigError::InvalidValue {
+                field: "database_url",
+                reason: "URL scheme does not match configured database backend"
+            })
         ));
 
         // Mysql backend rejects postgres:// and mongodb://
@@ -4073,7 +4079,10 @@ mod tests {
         };
         assert!(matches!(
             mysql_with_pg.validate(),
-            Err(ConfigError::InvalidValue { field: "database_url", reason: "URL scheme does not match configured database backend" })
+            Err(ConfigError::InvalidValue {
+                field: "database_url",
+                reason: "URL scheme does not match configured database backend"
+            })
         ));
 
         let mysql_with_mongo = Config {
@@ -4083,7 +4092,10 @@ mod tests {
         };
         assert!(matches!(
             mysql_with_mongo.validate(),
-            Err(ConfigError::InvalidValue { field: "database_url", reason: "URL scheme does not match configured database backend" })
+            Err(ConfigError::InvalidValue {
+                field: "database_url",
+                reason: "URL scheme does not match configured database backend"
+            })
         ));
 
         // Mongodb backend rejects postgres:// and mysql://
@@ -4094,7 +4106,10 @@ mod tests {
         };
         assert!(matches!(
             mongo_with_pg.validate(),
-            Err(ConfigError::InvalidValue { field: "database_url", reason: "URL scheme does not match configured database backend" })
+            Err(ConfigError::InvalidValue {
+                field: "database_url",
+                reason: "URL scheme does not match configured database backend"
+            })
         ));
 
         let mongo_with_mysql = Config {
@@ -4104,7 +4119,10 @@ mod tests {
         };
         assert!(matches!(
             mongo_with_mysql.validate(),
-            Err(ConfigError::InvalidValue { field: "database_url", reason: "URL scheme does not match configured database backend" })
+            Err(ConfigError::InvalidValue {
+                field: "database_url",
+                reason: "URL scheme does not match configured database backend"
+            })
         ));
     }
 

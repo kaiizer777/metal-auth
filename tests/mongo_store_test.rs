@@ -721,6 +721,37 @@ async fn test_mongo_sessions_lifecycle() {
         .expect("fetch deleted session");
     assert!(after_delete.is_none());
 
+    // 7. Expired session retrieval parity (storage layer returns existing session without premature expiry filtering)
+    let expired_token_hash = format!("sess_expired_hash_{}", Uuid::new_v4());
+    let past_expiry = Utc::now() - chrono::Duration::hours(1);
+    let expired_session = store
+        .sessions()
+        .create_session(
+            user.id,
+            &expired_token_hash,
+            "cookie",
+            Some("csrf_expired"),
+            past_expiry,
+        )
+        .await
+        .expect("create expired session");
+
+    let fetched_expired = store
+        .sessions()
+        .get_session_by_token_hash(&expired_token_hash)
+        .await
+        .expect("fetch expired session")
+        .expect("expired session exists in storage");
+    assert_eq!(fetched_expired.id, expired_session.id);
+    assert_eq!(fetched_expired.user_id, user.id);
+    assert!(fetched_expired.absolute_expires_at <= Utc::now());
+
+    store
+        .sessions()
+        .delete_session(expired_session.id)
+        .await
+        .expect("delete expired session");
+
     // Cleanup
     let _ = store.users().delete_user(user.id).await;
 }

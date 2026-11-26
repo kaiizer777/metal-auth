@@ -1224,3 +1224,69 @@ async fn test_mongo_transaction_atomicity() {
         Err(e) => panic!("unexpected error beginning mongo tx: {:?}", e),
     }
 }
+
+#[tokio::test]
+async fn test_mongo_delete_user_non_existent() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_delete_user_non_existent: MONGO_URL not set");
+        return;
+    };
+    let random_id = Uuid::new_v4();
+    let res = store.users().delete_user(random_id).await;
+    assert_eq!(res.unwrap(), false);
+}
+
+#[tokio::test]
+async fn test_mongo_tx_delete_user_rollback() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_tx_delete_user_rollback: MONGO_URL not set");
+        return;
+    };
+
+    let tx_res = store.begin().await;
+    let mut tx = match tx_res {
+        Ok(tx) => tx,
+        Err(AppError::TransactionNotSupported) => {
+            eprintln!("skipping test_mongo_tx_delete_user_rollback: transactions not supported on standalone");
+            return;
+        }
+        Err(e) => panic!("unexpected error beginning mongo tx: {:?}", e),
+    };
+
+    let email = format!("mongo_rollback_{}@example.com", Uuid::new_v4());
+    let user = store
+        .users()
+        .create_user(&email, "hash")
+        .await
+        .expect("create user");
+
+    let token_hash = format!("sess_{}", Uuid::new_v4());
+    let _session = store
+        .sessions()
+        .create_session(
+            user.id,
+            &token_hash,
+            "cookie",
+            Some("csrf"),
+            Utc::now() + chrono::Duration::hours(1),
+        )
+        .await
+        .expect("create session");
+
+    let deleted = tx
+        .users()
+        .delete_user(user.id)
+        .await
+        .expect("delete_user inside tx");
+    assert!(deleted);
+
+    tx.rollback().await.expect("rollback mongo tx");
+
+    // After rollback, user and session must still exist
+    assert!(store.users().get_user_by_id(user.id).await.unwrap().is_some());
+    let sessions = store.sessions().list_user_sessions(user.id).await.unwrap();
+    assert_eq!(sessions.len(), 1);
+
+    // Cleanup
+    let _ = store.users().delete_user(user.id).await;
+}

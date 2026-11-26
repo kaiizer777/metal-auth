@@ -31,8 +31,10 @@ pub mod totp;
 pub fn is_mysql_duplicate_key_error(err: &sqlx::Error) -> bool {
     match err {
         sqlx::Error::Database(db_err) => {
-            let mysql_err = db_err.downcast_ref::<sqlx::mysql::MySqlDatabaseError>();
-            if mysql_err.number() == 1062 {
+            if db_err
+                .try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+                .is_some_and(|mysql_err| mysql_err.number() == 1062)
+            {
                 return true;
             }
             if db_err.code().as_deref() == Some("1062") {

@@ -58,70 +58,89 @@ pub async fn upsert_secret(
         return Err(AppError::NotFound);
     }
 
-    // 2. Check existing secret
+    // 2. Insert or fenced update secret
     let totp_coll = db.collection::<TotpSecretDoc>(TOTP_SECRETS_COLLECTION);
-    let secret_filter = doc! { "user_id": bson::Uuid::from(user_id) };
-    let existing = match session.as_deref_mut() {
-        Some(s) => totp_coll.find_one(secret_filter.clone()).session(s).await,
-        None => totp_coll.find_one(secret_filter.clone()).await,
-    }
-    .map_err(AppError::from)?;
-
     let now = Utc::now();
-    match existing {
-        Some(secret) => {
-            if secret.enabled {
-                return Err(AppError::TotpAlreadyEnabled);
+
+    for _ in 0..2 {
+        let secret_filter = doc! { "user_id": bson::Uuid::from(user_id) };
+        let existing = match session.as_deref_mut() {
+            Some(s) => totp_coll.find_one(secret_filter).session(s).await,
+            None => totp_coll.find_one(secret_filter).await,
+        }
+        .map_err(AppError::from)?;
+
+        match existing {
+            Some(secret) => {
+                if secret.enabled {
+                    return Err(AppError::TotpAlreadyEnabled);
+                }
+                let update_filter = doc! {
+                    "user_id": bson::Uuid::from(user_id),
+                    "enabled": false,
+                };
+                let update = doc! {
+                    "$set": {
+                        "encrypted_secret": Binary {
+                            subtype: bson::spec::BinarySubtype::Generic,
+                            bytes: encrypted_secret.to_vec(),
+                        },
+                        "backup_codes": bson::to_bson(&backup_codes).map_err(|e| AppError::Database(crate::error::DbError::from(e)))?,
+                        "updated_at": BsonDateTime::from_chrono(now),
+                    }
+                };
+                let res = match session.as_deref_mut() {
+                    Some(s) => totp_coll.update_one(update_filter, update).session(s).await,
+                    None => totp_coll.update_one(update_filter, update).await,
+                }
+                .map_err(AppError::from)?;
+
+                if res.matched_count == 0 {
+                    return Err(AppError::TotpAlreadyEnabled);
+                }
+
+                return Ok(TotpSecret {
+                    id: secret.id.into(),
+                    user_id,
+                    encrypted_secret: encrypted_secret.to_vec(),
+                    backup_codes,
+                    enabled: false,
+                    created_at: secret.created_at.to_chrono(),
+                    updated_at: now,
+                });
             }
-            let update = doc! {
-                "$set": {
-                    "encrypted_secret": Binary {
+            None => {
+                let id = Uuid::new_v4();
+                let doc = TotpSecretDoc {
+                    id: bson::Uuid::from(id),
+                    user_id: bson::Uuid::from(user_id),
+                    encrypted_secret: Binary {
                         subtype: bson::spec::BinarySubtype::Generic,
                         bytes: encrypted_secret.to_vec(),
                     },
-                    "backup_codes": bson::to_bson(&backup_codes).map_err(|e| AppError::Database(crate::error::DbError::from(e)))?,
-                    "updated_at": BsonDateTime::from_chrono(now),
+                    backup_codes: backup_codes.clone(),
+                    enabled: false,
+                    created_at: BsonDateTime::from_chrono(now),
+                    updated_at: BsonDateTime::from_chrono(now),
+                };
+                let res = match session.as_deref_mut() {
+                    Some(s) => totp_coll.insert_one(&doc).session(s).await,
+                    None => totp_coll.insert_one(&doc).await,
+                };
+
+                match res {
+                    Ok(_) => return Ok(TotpSecret::from(doc)),
+                    Err(e) if is_duplicate_key_error(&e) => {
+                        // Concurrent insert collision; retry via find_one and fenced update.
+                        continue;
+                    }
+                    Err(e) => return Err(AppError::from(e)),
                 }
-            };
-            match session.as_deref_mut() {
-                Some(s) => totp_coll.update_one(secret_filter, update).session(s).await,
-                None => totp_coll.update_one(secret_filter, update).await,
             }
-            .map_err(AppError::from)?;
-
-            Ok(TotpSecret {
-                id: secret.id.into(),
-                user_id,
-                encrypted_secret: encrypted_secret.to_vec(),
-                backup_codes,
-                enabled: false,
-                created_at: secret.created_at.to_chrono(),
-                updated_at: now,
-            })
-        }
-        None => {
-            let id = Uuid::new_v4();
-            let doc = TotpSecretDoc {
-                id: bson::Uuid::from(id),
-                user_id: bson::Uuid::from(user_id),
-                encrypted_secret: Binary {
-                    subtype: bson::spec::BinarySubtype::Generic,
-                    bytes: encrypted_secret.to_vec(),
-                },
-                backup_codes: backup_codes.clone(),
-                enabled: false,
-                created_at: BsonDateTime::from_chrono(now),
-                updated_at: BsonDateTime::from_chrono(now),
-            };
-            match session.as_deref_mut() {
-                Some(s) => totp_coll.insert_one(&doc).session(s).await,
-                None => totp_coll.insert_one(&doc).await,
-            }
-            .map_err(AppError::from)?;
-
-            Ok(TotpSecret::from(doc))
         }
     }
+
+    Err(AppError::TotpAlreadyEnabled)
 }
 
 pub async fn enable_totp(

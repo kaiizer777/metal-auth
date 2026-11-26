@@ -1073,6 +1073,92 @@ async fn test_mongo_totp_lifecycle() {
 }
 
 #[tokio::test]
+async fn test_mongo_totp_upsert_already_enabled() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_totp_upsert_already_enabled: MONGO_URL not set");
+        return;
+    };
+
+    let user = store
+        .users()
+        .create_user(&format!("totp_en_{}@example.com", Uuid::new_v4()), "hash")
+        .await
+        .expect("create user");
+
+    let secret = b"initial_totp_secret_bytes";
+    let backup_codes = serde_json::json!(["bc1"]);
+
+    store
+        .totp()
+        .upsert_secret(user.id, secret, backup_codes.clone())
+        .await
+        .expect("initial upsert succeeds");
+
+    store
+        .totp()
+        .enable_totp(user.id)
+        .await
+        .expect("enable totp succeeds");
+
+    // Upserting on an enabled TOTP secret must fail with TotpAlreadyEnabled
+    let res = store
+        .totp()
+        .upsert_secret(user.id, b"new_secret_bytes", serde_json::json!(["bc2"]))
+        .await;
+
+    assert!(matches!(res, Err(AppError::TotpAlreadyEnabled)));
+
+    // Verify original secret is intact and still enabled
+    let current = store
+        .totp()
+        .get_secret(user.id)
+        .await
+        .expect("get secret")
+        .expect("secret exists");
+    assert!(current.enabled);
+    assert_eq!(current.encrypted_secret, secret);
+
+    let _ = store.users().delete_user(user.id).await;
+}
+
+#[tokio::test]
+async fn test_mongo_totp_concurrent_upsert() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_totp_concurrent_upsert: MONGO_URL not set");
+        return;
+    };
+
+    let user = store
+        .users()
+        .create_user(&format!("totp_cr_{}@example.com", Uuid::new_v4()), "hash")
+        .await
+        .expect("create user");
+
+    let (res_a, res_b) = tokio::join!(
+        store
+            .totp()
+            .upsert_secret(user.id, b"secret_a_bytes", serde_json::json!(["a1"])),
+        store
+            .totp()
+            .upsert_secret(user.id, b"secret_b_bytes", serde_json::json!(["b1"]))
+    );
+
+    // Neither request should fail with a raw database duplicate key error (HTTP 500)
+    assert!(res_a.is_ok(), "res_a error: {:?}", res_a.err());
+    assert!(res_b.is_ok(), "res_b error: {:?}", res_b.err());
+
+    let final_secret = store
+        .totp()
+        .get_secret(user.id)
+        .await
+        .expect("get secret")
+        .expect("secret exists");
+    assert!(!final_secret.enabled);
+
+    let _ = store.users().delete_user(user.id).await;
+}
+
+#[tokio::test]
 async fn test_mongo_totp_used_codes_ttl_index() {
     let Some(store) = get_test_mongo_store().await else {
         eprintln!("skipping test_mongo_totp_used_codes_ttl_index: MONGO_URL not set");

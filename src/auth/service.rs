@@ -236,12 +236,13 @@ impl AuthServiceImpl {
     ) -> AppResult<AuthenticatedLogin> {
         let normalized_email = email.trim().to_lowercase();
 
-        let maybe_user =
-            sqlx::query("SELECT id, password_hash, email_verified FROM users WHERE email = $1")
-                .bind(&normalized_email)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(AppError::from)?;
+        let maybe_user = sqlx::query(
+            "SELECT id, password_hash, email_verified FROM users WHERE LOWER(email) = LOWER($1)",
+        )
+        .bind(&normalized_email)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(AppError::from)?;
 
         match maybe_user {
             None => {
@@ -361,7 +362,7 @@ impl AuthServiceImpl {
         let normalized_email = email.trim().to_lowercase();
 
         // Always run the same SELECT — round-trip cost is structurally identical
-        let maybe_user = sqlx::query("SELECT id, email FROM users WHERE email = $1")
+        let maybe_user = sqlx::query("SELECT id, email FROM users WHERE LOWER(email) = LOWER($1)")
             .bind(&normalized_email)
             .fetch_optional(&self.pool)
             .await
@@ -1743,5 +1744,58 @@ mod tests {
 
         sender.release.notify_one();
         wait_mailer_delivered(&sender).await;
+    }
+
+    #[tokio::test]
+    async fn login_and_reset_case_insensitive_lookup() {
+        let Some(ctx) = setup_db_context().await else {
+            return;
+        };
+
+        let raw_email = format!("MiXeD_{}@ExAmPlE.cOm", Uuid::new_v4());
+        let password = fixture_password();
+        let config = Arc::clone(&ctx.service.config);
+        let password_hash = hash_password(&password, &config).unwrap();
+
+        let row = sqlx::query(
+            "INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, true) RETURNING id",
+        )
+        .bind(&raw_email)
+        .bind(&password_hash)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+        let user_id: Uuid = row.get("id");
+
+        let auth_lower = ctx
+            .service
+            .login_with_proof(&raw_email.to_lowercase(), &password)
+            .await
+            .expect("login with lowercase email must succeed");
+        assert_eq!(auth_lower.user_id, user_id);
+
+        let auth_upper = ctx
+            .service
+            .login_with_proof(&raw_email.to_uppercase(), &password)
+            .await
+            .expect("login with uppercase email must succeed");
+        assert_eq!(auth_upper.user_id, user_id);
+
+        ctx.service
+            .request_password_reset(&raw_email.to_uppercase())
+            .await
+            .expect("request_password_reset with uppercase email must succeed");
+
+        let count_row =
+            sqlx::query("SELECT COUNT(*) as cnt FROM password_reset_tokens WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(&ctx.pool)
+                .await
+                .unwrap();
+        let cnt: i64 = count_row.get("cnt");
+        assert_eq!(
+            cnt, 1,
+            "password reset token must be created for matched user"
+        );
     }
 }

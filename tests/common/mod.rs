@@ -766,7 +766,11 @@ pub fn sanitize_and_bound_mongo_db_name(base: &str) -> String {
     if sanitized.is_empty() {
         sanitized = "metal_auth_test".to_string();
     }
-    sanitized.truncate(30);
+    let boundary = sanitized.floor_char_boundary(30);
+    sanitized.truncate(boundary);
+    if sanitized.is_empty() {
+        sanitized = "metal_auth_test".to_string();
+    }
     sanitized
 }
 
@@ -774,7 +778,7 @@ pub fn sanitize_and_bound_mongo_db_name(base: &str) -> String {
 ///
 /// MongoDB limits database names to strictly less than 64 bytes (maximum 63 bytes).
 /// Appending a 32-character simple UUID suffix (`_` + 32 chars = 33 chars) requires
-/// bounding the sanitized base name to at most 30 characters so the total length
+/// bounding the sanitized base name to at most 30 bytes so the total length
 /// never exceeds 63 bytes.
 pub fn mongo_test_database_name() -> String {
     let base = std::env::var("MONGO_DATABASE")
@@ -782,7 +786,8 @@ pub fn mongo_test_database_name() -> String {
         .unwrap_or_else(|_| "metal_auth_test".to_string());
     let prefix = sanitize_and_bound_mongo_db_name(&base);
     let mut name = format!("{}_{}", prefix, Uuid::new_v4().simple());
-    name.truncate(63);
+    let boundary = name.floor_char_boundary(63);
+    name.truncate(boundary);
     name
 }
 
@@ -819,14 +824,12 @@ impl MongoTestGuard {
 #[cfg(feature = "mongodb")]
 impl Drop for MongoTestGuard {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.database_name.lock() {
-            if let Some(name) = guard.take() {
-                let client = self.client.clone();
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.spawn(async move {
-                        let _ = client.database(&name).drop().await;
-                    });
-                }
+        if let Some(name) = self.database_name.lock().ok().and_then(|mut g| g.take()) {
+            let client = self.client.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = client.database(&name).drop().await;
+                });
             }
         }
     }

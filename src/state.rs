@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
-use sqlx::PgPool;
+use sqlx::{PgPool, postgres::PgConnectOptions};
 
 use crate::{
     auth::service::AuthServiceImpl,
-    config::{AppConfig, Config},
+    config::{AppConfig, Config, DatabaseBackend},
     db::DatabaseStore,
     email::{dispatcher::EmailDispatcher, hook::SharedEmailSender},
-    error::AppError,
+    error::{AppError, ConfigError},
     oauth::OAuthService,
     ratelimit::RateLimiter,
     session::SessionService,
@@ -55,7 +55,17 @@ impl AppState {
 
     pub fn new_with_store(store: Arc<dyn DatabaseStore>, config: Config) -> Result<Self, AppError> {
         let auth_config = Arc::new(AppConfig::from_env()?);
-        let pool = PgPool::connect_lazy(&config.database_url).map_err(AppError::from)?;
+        // The injected store selects the backend. Only Postgres builds a pool
+        // from the URL; other backends get a lazy placeholder that never
+        // connects (pool-typed services are #119's scope).
+        let pool = match config.backend {
+            DatabaseBackend::Postgres => {
+                PgPool::connect_lazy(&config.database_url).map_err(AppError::from)?
+            }
+            DatabaseBackend::Mysql | DatabaseBackend::Mongodb => {
+                PgPool::connect_lazy_with(PgConnectOptions::new())
+            }
+        };
         Self::with_configs_dispatcher_and_store(pool, config, auth_config, None, store)
     }
 
@@ -113,6 +123,12 @@ impl AppState {
     ) -> Result<Self, AppError> {
         // Single construction choke point for every `AppState` constructor: a router can
         // never be built from a config the dispatcher mode or CORS rules reject.
+        if store.backend() != config.backend {
+            return Err(AppError::Config(ConfigError::InvalidValue {
+                field: "backend",
+                reason: "injected store backend does not match configured database backend",
+            }));
+        }
         config.validate().map_err(AppError::Config)?;
 
         let dispatcher = email_dispatcher

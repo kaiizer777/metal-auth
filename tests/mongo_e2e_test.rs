@@ -470,4 +470,30 @@ fn test_mongo_database_name_bounded_and_sanitized() {
     // 4. Empty base defaults to fallback
     let empty = common::sanitize_and_bound_mongo_db_name("");
     assert_eq!(empty, "metal_auth_test");
+
+    // 5. Multi-byte UTF-8 strings do not panic, truncate at valid char boundaries <= 30 bytes,
+    // and keep total database name length strictly <= 63 bytes with the 33-byte UUID suffix.
+    let multibyte_emoji = "🦀".repeat(20);
+    let bounded_emoji = common::sanitize_and_bound_mongo_db_name(&multibyte_emoji);
+    assert!(bounded_emoji.len() <= 30);
+    assert_eq!(bounded_emoji, "🦀".repeat(7)); // 7 * 4 = 28 bytes <= 30
+    assert_eq!(bounded_emoji.len(), 28);
+
+    let cjk_base = "データベース名_日本語_テスト";
+    let bounded_cjk = common::sanitize_and_bound_mongo_db_name(cjk_base);
+    assert!(bounded_cjk.len() <= 30);
+    assert_eq!(bounded_cjk, "データベース名_日本"); // Truncates cleanly before 語 at byte 28
+    assert_eq!(bounded_cjk.len(), 28);
+
+    let mixed_base = "🦀_auth_db_日本語_test_database_name_exceeding_length";
+    let bounded_mixed = common::sanitize_and_bound_mongo_db_name(mixed_base);
+    assert!(bounded_mixed.len() <= 30);
+
+    let full_name = format!("{}_{}", bounded_mixed, Uuid::new_v4().simple());
+    assert!(
+        full_name.len() <= 63,
+        "database name exceeds 63 bytes: {} (len {})",
+        full_name,
+        full_name.len()
+    );
 }

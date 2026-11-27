@@ -31,8 +31,10 @@ pub mod totp;
 pub fn is_mysql_duplicate_key_error(err: &sqlx::Error) -> bool {
     match err {
         sqlx::Error::Database(db_err) => {
-            let mysql_err = db_err.downcast_ref::<sqlx::mysql::MySqlDatabaseError>();
-            if mysql_err.number() == 1062 {
+            if db_err
+                .try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+                .is_some_and(|mysql_err| mysql_err.number() == 1062)
+            {
                 return true;
             }
             if db_err.code().as_deref() == Some("1062") {
@@ -826,5 +828,99 @@ impl StoreTx for MySqlTx {
             tx.rollback().await.map_err(AppError::from)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::borrow::Cow;
+    use std::error::Error as StdError;
+    use std::fmt;
+
+    #[derive(Debug)]
+    struct MockDbError {
+        code: Option<String>,
+        message: String,
+    }
+
+    impl fmt::Display for MockDbError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{}", self.message)
+        }
+    }
+
+    impl StdError for MockDbError {}
+
+    impl sqlx::error::DatabaseError for MockDbError {
+        fn message(&self) -> &str {
+            &self.message
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+
+        fn code(&self) -> Option<Cow<'_, str>> {
+            self.code.as_deref().map(Cow::Borrowed)
+        }
+
+        fn as_error(&self) -> &(dyn StdError + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn StdError + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn StdError + Send + Sync + 'static> {
+            self
+        }
+    }
+
+    fn make_db_err(code: Option<&str>, message: &str) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(MockDbError {
+            code: code.map(ToString::to_string),
+            message: message.to_string(),
+        }))
+    }
+
+    #[test]
+    fn test_duplicate_key_by_error_code_1062() {
+        let err = make_db_err(Some("1062"), "Some error message");
+        assert!(is_mysql_duplicate_key_error(&err));
+    }
+
+    #[test]
+    fn test_duplicate_key_by_message_content() {
+        let err = make_db_err(
+            None,
+            "Duplicate entry 'alice@example.com' for key 'users.email'",
+        );
+        assert!(is_mysql_duplicate_key_error(&err));
+    }
+
+    #[test]
+    fn test_duplicate_key_by_sqlstate_23000_and_duplicate_msg() {
+        let err = make_db_err(Some("23000"), "Operation failed: Duplicate record");
+        assert!(is_mysql_duplicate_key_error(&err));
+    }
+
+    #[test]
+    fn test_sqlstate_23000_without_duplicate_keyword_returns_false() {
+        let err = make_db_err(Some("23000"), "Foreign key constraint fails");
+        assert!(!is_mysql_duplicate_key_error(&err));
+    }
+
+    #[test]
+    fn test_unrelated_database_error_returns_false_without_panic() {
+        let err = make_db_err(Some("1146"), "Table 'test.users' doesn't exist");
+        assert!(!is_mysql_duplicate_key_error(&err));
+    }
+
+    #[test]
+    fn test_non_database_error_returns_false() {
+        let err = sqlx::Error::RowNotFound;
+        assert!(!is_mysql_duplicate_key_error(&err));
     }
 }

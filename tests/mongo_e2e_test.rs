@@ -1,8 +1,11 @@
 #![cfg(feature = "mongodb")]
 
+mod common;
+
 use std::time::Duration;
 
 use chrono::Utc;
+use common::setup_mongo_test_app;
 use metal_auth::{
     AppError, DatabaseBackend, DatabaseStore, MongoStore, db::mongo::indexes::ensure_indexes,
 };
@@ -33,9 +36,16 @@ async fn get_test_mongo_store() -> Option<MongoStore> {
     let db = client.database(&db_name);
     db.run_command(doc! { "ping": 1 }).await.ok()?;
 
+    let hello_doc = db.run_command(doc! { "hello": 1 }).await.ok()?;
+    let is_replica_set = hello_doc.contains_key("setName")
+        || hello_doc
+            .get_str("msg")
+            .map(|m| m == "isdbgrid")
+            .unwrap_or(false);
+
     ensure_indexes(&db).await.ok()?;
 
-    let store = MongoStore::new(client, &db_name, false, allow_standalone);
+    let store = MongoStore::new(client, &db_name, is_replica_set, allow_standalone);
     Some(store)
 }
 
@@ -325,4 +335,85 @@ async fn test_mongo_complete_auth_journey() {
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn test_mongo_http_and_service_journey() {
+    let Some(app) = setup_mongo_test_app().await else {
+        eprintln!("skipping test_mongo_http_and_service_journey: MONGODB_URI not set");
+        return;
+    };
+
+    // 1. Backend routing verification
+    assert_eq!(app.state.store().backend(), DatabaseBackend::Mongodb);
+
+    // 2. HTTP layer functionality
+    // 2a. Unauthenticated logout returns 204 No Content
+    let resp = app.post_empty("/auth/logout").await;
+    assert_eq!(resp.status(), axum::http::StatusCode::NO_CONTENT);
+
+    // 2b. Malformed signup returns 400 Bad Request with ValidationError
+    let resp = app
+        .post_json(
+            "/auth/signup",
+            serde_json::json!({
+                "email": "not-an-email",
+                "password": "short"
+            }),
+        )
+        .await;
+    assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        resp.error_code(),
+        Some(metal_auth::ErrorCode::ValidationError)
+    );
+
+    // 2c. CORS preflight OPTIONS /auth/login
+    let req = axum::http::Request::builder()
+        .method(axum::http::Method::OPTIONS)
+        .uri("/auth/login")
+        .header(axum::http::header::ORIGIN, "https://app.example.com")
+        .header(axum::http::header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+        .body(axum::body::Body::empty())
+        .expect("build cors options request");
+    let resp = app.dispatch(req).await;
+    assert!(resp.status().is_success());
+    assert_eq!(
+        resp.header("access-control-allow-origin"),
+        Some("https://app.example.com")
+    );
+
+    // 2d. Fallback 404 Not Found
+    let req = axum::http::Request::builder()
+        .method(axum::http::Method::GET)
+        .uri("/nonexistent_route_404")
+        .body(axum::body::Body::empty())
+        .expect("build 404 request");
+    let resp = app.dispatch(req).await;
+    assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+
+    // 3. Outbox service integration
+    let store = app.state.store();
+    let email = format!("mongo_outbox_{}@example.com", Uuid::new_v4());
+    let outbox_entry = store
+        .outbox()
+        .insert_outbox(
+            &email,
+            "verification",
+            serde_json::json!({"action": "verify", "email": email}),
+        )
+        .await
+        .expect("insert outbox entry in mongo store");
+    assert_eq!(outbox_entry.recipient, email);
+
+    // Flush through dispatcher
+    if let Some(dispatcher) = app.state.email_dispatcher.as_ref() {
+        let flushed = dispatcher
+            .flush_outbox()
+            .await
+            .expect("flush outbox via dispatcher");
+        assert!(flushed >= 1);
+        let calls = app.email_sender.verification_calls();
+        assert!(calls.iter().any(|c| c.to == email));
+    }
 }

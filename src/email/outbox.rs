@@ -2,18 +2,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
-#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
-use sqlx::PgPool;
 use tracing::{error, info, warn};
 
 use crate::db::models::{EMAIL_TYPE_PASSWORD_RESET, EMAIL_TYPE_VERIFICATION, EmailOutbox};
 #[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
-use crate::db::outbox::{
-    claim_pending_outbox, mark_outbox_failed, mark_outbox_sent, record_outbox_retry,
-};
+use crate::db::store::{DatabaseStore, OutboxStore};
 pub use crate::email::OutboxWorkerConfig;
 use crate::email::hook::{SharedEmailSender, sanitize_error_str, sanitize_sender_error};
 use crate::email::payload::{PasswordResetEmailPayload, VerificationEmailPayload};
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
+use crate::error::AppError;
 
 /// Computes exponential backoff: `initial_backoff * 2^retry_count`, clamped at `max_backoff`.
 pub fn calculate_backoff(
@@ -30,31 +28,32 @@ pub fn calculate_backoff(
 /// Atomically claims and processes a batch of pending outbox messages.
 #[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 pub async fn process_outbox_batch(
-    pool: &PgPool,
+    store: &dyn OutboxStore,
     sender: &Option<SharedEmailSender>,
     timeout: Duration,
     config: &OutboxWorkerConfig,
-) -> Result<usize, sqlx::Error> {
+) -> Result<usize, AppError> {
     let Some(sender) = sender.as_ref() else {
         return Ok(0);
     };
 
-    let messages =
-        claim_pending_outbox(pool, config.batch_size as i64, config.lease_duration).await?;
+    let messages = store
+        .claim_pending_outbox(config.batch_size, config.lease_duration)
+        .await?;
     if messages.is_empty() {
         return Ok(0);
     }
 
     let count = messages.len();
     for msg in messages {
-        deliver_single_message(pool, sender, msg, timeout, config).await;
+        deliver_single_message(store, sender, msg, timeout, config).await;
     }
 
     Ok(count)
 }
 
 async fn deliver_single_message(
-    pool: &PgPool,
+    store: &dyn OutboxStore,
     sender: &SharedEmailSender,
     msg: EmailOutbox,
     timeout: Duration,
@@ -79,7 +78,7 @@ async fn deliver_single_message(
                     // persistence boundary anyway so `error_log` never depends on it.
                     let err_msg = sanitize_error_str(&format!("corrupt verification payload: {e}"));
                     error!(op = "outbox_delivery", id = %id, err = %err_msg);
-                    mark_failed(pool, id, &err_msg).await;
+                    mark_failed(store, id, &err_msg).await;
                     return;
                 }
             }
@@ -93,7 +92,7 @@ async fn deliver_single_message(
                     let err_msg =
                         sanitize_error_str(&format!("corrupt password reset payload: {e}"));
                     error!(op = "outbox_delivery", id = %id, err = %err_msg);
-                    mark_failed(pool, id, &err_msg).await;
+                    mark_failed(store, id, &err_msg).await;
                     return;
                 }
             }
@@ -101,18 +100,16 @@ async fn deliver_single_message(
         unknown => {
             let err_msg = sanitize_error_str(&format!("unknown email type: {unknown}"));
             error!(op = "outbox_delivery", id = %id, err = %err_msg);
-            mark_failed(pool, id, &err_msg).await;
+            mark_failed(store, id, &err_msg).await;
             return;
         }
     };
 
     match result {
-        Ok(Ok(())) => match mark_outbox_sent(pool, id).await {
-            Ok(true) => {
+        // Lease misses stay log-only inside the store impls, so settle is fire-and-log.
+        Ok(Ok(())) => match store.mark_outbox_sent(id).await {
+            Ok(()) => {
                 info!(op = "outbox_delivery", id = %id, email_type = %email_type, "outbox email sent")
-            }
-            Ok(false) => {
-                warn!(op = "outbox_delivery", id = %id, "outbox lease expired; claim lost before completion")
             }
             Err(e) => {
                 error!(op = "outbox_delivery", id = %id, err = %e, "database error marking sent")
@@ -120,31 +117,25 @@ async fn deliver_single_message(
         },
         Ok(Err(send_err)) => {
             let err_msg = format!("send error: {}", sanitize_sender_error(&send_err));
-            handle_delivery_failure(pool, id, retry_count, &err_msg, config).await;
+            handle_delivery_failure(store, id, retry_count, &err_msg, config).await;
         }
         Err(_elapsed) => {
             let err_msg = "send timed out".to_string();
-            handle_delivery_failure(pool, id, retry_count, &err_msg, config).await;
+            handle_delivery_failure(store, id, retry_count, &err_msg, config).await;
         }
     }
 }
 
 // Shared terminal-failure path: persists a sanitized `error_log` and logs it.
-async fn mark_failed(pool: &PgPool, id: uuid::Uuid, err_msg: &str) {
-    match mark_outbox_failed(pool, id, err_msg).await {
-        Ok(true) => {}
-        Ok(false) => {
-            warn!(op = "outbox_delivery", id = %id, "outbox lease expired; claim lost before marking failed")
-        }
-        Err(e) => {
-            error!(op = "outbox_delivery", id = %id, err = %e, "database error marking outbox as failed")
-        }
+async fn mark_failed(store: &dyn OutboxStore, id: uuid::Uuid, err_msg: &str) {
+    if let Err(e) = store.mark_outbox_failed(id, err_msg).await {
+        error!(op = "outbox_delivery", id = %id, err = %e, "database error marking outbox as failed")
     }
 }
 
 #[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 async fn handle_delivery_failure(
-    pool: &PgPool,
+    store: &dyn OutboxStore,
     id: uuid::Uuid,
     retry_count: i32,
     err_msg: &str,
@@ -159,19 +150,13 @@ async fn handle_delivery_failure(
             err = %err_msg,
             "outbox delivery exhausted max retries; marked failed"
         );
-        match mark_outbox_failed(pool, id, err_msg).await {
-            Ok(true) => {}
-            Ok(false) => warn!(
-                op = "outbox_delivery",
-                id = %id,
-                "outbox lease expired; claim lost before marking failed"
-            ),
-            Err(e) => error!(
+        if let Err(e) = store.mark_outbox_failed(id, err_msg).await {
+            error!(
                 op = "outbox_delivery",
                 id = %id,
                 err = %e,
                 "database error marking outbox as failed"
-            ),
+            );
         }
     } else {
         let backoff = calculate_backoff(retry_count, config.initial_backoff, config.max_backoff);
@@ -185,26 +170,25 @@ async fn handle_delivery_failure(
             err = %err_msg,
             "outbox delivery failed; scheduled retry with exponential backoff"
         );
-        match record_outbox_retry(pool, id, next_retry_at, err_msg).await {
-            Ok(true) => {}
-            Ok(false) => warn!(
-                op = "outbox_delivery",
-                id = %id,
-                "outbox lease expired; claim lost before recording retry"
-            ),
-            Err(e) => error!(
+        // Pass the incremented count through: the Mongo impl sets it, the SQL
+        // impls increment past it to the same value.
+        if let Err(e) = store
+            .record_outbox_retry(id, next_retry_count, next_retry_at, err_msg)
+            .await
+        {
+            error!(
                 op = "outbox_delivery",
                 id = %id,
                 err = %e,
                 "database error recording outbox retry"
-            ),
+            );
         }
     }
 }
 
 #[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 async fn drain_outbox_batches(
-    pool: &PgPool,
+    store: &dyn OutboxStore,
     sender: &Option<SharedEmailSender>,
     timeout: Duration,
     config: &OutboxWorkerConfig,
@@ -215,7 +199,7 @@ async fn drain_outbox_batches(
         // claiming another. Under a large backlog an unconditional drain would
         // delay exit indefinitely, but an already-signalled shutdown must not
         // abandon the in-flight batch either.
-        match process_outbox_batch(pool, sender, timeout, config).await {
+        match process_outbox_batch(store, sender, timeout, config).await {
             Ok(count) if count >= config.batch_size as usize => {
                 if shutdown.has_changed().unwrap_or(true) {
                     break;
@@ -236,14 +220,14 @@ async fn drain_outbox_batches(
 /// shutdown; this wrapper never signals shutdown so the loop is infinite.
 #[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 pub async fn run_outbox_worker(
-    pool: PgPool,
+    store: Arc<dyn DatabaseStore>,
     sender: Option<SharedEmailSender>,
     timeout: Duration,
     config: OutboxWorkerConfig,
     notify: Arc<tokio::sync::Notify>,
 ) {
     let (_shutdown_guard, shutdown) = tokio::sync::watch::channel(false);
-    run_outbox_worker_until(pool, sender, timeout, config, notify, shutdown).await;
+    run_outbox_worker_until(store, sender, timeout, config, notify, shutdown).await;
 }
 
 /// Same as [`run_outbox_worker`], but each loop iteration also watches
@@ -251,25 +235,35 @@ pub async fn run_outbox_worker(
 /// after the in-flight drain completes, so no claimed message is abandoned.
 #[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 pub async fn run_outbox_worker_until(
-    pool: PgPool,
+    store: Arc<dyn DatabaseStore>,
     sender: Option<SharedEmailSender>,
     timeout: Duration,
     config: OutboxWorkerConfig,
     notify: Arc<tokio::sync::Notify>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    if let Err(e) = crate::db::outbox::recover_stale_processing(&pool).await {
+    if let Err(e) = store
+        .outbox()
+        .recover_stale_processing(config.lease_duration)
+        .await
+    {
         error!(err = %e, "failed to recover stale outbox processing records on startup");
     }
-    if let Err(e) = crate::db::outbox::cleanup_sent_outbox(&pool, config.sent_retention).await {
+    if let Err(e) = store
+        .outbox()
+        .cleanup_sent_outbox(config.sent_retention)
+        .await
+    {
         error!(err = %e, "failed to cleanup sent outbox records on startup");
     }
-    if let Err(e) = crate::totp::service::prune_expired_challenges(&pool).await {
+    // Same `expires_at <= NOW()` predicate as the retired pool-typed
+    // `prune_expired_challenges`, routed through each backend's `TotpStore`.
+    if let Err(e) = store.totp().prune_expired_two_factor_tokens().await {
         error!(err = %e, "failed to prune expired two-factor challenge tokens on startup");
     }
 
     // Drain existing pending records immediately on startup before sleeping
-    drain_outbox_batches(&pool, &sender, timeout, &config, &shutdown).await;
+    drain_outbox_batches(store.outbox(), &sender, timeout, &config, &shutdown).await;
 
     loop {
         tokio::select! {
@@ -280,11 +274,15 @@ pub async fn run_outbox_worker_until(
             }
         }
 
-        drain_outbox_batches(&pool, &sender, timeout, &config, &shutdown).await;
-        if let Err(e) = crate::db::outbox::cleanup_sent_outbox(&pool, config.sent_retention).await {
+        drain_outbox_batches(store.outbox(), &sender, timeout, &config, &shutdown).await;
+        if let Err(e) = store
+            .outbox()
+            .cleanup_sent_outbox(config.sent_retention)
+            .await
+        {
             error!(err = %e, "failed to cleanup sent outbox records");
         }
-        if let Err(e) = crate::totp::service::prune_expired_challenges(&pool).await {
+        if let Err(e) = store.totp().prune_expired_two_factor_tokens().await {
             error!(err = %e, "failed to prune expired two-factor challenge tokens");
         }
     }
@@ -293,6 +291,328 @@ pub async fn run_outbox_worker_until(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::PgPool;
+
+    // In-memory `OutboxStore` so the claim→deliver→settle flow is covered
+    // without a database; per-backend SQL semantics stay with the PG
+    // integration tests below.
+    struct FakeOutboxStore {
+        rows: std::sync::Mutex<Vec<EmailOutbox>>,
+    }
+
+    impl FakeOutboxStore {
+        fn with_rows(rows: Vec<EmailOutbox>) -> Self {
+            Self {
+                rows: std::sync::Mutex::new(rows),
+            }
+        }
+
+        fn row(&self, id: uuid::Uuid) -> EmailOutbox {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.id == id)
+                .cloned()
+                .expect("test row present")
+        }
+    }
+
+    fn fake_msg(email_type: &str, payload: serde_json::Value) -> EmailOutbox {
+        EmailOutbox {
+            id: uuid::Uuid::new_v4(),
+            recipient: "fake@example.com".into(),
+            email_type: email_type.into(),
+            payload,
+            status: crate::db::models::OUTBOX_STATUS_PENDING.into(),
+            retry_count: 0,
+            next_retry_at: Utc::now() - ChronoDuration::seconds(1),
+            created_at: Utc::now(),
+            sent_at: None,
+            error_log: None,
+        }
+    }
+
+    fn verification_payload_value() -> serde_json::Value {
+        serde_json::json!({
+            "user_id": uuid::Uuid::new_v4(),
+            "to": "fake@example.com",
+            "token": "tok",
+            "url": "https://example.com",
+            "expires_at": Utc::now(),
+        })
+    }
+
+    #[async_trait::async_trait]
+    impl crate::db::store::OutboxStore for FakeOutboxStore {
+        async fn insert_outbox(
+            &self,
+            recipient: &str,
+            email_type: &str,
+            payload: serde_json::Value,
+        ) -> Result<EmailOutbox, AppError> {
+            let mut msg = fake_msg(email_type, payload);
+            msg.recipient = recipient.into();
+            self.rows.lock().unwrap().push(msg.clone());
+            Ok(msg)
+        }
+
+        async fn claim_pending_outbox(
+            &self,
+            batch_size: u32,
+            _lock_duration: Duration,
+        ) -> Result<Vec<EmailOutbox>, AppError> {
+            let now = Utc::now();
+            let mut rows = self.rows.lock().unwrap();
+            let mut claimed = Vec::new();
+            for row in rows.iter_mut() {
+                if claimed.len() >= batch_size as usize {
+                    break;
+                }
+                if row.status == crate::db::models::OUTBOX_STATUS_PENDING
+                    && row.next_retry_at <= now
+                {
+                    row.status = crate::db::models::OUTBOX_STATUS_PROCESSING.into();
+                    claimed.push(row.clone());
+                }
+            }
+            Ok(claimed)
+        }
+
+        async fn mark_outbox_sent(&self, id: uuid::Uuid) -> Result<(), AppError> {
+            let mut rows = self.rows.lock().unwrap();
+            match rows.iter_mut().find(|r| r.id == id) {
+                Some(row) if row.status == crate::db::models::OUTBOX_STATUS_PROCESSING => {
+                    row.status = crate::db::models::OUTBOX_STATUS_SENT.into();
+                    row.sent_at = Some(Utc::now());
+                    Ok(())
+                }
+                // Lost lease stays log-only, mirroring the backend impls.
+                Some(_) | None => Ok(()),
+            }
+        }
+
+        async fn record_outbox_retry(
+            &self,
+            id: uuid::Uuid,
+            retry_count: i32,
+            next_retry_at: chrono::DateTime<Utc>,
+            error_log: &str,
+        ) -> Result<(), AppError> {
+            let mut rows = self.rows.lock().unwrap();
+            if let Some(row) = rows.iter_mut().find(|r| r.id == id) {
+                row.retry_count = retry_count;
+                row.next_retry_at = next_retry_at;
+                row.error_log = Some(error_log.into());
+                row.status = crate::db::models::OUTBOX_STATUS_PENDING.into();
+            }
+            Ok(())
+        }
+
+        async fn mark_outbox_failed(
+            &self,
+            id: uuid::Uuid,
+            error_log: &str,
+        ) -> Result<(), AppError> {
+            let mut rows = self.rows.lock().unwrap();
+            if let Some(row) = rows.iter_mut().find(|r| r.id == id) {
+                row.status = crate::db::models::OUTBOX_STATUS_FAILED.into();
+                row.error_log = Some(error_log.into());
+            }
+            Ok(())
+        }
+
+        async fn cleanup_sent_outbox(&self, _retention: Duration) -> Result<u64, AppError> {
+            let mut rows = self.rows.lock().unwrap();
+            let before = rows.len();
+            rows.retain(|r| r.status != crate::db::models::OUTBOX_STATUS_SENT);
+            Ok((before - rows.len()) as u64)
+        }
+
+        async fn recover_stale_processing(&self, _stale: Duration) -> Result<u64, AppError> {
+            let mut rows = self.rows.lock().unwrap();
+            let mut recovered = 0;
+            for row in rows.iter_mut() {
+                if row.status == crate::db::models::OUTBOX_STATUS_PROCESSING {
+                    row.status = crate::db::models::OUTBOX_STATUS_PENDING.into();
+                    recovered += 1;
+                }
+            }
+            Ok(recovered)
+        }
+    }
+
+    struct FakeSender {
+        calls: std::sync::Mutex<Vec<String>>,
+        fail: bool,
+    }
+
+    impl FakeSender {
+        fn ok() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                fail: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                fail: true,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::email::hook::EmailSender for FakeSender {
+        async fn send_verification_email(
+            &self,
+            payload: VerificationEmailPayload,
+        ) -> Result<(), crate::email::hook::DynError> {
+            self.calls.lock().unwrap().push(payload.to.clone());
+            if self.fail {
+                return Err("fake sender down".into());
+            }
+            Ok(())
+        }
+
+        async fn send_password_reset_email(
+            &self,
+            payload: PasswordResetEmailPayload,
+        ) -> Result<(), crate::email::hook::DynError> {
+            self.calls.lock().unwrap().push(payload.to.clone());
+            if self.fail {
+                return Err("fake sender down".into());
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_claim_delivers_and_marks_sent() {
+        let store = FakeOutboxStore::with_rows(vec![
+            fake_msg(
+                crate::db::models::EMAIL_TYPE_VERIFICATION,
+                verification_payload_value(),
+            ),
+            fake_msg(
+                crate::db::models::EMAIL_TYPE_VERIFICATION,
+                verification_payload_value(),
+            ),
+        ]);
+        let sender: SharedEmailSender = Arc::new(FakeSender::ok());
+        let count = process_outbox_batch(
+            &store,
+            &Some(sender.clone()),
+            Duration::from_secs(1),
+            &OutboxWorkerConfig::default(),
+        )
+        .await
+        .expect("batch processes");
+        assert_eq!(count, 2);
+        for row in store.rows.lock().unwrap().iter() {
+            assert_eq!(row.status, crate::db::models::OUTBOX_STATUS_SENT);
+        }
+    }
+
+    #[tokio::test]
+    async fn exhausted_retries_mark_failed() {
+        let mut msg = fake_msg(
+            crate::db::models::EMAIL_TYPE_VERIFICATION,
+            verification_payload_value(),
+        );
+        msg.status = crate::db::models::OUTBOX_STATUS_PROCESSING.into();
+        let id = msg.id;
+        let store = FakeOutboxStore::with_rows(vec![msg]);
+        let sender: SharedEmailSender = Arc::new(FakeSender::failing());
+        let config = OutboxWorkerConfig {
+            max_retries: 1,
+            ..OutboxWorkerConfig::default()
+        };
+        deliver_single_message(
+            &store,
+            &sender,
+            store.row(id),
+            Duration::from_secs(1),
+            &config,
+        )
+        .await;
+        let row = store.row(id);
+        assert_eq!(row.status, crate::db::models::OUTBOX_STATUS_FAILED);
+        assert!(
+            row.error_log
+                .unwrap_or_default()
+                .contains("fake sender down")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_send_schedules_retry_with_backoff() {
+        let mut msg = fake_msg(
+            crate::db::models::EMAIL_TYPE_VERIFICATION,
+            verification_payload_value(),
+        );
+        msg.status = crate::db::models::OUTBOX_STATUS_PROCESSING.into();
+        let id = msg.id;
+        let store = FakeOutboxStore::with_rows(vec![msg]);
+        let sender: SharedEmailSender = Arc::new(FakeSender::failing());
+        deliver_single_message(
+            &store,
+            &sender,
+            store.row(id),
+            Duration::from_secs(1),
+            &OutboxWorkerConfig::default(),
+        )
+        .await;
+        let row = store.row(id);
+        assert_eq!(row.status, crate::db::models::OUTBOX_STATUS_PENDING);
+        assert_eq!(row.retry_count, 1);
+        assert!(row.next_retry_at > Utc::now());
+    }
+
+    #[tokio::test]
+    async fn corrupt_payload_marks_failed_without_sender_call() {
+        let mut msg = fake_msg(
+            crate::db::models::EMAIL_TYPE_VERIFICATION,
+            serde_json::json!({"corrupt": true}),
+        );
+        msg.status = crate::db::models::OUTBOX_STATUS_PROCESSING.into();
+        let id = msg.id;
+        let store = FakeOutboxStore::with_rows(vec![msg]);
+        let sender = Arc::new(FakeSender::ok());
+        deliver_single_message(
+            &store,
+            &(sender.clone() as SharedEmailSender),
+            store.row(id),
+            Duration::from_secs(1),
+            &OutboxWorkerConfig::default(),
+        )
+        .await;
+        let row = store.row(id);
+        assert_eq!(row.status, crate::db::models::OUTBOX_STATUS_FAILED);
+        assert!(sender.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_type_marks_failed() {
+        let mut msg = fake_msg("unknown_notification", serde_json::json!({}));
+        msg.status = crate::db::models::OUTBOX_STATUS_PROCESSING.into();
+        let id = msg.id;
+        let store = FakeOutboxStore::with_rows(vec![msg]);
+        let sender: SharedEmailSender = Arc::new(FakeSender::ok());
+        deliver_single_message(
+            &store,
+            &sender,
+            store.row(id),
+            Duration::from_secs(1),
+            &OutboxWorkerConfig::default(),
+        )
+        .await;
+        assert_eq!(
+            store.row(id).status,
+            crate::db::models::OUTBOX_STATUS_FAILED
+        );
+    }
 
     #[test]
     fn test_calculate_backoff_exponential() {
@@ -350,6 +670,7 @@ mod tests {
         assert_eq!(custom.lease_duration, Duration::from_secs(45));
     }
 
+    #[cfg(feature = "postgres")]
     async fn test_pool() -> Option<PgPool> {
         dotenvy::dotenv().ok();
         let url = match std::env::var("DATABASE_URL") {
@@ -372,12 +693,14 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn deliver_single_message_handles_corrupt_verification_payload() {
         let _guard = crate::db::DB_TEST_LOCK.lock().await;
         let Some(pool) = test_pool().await else {
             return;
         };
+        let store = crate::db::postgres::PostgresStore::new(pool.clone());
 
         let row_id = uuid::Uuid::new_v4();
         let recipient = format!("corrupt_v_{}@example.com", row_id);
@@ -401,7 +724,7 @@ mod tests {
 
         let sender: SharedEmailSender = Arc::new(crate::email::NoopEmailSender);
         deliver_single_message(
-            &pool,
+            store.outbox(),
             &sender,
             msg,
             Duration::from_secs(1),
@@ -428,12 +751,14 @@ mod tests {
             .await;
     }
 
+    #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn deliver_single_message_handles_corrupt_password_reset_payload() {
         let _guard = crate::db::DB_TEST_LOCK.lock().await;
         let Some(pool) = test_pool().await else {
             return;
         };
+        let store = crate::db::postgres::PostgresStore::new(pool.clone());
 
         let row_id = uuid::Uuid::new_v4();
         let recipient = format!("corrupt_pr_{}@example.com", row_id);
@@ -457,7 +782,7 @@ mod tests {
 
         let sender: SharedEmailSender = Arc::new(crate::email::NoopEmailSender);
         deliver_single_message(
-            &pool,
+            store.outbox(),
             &sender,
             msg,
             Duration::from_secs(1),
@@ -484,12 +809,14 @@ mod tests {
             .await;
     }
 
+    #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn deliver_single_message_handles_unknown_email_type() {
         let _guard = crate::db::DB_TEST_LOCK.lock().await;
         let Some(pool) = test_pool().await else {
             return;
         };
+        let store = crate::db::postgres::PostgresStore::new(pool.clone());
 
         let row_id = uuid::Uuid::new_v4();
         let recipient = format!("unknown_type_{}@example.com", row_id);
@@ -513,7 +840,7 @@ mod tests {
 
         let sender: SharedEmailSender = Arc::new(crate::email::NoopEmailSender);
         deliver_single_message(
-            &pool,
+            store.outbox(),
             &sender,
             msg,
             Duration::from_secs(1),
@@ -559,12 +886,14 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn deliver_single_message_handles_timeout() {
         let _guard = crate::db::DB_TEST_LOCK.lock().await;
         let Some(pool) = test_pool().await else {
             return;
         };
+        let store = crate::db::postgres::PostgresStore::new(pool.clone());
 
         let row_id = uuid::Uuid::new_v4();
         let recipient = format!("timeout_{}@example.com", row_id);
@@ -596,7 +925,7 @@ mod tests {
 
         let sender: SharedEmailSender = Arc::new(HangingEmailSender);
         deliver_single_message(
-            &pool,
+            store.outbox(),
             &sender,
             msg,
             Duration::from_millis(10),
@@ -624,12 +953,14 @@ mod tests {
             .await;
     }
 
+    #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn deliver_single_message_lost_lease_logs_warning_and_does_not_panic() {
         let _guard = crate::db::DB_TEST_LOCK.lock().await;
         let Some(pool) = test_pool().await else {
             return;
         };
+        let store = crate::db::postgres::PostgresStore::new(pool.clone());
 
         let row_id = uuid::Uuid::new_v4();
         let recipient = format!("lost_lease_{}@example.com", row_id);
@@ -661,7 +992,7 @@ mod tests {
 
         let sender: SharedEmailSender = Arc::new(crate::email::NoopEmailSender);
         deliver_single_message(
-            &pool,
+            store.outbox(),
             &sender,
             msg,
             Duration::from_secs(1),
@@ -681,12 +1012,14 @@ mod tests {
             .await;
     }
 
+    #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn drain_outbox_batches_loops_until_empty() {
         let _guard = crate::db::DB_TEST_LOCK.lock().await;
         let Some(pool) = test_pool().await else {
             return;
         };
+        let store = crate::db::postgres::PostgresStore::new(pool.clone());
 
         let mut ids = Vec::new();
         for i in 0..3 {
@@ -722,7 +1055,14 @@ mod tests {
         };
 
         let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
-        drain_outbox_batches(&pool, &sender, Duration::from_secs(1), &config, &shutdown).await;
+        drain_outbox_batches(
+            store.outbox(),
+            &sender,
+            Duration::from_secs(1),
+            &config,
+            &shutdown,
+        )
+        .await;
 
         for id in &ids {
             let row = crate::db::outbox::get_outbox_by_id(&pool, *id)
@@ -739,6 +1079,7 @@ mod tests {
     }
 
     #[derive(Default)]
+    #[cfg(feature = "postgres")]
     struct GatedShutdownSender {
         entered: tokio::sync::Notify,
         release: tokio::sync::Notify,
@@ -767,6 +1108,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn drain_stops_claiming_after_shutdown() {
         let _guard = crate::db::DB_TEST_LOCK.lock().await;
@@ -811,10 +1153,10 @@ mod tests {
 
         // Signal shutdown while the first delivery is in flight: the drain
         // must finish that batch but never claim the second row.
-        let drain_pool = pool.clone();
+        let drain_store = crate::db::postgres::PostgresStore::new(pool.clone());
         let drain = tokio::spawn(async move {
             drain_outbox_batches(
-                &drain_pool,
+                drain_store.outbox(),
                 &gated,
                 Duration::from_secs(5),
                 &config,

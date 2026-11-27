@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use tracing::{Instrument, error, info_span, warn};
 
+use crate::db::DatabaseStore;
 use crate::email::OutboxWorkerConfig;
 use crate::email::hook::{DynError, SharedEmailSender, sanitize_sender_error};
 use crate::email::payload::{PasswordResetEmailPayload, VerificationEmailPayload};
@@ -63,10 +64,10 @@ pub struct EmailDispatcher {
     #[allow(dead_code)]
     worker_started: Arc<AtomicBool>,
     outbox_config: OutboxWorkerConfig,
-    /// PG outbox worker runs only for the Postgres backend. On MySQL/Mongo
-    /// the pool-typed worker would claim via the placeholder pool; #119 owns
-    /// the store-backed retype, so startup stays disabled there.
-    outbox_worker_enabled: bool,
+    /// Backend-agnostic outbox handle. Attached via [`Self::with_store`] before
+    /// the worker starts; every backend's store implements the claim/settle
+    /// contract, so the worker runs identically on Postgres, MySQL and Mongo.
+    store: Option<Arc<dyn DatabaseStore>>,
     /// Inline (caller-blocking) delivery — test-only, absent from default builds.
     #[cfg(any(test, feature = "test-utils"))]
     block_on_delivery: bool,
@@ -88,7 +89,7 @@ impl EmailDispatcher {
             notify: Arc::new(tokio::sync::Notify::new()),
             worker_started: Arc::new(AtomicBool::new(false)),
             outbox_config: OutboxWorkerConfig::default(),
-            outbox_worker_enabled: true,
+            store: None,
             #[cfg(any(test, feature = "test-utils"))]
             block_on_delivery: false,
             #[cfg(any(test, feature = "test-utils"))]
@@ -112,24 +113,27 @@ impl EmailDispatcher {
     /// Configures outbox worker settings from application configuration.
     pub fn with_outbox_config(mut self, config: &crate::config::Config) -> Self {
         self.outbox_config = OutboxWorkerConfig::from(config);
-        self.outbox_worker_enabled = config.backend == crate::config::DatabaseBackend::Postgres;
+        self
+    }
+
+    /// Attaches the backend store the outbox worker claims and settles through.
+    pub fn with_store(mut self, store: Arc<dyn DatabaseStore>) -> Self {
+        self.store = Some(store);
         self
     }
 
     /// Spawns the background outbox worker loop once if not already running.
     #[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
-    pub fn ensure_worker_started(&self, pool: &sqlx::PgPool) {
+    pub fn ensure_worker_started(&self) {
         #[cfg(any(test, feature = "test-utils"))]
         if self.block_on_delivery {
             return;
         }
 
-        if !self.outbox_worker_enabled {
-            warn!(
-                "outbox worker disabled for non-postgres backend; pool-typed worker cannot run until #119"
-            );
+        let Some(store) = self.store.clone() else {
+            warn!("no outbox store attached; skipping background outbox worker spawn");
             return;
-        }
+        };
 
         if tokio::runtime::Handle::try_current().is_err() {
             warn!("no active tokio runtime; skipping background outbox worker spawn");
@@ -137,14 +141,13 @@ impl EmailDispatcher {
         }
 
         if !self.worker_started.swap(true, Ordering::SeqCst) {
-            let pool = pool.clone();
             let sender = self.sender.clone();
             let timeout = self.timeout;
             let config = self.outbox_config.clone();
             let notify = Arc::clone(&self.notify);
 
             tokio::spawn(async move {
-                crate::email::outbox::run_outbox_worker(pool, sender, timeout, config, notify)
+                crate::email::outbox::run_outbox_worker(store, sender, timeout, config, notify)
                     .await;
             });
         }
@@ -155,11 +158,17 @@ impl EmailDispatcher {
     /// Under blocking test mode (`new_blocking`), delivers pending messages inline so
     /// assertions can verify delivery synchronously without polling.
     #[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
-    pub async fn on_outbox_committed(&self, _pool: &sqlx::PgPool) {
+    pub async fn on_outbox_committed(&self) {
         #[cfg(any(test, feature = "test-utils"))]
         if self.block_on_delivery {
+            let Some(store) = self.store.clone() else {
+                let err = "no outbox store attached".to_string();
+                tracing::error!(err = %err, "inline outbox batch failed; no worker will retry it");
+                self.record_inline_error(err);
+                return;
+            };
             let result = crate::email::outbox::process_outbox_batch(
-                _pool,
+                store.outbox(),
                 &self.sender,
                 self.timeout,
                 &self.outbox_config,
@@ -182,17 +191,19 @@ impl EmailDispatcher {
     /// Synchronously drains and processes all due outbox messages.
     ///
     /// Test helper in practice; unlike the detached dispatch paths this is a
-    /// typed boundary — DB failures surface as [`crate::AppError`] (wire
-    /// envelope) instead of raw [`sqlx::Error`].
+    /// typed boundary — DB failures surface as [`crate::AppError`].
     #[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
-    pub async fn flush_outbox(&self, pool: &sqlx::PgPool) -> Result<usize, crate::AppError> {
-        Ok(crate::email::outbox::process_outbox_batch(
-            pool,
+    pub async fn flush_outbox(&self) -> Result<usize, crate::AppError> {
+        let Some(store) = self.store.clone() else {
+            return Err(crate::AppError::Internal);
+        };
+        crate::email::outbox::process_outbox_batch(
+            store.outbox(),
             &self.sender,
             self.timeout,
             &self.outbox_config,
         )
-        .await?)
+        .await
     }
 
     /// Returns a reference to the configured email sender, if any.
@@ -337,7 +348,7 @@ impl fmt::Debug for EmailDispatcher {
             .field("sender", &self.sender.is_some())
             .field("base_url", &self.base_url)
             .field("outbox_config", &self.outbox_config)
-            .field("outbox_worker_enabled", &self.outbox_worker_enabled);
+            .field("store", &self.store.is_some());
         #[cfg(any(test, feature = "test-utils"))]
         debug.field("block_on_delivery", &self.block_on_delivery);
         #[cfg(any(test, feature = "test-utils"))]
@@ -515,10 +526,10 @@ mod tests {
     #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn ensure_worker_started_outside_tokio_does_not_panic() {
+        // No store attached: returns before reaching the runtime check.
         let dispatcher = EmailDispatcher::new(None, Duration::from_secs(1));
-        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/dummy").unwrap();
         let handle = std::thread::spawn(move || {
-            dispatcher.ensure_worker_started(&pool);
+            dispatcher.ensure_worker_started();
             assert!(!dispatcher.worker_started.load(Ordering::SeqCst));
         });
         handle.join().unwrap();
@@ -527,9 +538,12 @@ mod tests {
     #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn blocking_dispatcher_skips_worker_spawn() {
-        let dispatcher = EmailDispatcher::new_blocking(None, Duration::from_secs(1));
         let pool = sqlx::PgPool::connect_lazy("postgres://localhost/dummy").unwrap();
-        dispatcher.ensure_worker_started(&pool);
+        let store: Arc<dyn crate::db::DatabaseStore> =
+            Arc::new(crate::db::postgres::PostgresStore::new(pool));
+        let dispatcher =
+            EmailDispatcher::new_blocking(None, Duration::from_secs(1)).with_store(store);
+        dispatcher.ensure_worker_started();
         assert!(!dispatcher.worker_started.load(Ordering::SeqCst));
     }
 
@@ -539,17 +553,20 @@ mod tests {
     #[tokio::test]
     async fn blocking_batch_claim_failure_is_reported_instead_of_discarded() {
         let sender = Arc::new(RecordingSender::default());
-        let dispatcher = EmailDispatcher::new_blocking(
-            Some(sender.clone() as SharedEmailSender),
-            Duration::from_secs(1),
-        );
         let pool = sqlx::postgres::PgPoolOptions::new()
             .acquire_timeout(Duration::from_millis(500))
             .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/postgres")
             .expect("lazy pool");
+        let store: Arc<dyn crate::db::DatabaseStore> =
+            Arc::new(crate::db::postgres::PostgresStore::new(pool));
+        let dispatcher = EmailDispatcher::new_blocking(
+            Some(sender.clone() as SharedEmailSender),
+            Duration::from_secs(1),
+        )
+        .with_store(store);
 
         assert_eq!(dispatcher.inline_delivery_error(), None);
-        dispatcher.on_outbox_committed(&pool).await;
+        dispatcher.on_outbox_committed().await;
 
         let err = dispatcher
             .inline_delivery_error()
@@ -598,12 +615,11 @@ mod tests {
     #[tokio::test]
     async fn on_outbox_committed_non_blocking_notifies_worker() {
         let dispatcher = EmailDispatcher::new(None, Duration::from_secs(1));
-        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/dummy").unwrap();
 
         let notify = Arc::clone(&dispatcher.notify);
         let notified_future = notify.notified();
 
-        dispatcher.on_outbox_committed(&pool).await;
+        dispatcher.on_outbox_committed().await;
 
         tokio::time::timeout(Duration::from_millis(100), notified_future)
             .await
@@ -613,53 +629,82 @@ mod tests {
     #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn ensure_worker_started_in_tokio_runtime_spawns_worker_once() {
-        let dispatcher = EmailDispatcher::new(None, Duration::from_secs(1));
         let pool = sqlx::PgPool::connect_lazy("postgres://localhost/dummy").unwrap();
+        let store: Arc<dyn crate::db::DatabaseStore> =
+            Arc::new(crate::db::postgres::PostgresStore::new(pool));
+        let dispatcher = EmailDispatcher::new(None, Duration::from_secs(1)).with_store(store);
 
         assert!(!dispatcher.worker_started.load(Ordering::SeqCst));
-        dispatcher.ensure_worker_started(&pool);
+        dispatcher.ensure_worker_started();
         assert!(dispatcher.worker_started.load(Ordering::SeqCst));
 
         // Subsequent call is a no-op and preserves true
-        dispatcher.ensure_worker_started(&pool);
+        dispatcher.ensure_worker_started();
         assert!(dispatcher.worker_started.load(Ordering::SeqCst));
     }
 
-    #[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
+    #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn outbox_worker_starts_for_postgres_backend_config() {
         let cfg = crate::config::Config {
             backend: crate::config::DatabaseBackend::Postgres,
             ..Default::default()
         };
-        let dispatcher =
-            EmailDispatcher::new(None, Duration::from_secs(1)).with_outbox_config(&cfg);
         let pool = sqlx::PgPool::connect_lazy("postgres://localhost/dummy").unwrap();
+        let store: Arc<dyn crate::db::DatabaseStore> =
+            Arc::new(crate::db::postgres::PostgresStore::new(pool));
+        let dispatcher = EmailDispatcher::new(None, Duration::from_secs(1))
+            .with_outbox_config(&cfg)
+            .with_store(store);
 
-        dispatcher.ensure_worker_started(&pool);
+        dispatcher.ensure_worker_started();
         assert!(dispatcher.worker_started.load(Ordering::SeqCst));
     }
 
-    #[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
+    // Gate inversion proof for #119: with a store attached, the worker starts
+    // on every backend when a tokio runtime is present.
+    #[cfg(feature = "mysql")]
     #[tokio::test]
-    async fn outbox_worker_stays_stopped_for_non_postgres_backend() {
-        for backend in [
-            crate::config::DatabaseBackend::Mysql,
-            crate::config::DatabaseBackend::Mongodb,
-        ] {
-            let cfg = crate::config::Config {
-                backend,
-                ..Default::default()
-            };
-            let dispatcher =
-                EmailDispatcher::new(None, Duration::from_secs(1)).with_outbox_config(&cfg);
-            let pool = sqlx::PgPool::connect_lazy("postgres://localhost/dummy").unwrap();
+    async fn outbox_worker_starts_for_mysql_backend_config() {
+        let cfg = crate::config::Config {
+            backend: crate::config::DatabaseBackend::Mysql,
+            ..Default::default()
+        };
+        let pool = sqlx::MySqlPool::connect_lazy("mysql://localhost/dummy").unwrap();
+        let store: Arc<dyn crate::db::DatabaseStore> = Arc::new(crate::db::MySqlStore::new(pool));
+        let dispatcher = EmailDispatcher::new(None, Duration::from_secs(1))
+            .with_outbox_config(&cfg)
+            .with_store(store);
 
-            dispatcher.ensure_worker_started(&pool);
-            assert!(
-                !dispatcher.worker_started.load(Ordering::SeqCst),
-                "no PG worker on a non-postgres backend"
-            );
-        }
+        dispatcher.ensure_worker_started();
+        assert!(dispatcher.worker_started.load(Ordering::SeqCst));
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[tokio::test]
+    async fn outbox_worker_starts_for_mongodb_backend_config() {
+        let cfg = crate::config::Config {
+            backend: crate::config::DatabaseBackend::Mongodb,
+            database_url: "mongodb://localhost:27017/test_db".into(),
+            mongo: Some(crate::config::MongoConfig {
+                database_name: "test_db".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // Parse-only options and a lazy client: no connection is opened.
+        let options = mongodb::options::ClientOptions::parse("mongodb://localhost:27017/test_db")
+            .await
+            .expect("parse-only client options");
+        let client = mongodb::Client::with_options(options).expect("lazy client");
+        let store: Arc<dyn crate::db::DatabaseStore> = Arc::new(crate::db::mongo::MongoStore::new(
+            client, "test_db", false, true,
+        ));
+        let dispatcher = EmailDispatcher::new(None, Duration::from_secs(1))
+            .with_outbox_config(&cfg)
+            .with_store(store);
+
+        dispatcher.ensure_worker_started();
+        assert!(dispatcher.worker_started.load(Ordering::SeqCst));
     }
 }

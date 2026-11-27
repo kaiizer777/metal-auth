@@ -906,20 +906,6 @@ impl TotpService {
     }
 }
 
-/// Delete every challenge token whose TTL has passed, returning the number of rows removed.
-///
-/// Rows at or past `expires_at` are unreachable — the handler rejects them before redemption
-/// is attempted — so this only reclaims storage that no request can claim. Reaps globally, not
-/// per user, and takes no user row lock: deleting an FK child never touches the parent.
-///
-/// One autocommit statement; `idx_two_factor_tokens_expires` serves the range predicate.
-pub(crate) async fn prune_expired_challenges(pool: &PgPool) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query("DELETE FROM two_factor_tokens WHERE expires_at <= NOW()")
-        .execute(pool)
-        .await?;
-    Ok(result.rows_affected())
-}
-
 /// Serialize every check that consumes a code for one user, for the life of the transaction.
 ///
 /// Transaction-scoped: commit or rollback releases it, no manual unlock. Taken before the
@@ -2625,7 +2611,12 @@ mod tests {
         .expect("expire");
 
         // Global reap: other users' rows may exist, so assert on this user's rows only.
-        let pruned = prune_expired_challenges(&ctx.pool).await.expect("prune");
+        // Same `expires_at <= NOW()` predicate as the retired pool-typed helper,
+        // routed through the backend's `TotpStore`.
+        let store = crate::db::postgres::PostgresStore::new(ctx.pool.clone());
+        let pruned = crate::db::store::TotpStore::prune_expired_two_factor_tokens(&store)
+            .await
+            .expect("prune");
         assert!(pruned >= 1, "the expired row must be counted as pruned");
         assert_eq!(count_rows(&ctx.pool, "two_factor_tokens", user_id).await, 1);
         assert!(matches!(

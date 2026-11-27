@@ -122,8 +122,9 @@ impl AppState {
     ///
     /// Postgres reuses the pool-typed constructor; other backends pair the backend's
     /// real store with an inert lazy placeholder pool (pool-typed services are
-    /// #119's scope; construction opens no connections and starts no outbox
-    /// worker off Postgres). `Config::validate` already rejects a backend whose
+    /// #119's scope; construction opens no connections). The outbox worker is
+    /// store-backed, so it starts on every backend with a sender.
+    /// `Config::validate` already rejects a backend whose
     /// Cargo feature is off, so the trailing arm is unreachable defense-in-depth.
     pub async fn with_dispatcher_for_backend(
         config: Config,
@@ -208,24 +209,29 @@ impl AppState {
         }
         config.validate().map_err(AppError::Config)?;
 
-        // Backend gate for caller-supplied dispatchers: `new` enables the PG
-        // outbox worker by default and only `with_outbox_config` derives the
-        // per-backend flag, so an injected dispatcher skips the default-path
-        // gate. Normalize it here — before `AuthServiceImpl::new` fires
-        // `ensure_worker_started` — and store the normalized copy so
-        // `with_auth_config` cannot reopen the hole. Postgres passes through
-        // untouched; #119 owns the store-backed retype.
+        // Store injection for caller-supplied dispatchers: the outbox worker
+        // claims through the backend store, so every dispatcher needs it
+        // attached before `AuthServiceImpl::new` fires
+        // `ensure_worker_started`. Non-Postgres configs also derive the
+        // outbox settings here, since an injected dispatcher skips the
+        // default-path `with_outbox_config`.
         let email_dispatcher = email_dispatcher.map(|supplied| {
-            if config.backend != DatabaseBackend::Postgres {
-                Arc::new(supplied.as_ref().clone().with_outbox_config(&config))
+            let configured = if config.backend != DatabaseBackend::Postgres {
+                supplied.as_ref().clone().with_outbox_config(&config)
             } else {
-                supplied
-            }
+                supplied.as_ref().clone()
+            };
+            Arc::new(configured.with_store(Arc::clone(&store)))
         });
 
-        let dispatcher = email_dispatcher
-            .clone()
-            .unwrap_or_else(|| default_email_dispatcher(&config));
+        let dispatcher = email_dispatcher.clone().unwrap_or_else(|| {
+            Arc::new(
+                default_email_dispatcher(&config)
+                    .as_ref()
+                    .clone()
+                    .with_store(Arc::clone(&store)),
+            )
+        });
 
         let auth_service = Arc::new(AuthServiceImpl::new(
             pool.clone(),
@@ -437,24 +443,24 @@ mod tests {
         }
     }
 
-    // Sender-bearing dispatcher as a caller would inject it: `new` leaves the
-    // PG worker enabled, `with_outbox_config` is never applied.
+    // Sender-bearing dispatcher as a caller would inject it: bare `new`
+    // carries no store and never saw `with_outbox_config`.
     fn sender_bearing_dispatcher() -> Arc<EmailDispatcher> {
         let sender: crate::email::hook::SharedEmailSender = Arc::new(StubSender);
         Arc::new(EmailDispatcher::new(Some(sender), Duration::from_secs(1)))
     }
 
     // `worker_started` is private to the dispatcher module; the `Debug` output
-    // carries the gate bit (`outbox_worker_enabled`, added for the default-path
-    // gate), and the dispatcher suite already proves a disabled flag means no
-    // spawn — so asserting the stored dispatcher's flag covers the choke point.
+    // carries the store bit, and the dispatcher suite proves an attached store
+    // means the worker spawns — so asserting the stored dispatcher's flag
+    // covers the choke point.
     fn gate_flag(stored: &Arc<EmailDispatcher>) -> String {
         format!("{stored:?}")
     }
 
     #[cfg(feature = "mysql")]
     #[tokio::test]
-    async fn injected_dispatcher_starts_no_worker_on_mysql() {
+    async fn injected_dispatcher_carries_store_on_mysql() {
         let config = Config {
             database_url: "mysql://localhost/test".into(),
             backend: DatabaseBackend::Mysql,
@@ -476,16 +482,16 @@ mod tests {
             .email_dispatcher
             .as_ref()
             .expect("injected dispatcher is stored");
-        assert!(stored.sender().is_some(), "gating keeps the sender");
+        assert!(stored.sender().is_some(), "injection keeps the sender");
         assert!(
-            gate_flag(stored).contains("outbox_worker_enabled: false"),
-            "injected dispatcher must not start the PG worker on MySQL"
+            gate_flag(stored).contains("store: true"),
+            "injected dispatcher must carry the backend store on MySQL"
         );
     }
 
     #[cfg(feature = "mongodb")]
     #[tokio::test]
-    async fn injected_dispatcher_starts_no_worker_on_mongodb() {
+    async fn injected_dispatcher_carries_store_on_mongodb() {
         let config = Config {
             database_url: "mongodb://localhost:27017/test_db".into(),
             backend: DatabaseBackend::Mongodb,
@@ -516,16 +522,16 @@ mod tests {
             .email_dispatcher
             .as_ref()
             .expect("injected dispatcher is stored");
-        assert!(stored.sender().is_some(), "gating keeps the sender");
+        assert!(stored.sender().is_some(), "injection keeps the sender");
         assert!(
-            gate_flag(stored).contains("outbox_worker_enabled: false"),
-            "injected dispatcher must not start the PG worker on MongoDB"
+            gate_flag(stored).contains("store: true"),
+            "injected dispatcher must carry the backend store on MongoDB"
         );
     }
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
-    async fn injected_dispatcher_keeps_worker_on_postgres() {
+    async fn injected_dispatcher_carries_store_on_postgres() {
         let config = valid_config();
         let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
         let store: Arc<dyn DatabaseStore> = Arc::new(crate::db::postgres::PostgresStore::new(
@@ -544,8 +550,8 @@ mod tests {
             .as_ref()
             .expect("injected dispatcher is stored");
         assert!(
-            gate_flag(stored).contains("outbox_worker_enabled: true"),
-            "Postgres must not suppress an injected dispatcher's worker"
+            gate_flag(stored).contains("store: true"),
+            "Postgres must not drop an injected dispatcher's store"
         );
     }
 }

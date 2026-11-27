@@ -525,9 +525,7 @@ impl AppError {
             Self::PasswordTooShort => {
                 "Password does not meet the minimum length requirement".to_owned()
             }
-            Self::PasswordTooLong => {
-                "Password exceeds the maximum length requirement".to_owned()
-            }
+            Self::PasswordTooLong => "Password exceeds the maximum length requirement".to_owned(),
             Self::PasswordTooCommon => {
                 "Password is too common, please choose a stronger password".to_owned()
             }
@@ -547,15 +545,11 @@ impl AppError {
             }
             Self::CsrfTokenMissing => "CSRF token is missing".to_owned(),
             Self::CsrfTokenInvalid => "CSRF token is invalid".to_owned(),
-            Self::RateLimitExceeded => {
-                "Too many requests, please try again later".to_owned()
-            }
+            Self::RateLimitExceeded => "Too many requests, please try again later".to_owned(),
             // Phase 6
             Self::OAuthStateInvalid => "invalid oauth state".to_owned(),
             Self::OAuthCodeInvalid => "oauth code is invalid".to_owned(),
-            Self::OAuthEmailUnverified => {
-                "oauth provider email is not verified".to_owned()
-            }
+            Self::OAuthEmailUnverified => "oauth provider email is not verified".to_owned(),
             Self::OAuthProviderNotFound => "oauth provider not found".to_owned(),
             Self::OAuthAccountLinkConflict => {
                 "cannot link oauth identity to unverified local account".to_owned()
@@ -586,9 +580,7 @@ impl AppError {
                 "transactions require a mongodb replica set".to_owned()
             }
             // Same wire code and message as the login gate.
-            Self::TotpEmailNotVerified => {
-                "Email address has not been verified".to_owned()
-            }
+            Self::TotpEmailNotVerified => "Email address has not been verified".to_owned(),
         }
     }
 
@@ -1543,10 +1535,7 @@ mod tests {
     #[test]
     fn test_unsupported_database_backend_and_transaction_sentinels() {
         let unsupported = AppError::UnsupportedDatabaseBackend("cockroachdb".into());
-        assert_eq!(
-            unsupported.status_code(),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
+        assert_eq!(unsupported.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
             unsupported.error_code(),
             ErrorCode::UnsupportedDatabaseBackend

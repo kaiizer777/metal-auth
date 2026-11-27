@@ -644,6 +644,199 @@ async fn setup_test_app_with_auth_config_and(
     })
 }
 
+/// Initializes a live MySQL test app with the Argon2 floor and capturing email sender.
+/// Returns `None` if `MYSQL_DATABASE_URL` (or `MYSQL_URL`) is unset or unreachable.
+#[cfg(feature = "mysql")]
+pub async fn setup_mysql_test_app() -> Option<TestApp> {
+    if std::env::var("TEST_SKIP_DOTENV").is_err() {
+        dotenvy::dotenv().ok();
+    }
+    let url = std::env::var("MYSQL_DATABASE_URL")
+        .or_else(|_| std::env::var("MYSQL_URL"))
+        .ok()?;
+    if !url.starts_with("mysql://") {
+        return None;
+    }
+
+    let opts = metal_auth::db::DbPoolOptions {
+        max_connections: TEST_POOL_MAX_CONNECTIONS,
+        min_connections: 1,
+        acquire_timeout: Duration::from_secs(3),
+        max_retries: 1,
+        ..Default::default()
+    };
+    let pool = metal_auth::db::init_mysql_pool_with_options(&url, opts)
+        .await
+        .ok()?;
+    let store: Arc<dyn metal_auth::DatabaseStore> = Arc::new(metal_auth::MySqlStore::new(pool));
+
+    let cfg = Config {
+        database_url: url,
+        backend: metal_auth::config::DatabaseBackend::Mysql,
+        mongo: None,
+        port: 8080,
+        allowed_origins: vec!["https://app.example.com".into()],
+        allowed_methods: vec!["GET".into(), "POST".into(), "OPTIONS".into()],
+        allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
+        max_connections: TEST_POOL_MAX_CONNECTIONS,
+        min_connections: 1,
+        base_url: "https://example.com".into(),
+        email_dispatch_timeout: Duration::from_secs(10),
+        async_email_dispatch: true,
+        outbox_poll_interval: Duration::from_millis(50),
+        outbox_batch_size: 50,
+        outbox_max_retries: 5,
+        outbox_initial_backoff: Duration::from_secs(1),
+        outbox_max_backoff: Duration::from_secs(300),
+        outbox_sent_retention: Duration::from_secs(7 * 24 * 3600),
+        session: metal_auth::SessionConfig::default(),
+        rate_limit: metal_auth::RateLimitConfig::default(),
+        oauth: metal_auth::OAuthConfig::default(),
+        totp: metal_auth::TotpConfig {
+            encryption_key: Some("00".repeat(32)),
+            ..metal_auth::TotpConfig::default()
+        },
+    };
+
+    let placeholder_pool =
+        sqlx::PgPool::connect_lazy("postgres://metal-auth-placeholder.invalid:1/placeholder")
+            .expect("lazy placeholder pool");
+    let email_sender = Arc::new(CapturingEmailSender::new());
+    let dispatcher = Arc::new(
+        EmailDispatcher::new_blocking(
+            Some(Arc::clone(&email_sender) as metal_auth::SharedEmailSender),
+            Duration::from_secs(10),
+        )
+        .with_base_url("https://example.com"),
+    );
+
+    let state = AppState::with_configs_dispatcher_and_store(
+        placeholder_pool.clone(),
+        cfg,
+        Arc::new(test_auth_config()),
+        Some(dispatcher),
+        store,
+    )
+    .ok()?;
+    let router = metal_auth::handler::create_router(state.clone()).ok()?;
+
+    Some(TestApp {
+        router,
+        pool: placeholder_pool,
+        state,
+        email_sender,
+        base_url: "https://example.com".into(),
+    })
+}
+
+/// Initializes a live MongoDB test app with the Argon2 floor and capturing email sender.
+/// Returns `None` if `MONGODB_URI` (or `MONGODB_URL` / `MONGO_URL`) is unset or unreachable.
+#[cfg(feature = "mongodb")]
+pub async fn setup_mongo_test_app() -> Option<TestApp> {
+    if std::env::var("TEST_SKIP_DOTENV").is_err() {
+        dotenvy::dotenv().ok();
+    }
+    let url = std::env::var("MONGODB_URI")
+        .or_else(|_| std::env::var("MONGODB_URL"))
+        .or_else(|_| std::env::var("MONGO_URL"))
+        .ok()?;
+    if !url.starts_with("mongodb://") && !url.starts_with("mongodb+srv://") {
+        return None;
+    }
+    let db_name = std::env::var("MONGO_DATABASE")
+        .or_else(|_| std::env::var("MONGODB_DATABASE"))
+        .unwrap_or_else(|_| "metal_auth_test".to_string());
+    let allow_standalone = std::env::var("MONGO_ALLOW_NON_TRANSACTIONAL_STANDALONE")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(true);
+
+    let mut client_options = mongodb::options::ClientOptions::parse(&url).await.ok()?;
+    client_options.connect_timeout = Some(Duration::from_secs(3));
+    client_options.server_selection_timeout = Some(Duration::from_secs(3));
+    let client = mongodb::Client::with_options(client_options).ok()?;
+    let db = client.database(&db_name);
+    db.run_command(mongodb::bson::doc! { "ping": 1 }).await.ok()?;
+
+    let hello_doc = db
+        .run_command(mongodb::bson::doc! { "hello": 1 })
+        .await
+        .ok()?;
+    let is_replica_set = hello_doc.contains_key("setName")
+        || hello_doc
+            .get_str("msg")
+            .map(|m| m == "isdbgrid")
+            .unwrap_or(false);
+
+    metal_auth::db::mongo::indexes::ensure_indexes(&db)
+        .await
+        .ok()?;
+
+    let mongo_store =
+        metal_auth::MongoStore::new(client, &db_name, is_replica_set, allow_standalone);
+    let store: Arc<dyn metal_auth::DatabaseStore> = Arc::new(mongo_store);
+
+    let cfg = Config {
+        database_url: url,
+        backend: metal_auth::config::DatabaseBackend::Mongodb,
+        mongo: Some(metal_auth::config::MongoConfig {
+            database_name: db_name,
+            allow_non_transactional_standalone: allow_standalone,
+        }),
+        port: 8080,
+        allowed_origins: vec!["https://app.example.com".into()],
+        allowed_methods: vec!["GET".into(), "POST".into(), "OPTIONS".into()],
+        allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
+        max_connections: TEST_POOL_MAX_CONNECTIONS,
+        min_connections: 1,
+        base_url: "https://example.com".into(),
+        email_dispatch_timeout: Duration::from_secs(10),
+        async_email_dispatch: true,
+        outbox_poll_interval: Duration::from_millis(50),
+        outbox_batch_size: 50,
+        outbox_max_retries: 5,
+        outbox_initial_backoff: Duration::from_secs(1),
+        outbox_max_backoff: Duration::from_secs(300),
+        outbox_sent_retention: Duration::from_secs(7 * 24 * 3600),
+        session: metal_auth::SessionConfig::default(),
+        rate_limit: metal_auth::RateLimitConfig::default(),
+        oauth: metal_auth::OAuthConfig::default(),
+        totp: metal_auth::TotpConfig {
+            encryption_key: Some("00".repeat(32)),
+            ..metal_auth::TotpConfig::default()
+        },
+    };
+
+    let placeholder_pool =
+        sqlx::PgPool::connect_lazy("postgres://metal-auth-placeholder.invalid:1/placeholder")
+            .expect("lazy placeholder pool");
+    let email_sender = Arc::new(CapturingEmailSender::new());
+    let dispatcher = Arc::new(
+        EmailDispatcher::new_blocking(
+            Some(Arc::clone(&email_sender) as metal_auth::SharedEmailSender),
+            Duration::from_secs(10),
+        )
+        .with_base_url("https://example.com"),
+    );
+
+    let state = AppState::with_configs_dispatcher_and_store(
+        placeholder_pool.clone(),
+        cfg,
+        Arc::new(test_auth_config()),
+        Some(dispatcher),
+        store,
+    )
+    .ok()?;
+    let router = metal_auth::handler::create_router(state.clone()).ok()?;
+
+    Some(TestApp {
+        router,
+        pool: placeholder_pool,
+        state,
+        email_sender,
+        base_url: "https://example.com".into(),
+    })
+}
+
 // ─── Session and TOTP journey helpers ────────────────────────────────────────
 
 /// The cookies a browser replays after login: session id plus its CSRF pair.

@@ -208,6 +208,21 @@ impl AppState {
         }
         config.validate().map_err(AppError::Config)?;
 
+        // Backend gate for caller-supplied dispatchers: `new` enables the PG
+        // outbox worker by default and only `with_outbox_config` derives the
+        // per-backend flag, so an injected dispatcher skips the default-path
+        // gate. Normalize it here — before `AuthServiceImpl::new` fires
+        // `ensure_worker_started` — and store the normalized copy so
+        // `with_auth_config` cannot reopen the hole. Postgres passes through
+        // untouched; #119 owns the store-backed retype.
+        let email_dispatcher = email_dispatcher.map(|supplied| {
+            if config.backend != DatabaseBackend::Postgres {
+                Arc::new(supplied.as_ref().clone().with_outbox_config(&config))
+            } else {
+                supplied
+            }
+        });
+
         let dispatcher = email_dispatcher
             .clone()
             .unwrap_or_else(|| default_email_dispatcher(&config));

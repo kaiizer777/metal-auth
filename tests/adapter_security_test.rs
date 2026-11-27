@@ -39,7 +39,12 @@ impl tracing::field::Visit for StringVisitor {
 
 #[test]
 fn test_security_zero_leak_log_audit() {
+    use metal_auth::auth::{
+        LoginRequest, LoginResponse, PasswordResetConfirmRequest, SignupRequest,
+        VerifyEmailRequest,
+    };
     use tracing_subscriber::layer::SubscriberExt;
+    use uuid::Uuid;
 
     let capture = MemoryLogCapture::default();
     let subscriber = tracing_subscriber::registry().with(capture.clone());
@@ -48,9 +53,33 @@ fn test_security_zero_leak_log_audit() {
     let raw_secret = "super_secret_raw_token_xyz_123456789";
     let raw_password = "attacker_password_999";
 
-    // Simulate an error event using tracing
+    let signup_req = SignupRequest {
+        email: "test_user@example.com".to_string(),
+        password: raw_password.to_string(),
+    };
+    let login_req = LoginRequest {
+        email: "test_user@example.com".to_string(),
+        password: raw_password.to_string(),
+    };
+    let verify_email_req = VerifyEmailRequest {
+        token: raw_secret.to_string(),
+    };
+    let reset_confirm_req = PasswordResetConfirmRequest {
+        token: raw_secret.to_string(),
+        new_password: raw_password.to_string(),
+    };
+    let login_resp_session = LoginResponse::with_token(Uuid::new_v4(), raw_secret);
+    let login_resp_2fa = LoginResponse::two_factor_required(raw_secret);
+
+    // Simulate an error event using tracing with secret-bearing DTOs
     tracing::warn!(
         user = "test_user@example.com",
+        signup = ?signup_req,
+        login = ?login_req,
+        verify = ?verify_email_req,
+        reset = ?reset_confirm_req,
+        session = ?login_resp_session,
+        two_fa = ?login_resp_2fa,
         error = %AppError::InvalidCredentials,
         "Authentication failed for user"
     );
@@ -60,7 +89,14 @@ fn test_security_zero_leak_log_audit() {
     let all_logs = logs.join("\n");
     assert!(!all_logs.contains(raw_secret));
     assert!(!all_logs.contains(raw_password));
-    assert!(all_logs.contains("Authentication failed"));
+    assert!(all_logs.contains("[redacted]"));
+    assert!(all_logs.contains("Authentication failed for user"));
+    assert!(all_logs.contains("SignupRequest"));
+    assert!(all_logs.contains("LoginRequest"));
+    assert!(all_logs.contains("VerifyEmailRequest"));
+    assert!(all_logs.contains("PasswordResetConfirmRequest"));
+    assert!(all_logs.contains("LoginResponse::Session"));
+    assert!(all_logs.contains("LoginResponse::TwoFactorRequired"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -97,10 +133,16 @@ mod mongo_security {
         let client = Client::with_options(client_options).ok()?;
         let db = client.database(&db_name);
         db.run_command(doc! { "ping": 1 }).await.ok()?;
+        let hello_doc = db.run_command(doc! { "hello": 1 }).await.ok()?;
+        let is_replica_set = hello_doc.contains_key("setName")
+            || hello_doc
+                .get_str("msg")
+                .map(|m| m == "isdbgrid")
+                .unwrap_or(false);
         metal_auth::db::mongo::indexes::ensure_indexes(&db)
             .await
             .ok()?;
-        Some(MongoStore::new(client, &db_name, false, true))
+        Some(MongoStore::new(client, &db_name, is_replica_set, true))
     }
 
     #[test]

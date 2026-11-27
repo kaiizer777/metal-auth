@@ -89,7 +89,7 @@ impl AuthServiceImpl {
     ) -> Result<Self, AppError> {
         config.validate().map_err(AppError::Config)?;
         let dummy_hash = generate_dummy_hash(&config)?;
-        dispatcher.ensure_worker_started(&pool);
+        dispatcher.ensure_worker_started();
         Ok(Self {
             pool,
             config,
@@ -194,7 +194,7 @@ impl AuthServiceImpl {
 
         tx.commit().await.map_err(AppError::from)?;
 
-        self.dispatcher.on_outbox_committed(&self.pool).await;
+        self.dispatcher.on_outbox_committed().await;
 
         Ok(())
     }
@@ -445,7 +445,7 @@ impl AuthServiceImpl {
 
             tx.commit().await.map_err(AppError::from)?;
 
-            self.dispatcher.on_outbox_committed(&self.pool).await;
+            self.dispatcher.on_outbox_committed().await;
         }
 
         Ok(())
@@ -757,10 +757,15 @@ mod tests {
             ..Default::default()
         });
         let sender = ArcCapturingSender::default();
-        let dispatcher = Arc::new(EmailDispatcher::new_blocking(
-            Some(Arc::new(sender.clone())),
-            std::time::Duration::from_secs(10),
-        ));
+        let store: Arc<dyn crate::db::DatabaseStore> =
+            Arc::new(crate::db::postgres::PostgresStore::new(pool.clone()));
+        let dispatcher = Arc::new(
+            EmailDispatcher::new_blocking(
+                Some(Arc::new(sender.clone())),
+                std::time::Duration::from_secs(10),
+            )
+            .with_store(store),
+        );
         let service = AuthServiceImpl::new(pool.clone(), config, dispatcher).ok()?;
         Some(DbTestContext {
             service,
@@ -1531,10 +1536,15 @@ mod tests {
 
     /// Builds a service whose dispatcher blocks inside the mailer until released.
     fn gated_service(ctx: &DbTestContext, sender: &GatedSender) -> AuthServiceImpl {
-        let dispatcher = Arc::new(EmailDispatcher::new(
-            Some(Arc::new(sender.clone())),
-            std::time::Duration::from_secs(10),
-        ));
+        let store: Arc<dyn crate::db::DatabaseStore> =
+            Arc::new(crate::db::postgres::PostgresStore::new(ctx.pool.clone()));
+        let dispatcher = Arc::new(
+            EmailDispatcher::new(
+                Some(Arc::new(sender.clone())),
+                std::time::Duration::from_secs(10),
+            )
+            .with_store(store),
+        );
         AuthServiceImpl::new(
             ctx.pool.clone(),
             Arc::clone(&ctx.service.config),

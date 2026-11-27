@@ -239,9 +239,14 @@ async fn test_outbox_retry_and_exhaustion_to_failed() {
     };
 
     // Attempt 1: failure schedules retry with backoff, retry_count becomes 1
-    let p1 = process_outbox_batch(&app.pool, &failing_sender, Duration::from_secs(1), &config)
-        .await
-        .expect("batch attempt 1");
+    let p1 = process_outbox_batch(
+        app.state.store.outbox(),
+        &failing_sender,
+        Duration::from_secs(1),
+        &config,
+    )
+    .await
+    .expect("batch attempt 1");
     assert!(p1 >= 1);
 
     let updated = get_outbox_by_id(&app.pool, row.id)
@@ -266,9 +271,14 @@ async fn test_outbox_retry_and_exhaustion_to_failed() {
         .expect("reset next_retry_at");
 
     // Attempt 2: retry_count becomes 2
-    let p2 = process_outbox_batch(&app.pool, &failing_sender, Duration::from_secs(1), &config)
-        .await
-        .expect("batch attempt 2");
+    let p2 = process_outbox_batch(
+        app.state.store.outbox(),
+        &failing_sender,
+        Duration::from_secs(1),
+        &config,
+    )
+    .await
+    .expect("batch attempt 2");
     assert!(p2 >= 1);
 
     let updated2 = get_outbox_by_id(&app.pool, row.id)
@@ -286,9 +296,14 @@ async fn test_outbox_retry_and_exhaustion_to_failed() {
         .expect("reset next_retry_at");
 
     // Attempt 3: next_retry_count reaches max_retries (3), row marked failed
-    let p3 = process_outbox_batch(&app.pool, &failing_sender, Duration::from_secs(1), &config)
-        .await
-        .expect("batch attempt 3");
+    let p3 = process_outbox_batch(
+        app.state.store.outbox(),
+        &failing_sender,
+        Duration::from_secs(1),
+        &config,
+    )
+    .await
+    .expect("batch attempt 3");
     assert!(p3 >= 1);
 
     let failed = get_outbox_by_id(&app.pool, row.id)
@@ -337,13 +352,11 @@ async fn test_outbox_durability_across_process_restart() {
     let dispatcher = EmailDispatcher::new(
         Some(Arc::clone(&sender) as SharedEmailSender),
         Duration::from_secs(5),
-    );
+    )
+    .with_store(app.state.store.clone());
 
     // 3. Worker polls and delivers the pending message left from previous run
-    let delivered = dispatcher
-        .flush_outbox(&app.pool)
-        .await
-        .expect("flush outbox");
+    let delivered = dispatcher.flush_outbox().await.expect("flush outbox");
     assert!(
         delivered >= 1,
         "pending outbox row from prior run delivered"
@@ -512,7 +525,7 @@ async fn test_outbox_unconfigured_sender_does_not_burn_retries() {
         .expect("insert outbox");
 
     let processed = process_outbox_batch(
-        &app.pool,
+        app.state.store.outbox(),
         &None,
         Duration::from_secs(5),
         &OutboxWorkerConfig::default(),
@@ -675,8 +688,9 @@ async fn test_outbox_error_log_redacts_echoed_token() {
     let dispatcher = EmailDispatcher::new(
         Some(Arc::clone(&sender) as SharedEmailSender),
         Duration::from_secs(5),
-    );
-    let _ = dispatcher.flush_outbox(&app.pool).await;
+    )
+    .with_store(app.state.store.clone());
+    let _ = dispatcher.flush_outbox().await;
 
     let stored = get_outbox_by_id(&app.pool, row.id)
         .await
@@ -723,7 +737,7 @@ async fn test_outbox_worker_until_stops_on_shutdown() {
     let sender: Option<SharedEmailSender> = Some(Arc::new(NoopEmailSender));
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let worker = tokio::spawn(run_outbox_worker_until(
-        app.pool.clone(),
+        app.state.store.clone(),
         sender,
         Duration::from_secs(5),
         OutboxWorkerConfig::default(),
@@ -835,7 +849,7 @@ async fn test_outbox_worker_prunes_expired_two_factor_challenges() {
     let notify = Arc::new(tokio::sync::Notify::new());
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let worker = tokio::spawn(run_outbox_worker_until(
-        app.pool.clone(),
+        app.state.store.clone(),
         Some(Arc::new(NoopEmailSender) as SharedEmailSender),
         Duration::from_secs(5),
         OutboxWorkerConfig::default(),

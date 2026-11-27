@@ -210,7 +210,10 @@ pub async fn mark_outbox_failed(
         "$set": {
             "status": OUTBOX_STATUS_FAILED,
             "error_log": error_log,
-        }
+        },
+        "$inc": {
+            "retry_count": 1,
+        },
     };
     let coll = db.collection::<EmailOutboxDoc>(EMAIL_OUTBOX_COLLECTION);
     let res = match session.as_deref_mut() {

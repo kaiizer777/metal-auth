@@ -526,8 +526,10 @@ mod tests {
     #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn ensure_worker_started_outside_tokio_does_not_panic() {
-        // No store attached: returns before reaching the runtime check.
-        let dispatcher = EmailDispatcher::new(None, Duration::from_secs(1));
+        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/dummy").unwrap();
+        let store: Arc<dyn crate::db::DatabaseStore> =
+            Arc::new(crate::db::postgres::PostgresStore::new(pool));
+        let dispatcher = EmailDispatcher::new(None, Duration::from_secs(1)).with_store(store);
         let handle = std::thread::spawn(move || {
             dispatcher.ensure_worker_started();
             assert!(!dispatcher.worker_started.load(Ordering::SeqCst));

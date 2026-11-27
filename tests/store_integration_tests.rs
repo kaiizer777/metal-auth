@@ -587,13 +587,15 @@ async fn assert_get_user_by_email_case_insensitive(store: &dyn DatabaseStore) {
     let tx_res = store.begin().await;
     match tx_res {
         Ok(mut tx) => {
-            let in_tx = tx
-                .users()
-                .get_user_by_email(&upper)
-                .await
-                .expect("fetch by email in tx")
-                .expect("user exists");
-            assert_eq!(in_tx.id, user.id);
+            for variant in [&upper, &mixed, &format!("  {email}  ")] {
+                let in_tx = tx
+                    .users()
+                    .get_user_by_email(variant)
+                    .await
+                    .expect("fetch by email in tx")
+                    .expect("user exists");
+                assert_eq!(in_tx.id, user.id);
+            }
             tx.rollback().await.expect("rollback tx");
         }
         Err(metal_auth::AppError::TransactionNotSupported) => {}
@@ -863,9 +865,10 @@ async fn get_mongo_store() -> Option<metal_auth::MongoStore> {
     if !url.starts_with("mongodb://") && !url.starts_with("mongodb+srv://") {
         return None;
     }
-    let db_name = std::env::var("MONGO_DATABASE")
+    let base_db_name = std::env::var("MONGO_DATABASE")
         .or_else(|_| std::env::var("MONGODB_DATABASE"))
         .unwrap_or_else(|_| "metal_auth_test".to_string());
+    let db_name = format!("{}_{}", base_db_name, Uuid::new_v4().simple());
     let allow_standalone = std::env::var("MONGO_ALLOW_NON_TRANSACTIONAL_STANDALONE")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);

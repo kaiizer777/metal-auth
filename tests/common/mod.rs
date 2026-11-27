@@ -646,6 +646,12 @@ async fn setup_test_app_with_auth_config_and(
 
 /// Initializes a live MySQL test app with the Argon2 floor and capturing email sender.
 /// Returns `None` if `MYSQL_DATABASE_URL` (or `MYSQL_URL`) is unset or unreachable.
+///
+/// # Note on `app.pool`
+/// The returned [`TestApp::pool`] contains an unreachable PostgreSQL mock/placeholder
+/// pool rather than the live MySQL pool. For database operations, tests and callers must
+/// use [`app.state.store()`] or [`TestApp::state`]'s store rather than `app.pool` (which
+/// will fail on any query).
 #[cfg(feature = "mysql")]
 pub async fn setup_mysql_test_app() -> Option<TestApp> {
     if std::env::var("TEST_SKIP_DOTENV").is_err() {
@@ -698,6 +704,8 @@ pub async fn setup_mysql_test_app() -> Option<TestApp> {
         },
     };
 
+    // Note: TestApp requires a PgPool, so non-PostgreSQL backend fixtures provide an
+    // unreachable placeholder pool. Callers must use app.state.store() instead of app.pool.
     let placeholder_pool =
         sqlx::PgPool::connect_lazy("postgres://metal-auth-placeholder.invalid:1/placeholder")
             .expect("lazy placeholder pool");
@@ -731,6 +739,12 @@ pub async fn setup_mysql_test_app() -> Option<TestApp> {
 
 /// Initializes a live MongoDB test app with the Argon2 floor and capturing email sender.
 /// Returns `None` if `MONGODB_URI` (or `MONGODB_URL` / `MONGO_URL`) is unset or unreachable.
+///
+/// # Note on `app.pool`
+/// The returned [`TestApp::pool`] contains an unreachable PostgreSQL mock/placeholder
+/// pool rather than the live MongoDB pool. For database operations, tests and callers must
+/// use [`app.state.store()`] or [`TestApp::state`]'s store rather than `app.pool` (which
+/// will fail on any query). Each call uses an isolated database name to prevent race conditions.
 #[cfg(feature = "mongodb")]
 pub async fn setup_mongo_test_app() -> Option<TestApp> {
     if std::env::var("TEST_SKIP_DOTENV").is_err() {
@@ -743,9 +757,10 @@ pub async fn setup_mongo_test_app() -> Option<TestApp> {
     if !url.starts_with("mongodb://") && !url.starts_with("mongodb+srv://") {
         return None;
     }
-    let db_name = std::env::var("MONGO_DATABASE")
+    let base_db_name = std::env::var("MONGO_DATABASE")
         .or_else(|_| std::env::var("MONGODB_DATABASE"))
         .unwrap_or_else(|_| "metal_auth_test".to_string());
+    let db_name = format!("{}_{}", base_db_name, Uuid::new_v4().simple());
     let allow_standalone = std::env::var("MONGO_ALLOW_NON_TRANSACTIONAL_STANDALONE")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
@@ -808,6 +823,8 @@ pub async fn setup_mongo_test_app() -> Option<TestApp> {
         },
     };
 
+    // Note: TestApp requires a PgPool, so non-PostgreSQL backend fixtures provide an
+    // unreachable placeholder pool. Callers must use app.state.store() instead of app.pool.
     let placeholder_pool =
         sqlx::PgPool::connect_lazy("postgres://metal-auth-placeholder.invalid:1/placeholder")
             .expect("lazy placeholder pool");

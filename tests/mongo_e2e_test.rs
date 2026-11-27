@@ -22,9 +22,10 @@ async fn get_test_mongo_store() -> Option<MongoStore> {
     if !url.starts_with("mongodb://") && !url.starts_with("mongodb+srv://") {
         return None;
     }
-    let db_name = std::env::var("MONGO_DATABASE")
+    let base_db_name = std::env::var("MONGO_DATABASE")
         .or_else(|_| std::env::var("MONGODB_DATABASE"))
         .unwrap_or_else(|_| "metal_auth_test".to_string());
+    let db_name = format!("{}_{}", base_db_name, Uuid::new_v4().simple());
     let allow_standalone = std::env::var("MONGO_ALLOW_NON_TRANSACTIONAL_STANDALONE")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
@@ -337,6 +338,9 @@ async fn test_mongo_complete_auth_journey() {
             .unwrap()
             .is_none()
     );
+
+    // Drop isolated test database
+    let _ = store.db().drop().await;
 }
 
 #[tokio::test]

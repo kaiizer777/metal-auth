@@ -123,7 +123,7 @@ impl AppState {
     /// Postgres reuses the pool-typed constructor; other backends pair the backend's
     /// real store with an inert lazy placeholder pool (pool-typed services are
     /// #119's scope; construction opens no connections). The outbox worker is
-    /// store-backed, so it starts on every backend with a sender.
+    /// store-backed, so it starts on every backend (without a sender it performs maintenance only).
     /// `Config::validate` already rejects a backend whose
     /// Cargo feature is off, so the trailing arm is unreachable defense-in-depth.
     pub async fn with_dispatcher_for_backend(

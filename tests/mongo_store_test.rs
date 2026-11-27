@@ -49,9 +49,18 @@ async fn get_test_mongo_store() -> Option<MongoStore> {
     let db = client.database(&db_name);
     db.run_command(doc! { "ping": 1 }).await.ok()?;
 
-    ensure_indexes(&db).await.ok()?;
+    let hello_cmd = doc! { "hello": 1 };
+    let is_replica_set = db
+        .run_command(hello_cmd)
+        .await
+        .map(|doc| doc.get_str("setName").is_ok())
+        .unwrap_or(false);
 
-    let store = MongoStore::new(client, &db_name, false, allow_standalone);
+    ensure_indexes(&db)
+        .await
+        .expect("Failed to create mongo indexes for test store");
+
+    let store = MongoStore::new(client, &db_name, is_replica_set, allow_standalone);
     Some(store)
 }
 
@@ -1944,6 +1953,11 @@ async fn test_mongo_tx_delete_user_rollback() {
         eprintln!("skipping test_mongo_tx_delete_user_rollback: MONGO_URL not set");
         return;
     };
+
+    if !store.is_replica_set() {
+        eprintln!("Skipping test_mongo_tx_delete_user_rollback: not running on a replica set");
+        return;
+    }
 
     let tx_res = store.begin().await;
     let mut tx = match tx_res {

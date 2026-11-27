@@ -191,7 +191,13 @@ impl UserStore for MongoStore {
     async fn delete_user(&self, user_id: Uuid) -> Result<bool, AppError> {
         if self.is_replica_set {
             let mut session = self.client.start_session().await.map_err(AppError::from)?;
-            session.start_transaction().await.map_err(AppError::from)?;
+            session
+                .start_transaction()
+                .selection_criteria(mongodb::options::SelectionCriteria::ReadPreference(
+                    mongodb::options::ReadPreference::Primary,
+                ))
+                .await
+                .map_err(AppError::from)?;
             match auth::delete_user(&self.db, Some(&mut session), user_id).await {
                 Ok(deleted) => {
                     session.commit_transaction().await.map_err(AppError::from)?;

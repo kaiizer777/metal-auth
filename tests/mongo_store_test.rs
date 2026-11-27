@@ -840,19 +840,33 @@ async fn test_mongo_outbox_concurrent_claims() {
     let mut tasks = Vec::new();
     for _ in 0..4 {
         let worker_store = store.clone();
+        let seeded_set = seeded_set.clone();
         let task = tokio::spawn(async move {
             let mut worker_claimed = Vec::new();
-            for _ in 0..10 {
+            for _ in 0..20 {
                 let batch = worker_store
                     .outbox()
                     .claim_pending_outbox(5, Duration::from_secs(60))
                     .await
                     .expect("claim outbox batch");
                 if batch.is_empty() {
-                    break;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
                 }
                 for item in batch {
-                    worker_claimed.push(item.id);
+                    if seeded_set.contains(&item.id) {
+                        worker_claimed.push(item.id);
+                    } else {
+                        // Release unowned items back to pending so concurrent tests aren't starved
+                        let _ = worker_store
+                            .db()
+                            .collection::<bson::Document>(EMAIL_OUTBOX_COLLECTION)
+                            .update_one(
+                                doc! { "_id": bson::Uuid::from(item.id) },
+                                doc! { "$set": { "status": OUTBOX_STATUS_PENDING } },
+                            )
+                            .await;
+                    }
                 }
             }
             worker_claimed
@@ -974,7 +988,9 @@ async fn test_mongo_outbox_recover_stale_processing() {
     assert!(!premature_claim.iter().any(|item| item.id == outbox.id));
 
     // Update the record's next_retry_at directly in MongoDB to a past timestamp
-    let coll = store.db().collection::<bson::Document>("outbox");
+    let coll = store
+        .db()
+        .collection::<bson::Document>(EMAIL_OUTBOX_COLLECTION);
     let past_time = Utc::now() - chrono::Duration::seconds(10);
     coll.update_one(
         doc! { "_id": bson::Uuid::from(outbox.id) },
@@ -1392,6 +1408,46 @@ async fn test_mongo_oauth_list_accounts_sort_order() {
     assert_eq!(accounts[2].provider_id, "discord");
     assert!(accounts[0].created_at < accounts[1].created_at);
     assert!(accounts[1].created_at < accounts[2].created_at);
+
+    // Verify deterministic tie-breaker on identical created_at using _id: 1
+    let tie_time = now - chrono::Duration::hours(4);
+    let id_a = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    let id_b = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+    // Insert higher id first, lower id second
+    let tie_docs = vec![
+        doc! {
+            "_id": bson::Uuid::from(id_b),
+            "user_id": bson::Uuid::from(user.id),
+            "provider_id": "tie_provider_b",
+            "provider_user_id": format!("tie_user_{}", id_b),
+            "email": "tie_b@example.com",
+            "created_at": bson::DateTime::from_chrono(tie_time),
+            "updated_at": bson::DateTime::from_chrono(tie_time),
+        },
+        doc! {
+            "_id": bson::Uuid::from(id_a),
+            "user_id": bson::Uuid::from(user.id),
+            "provider_id": "tie_provider_a",
+            "provider_user_id": format!("tie_user_{}", id_a),
+            "email": "tie_a@example.com",
+            "created_at": bson::DateTime::from_chrono(tie_time),
+            "updated_at": bson::DateTime::from_chrono(tie_time),
+        },
+    ];
+    coll.insert_many(tie_docs)
+        .await
+        .expect("insert tie oauth accounts");
+
+    let updated_accounts = store
+        .oauth()
+        .list_accounts_for_user(user.id)
+        .await
+        .expect("list accounts with ties");
+    // tie_time is older than t1, t2, t3, so tie accounts appear first
+    assert_eq!(updated_accounts[0].id, id_a);
+    assert_eq!(updated_accounts[1].id, id_b);
+    assert_eq!(updated_accounts[0].provider_id, "tie_provider_a");
+    assert_eq!(updated_accounts[1].provider_id, "tie_provider_b");
 
     // Cleanup
     let _ = store.users().delete_user(user.id).await;
@@ -2073,13 +2129,23 @@ async fn test_mongo_tx_drop_aborts_transaction() {
         // tx is intentionally dropped here without commit() or rollback()
     };
 
-    // Yield briefly to allow the background abort task spawned in Drop to complete
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Assert that the uncommitted mutation was aborted and user does not exist
-    let fetched = store.users().get_user_by_id(user_id).await.unwrap();
+    // Poll boundedly for background abort task spawned in Drop to complete
+    let mut aborted = false;
+    for _ in 0..20 {
+        if store
+            .users()
+            .get_user_by_id(user_id)
+            .await
+            .unwrap()
+            .is_none()
+        {
+            aborted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert!(
-        fetched.is_none(),
+        aborted,
         "uncommitted user must not exist after MongoTx drop"
     );
 

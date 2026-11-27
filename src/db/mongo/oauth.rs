@@ -42,7 +42,7 @@ pub async fn list_accounts_for_user(
 ) -> Result<Vec<OAuthAccount>, AppError> {
     let filter = doc! { "user_id": bson::Uuid::from(user_id) };
     let find_options = FindOptions::builder()
-        .sort(doc! { "created_at": 1 })
+        .sort(doc! { "created_at": 1, "_id": 1 })
         .build();
     let coll = db.collection::<OAuthAccountDoc>(OAUTH_ACCOUNTS_COLLECTION);
     let mut accounts = Vec::new();

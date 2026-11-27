@@ -2,12 +2,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 use sqlx::PgPool;
 use tracing::{error, info, warn};
 
 use crate::db::models::{EMAIL_TYPE_PASSWORD_RESET, EMAIL_TYPE_VERIFICATION, EmailOutbox};
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 use crate::db::outbox::{
     claim_pending_outbox, mark_outbox_failed, mark_outbox_sent, record_outbox_retry,
 };
@@ -28,7 +28,7 @@ pub fn calculate_backoff(
 }
 
 /// Atomically claims and processes a batch of pending outbox messages.
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 pub async fn process_outbox_batch(
     pool: &PgPool,
     sender: &Option<SharedEmailSender>,
@@ -142,7 +142,7 @@ async fn mark_failed(pool: &PgPool, id: uuid::Uuid, err_msg: &str) {
     }
 }
 
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 async fn handle_delivery_failure(
     pool: &PgPool,
     id: uuid::Uuid,
@@ -202,7 +202,7 @@ async fn handle_delivery_failure(
     }
 }
 
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 async fn drain_outbox_batches(
     pool: &PgPool,
     sender: &Option<SharedEmailSender>,
@@ -234,7 +234,7 @@ async fn drain_outbox_batches(
 ///
 /// Prefer [`run_outbox_worker_until`] when the host supports graceful
 /// shutdown; this wrapper never signals shutdown so the loop is infinite.
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 pub async fn run_outbox_worker(
     pool: PgPool,
     sender: Option<SharedEmailSender>,
@@ -249,7 +249,7 @@ pub async fn run_outbox_worker(
 /// Same as [`run_outbox_worker`], but each loop iteration also watches
 /// `shutdown`: sending any value (or dropping the sender) breaks the loop
 /// after the in-flight drain completes, so no claimed message is abandoned.
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 pub async fn run_outbox_worker_until(
     pool: PgPool,
     sender: Option<SharedEmailSender>,

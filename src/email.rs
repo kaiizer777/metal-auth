@@ -4,7 +4,7 @@ use std::time::Duration;
 
 pub mod dispatcher;
 pub mod hook;
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 pub mod outbox;
 pub mod payload;
 
@@ -12,7 +12,7 @@ pub use dispatcher::{EmailDispatcher, build_reset_url, build_verification_url};
 pub use hook::{
     DynError, EmailSender, SharedEmailSender, sanitize_error_str, sanitize_sender_error,
 };
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 pub use outbox::{process_outbox_batch, run_outbox_worker, run_outbox_worker_until};
 pub use payload::{PasswordResetEmailPayload, VerificationEmailPayload};
 

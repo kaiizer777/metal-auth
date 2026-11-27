@@ -153,8 +153,10 @@ jobs:
       - run: cargo test --locked --test totp_security_test -- --test-threads=1
       - run: cargo test --locked --test mysql_store_test --no-default-features --features mysql -- --test-threads=1
       - run: cargo test --locked --test mysql_e2e_test --no-default-features --features mysql -- --test-threads=1
+      - run: cargo test --locked --test boot_test --no-default-features --features mysql -- --test-threads=1
       - run: cargo test --locked --test mongo_store_test --no-default-features --features mongodb -- --test-threads=1
       - run: cargo test --locked --test mongo_e2e_test --no-default-features --features mongodb -- --test-threads=1
+      - run: cargo test --locked --test boot_test --no-default-features --features mongodb -- --test-threads=1
       - run: cargo test --locked --test adapter_security_test --all-features -- --test-threads=1
 
   msrv:

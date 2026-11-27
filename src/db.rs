@@ -16,7 +16,7 @@ use crate::error::AppError;
 use crate::error::ConfigError;
 
 pub mod models;
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 pub mod outbox;
 pub mod store;
 

@@ -31,19 +31,19 @@ pub mod crypto;
 pub mod db;
 pub mod email;
 pub mod error;
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 pub mod handler;
 pub mod middleware;
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 pub mod oauth;
 pub mod ratelimit;
 pub mod session;
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 pub mod state;
 pub mod totp;
 
 pub use auth::UserResponse;
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 pub use auth::{Auth, AuthService, AuthServiceImpl, AuthenticatedLogin};
 pub use config::{
     AppConfig, Config, DatabaseBackend, MongoConfig, OAuthConfig, ProviderConfig, RateLimitConfig,
@@ -66,12 +66,12 @@ pub use email::{
     PasswordResetEmailPayload, SharedEmailSender, VerificationEmailPayload,
 };
 pub use error::{AppError, AppResult, ConfigError, DbError, ErrorCode, ErrorResponse};
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 pub use handler::{auth_routes, oauth_routes, session_routes, totp_routes};
 pub use middleware::security_headers_middleware;
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 pub use middleware::{AuthUser, csrf_middleware, require_auth};
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 pub use oauth::{
     AppleProvider, GitHubProvider, GoogleProvider, OAUTH_BODY_LIMIT, OAuthCallbackOutcome,
     OAuthCallbackResult, OAuthProvider, OAuthService, OAuthStateManager, OAuthStatePayload,
@@ -84,15 +84,15 @@ pub use oauth::{
     validate_state, verify_pkce,
 };
 pub use ratelimit::{RateLimiter, rate_limit_key};
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 pub use session::SessionService;
 pub use session::{
     SessionCookieSource, clear_session_cookie, has_bearer_token, read_bearer_token,
     read_session_cookie, set_csrf_cookie, set_session_cookie,
 };
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 pub use state::AppState;
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 pub use totp::service::{EnrollTotpResponse, FreshAuthProof, TotpService};
 
 #[cfg(any(test, feature = "test-utils"))]

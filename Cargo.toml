@@ -76,8 +76,10 @@ tracing = "0.1"
 [features]
 default = ["postgres"]
 postgres = ["dep:sqlx", "sqlx/postgres"]
-mysql = ["dep:sqlx", "sqlx/mysql"]
-mongodb = ["dep:mongodb", "dep:bson"]
+# sqlx/postgres below is a transitional bridge: the PgPool-typed service surface
+# (#120) must resolve under non-postgres builds until #119 retypes it store-backed.
+mysql = ["dep:sqlx", "sqlx/mysql", "sqlx/postgres"]
+mongodb = ["dep:mongodb", "dep:bson", "dep:sqlx", "sqlx/postgres"]
 test-utils = []
 
 [dev-dependencies]

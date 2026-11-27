@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
-use sqlx::PgPool;
+use sqlx::{PgPool, postgres::PgConnectOptions};
 
 use crate::{
     auth::service::AuthServiceImpl,
-    config::{AppConfig, Config},
+    config::{AppConfig, Config, DatabaseBackend},
     db::DatabaseStore,
     email::{dispatcher::EmailDispatcher, hook::SharedEmailSender},
-    error::AppError,
+    error::{AppError, ConfigError},
     oauth::OAuthService,
     ratelimit::RateLimiter,
     session::SessionService,
@@ -31,6 +31,30 @@ pub fn default_email_dispatcher(config: &Config) -> Arc<EmailDispatcher> {
     create_email_dispatcher(config, None)
 }
 
+/// Lazy pool standing in for backends whose services are still pool-typed.
+///
+/// Provably inert: the target is `metal-auth-placeholder.invalid` (RFC 2606
+/// `.invalid` never resolves) on port 1, set explicitly so `PGHOST`/`PGPORT`
+/// in the environment cannot redirect it at a real database (`new()` reads
+/// both). Any use fails fast with a connection error instead of touching the
+/// wrong DB's outbox/2FA tables. #119 removes it with the store-backed retype.
+pub(crate) fn placeholder_pool() -> PgPool {
+    tracing::warn!(
+        event = "placeholder_pool_in_use",
+        reason =
+            "pool-typed services pending #119 retype; DB-backed calls on this backend fail fast",
+    );
+    PgPool::connect_lazy_with(placeholder_options())
+}
+
+/// Options behind [`placeholder_pool`]; split out so tests pin the target
+/// without opening a connection.
+fn placeholder_options() -> PgConnectOptions {
+    PgConnectOptions::new()
+        .host("metal-auth-placeholder.invalid")
+        .port(1)
+}
+
 #[derive(Clone, Debug)]
 pub struct AppState {
     pub pool: PgPool,
@@ -46,6 +70,7 @@ pub struct AppState {
 }
 
 impl AppState {
+    #[cfg(feature = "postgres")]
     pub fn new(pool: PgPool, config: Config) -> Result<Self, AppError> {
         let auth_config = Arc::new(AppConfig::from_env()?);
         let store: Arc<dyn DatabaseStore> =
@@ -55,7 +80,16 @@ impl AppState {
 
     pub fn new_with_store(store: Arc<dyn DatabaseStore>, config: Config) -> Result<Self, AppError> {
         let auth_config = Arc::new(AppConfig::from_env()?);
-        let pool = PgPool::connect_lazy(&config.database_url).map_err(AppError::from)?;
+        // The injected store selects the backend. Only Postgres builds a pool
+        // from the URL; other backends get an inert lazy placeholder
+        // (unroutable by construction, any use fails fast; pool-typed
+        // services are #119's scope).
+        let pool = match config.backend {
+            DatabaseBackend::Postgres => {
+                PgPool::connect_lazy(&config.database_url).map_err(AppError::from)?
+            }
+            DatabaseBackend::Mysql | DatabaseBackend::Mongodb => placeholder_pool(),
+        };
         Self::with_configs_dispatcher_and_store(pool, config, auth_config, None, store)
     }
 
@@ -84,6 +118,58 @@ impl AppState {
         self
     }
 
+    /// Builds an [`AppState`] from config, connecting what the configured backend needs.
+    ///
+    /// Postgres reuses the pool-typed constructor; other backends pair the backend's
+    /// real store with an inert lazy placeholder pool (pool-typed services are
+    /// #119's scope; construction opens no connections and starts no outbox
+    /// worker off Postgres). `Config::validate` already rejects a backend whose
+    /// Cargo feature is off, so the trailing arm is unreachable defense-in-depth.
+    pub async fn with_dispatcher_for_backend(
+        config: Config,
+        auth_config: Arc<AppConfig>,
+        email_dispatcher: Arc<EmailDispatcher>,
+    ) -> Result<Self, AppError> {
+        config.validate().map_err(AppError::Config)?;
+        match config.backend {
+            #[cfg(feature = "postgres")]
+            DatabaseBackend::Postgres => {
+                let pool = crate::db::init_pool(&config).await?;
+                Self::with_dispatcher(pool, config, auth_config, email_dispatcher)
+            }
+            #[cfg(feature = "mysql")]
+            DatabaseBackend::Mysql => {
+                let pool = crate::db::init_mysql_pool(&config).await?;
+                let store: Arc<dyn DatabaseStore> = Arc::new(crate::db::MySqlStore::new(pool));
+                Self::with_configs_dispatcher_and_store(
+                    placeholder_pool(),
+                    config,
+                    auth_config,
+                    Some(email_dispatcher),
+                    store,
+                )
+            }
+            #[cfg(feature = "mongodb")]
+            DatabaseBackend::Mongodb => {
+                let store: Arc<dyn DatabaseStore> =
+                    Arc::new(crate::db::mongo::init_mongo_store(&config).await?);
+                Self::with_configs_dispatcher_and_store(
+                    placeholder_pool(),
+                    config,
+                    auth_config,
+                    Some(email_dispatcher),
+                    store,
+                )
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(AppError::Config(ConfigError::InvalidValue {
+                field: "database_url",
+                reason: "backend requested but its Cargo feature is not enabled",
+            })),
+        }
+    }
+
+    #[cfg(feature = "postgres")]
     pub fn with_dispatcher(
         pool: PgPool,
         config: Config,
@@ -93,6 +179,7 @@ impl AppState {
         Self::with_configs_and_dispatcher(pool, config, auth_config, Some(email_dispatcher))
     }
 
+    #[cfg(feature = "postgres")]
     pub fn with_configs_and_dispatcher(
         pool: PgPool,
         config: Config,
@@ -113,7 +200,28 @@ impl AppState {
     ) -> Result<Self, AppError> {
         // Single construction choke point for every `AppState` constructor: a router can
         // never be built from a config the dispatcher mode or CORS rules reject.
+        if store.backend() != config.backend {
+            return Err(AppError::Config(ConfigError::InvalidValue {
+                field: "backend",
+                reason: "injected store backend does not match configured database backend",
+            }));
+        }
         config.validate().map_err(AppError::Config)?;
+
+        // Backend gate for caller-supplied dispatchers: `new` enables the PG
+        // outbox worker by default and only `with_outbox_config` derives the
+        // per-backend flag, so an injected dispatcher skips the default-path
+        // gate. Normalize it here — before `AuthServiceImpl::new` fires
+        // `ensure_worker_started` — and store the normalized copy so
+        // `with_auth_config` cannot reopen the hole. Postgres passes through
+        // untouched; #119 owns the store-backed retype.
+        let email_dispatcher = email_dispatcher.map(|supplied| {
+            if config.backend != DatabaseBackend::Postgres {
+                Arc::new(supplied.as_ref().clone().with_outbox_config(&config))
+            } else {
+                supplied
+            }
+        });
 
         let dispatcher = email_dispatcher
             .clone()
@@ -170,6 +278,7 @@ impl AppState {
         })
     }
 
+    #[cfg(feature = "postgres")]
     pub fn with_email_dispatcher(
         pool: PgPool,
         config: Config,
@@ -231,6 +340,13 @@ mod tests {
         let config = valid_config();
         let dispatcher = create_email_dispatcher(&config, None);
         assert_eq!(dispatcher.base_url(), Some("https://example.com"));
+    }
+
+    #[test]
+    fn placeholder_pool_target_is_unroutable() {
+        let options = super::placeholder_options();
+        assert_eq!(options.get_host(), "metal-auth-placeholder.invalid");
+        assert_eq!(options.get_port(), 1);
     }
 
     #[tokio::test]
@@ -299,6 +415,137 @@ mod tests {
             state
                 .rate_limiter
                 .allow("sync_key", 5, Duration::from_secs(60))
+        );
+    }
+
+    struct StubSender;
+
+    #[async_trait::async_trait]
+    impl crate::email::hook::EmailSender for StubSender {
+        async fn send_verification_email(
+            &self,
+            _payload: crate::email::VerificationEmailPayload,
+        ) -> Result<(), crate::email::hook::DynError> {
+            Ok(())
+        }
+
+        async fn send_password_reset_email(
+            &self,
+            _payload: crate::email::PasswordResetEmailPayload,
+        ) -> Result<(), crate::email::hook::DynError> {
+            Ok(())
+        }
+    }
+
+    // Sender-bearing dispatcher as a caller would inject it: `new` leaves the
+    // PG worker enabled, `with_outbox_config` is never applied.
+    fn sender_bearing_dispatcher() -> Arc<EmailDispatcher> {
+        let sender: crate::email::hook::SharedEmailSender = Arc::new(StubSender);
+        Arc::new(EmailDispatcher::new(Some(sender), Duration::from_secs(1)))
+    }
+
+    // `worker_started` is private to the dispatcher module; the `Debug` output
+    // carries the gate bit (`outbox_worker_enabled`, added for the default-path
+    // gate), and the dispatcher suite already proves a disabled flag means no
+    // spawn — so asserting the stored dispatcher's flag covers the choke point.
+    fn gate_flag(stored: &Arc<EmailDispatcher>) -> String {
+        format!("{stored:?}")
+    }
+
+    #[cfg(feature = "mysql")]
+    #[tokio::test]
+    async fn injected_dispatcher_starts_no_worker_on_mysql() {
+        let config = Config {
+            database_url: "mysql://localhost/test".into(),
+            backend: DatabaseBackend::Mysql,
+            ..valid_config()
+        };
+        let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
+        let store: Arc<dyn DatabaseStore> = Arc::new(crate::db::MySqlStore::new(
+            sqlx::MySqlPool::connect_lazy("mysql://localhost/test").unwrap(),
+        ));
+        let state = AppState::with_configs_dispatcher_and_store(
+            pool,
+            config,
+            Arc::new(AppConfig::default()),
+            Some(sender_bearing_dispatcher()),
+            store,
+        )
+        .expect("valid AppState initialization");
+        let stored = state
+            .email_dispatcher
+            .as_ref()
+            .expect("injected dispatcher is stored");
+        assert!(stored.sender().is_some(), "gating keeps the sender");
+        assert!(
+            gate_flag(stored).contains("outbox_worker_enabled: false"),
+            "injected dispatcher must not start the PG worker on MySQL"
+        );
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[tokio::test]
+    async fn injected_dispatcher_starts_no_worker_on_mongodb() {
+        let config = Config {
+            database_url: "mongodb://localhost:27017/test_db".into(),
+            backend: DatabaseBackend::Mongodb,
+            mongo: Some(crate::config::MongoConfig {
+                database_name: "test_db".into(),
+                ..Default::default()
+            }),
+            ..valid_config()
+        };
+        // Parse-only options and a lazy client: no connection is opened.
+        let options = mongodb::options::ClientOptions::parse("mongodb://localhost:27017/test_db")
+            .await
+            .expect("parse-only client options");
+        let client = mongodb::Client::with_options(options).expect("lazy client");
+        let store: Arc<dyn DatabaseStore> = Arc::new(crate::db::mongo::MongoStore::new(
+            client, "test_db", false, true,
+        ));
+        let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
+        let state = AppState::with_configs_dispatcher_and_store(
+            pool,
+            config,
+            Arc::new(AppConfig::default()),
+            Some(sender_bearing_dispatcher()),
+            store,
+        )
+        .expect("valid AppState initialization");
+        let stored = state
+            .email_dispatcher
+            .as_ref()
+            .expect("injected dispatcher is stored");
+        assert!(stored.sender().is_some(), "gating keeps the sender");
+        assert!(
+            gate_flag(stored).contains("outbox_worker_enabled: false"),
+            "injected dispatcher must not start the PG worker on MongoDB"
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn injected_dispatcher_keeps_worker_on_postgres() {
+        let config = valid_config();
+        let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
+        let store: Arc<dyn DatabaseStore> = Arc::new(crate::db::postgres::PostgresStore::new(
+            PgPool::connect_lazy("postgres://localhost/test").unwrap(),
+        ));
+        let state = AppState::with_configs_dispatcher_and_store(
+            pool,
+            config,
+            Arc::new(AppConfig::default()),
+            Some(sender_bearing_dispatcher()),
+            store,
+        )
+        .expect("valid AppState initialization");
+        let stored = state
+            .email_dispatcher
+            .as_ref()
+            .expect("injected dispatcher is stored");
+        assert!(
+            gate_flag(stored).contains("outbox_worker_enabled: true"),
+            "Postgres must not suppress an injected dispatcher's worker"
         );
     }
 }

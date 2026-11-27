@@ -863,7 +863,12 @@ async fn test_mongo_outbox_concurrent_claims() {
                             .collection::<bson::Document>(EMAIL_OUTBOX_COLLECTION)
                             .update_one(
                                 doc! { "_id": bson::Uuid::from(item.id) },
-                                doc! { "$set": { "status": OUTBOX_STATUS_PENDING } },
+                                doc! {
+                                    "$set": {
+                                        "status": OUTBOX_STATUS_PENDING,
+                                        "next_retry_at": bson::DateTime::now(),
+                                    }
+                                },
                             )
                             .await;
                     }
@@ -1411,14 +1416,20 @@ async fn test_mongo_oauth_list_accounts_sort_order() {
 
     // Verify deterministic tie-breaker on identical created_at using _id: 1
     let tie_time = now - chrono::Duration::hours(4);
-    let id_a = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
-    let id_b = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+    let u1 = Uuid::new_v4();
+    let mut u2 = Uuid::new_v4();
+    while u1 == u2 {
+        u2 = Uuid::new_v4();
+    }
+    let (id_a, id_b) = if u1 < u2 { (u1, u2) } else { (u2, u1) };
+    let tie_provider_a = format!("tie_provider_a_{}", id_a);
+    let tie_provider_b = format!("tie_provider_b_{}", id_b);
     // Insert higher id first, lower id second
     let tie_docs = vec![
         doc! {
             "_id": bson::Uuid::from(id_b),
             "user_id": bson::Uuid::from(user.id),
-            "provider_id": "tie_provider_b",
+            "provider_id": &tie_provider_b,
             "provider_user_id": format!("tie_user_{}", id_b),
             "email": "tie_b@example.com",
             "created_at": bson::DateTime::from_chrono(tie_time),
@@ -1427,7 +1438,7 @@ async fn test_mongo_oauth_list_accounts_sort_order() {
         doc! {
             "_id": bson::Uuid::from(id_a),
             "user_id": bson::Uuid::from(user.id),
-            "provider_id": "tie_provider_a",
+            "provider_id": &tie_provider_a,
             "provider_user_id": format!("tie_user_{}", id_a),
             "email": "tie_a@example.com",
             "created_at": bson::DateTime::from_chrono(tie_time),
@@ -1446,8 +1457,8 @@ async fn test_mongo_oauth_list_accounts_sort_order() {
     // tie_time is older than t1, t2, t3, so tie accounts appear first
     assert_eq!(updated_accounts[0].id, id_a);
     assert_eq!(updated_accounts[1].id, id_b);
-    assert_eq!(updated_accounts[0].provider_id, "tie_provider_a");
-    assert_eq!(updated_accounts[1].provider_id, "tie_provider_b");
+    assert_eq!(updated_accounts[0].provider_id, tie_provider_a);
+    assert_eq!(updated_accounts[1].provider_id, tie_provider_b);
 
     // Cleanup
     let _ = store.users().delete_user(user.id).await;

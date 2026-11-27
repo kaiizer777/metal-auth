@@ -294,6 +294,52 @@ async fn test_store_tokens_lifecycle() {
 }
 
 #[tokio::test]
+async fn test_store_two_factor_token_round_trip() {
+    let app = setup_test_app().await.expect("test app initialization");
+    let store = app.state.store();
+    let email = format!("store_2fa_{}@example.com", Uuid::new_v4());
+    let user = store
+        .users()
+        .create_user(&email, "hash")
+        .await
+        .expect("create user");
+
+    // Consume of a hash that was never stored returns None, not an error.
+    let missing = store
+        .totp()
+        .consume_two_factor_token(&[7u8; 32])
+        .await
+        .expect("consume missing");
+    assert!(missing.is_none());
+
+    let token_hash = sha2::Sha256::digest(Uuid::new_v4().as_bytes()).to_vec();
+    let expires = Utc::now() + chrono::Duration::minutes(5);
+
+    let created = store
+        .totp()
+        .create_two_factor_token(user.id, &token_hash, "test-credential-hash", expires)
+        .await
+        .expect("create two-factor token");
+    assert_eq!(created.user_id, user.id);
+    assert_eq!(created.token_hash, token_hash);
+
+    let consumed = store
+        .totp()
+        .consume_two_factor_token(&token_hash)
+        .await
+        .expect("consume two-factor token")
+        .expect("token was present");
+    assert_eq!(consumed.id, created.id);
+
+    let second = store
+        .totp()
+        .consume_two_factor_token(&token_hash)
+        .await
+        .expect("second consume call");
+    assert!(second.is_none());
+}
+
+#[tokio::test]
 async fn test_store_outbox_lifecycle() {
     let app = setup_test_app().await.expect("test app initialization");
     let store = app.state.store();
@@ -401,4 +447,171 @@ async fn test_store_transaction_commit_and_rollback() {
         .expect("AppState::new_with_store");
     assert_eq!(custom_state.store().backend(), DatabaseBackend::Postgres);
     assert!(custom_state.store().ping().await.is_ok());
+}
+
+#[tokio::test]
+async fn test_store_oauth_round_trip() {
+    let app = setup_test_app().await.expect("test app initialization");
+    let store = app.state.store();
+    let email = format!("store_oauth_{}@example.com", Uuid::new_v4());
+    let user = store
+        .users()
+        .create_user(&email, "hash")
+        .await
+        .expect("create user");
+
+    let p_uid = format!("uid_{}", Uuid::new_v4());
+    let account = store
+        .oauth()
+        .link_account(user.id, "google", &p_uid, &email)
+        .await
+        .expect("link oauth account");
+    assert_eq!(account.user_id, user.id);
+
+    let duplicate_err = store
+        .oauth()
+        .link_account(user.id, "google", &p_uid, &email)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        duplicate_err,
+        metal_auth::AppError::OAuthAccountLinkConflict
+    ));
+
+    let missing = store
+        .oauth()
+        .get_account("google", &format!("uid_{}", Uuid::new_v4()))
+        .await
+        .expect("get missing account");
+    assert!(missing.is_none());
+
+    let fetched = store
+        .oauth()
+        .get_account("google", &p_uid)
+        .await
+        .expect("get account")
+        .expect("account exists");
+    assert_eq!(fetched.id, account.id);
+
+    let listed = store
+        .oauth()
+        .list_accounts_for_user(user.id)
+        .await
+        .expect("list accounts");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, account.id);
+
+    let unlinked = store
+        .oauth()
+        .unlink_account(user.id, "google")
+        .await
+        .expect("unlink account");
+    assert!(unlinked);
+
+    let after_unlink = store
+        .oauth()
+        .get_account("google", &p_uid)
+        .await
+        .expect("get after unlink");
+    assert!(after_unlink.is_none());
+
+    store
+        .users()
+        .delete_user(user.id)
+        .await
+        .expect("delete user");
+}
+
+#[tokio::test]
+async fn test_store_totp_upsert_enabled_row_rejected() {
+    let app = setup_test_app().await.expect("test app initialization");
+    let store = app.state.store();
+    let email = format!("store_totp_{}@example.com", Uuid::new_v4());
+    let user = store
+        .users()
+        .create_user(&email, "hash")
+        .await
+        .expect("create user");
+
+    let encrypted_secret = vec![1, 2, 3, 4, 5];
+    let backup_codes = serde_json::json!(["code1", "code2"]);
+
+    let secret = store
+        .totp()
+        .upsert_secret(user.id, &encrypted_secret, backup_codes.clone())
+        .await
+        .expect("upsert secret");
+    assert!(!secret.enabled);
+
+    store
+        .totp()
+        .enable_totp(user.id)
+        .await
+        .expect("enable totp");
+
+    let already_enabled_err = store
+        .totp()
+        .upsert_secret(user.id, &encrypted_secret, backup_codes)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            already_enabled_err,
+            metal_auth::AppError::TotpAlreadyEnabled
+        ),
+        "expected TotpAlreadyEnabled, got {:?}",
+        already_enabled_err
+    );
+}
+
+#[tokio::test]
+async fn test_store_get_user_by_email_case_insensitive() {
+    let app = setup_test_app().await.expect("test app initialization");
+    let store = app.state.store();
+    let email = format!("store_ci_{}@example.com", Uuid::new_v4());
+    let user = store
+        .users()
+        .create_user(&email, "hash")
+        .await
+        .expect("create user");
+
+    let upper = email.to_uppercase();
+    let mixed: String = email
+        .chars()
+        .enumerate()
+        .map(|(i, c)| {
+            if i % 2 == 0 {
+                c.to_ascii_uppercase()
+            } else {
+                c
+            }
+        })
+        .collect();
+    for variant in [&upper, &mixed, &format!("  {email}  ")] {
+        let fetched = store
+            .users()
+            .get_user_by_email(variant)
+            .await
+            .expect("fetch by email variant")
+            .expect("user exists");
+        assert_eq!(fetched.id, user.id);
+    }
+
+    let mut tx = store.begin().await.expect("begin tx");
+    let in_tx = tx
+        .users()
+        .get_user_by_email(&upper)
+        .await
+        .expect("fetch by email in tx")
+        .expect("user exists");
+    assert_eq!(in_tx.id, user.id);
+    tx.rollback().await.expect("rollback tx");
+
+    let unknown = format!("unknown_{}@example.com", Uuid::new_v4());
+    let missing = store
+        .users()
+        .get_user_by_email(&unknown)
+        .await
+        .expect("fetch unknown email");
+    assert!(missing.is_none());
 }

@@ -13,7 +13,7 @@ where
 {
     sqlx::query_as::<Postgres, OAuthAccount>(
         r#"
-        SELECT id, user_id, provider_id, provider_user_id, email, created_at
+        SELECT id, user_id, provider_id, provider_user_id, email, created_at, updated_at
         FROM oauth_accounts
         WHERE provider_id = $1 AND provider_user_id = $2
         "#,
@@ -34,7 +34,7 @@ where
 {
     sqlx::query_as::<Postgres, OAuthAccount>(
         r#"
-        SELECT id, user_id, provider_id, provider_user_id, email, created_at
+        SELECT id, user_id, provider_id, provider_user_id, email, created_at, updated_at
         FROM oauth_accounts
         WHERE user_id = $1
         ORDER BY created_at ASC
@@ -61,7 +61,7 @@ where
         r#"
         INSERT INTO oauth_accounts (user_id, provider_id, provider_user_id, email)
         VALUES ($1, $2, $3, $4)
-        RETURNING id, user_id, provider_id, provider_user_id, email, created_at
+        RETURNING id, user_id, provider_id, provider_user_id, email, created_at, updated_at
         "#,
     )
     .bind(user_id)

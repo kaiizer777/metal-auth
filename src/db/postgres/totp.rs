@@ -52,7 +52,12 @@ where
     .bind(backup_codes)
     .fetch_one(executor)
     .await
-    .map_err(AppError::from)
+    .map_err(|e| match e {
+        // Zero rows means the enabled = FALSE fence blocked the update on an
+        // already-enabled row; every other sqlx error keeps its mapping.
+        sqlx::Error::RowNotFound => AppError::TotpAlreadyEnabled,
+        e => AppError::from(e),
+    })
 }
 
 pub async fn enable_totp<'e, E>(executor: E, user_id: Uuid) -> Result<bool, AppError>
@@ -160,7 +165,7 @@ where
         r#"
         INSERT INTO two_factor_tokens (user_id, token_hash, credential_hash, expires_at)
         VALUES ($1, $2, $3, $4)
-        RETURNING id, user_id, token_hash, credential_hash, expires_at, created_at
+        RETURNING id, user_id, token_hash, expires_at
         "#,
     )
     .bind(user_id)
@@ -183,7 +188,7 @@ where
         r#"
         DELETE FROM two_factor_tokens
         WHERE token_hash = $1
-        RETURNING id, user_id, token_hash, credential_hash, expires_at, created_at
+        RETURNING id, user_id, token_hash, expires_at
         "#,
     )
     .bind(token_hash)

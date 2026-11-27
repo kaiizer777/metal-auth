@@ -63,7 +63,7 @@ where
         r#"
         SELECT id, email, password_hash, email_verified, created_at, updated_at
         FROM users
-        WHERE email = $1
+        WHERE LOWER(email) = LOWER($1)
         "#,
     )
     .bind(normalized)

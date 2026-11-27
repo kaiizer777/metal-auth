@@ -170,7 +170,7 @@ impl DbError {
     }
 }
 
-#[cfg(any(feature = "postgres", feature = "mysql"))]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 impl From<sqlx::Error> for DbError {
     fn from(err: sqlx::Error) -> Self {
         Self {
@@ -756,14 +756,14 @@ impl From<&AppError> for ErrorResponse {
     }
 }
 
-#[cfg(any(feature = "postgres", feature = "mysql"))]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 impl From<sqlx::Error> for AppError {
     fn from(err: sqlx::Error) -> Self {
         Self::Database(DbError::from(err))
     }
 }
 
-#[cfg(any(feature = "postgres", feature = "mysql"))]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 impl From<sqlx::migrate::MigrateError> for AppError {
     fn from(err: sqlx::migrate::MigrateError) -> Self {
         Self::Migration(DbError {

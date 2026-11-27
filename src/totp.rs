@@ -8,5 +8,5 @@
 //! to [`crate::handler`].
 pub mod backup;
 pub mod crypto;
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 pub mod service;

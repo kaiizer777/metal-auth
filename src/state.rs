@@ -31,6 +31,13 @@ pub fn default_email_dispatcher(config: &Config) -> Arc<EmailDispatcher> {
     create_email_dispatcher(config, None)
 }
 
+/// Lazy pool standing in for backends whose services are still pool-typed.
+///
+/// Opens no connections; #119 removes it with the store-backed retype.
+pub(crate) fn placeholder_pool() -> PgPool {
+    PgPool::connect_lazy_with(PgConnectOptions::new())
+}
+
 #[derive(Clone, Debug)]
 pub struct AppState {
     pub pool: PgPool,
@@ -46,6 +53,7 @@ pub struct AppState {
 }
 
 impl AppState {
+    #[cfg(feature = "postgres")]
     pub fn new(pool: PgPool, config: Config) -> Result<Self, AppError> {
         let auth_config = Arc::new(AppConfig::from_env()?);
         let store: Arc<dyn DatabaseStore> =
@@ -62,9 +70,7 @@ impl AppState {
             DatabaseBackend::Postgres => {
                 PgPool::connect_lazy(&config.database_url).map_err(AppError::from)?
             }
-            DatabaseBackend::Mysql | DatabaseBackend::Mongodb => {
-                PgPool::connect_lazy_with(PgConnectOptions::new())
-            }
+            DatabaseBackend::Mysql | DatabaseBackend::Mongodb => placeholder_pool(),
         };
         Self::with_configs_dispatcher_and_store(pool, config, auth_config, None, store)
     }
@@ -94,6 +100,57 @@ impl AppState {
         self
     }
 
+    /// Builds an [`AppState`] from config, connecting what the configured backend needs.
+    ///
+    /// Postgres reuses the pool-typed constructor; other backends pair the backend's
+    /// real store with a lazy placeholder pool (pool-typed services are #119's scope;
+    /// nothing here connects). `Config::validate` already rejects a backend whose
+    /// Cargo feature is off, so the trailing arm is unreachable defense-in-depth.
+    pub async fn with_dispatcher_for_backend(
+        config: Config,
+        auth_config: Arc<AppConfig>,
+        email_dispatcher: Arc<EmailDispatcher>,
+    ) -> Result<Self, AppError> {
+        config.validate().map_err(AppError::Config)?;
+        match config.backend {
+            #[cfg(feature = "postgres")]
+            DatabaseBackend::Postgres => {
+                let pool = crate::db::init_pool(&config).await?;
+                Self::with_dispatcher(pool, config, auth_config, email_dispatcher)
+            }
+            #[cfg(feature = "mysql")]
+            DatabaseBackend::Mysql => {
+                let pool = crate::db::init_mysql_pool(&config).await?;
+                let store: Arc<dyn DatabaseStore> = Arc::new(crate::db::MySqlStore::new(pool));
+                Self::with_configs_dispatcher_and_store(
+                    placeholder_pool(),
+                    config,
+                    auth_config,
+                    Some(email_dispatcher),
+                    store,
+                )
+            }
+            #[cfg(feature = "mongodb")]
+            DatabaseBackend::Mongodb => {
+                let store: Arc<dyn DatabaseStore> =
+                    Arc::new(crate::db::mongo::init_mongo_store(&config).await?);
+                Self::with_configs_dispatcher_and_store(
+                    placeholder_pool(),
+                    config,
+                    auth_config,
+                    Some(email_dispatcher),
+                    store,
+                )
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(AppError::Config(ConfigError::InvalidValue {
+                field: "database_url",
+                reason: "backend requested but its Cargo feature is not enabled",
+            })),
+        }
+    }
+
+    #[cfg(feature = "postgres")]
     pub fn with_dispatcher(
         pool: PgPool,
         config: Config,
@@ -103,6 +160,7 @@ impl AppState {
         Self::with_configs_and_dispatcher(pool, config, auth_config, Some(email_dispatcher))
     }
 
+    #[cfg(feature = "postgres")]
     pub fn with_configs_and_dispatcher(
         pool: PgPool,
         config: Config,
@@ -186,6 +244,7 @@ impl AppState {
         })
     }
 
+    #[cfg(feature = "postgres")]
     pub fn with_email_dispatcher(
         pool: PgPool,
         config: Config,

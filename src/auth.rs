@@ -1,13 +1,12 @@
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 use std::sync::Arc;
 
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 use axum::Router;
 
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 use crate::{
     config::{AppConfig, Config},
-    db,
     email::{dispatcher::EmailDispatcher, hook::SharedEmailSender},
     error::AppError,
     handler,
@@ -15,23 +14,23 @@ use crate::{
 };
 
 pub mod models;
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 pub mod service;
 
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 pub use crate::handler::auth_routes;
 pub use models::*;
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 pub use service::{AuthService, AuthServiceImpl, AuthenticatedLogin};
 
 /// Main authentication facade providing the configured HTTP [`Router`].
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 #[derive(Clone)]
 pub struct Auth {
     pub router: Router,
 }
 
-#[cfg(feature = "postgres")]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
 impl Auth {
     /// Initializes an `Auth` instance with the given configuration and a default `EmailDispatcher`.
     pub async fn new(cfg: Config) -> Result<Self, AppError> {
@@ -71,9 +70,7 @@ impl Auth {
         auth_cfg: Arc<AppConfig>,
         dispatcher: Arc<EmailDispatcher>,
     ) -> Result<Self, AppError> {
-        cfg.validate()?;
-        let pool = db::init_pool(&cfg).await?;
-        let state = AppState::with_dispatcher(pool, cfg, auth_cfg, dispatcher)?;
+        let state = AppState::with_dispatcher_for_backend(cfg, auth_cfg, dispatcher).await?;
         Self::from_state(state)
     }
 

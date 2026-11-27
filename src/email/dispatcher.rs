@@ -111,7 +111,7 @@ impl EmailDispatcher {
     }
 
     /// Spawns the background outbox worker loop once if not already running.
-    #[cfg(feature = "postgres")]
+    #[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
     pub fn ensure_worker_started(&self, pool: &sqlx::PgPool) {
         #[cfg(any(test, feature = "test-utils"))]
         if self.block_on_delivery {
@@ -141,7 +141,7 @@ impl EmailDispatcher {
     ///
     /// Under blocking test mode (`new_blocking`), delivers pending messages inline so
     /// assertions can verify delivery synchronously without polling.
-    #[cfg(feature = "postgres")]
+    #[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
     pub async fn on_outbox_committed(&self, _pool: &sqlx::PgPool) {
         #[cfg(any(test, feature = "test-utils"))]
         if self.block_on_delivery {
@@ -171,7 +171,7 @@ impl EmailDispatcher {
     /// Test helper in practice; unlike the detached dispatch paths this is a
     /// typed boundary — DB failures surface as [`crate::AppError`] (wire
     /// envelope) instead of raw [`sqlx::Error`].
-    #[cfg(feature = "postgres")]
+    #[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
     pub async fn flush_outbox(&self, pool: &sqlx::PgPool) -> Result<usize, crate::AppError> {
         Ok(crate::email::outbox::process_outbox_batch(
             pool,

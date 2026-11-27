@@ -53,7 +53,10 @@ async fn get_test_mongo_store() -> Option<MongoStore> {
     let is_replica_set = db
         .run_command(hello_cmd)
         .await
-        .map(|doc| doc.get_str("setName").is_ok())
+        .map(|doc| {
+            doc.contains_key("setName")
+                || doc.get_str("msg").map(|m| m == "isdbgrid").unwrap_or(false)
+        })
         .unwrap_or(false);
 
     ensure_indexes(&db)
@@ -2015,6 +2018,35 @@ async fn test_mongo_transaction_atomicity() {
                     .is_some()
             );
             let _ = store.users().delete_user(user.id).await;
+
+            // Verify rollback discards pending mutations
+            let mut tx_rollback = store.begin().await.expect("begin mongo tx for rollback");
+            let email_rollback = format!("mongo_tx_rollback_{}@example.com", Uuid::new_v4());
+            let user_rollback = tx_rollback
+                .users()
+                .create_user(&email_rollback, "hash")
+                .await
+                .expect("create user in mongo rollback tx");
+            tx_rollback.rollback().await.expect("rollback mongo tx");
+
+            assert!(
+                store
+                    .users()
+                    .get_user_by_id(user_rollback.id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "user created inside rolled-back transaction must not persist"
+            );
+            assert!(
+                store
+                    .users()
+                    .get_user_by_email(&email_rollback)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "user email created inside rolled-back transaction must not persist"
+            );
         }
         Err(AppError::TransactionNotSupported) => {
             // Standalone without replica set correctly fails closed

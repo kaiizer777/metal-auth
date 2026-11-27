@@ -454,7 +454,8 @@ impl AppError {
             | Self::EmailHookNotConfigured
             | Self::EmailDispatchFailed(_)
             | Self::EmailDispatchTimeout
-            | Self::EmailAlreadyExists => StatusCode::INTERNAL_SERVER_ERROR,
+            | Self::EmailAlreadyExists
+            | Self::UnsupportedDatabaseBackend(_) => StatusCode::INTERNAL_SERVER_ERROR,
             // 401
             Self::InvalidCredentials
             | Self::Unauthenticated
@@ -485,8 +486,7 @@ impl AppError {
             // 501
             Self::TransactionNotSupported => StatusCode::NOT_IMPLEMENTED,
             // 400
-            Self::UnsupportedDatabaseBackend(_)
-            | Self::PasswordTooShort
+            Self::PasswordTooShort
             | Self::PasswordTooLong
             | Self::PasswordTooCommon
             | Self::InvalidEmail
@@ -927,7 +927,7 @@ mod tests {
             ),
             (
                 AppError::UnsupportedDatabaseBackend("cockroachdb".to_string()),
-                StatusCode::BAD_REQUEST,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorCode::UnsupportedDatabaseBackend,
                 "cockroachdb",
             ),
@@ -1527,7 +1527,10 @@ mod tests {
     #[test]
     fn test_unsupported_database_backend_and_transaction_sentinels() {
         let unsupported = AppError::UnsupportedDatabaseBackend("cockroachdb".into());
-        assert_eq!(unsupported.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            unsupported.status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
         assert_eq!(
             unsupported.error_code(),
             ErrorCode::UnsupportedDatabaseBackend

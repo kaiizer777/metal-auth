@@ -957,10 +957,10 @@ async fn test_mongo_outbox_recover_stale_processing() {
         .await
         .expect("insert outbox email");
 
-    // Worker A claims with 1-second lease
+    // Worker A claims with 60-second lease
     let claimed = store
         .outbox()
-        .claim_pending_outbox(10, Duration::from_secs(1))
+        .claim_pending_outbox(10, Duration::from_secs(60))
         .await
         .expect("initial claim");
     assert!(claimed.iter().any(|item| item.id == outbox.id));
@@ -968,13 +968,20 @@ async fn test_mongo_outbox_recover_stale_processing() {
     // Active lease should NOT be claimable while lease is unexpired
     let premature_claim = store
         .outbox()
-        .claim_pending_outbox(10, Duration::from_secs(1))
+        .claim_pending_outbox(10, Duration::from_secs(60))
         .await
         .expect("premature claim check");
     assert!(!premature_claim.iter().any(|item| item.id == outbox.id));
 
-    // Wait 1.1s for lease to expire (1.1s > 1s lease, but << 60s stale_duration)
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    // Update the record's next_retry_at directly in MongoDB to a past timestamp
+    let coll = store.db().collection::<bson::Document>("outbox");
+    let past_time = Utc::now() - chrono::Duration::seconds(10);
+    coll.update_one(
+        doc! { "_id": bson::Uuid::from(outbox.id) },
+        doc! { "$set": { "next_retry_at": bson::DateTime::from_chrono(past_time) } },
+    )
+    .await
+    .expect("update next_retry_at to past");
 
     // recover_stale_processing with large stale_duration (e.g. 60s).
     // In pre-fix code, this checked next_retry_at <= now - 60s, failing to recover the expired lease.
@@ -988,6 +995,14 @@ async fn test_mongo_outbox_recover_stale_processing() {
         recovered >= 1,
         "expected at least 1 recovered record, got {recovered}"
     );
+
+    // Verify specific document transitioned to "pending"
+    let doc = coll
+        .find_one(doc! { "_id": bson::Uuid::from(outbox.id) })
+        .await
+        .expect("find outbox doc")
+        .expect("outbox doc exists");
+    assert_eq!(doc.get_str("status").unwrap(), "pending");
 
     // Verify record has reverted to pending and can be claimed by Worker B
     let reclaimed = store
@@ -1743,7 +1758,12 @@ async fn test_mongo_sessions_compound_index() {
             .as_ref()
             .filter(|o| o.name.as_deref() == Some("idx_sessions_user_id_active"))
         {
-            assert_eq!(model.keys, doc! { "user_id": 1, "last_active_at": -1 });
+            let keys: Vec<(&String, &bson::Bson)> = model.keys.iter().collect();
+            assert_eq!(keys.len(), 2);
+            assert_eq!(keys[0].0, "user_id");
+            assert_eq!(keys[0].1, &bson::Bson::Int32(1));
+            assert_eq!(keys[1].0, "last_active_at");
+            assert_eq!(keys[1].1, &bson::Bson::Int32(-1));
             found_index = true;
         }
     }
@@ -2031,7 +2051,7 @@ async fn test_mongo_tx_drop_aborts_transaction() {
     }
 
     let tx_res = store.begin().await;
-    let user_id = {
+    let (user_id, email) = {
         let mut tx = match tx_res {
             Ok(tx) => tx,
             Err(AppError::TransactionNotSupported) => {
@@ -2049,7 +2069,7 @@ async fn test_mongo_tx_drop_aborts_transaction() {
             .create_user(&email, "hash")
             .await
             .expect("create user in mongo tx");
-        user.id
+        (user.id, email)
         // tx is intentionally dropped here without commit() or rollback()
     };
 
@@ -2063,13 +2083,20 @@ async fn test_mongo_tx_drop_aborts_transaction() {
         "uncommitted user must not exist after MongoTx drop"
     );
 
-    // Verify subsequent operations on the collection succeed without lock contention
-    let email_after = format!("mongo_after_drop_{}@example.com", Uuid::new_v4());
-    let user_after = store
-        .users()
-        .create_user(&email_after, "hash")
-        .await
-        .expect("create user after drop abort");
-    assert_eq!(user_after.email, email_after);
+    // Verify subsequent operations on the collection succeed with the identical email,
+    // proving the aborted transaction released unique constraints without duplicate key error.
+    let mut user_after = None;
+    for _ in 0..20 {
+        match store.users().create_user(&email, "hash").await {
+            Ok(u) => {
+                user_after = Some(u);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    let user_after =
+        user_after.expect("create user with identical email after drop abort must succeed");
+    assert_eq!(user_after.email, email);
     let _ = store.users().delete_user(user_after.id).await;
 }

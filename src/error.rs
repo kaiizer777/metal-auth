@@ -505,74 +505,90 @@ impl AppError {
     }
 
     #[must_use]
-    pub fn response_message(&self) -> &str {
+    pub fn response_message(&self) -> String {
         match self {
-            Self::Config(_) => "Invalid configuration",
-            Self::Database(_) => "Database error",
-            Self::DatabaseUnavailable(_) => "Database unavailable",
-            Self::Migration(_) => "Migration failed",
-            Self::NotFound => "Not found",
-            Self::MethodNotAllowed => "Method not allowed",
+            Self::Config(_) => "Invalid configuration".to_owned(),
+            Self::Database(_) => "Database error".to_owned(),
+            Self::DatabaseUnavailable(_) => "Database unavailable".to_owned(),
+            Self::Migration(_) => "Migration failed".to_owned(),
+            Self::NotFound => "Not found".to_owned(),
+            Self::MethodNotAllowed => "Method not allowed".to_owned(),
             Self::Internal
             | Self::EmailHookNotConfigured
             | Self::EmailDispatchFailed(_)
             | Self::EmailDispatchTimeout
-            | Self::EmailAlreadyExists => "Internal error",
+            | Self::EmailAlreadyExists => "Internal error".to_owned(),
             // Phase 3
-            Self::InvalidCredentials => "Invalid email or password",
-            Self::Unauthenticated => "Authentication required",
-            Self::EmailNotVerified => "Email address has not been verified",
-            Self::PasswordTooShort => "Password does not meet the minimum length requirement",
-            Self::PasswordTooLong => "Password exceeds the maximum length requirement",
-            Self::PasswordTooCommon => "Password is too common, please choose a stronger password",
-            Self::InvalidEmail => "Invalid email address",
+            Self::InvalidCredentials => "Invalid email or password".to_owned(),
+            Self::Unauthenticated => "Authentication required".to_owned(),
+            Self::EmailNotVerified => "Email address has not been verified".to_owned(),
+            Self::PasswordTooShort => {
+                "Password does not meet the minimum length requirement".to_owned()
+            }
+            Self::PasswordTooLong => {
+                "Password exceeds the maximum length requirement".to_owned()
+            }
+            Self::PasswordTooCommon => {
+                "Password is too common, please choose a stronger password".to_owned()
+            }
+            Self::InvalidEmail => "Invalid email address".to_owned(),
             Self::ValidationError(msg) => {
                 if msg.is_empty() {
-                    "Invalid request body"
+                    "Invalid request body".to_owned()
                 } else {
-                    msg.as_str()
+                    msg.to_owned()
                 }
             }
-            Self::InvalidToken => "Invalid or already used token",
-            Self::TokenExpired => "Token has expired",
+            Self::InvalidToken => "Invalid or already used token".to_owned(),
+            Self::TokenExpired => "Token has expired".to_owned(),
             // Phase 4
             Self::SessionNotFound | Self::SessionExpired | Self::SessionInvalid => {
-                "Session is invalid or has expired"
+                "Session is invalid or has expired".to_owned()
             }
-            Self::CsrfTokenMissing => "CSRF token is missing",
-            Self::CsrfTokenInvalid => "CSRF token is invalid",
-            Self::RateLimitExceeded => "Too many requests, please try again later",
+            Self::CsrfTokenMissing => "CSRF token is missing".to_owned(),
+            Self::CsrfTokenInvalid => "CSRF token is invalid".to_owned(),
+            Self::RateLimitExceeded => {
+                "Too many requests, please try again later".to_owned()
+            }
             // Phase 6
-            Self::OAuthStateInvalid => "invalid oauth state",
-            Self::OAuthCodeInvalid => "oauth code is invalid",
-            Self::OAuthEmailUnverified => "oauth provider email is not verified",
-            Self::OAuthProviderNotFound => "oauth provider not found",
-            Self::OAuthAccountLinkConflict => {
-                "cannot link oauth identity to unverified local account"
+            Self::OAuthStateInvalid => "invalid oauth state".to_owned(),
+            Self::OAuthCodeInvalid => "oauth code is invalid".to_owned(),
+            Self::OAuthEmailUnverified => {
+                "oauth provider email is not verified".to_owned()
             }
-            Self::OAuthProviderError => "oauth provider error",
+            Self::OAuthProviderNotFound => "oauth provider not found".to_owned(),
+            Self::OAuthAccountLinkConflict => {
+                "cannot link oauth identity to unverified local account".to_owned()
+            }
+            Self::OAuthProviderError => "oauth provider error".to_owned(),
             // Phase 7
-            Self::TotpNotEnrolled => "totp not enrolled for this user",
-            Self::TotpAlreadyEnabled => "totp already enabled for this user",
-            Self::TotpCodeInvalid => "totp code is invalid",
-            Self::TotpCodeExpired => "totp code window has expired",
-            Self::TotpCodeReplayed => "totp code has already been used",
-            Self::TotpBackupCodeInvalid => "backup code is invalid",
-            Self::TwoFactorRequired => "two factor authentication required",
-            Self::TwoFactorTokenInvalid => "two factor token is invalid",
-            Self::TwoFactorTokenExpired => "two factor token has expired",
-            Self::TwoFactorUnavailable => "two factor authentication is temporarily unavailable",
-            Self::TotpRateLimitExceeded => "totp rate limit exceeded",
+            Self::TotpNotEnrolled => "totp not enrolled for this user".to_owned(),
+            Self::TotpAlreadyEnabled => "totp already enabled for this user".to_owned(),
+            Self::TotpCodeInvalid => "totp code is invalid".to_owned(),
+            Self::TotpCodeExpired => "totp code window has expired".to_owned(),
+            Self::TotpCodeReplayed => "totp code has already been used".to_owned(),
+            Self::TotpBackupCodeInvalid => "backup code is invalid".to_owned(),
+            Self::TwoFactorRequired => "two factor authentication required".to_owned(),
+            Self::TwoFactorTokenInvalid => "two factor token is invalid".to_owned(),
+            Self::TwoFactorTokenExpired => "two factor token has expired".to_owned(),
+            Self::TwoFactorUnavailable => {
+                "two factor authentication is temporarily unavailable".to_owned()
+            }
+            Self::TotpRateLimitExceeded => "totp rate limit exceeded".to_owned(),
             Self::UnsupportedDatabaseBackend(msg) => {
                 if msg.is_empty() {
-                    "Unsupported database backend"
+                    "Unsupported database backend".to_owned()
                 } else {
-                    msg.as_str()
+                    format!("Unsupported database backend: {msg}")
                 }
             }
-            Self::TransactionNotSupported => "transactions require a mongodb replica set",
+            Self::TransactionNotSupported => {
+                "transactions require a mongodb replica set".to_owned()
+            }
             // Same wire code and message as the login gate.
-            Self::TotpEmailNotVerified => "Email address has not been verified",
+            Self::TotpEmailNotVerified => {
+                "Email address has not been verified".to_owned()
+            }
         }
     }
 
@@ -719,7 +735,7 @@ impl IntoResponse for AppError {
                 tracing::debug!("totp enrollment blocked: email not verified")
             }
             Self::UnsupportedDatabaseBackend(backend) => {
-                tracing::warn!(backend = %backend, "unsupported database backend")
+                tracing::error!(backend = %backend, "unsupported database backend")
             }
             Self::TransactionNotSupported => {
                 tracing::error!("transactions not supported on this database deployment")
@@ -929,7 +945,7 @@ mod tests {
                 AppError::UnsupportedDatabaseBackend("cockroachdb".to_string()),
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorCode::UnsupportedDatabaseBackend,
-                "cockroachdb",
+                "Unsupported database backend: cockroachdb",
             ),
             (
                 AppError::TransactionNotSupported,
@@ -1535,7 +1551,10 @@ mod tests {
             unsupported.error_code(),
             ErrorCode::UnsupportedDatabaseBackend
         );
-        assert_eq!(unsupported.response_message(), "cockroachdb");
+        assert_eq!(
+            unsupported.response_message(),
+            "Unsupported database backend: cockroachdb"
+        );
 
         let unsupported_empty = AppError::UnsupportedDatabaseBackend("".into());
         assert_eq!(

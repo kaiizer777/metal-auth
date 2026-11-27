@@ -6,11 +6,17 @@ use chrono::Utc;
 use metal_auth::{
     AppError, Config, ConfigError, DatabaseBackend, DatabaseStore, MongoConfig, MongoStore,
     config::redact_url,
-    db::mongo::{
-        indexes::ensure_indexes,
+    db::{
         models::{
-            EmailOutboxDoc, OAuthAccountDoc, PasswordResetTokenDoc, SessionDoc, TotpSecretDoc,
-            TotpUsedCodeDoc, TwoFactorTokenDoc, UserDoc, VerificationTokenDoc,
+            OUTBOX_STATUS_FAILED, OUTBOX_STATUS_PENDING, OUTBOX_STATUS_PROCESSING,
+            OUTBOX_STATUS_SENT,
+        },
+        mongo::{
+            indexes::{EMAIL_OUTBOX_COLLECTION, ensure_indexes},
+            models::{
+                EmailOutboxDoc, OAuthAccountDoc, PasswordResetTokenDoc, SessionDoc, TotpSecretDoc,
+                TotpUsedCodeDoc, TwoFactorTokenDoc, UserDoc, VerificationTokenDoc,
+            },
         },
     },
     error::DbError,
@@ -43,9 +49,18 @@ async fn get_test_mongo_store() -> Option<MongoStore> {
     let db = client.database(&db_name);
     db.run_command(doc! { "ping": 1 }).await.ok()?;
 
-    ensure_indexes(&db).await.ok()?;
+    let hello_cmd = doc! { "hello": 1 };
+    let is_replica_set = db
+        .run_command(hello_cmd)
+        .await
+        .map(|doc| doc.get_str("setName").is_ok())
+        .unwrap_or(false);
 
-    let store = MongoStore::new(client, &db_name, false, allow_standalone);
+    ensure_indexes(&db)
+        .await
+        .expect("Failed to create mongo indexes for test store");
+
+    let store = MongoStore::new(client, &db_name, is_replica_set, allow_standalone);
     Some(store)
 }
 
@@ -575,7 +590,7 @@ async fn test_mongo_tokens_lifecycle() {
         .expect("consume replayed r token");
     assert!(r_replayed.is_none());
 
-    // Expired token test
+    // Expired verification token test (pure storage contract returns token metadata without premature expiry check)
     let expired_hash = [77u8; 32];
     let past_expiry = Utc::now() - chrono::Duration::hours(1);
     store
@@ -584,11 +599,45 @@ async fn test_mongo_tokens_lifecycle() {
         .await
         .expect("create expired token");
 
-    let exp_res = store
+    let exp_token = store
         .tokens()
         .consume_verification_token(&expired_hash)
-        .await;
-    assert!(matches!(exp_res, Err(AppError::TokenExpired)));
+        .await
+        .expect("consume expired verification token")
+        .expect("token exists");
+    assert_eq!(exp_token.user_id, user.id);
+    assert!(exp_token.expires_at <= Utc::now());
+
+    let exp_replayed = store
+        .tokens()
+        .consume_verification_token(&expired_hash)
+        .await
+        .expect("consume replayed expired verification token");
+    assert!(exp_replayed.is_none());
+
+    // Expired password reset token test
+    let expired_reset_hash = [78u8; 32];
+    store
+        .tokens()
+        .create_password_reset_token(user.id, &expired_reset_hash, past_expiry)
+        .await
+        .expect("create expired reset token");
+
+    let exp_reset_token = store
+        .tokens()
+        .consume_password_reset_token(&expired_reset_hash)
+        .await
+        .expect("consume expired reset token")
+        .expect("token exists");
+    assert_eq!(exp_reset_token.user_id, user.id);
+    assert!(exp_reset_token.expires_at <= Utc::now());
+
+    let exp_reset_replayed = store
+        .tokens()
+        .consume_password_reset_token(&expired_reset_hash)
+        .await
+        .expect("consume replayed expired reset token");
+    assert!(exp_reset_replayed.is_none());
 
     // Cleanup
     let _ = store.users().delete_user(user.id).await;
@@ -687,6 +736,37 @@ async fn test_mongo_sessions_lifecycle() {
         .expect("fetch deleted session");
     assert!(after_delete.is_none());
 
+    // 7. Expired session retrieval parity (storage layer returns existing session without premature expiry filtering)
+    let expired_token_hash = format!("sess_expired_hash_{}", Uuid::new_v4());
+    let past_expiry = Utc::now() - chrono::Duration::hours(1);
+    let expired_session = store
+        .sessions()
+        .create_session(
+            user.id,
+            &expired_token_hash,
+            "cookie",
+            Some("csrf_expired"),
+            past_expiry,
+        )
+        .await
+        .expect("create expired session");
+
+    let fetched_expired = store
+        .sessions()
+        .get_session_by_token_hash(&expired_token_hash)
+        .await
+        .expect("fetch expired session")
+        .expect("expired session exists in storage");
+    assert_eq!(fetched_expired.id, expired_session.id);
+    assert_eq!(fetched_expired.user_id, user.id);
+    assert!(fetched_expired.absolute_expires_at <= Utc::now());
+
+    store
+        .sessions()
+        .delete_session(expired_session.id)
+        .await
+        .expect("delete expired session");
+
     // Cleanup
     let _ = store.users().delete_user(user.id).await;
 }
@@ -735,6 +815,459 @@ async fn test_mongo_outbox_lifecycle() {
 }
 
 #[tokio::test]
+async fn test_mongo_outbox_concurrent_claims() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_outbox_concurrent_claims: MONGO_URL not set");
+        return;
+    };
+
+    let count = 20;
+    let mut seeded_ids = Vec::with_capacity(count);
+    for _ in 0..count {
+        let recipient = format!("concurrent_outbox_{}@example.com", Uuid::new_v4());
+        let payload = serde_json::json!({ "worker_test": true });
+        let outbox = store
+            .outbox()
+            .insert_outbox(&recipient, "verification", payload)
+            .await
+            .expect("insert outbox record");
+        seeded_ids.push(outbox.id);
+    }
+
+    let seeded_set: std::collections::HashSet<Uuid> = seeded_ids.iter().copied().collect();
+
+    // Spawn 4 concurrent worker tasks claiming batches
+    let mut tasks = Vec::new();
+    for _ in 0..4 {
+        let worker_store = store.clone();
+        let seeded_set = seeded_set.clone();
+        let task = tokio::spawn(async move {
+            let mut worker_claimed = Vec::new();
+            for _ in 0..20 {
+                let batch = worker_store
+                    .outbox()
+                    .claim_pending_outbox(5, Duration::from_secs(60))
+                    .await
+                    .expect("claim outbox batch");
+                if batch.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
+                for item in batch {
+                    if seeded_set.contains(&item.id) {
+                        worker_claimed.push(item.id);
+                    } else {
+                        // Release unowned items back to pending so concurrent tests aren't starved
+                        let _ = worker_store
+                            .db()
+                            .collection::<bson::Document>(EMAIL_OUTBOX_COLLECTION)
+                            .update_one(
+                                doc! { "_id": bson::Uuid::from(item.id) },
+                                doc! {
+                                    "$set": {
+                                        "status": OUTBOX_STATUS_PENDING,
+                                        "next_retry_at": bson::DateTime::now(),
+                                    }
+                                },
+                            )
+                            .await;
+                    }
+                }
+            }
+            worker_claimed
+        });
+        tasks.push(task);
+    }
+
+    let mut all_claimed = Vec::new();
+    for task in tasks {
+        let worker_claimed = task.await.expect("join worker task");
+        all_claimed.extend(worker_claimed);
+    }
+
+    let test_claimed: Vec<Uuid> = all_claimed
+        .into_iter()
+        .filter(|id| seeded_set.contains(id))
+        .collect();
+
+    // Verify mutual exclusion: exactly count records claimed, zero duplicates
+    assert_eq!(
+        test_claimed.len(),
+        count,
+        "every seeded record must be claimed exactly once"
+    );
+    let mut seen = std::collections::HashSet::new();
+    for id in &test_claimed {
+        assert!(
+            seen.insert(*id),
+            "duplicate claim detected for outbox record {id}"
+        );
+    }
+
+    // Cleanup
+    for id in seeded_ids {
+        let _ = store.outbox().mark_outbox_sent(id).await;
+    }
+    let _ = store
+        .outbox()
+        .cleanup_sent_outbox(Duration::from_secs(0))
+        .await;
+}
+
+#[tokio::test]
+async fn test_mongo_outbox_stale_lease_recovery() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_outbox_stale_lease_recovery: MONGO_URL not set");
+        return;
+    };
+
+    let recipient = format!("stale_outbox_{}@example.com", Uuid::new_v4());
+    let payload = serde_json::json!({ "stale_test": true });
+
+    let outbox = store
+        .outbox()
+        .insert_outbox(&recipient, "password_reset", payload)
+        .await
+        .expect("insert outbox email");
+
+    // Worker A claims with 1-second lease
+    let claimed = store
+        .outbox()
+        .claim_pending_outbox(10, Duration::from_secs(1))
+        .await
+        .expect("initial claim");
+    assert!(claimed.iter().any(|item| item.id == outbox.id));
+
+    // Wait 1.1s for lease to expire (1.1s > 1s lease, but < 2s double lease)
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    // Worker B should immediately recover and reclaim the record without waiting 2x lease
+    let reclaimed = store
+        .outbox()
+        .claim_pending_outbox(10, Duration::from_secs(60))
+        .await
+        .expect("reclaim stale record");
+    assert!(
+        reclaimed.iter().any(|item| item.id == outbox.id),
+        "stale processing record must be reclaimable as soon as next_retry_at <= now"
+    );
+
+    // Cleanup
+    let _ = store.outbox().mark_outbox_sent(outbox.id).await;
+    let _ = store
+        .outbox()
+        .cleanup_sent_outbox(Duration::from_secs(0))
+        .await;
+}
+
+#[tokio::test]
+async fn test_mongo_outbox_recover_stale_processing() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_outbox_recover_stale_processing: MONGO_URL not set");
+        return;
+    };
+
+    let recipient = format!("recover_stale_outbox_{}@example.com", Uuid::new_v4());
+    let payload = serde_json::json!({ "recover_test": true });
+
+    let outbox = store
+        .outbox()
+        .insert_outbox(&recipient, "password_reset", payload)
+        .await
+        .expect("insert outbox email");
+
+    // Worker A claims with 60-second lease
+    let claimed = store
+        .outbox()
+        .claim_pending_outbox(10, Duration::from_secs(60))
+        .await
+        .expect("initial claim");
+    assert!(claimed.iter().any(|item| item.id == outbox.id));
+
+    // Active lease should NOT be claimable while lease is unexpired
+    let premature_claim = store
+        .outbox()
+        .claim_pending_outbox(10, Duration::from_secs(60))
+        .await
+        .expect("premature claim check");
+    assert!(!premature_claim.iter().any(|item| item.id == outbox.id));
+
+    // Update the record's next_retry_at directly in MongoDB to a past timestamp
+    let coll = store
+        .db()
+        .collection::<bson::Document>(EMAIL_OUTBOX_COLLECTION);
+    let past_time = Utc::now() - chrono::Duration::seconds(10);
+    coll.update_one(
+        doc! { "_id": bson::Uuid::from(outbox.id) },
+        doc! { "$set": { "next_retry_at": bson::DateTime::from_chrono(past_time) } },
+    )
+    .await
+    .expect("update next_retry_at to past");
+
+    // recover_stale_processing with large stale_duration (e.g. 60s).
+    // In pre-fix code, this checked next_retry_at <= now - 60s, failing to recover the expired lease.
+    // In post-fix code, next_retry_at <= now recovers it immediately to pending.
+    let recovered = store
+        .outbox()
+        .recover_stale_processing(Duration::from_secs(60))
+        .await
+        .expect("recover stale processing");
+    assert!(
+        recovered >= 1,
+        "expected at least 1 recovered record, got {recovered}"
+    );
+
+    // Verify specific document transitioned to "pending"
+    let doc = coll
+        .find_one(doc! { "_id": bson::Uuid::from(outbox.id) })
+        .await
+        .expect("find outbox doc")
+        .expect("outbox doc exists");
+    assert_eq!(doc.get_str("status").unwrap(), "pending");
+
+    // Verify record has reverted to pending and can be claimed by Worker B
+    let reclaimed = store
+        .outbox()
+        .claim_pending_outbox(10, Duration::from_secs(60))
+        .await
+        .expect("reclaim recovered record");
+    assert!(
+        reclaimed.iter().any(|item| item.id == outbox.id),
+        "recovered record must be in pending status and claimable"
+    );
+
+    // Cleanup
+    let _ = store.outbox().mark_outbox_sent(outbox.id).await;
+    let _ = store
+        .outbox()
+        .cleanup_sent_outbox(Duration::from_secs(0))
+        .await;
+}
+
+#[tokio::test]
+async fn test_mongo_outbox_status_guards() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_outbox_status_guards: MONGO_URL not set");
+        return;
+    };
+
+    let coll = store
+        .db()
+        .collection::<EmailOutboxDoc>(EMAIL_OUTBOX_COLLECTION);
+
+    let recipient = format!("guard_{}@example.com", Uuid::new_v4());
+    let payload = serde_json::json!({ "guard_test": true });
+
+    // 1. Insert record (initial status = pending)
+    let outbox = store
+        .outbox()
+        .insert_outbox(&recipient, "verification", payload)
+        .await
+        .expect("insert outbox email");
+    assert_eq!(outbox.status, OUTBOX_STATUS_PENDING);
+
+    let doc = coll
+        .find_one(doc! { "_id": bson::Uuid::from(outbox.id) })
+        .await
+        .expect("find doc")
+        .expect("doc exists");
+    assert_eq!(doc.status, OUTBOX_STATUS_PENDING);
+    assert!(doc.sent_at.is_none());
+    assert!(doc.error_log.is_none());
+
+    // 2. Calling mark_outbox_sent while pending must NOT change status or sent_at
+    store
+        .outbox()
+        .mark_outbox_sent(outbox.id)
+        .await
+        .expect("mark_outbox_sent returns Ok even if unmatched");
+
+    let doc = coll
+        .find_one(doc! { "_id": bson::Uuid::from(outbox.id) })
+        .await
+        .expect("find doc")
+        .expect("doc exists");
+    assert_eq!(doc.status, OUTBOX_STATUS_PENDING);
+    assert!(doc.sent_at.is_none());
+
+    // 3. Calling record_outbox_retry while pending must NOT change status, error_log, or retry_count
+    let next_retry = Utc::now() - chrono::Duration::seconds(10);
+    store
+        .outbox()
+        .record_outbox_retry(outbox.id, 1, next_retry, "premature retry")
+        .await
+        .expect("record_outbox_retry returns Ok even if unmatched");
+
+    let doc = coll
+        .find_one(doc! { "_id": bson::Uuid::from(outbox.id) })
+        .await
+        .expect("find doc")
+        .expect("doc exists");
+    assert_eq!(doc.status, OUTBOX_STATUS_PENDING);
+    assert_eq!(doc.retry_count, 0);
+    assert!(doc.error_log.is_none());
+
+    // 4. Calling mark_outbox_failed while pending must NOT change status or error_log
+    store
+        .outbox()
+        .mark_outbox_failed(outbox.id, "premature fail")
+        .await
+        .expect("mark_outbox_failed returns Ok even if unmatched");
+
+    let doc = coll
+        .find_one(doc! { "_id": bson::Uuid::from(outbox.id) })
+        .await
+        .expect("find doc")
+        .expect("doc exists");
+    assert_eq!(doc.status, OUTBOX_STATUS_PENDING);
+    assert!(doc.error_log.is_none());
+
+    // 5. Claim record -> transitions to processing
+    let claimed = store
+        .outbox()
+        .claim_pending_outbox(10, Duration::from_secs(60))
+        .await
+        .expect("claim outbox batch");
+    assert!(claimed.iter().any(|item| item.id == outbox.id));
+
+    let doc = coll
+        .find_one(doc! { "_id": bson::Uuid::from(outbox.id) })
+        .await
+        .expect("find doc")
+        .expect("doc exists");
+    assert_eq!(doc.status, OUTBOX_STATUS_PROCESSING);
+
+    // 6. While processing, record_outbox_retry succeeds and transitions to pending with error_log
+    store
+        .outbox()
+        .record_outbox_retry(outbox.id, 1, next_retry, "transient error")
+        .await
+        .expect("record_outbox_retry while processing");
+
+    let doc = coll
+        .find_one(doc! { "_id": bson::Uuid::from(outbox.id) })
+        .await
+        .expect("find doc")
+        .expect("doc exists");
+    assert_eq!(doc.status, OUTBOX_STATUS_PENDING);
+    assert_eq!(doc.retry_count, 1);
+    assert_eq!(doc.error_log.as_deref(), Some("transient error"));
+
+    // 7. Re-claim record back to processing (since next_retry was in the past)
+    let reclaimed = store
+        .outbox()
+        .claim_pending_outbox(10, Duration::from_secs(60))
+        .await
+        .expect("reclaim outbox batch");
+    assert!(reclaimed.iter().any(|item| item.id == outbox.id));
+
+    // 8. While processing, mark_outbox_sent succeeds, sets sent_at, and CLEARS error_log to None
+    store
+        .outbox()
+        .mark_outbox_sent(outbox.id)
+        .await
+        .expect("mark_outbox_sent while processing");
+
+    let doc = coll
+        .find_one(doc! { "_id": bson::Uuid::from(outbox.id) })
+        .await
+        .expect("find doc")
+        .expect("doc exists");
+    assert_eq!(doc.status, OUTBOX_STATUS_SENT);
+    assert!(doc.sent_at.is_some());
+    assert_eq!(
+        doc.error_log, None,
+        "mark_outbox_sent must clear error_log to None"
+    );
+
+    // 9. Stale worker operations on sent record must NOT mutate the document
+    store
+        .outbox()
+        .record_outbox_retry(outbox.id, 2, next_retry, "stale worker error")
+        .await
+        .expect("stale record_outbox_retry on sent");
+
+    let doc = coll
+        .find_one(doc! { "_id": bson::Uuid::from(outbox.id) })
+        .await
+        .expect("find doc")
+        .expect("doc exists");
+    assert_eq!(doc.status, OUTBOX_STATUS_SENT);
+    assert_eq!(doc.error_log, None);
+    assert_eq!(doc.retry_count, 1);
+
+    store
+        .outbox()
+        .mark_outbox_failed(outbox.id, "stale worker fatal")
+        .await
+        .expect("stale mark_outbox_failed on sent");
+
+    let doc = coll
+        .find_one(doc! { "_id": bson::Uuid::from(outbox.id) })
+        .await
+        .expect("find doc")
+        .expect("doc exists");
+    assert_eq!(doc.status, OUTBOX_STATUS_SENT);
+    assert_eq!(doc.error_log, None);
+
+    // 10. Verify mark_outbox_failed on processing status
+    let recipient_failed = format!("guard_failed_{}@example.com", Uuid::new_v4());
+    let outbox_failed = store
+        .outbox()
+        .insert_outbox(&recipient_failed, "password_reset", serde_json::json!({}))
+        .await
+        .expect("insert outbox email");
+
+    let claimed_failed = store
+        .outbox()
+        .claim_pending_outbox(10, Duration::from_secs(60))
+        .await
+        .expect("claim outbox email");
+    assert!(
+        claimed_failed
+            .iter()
+            .any(|item| item.id == outbox_failed.id)
+    );
+
+    store
+        .outbox()
+        .mark_outbox_failed(outbox_failed.id, "fatal error")
+        .await
+        .expect("mark_outbox_failed on processing");
+
+    let doc = coll
+        .find_one(doc! { "_id": bson::Uuid::from(outbox_failed.id) })
+        .await
+        .expect("find doc")
+        .expect("doc exists");
+    assert_eq!(doc.status, OUTBOX_STATUS_FAILED);
+    assert_eq!(doc.error_log.as_deref(), Some("fatal error"));
+
+    // Stale sent attempt on failed status must be a no-op
+    store
+        .outbox()
+        .mark_outbox_sent(outbox_failed.id)
+        .await
+        .expect("stale mark_outbox_sent on failed");
+
+    let doc = coll
+        .find_one(doc! { "_id": bson::Uuid::from(outbox_failed.id) })
+        .await
+        .expect("find doc")
+        .expect("doc exists");
+    assert_eq!(doc.status, OUTBOX_STATUS_FAILED);
+
+    // Cleanup
+    let _ = store
+        .outbox()
+        .cleanup_sent_outbox(Duration::from_secs(0))
+        .await;
+    let _ = coll
+        .delete_one(doc! { "_id": bson::Uuid::from(outbox_failed.id) })
+        .await;
+}
+
+#[tokio::test]
 async fn test_mongo_oauth_lifecycle() {
     let Some(store) = get_test_mongo_store().await else {
         eprintln!("skipping test_mongo_oauth_lifecycle: MONGO_URL not set");
@@ -768,6 +1301,15 @@ async fn test_mongo_oauth_lifecycle() {
         .expect("account found");
     assert_eq!(by_prov.id, account.id);
 
+    // List accounts for user
+    let accounts = store
+        .oauth()
+        .list_accounts_for_user(user.id)
+        .await
+        .expect("list accounts");
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].id, account.id);
+
     // Duplicate link conflict
     let conflict = store
         .oauth()
@@ -782,6 +1324,141 @@ async fn test_mongo_oauth_lifecycle() {
         .await
         .expect("unlink account");
     assert!(unlinked);
+
+    let accounts_after = store
+        .oauth()
+        .list_accounts_for_user(user.id)
+        .await
+        .expect("list accounts after unlink");
+    assert!(accounts_after.is_empty());
+
+    // Cleanup
+    let _ = store.users().delete_user(user.id).await;
+}
+
+#[tokio::test]
+async fn test_mongo_oauth_list_accounts_sort_order() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_oauth_list_accounts_sort_order: MONGO_URL not set");
+        return;
+    };
+
+    let user = store
+        .users()
+        .create_user(
+            &format!("oauth_sort_{}@example.com", Uuid::new_v4()),
+            "hash",
+        )
+        .await
+        .expect("create user");
+
+    // 0 accounts returns empty vec
+    let empty = store
+        .oauth()
+        .list_accounts_for_user(user.id)
+        .await
+        .expect("list empty accounts");
+    assert!(empty.is_empty());
+
+    let now = Utc::now();
+    let t1 = now - chrono::Duration::hours(3);
+    let t2 = now - chrono::Duration::hours(2);
+    let t3 = now - chrono::Duration::hours(1);
+
+    // Insert out of chronological order: t2 (google), t3 (discord), t1 (github)
+    let coll = store.db().collection::<bson::Document>("oauth_accounts");
+    let docs = vec![
+        doc! {
+            "_id": bson::Uuid::from(Uuid::new_v4()),
+            "user_id": bson::Uuid::from(user.id),
+            "provider_id": "google",
+            "provider_user_id": format!("google_{}", Uuid::new_v4()),
+            "email": "user@google.com",
+            "created_at": bson::DateTime::from_chrono(t2),
+            "updated_at": bson::DateTime::from_chrono(t2),
+        },
+        doc! {
+            "_id": bson::Uuid::from(Uuid::new_v4()),
+            "user_id": bson::Uuid::from(user.id),
+            "provider_id": "discord",
+            "provider_user_id": format!("discord_{}", Uuid::new_v4()),
+            "email": "user@discord.com",
+            "created_at": bson::DateTime::from_chrono(t3),
+            "updated_at": bson::DateTime::from_chrono(t3),
+        },
+        doc! {
+            "_id": bson::Uuid::from(Uuid::new_v4()),
+            "user_id": bson::Uuid::from(user.id),
+            "provider_id": "github",
+            "provider_user_id": format!("github_{}", Uuid::new_v4()),
+            "email": "user@github.com",
+            "created_at": bson::DateTime::from_chrono(t1),
+            "updated_at": bson::DateTime::from_chrono(t1),
+        },
+    ];
+
+    coll.insert_many(docs)
+        .await
+        .expect("insert out-of-order oauth accounts");
+
+    let accounts = store
+        .oauth()
+        .list_accounts_for_user(user.id)
+        .await
+        .expect("list accounts sorted");
+
+    assert_eq!(accounts.len(), 3);
+    assert_eq!(accounts[0].provider_id, "github");
+    assert_eq!(accounts[1].provider_id, "google");
+    assert_eq!(accounts[2].provider_id, "discord");
+    assert!(accounts[0].created_at < accounts[1].created_at);
+    assert!(accounts[1].created_at < accounts[2].created_at);
+
+    // Verify deterministic tie-breaker on identical created_at using _id: 1
+    let tie_time = now - chrono::Duration::hours(4);
+    let u1 = Uuid::new_v4();
+    let mut u2 = Uuid::new_v4();
+    while u1 == u2 {
+        u2 = Uuid::new_v4();
+    }
+    let (id_a, id_b) = if u1 < u2 { (u1, u2) } else { (u2, u1) };
+    let tie_provider_a = format!("tie_provider_a_{}", id_a);
+    let tie_provider_b = format!("tie_provider_b_{}", id_b);
+    // Insert higher id first, lower id second
+    let tie_docs = vec![
+        doc! {
+            "_id": bson::Uuid::from(id_b),
+            "user_id": bson::Uuid::from(user.id),
+            "provider_id": &tie_provider_b,
+            "provider_user_id": format!("tie_user_{}", id_b),
+            "email": "tie_b@example.com",
+            "created_at": bson::DateTime::from_chrono(tie_time),
+            "updated_at": bson::DateTime::from_chrono(tie_time),
+        },
+        doc! {
+            "_id": bson::Uuid::from(id_a),
+            "user_id": bson::Uuid::from(user.id),
+            "provider_id": &tie_provider_a,
+            "provider_user_id": format!("tie_user_{}", id_a),
+            "email": "tie_a@example.com",
+            "created_at": bson::DateTime::from_chrono(tie_time),
+            "updated_at": bson::DateTime::from_chrono(tie_time),
+        },
+    ];
+    coll.insert_many(tie_docs)
+        .await
+        .expect("insert tie oauth accounts");
+
+    let updated_accounts = store
+        .oauth()
+        .list_accounts_for_user(user.id)
+        .await
+        .expect("list accounts with ties");
+    // tie_time is older than t1, t2, t3, so tie accounts appear first
+    assert_eq!(updated_accounts[0].id, id_a);
+    assert_eq!(updated_accounts[1].id, id_b);
+    assert_eq!(updated_accounts[0].provider_id, tie_provider_a);
+    assert_eq!(updated_accounts[1].provider_id, tie_provider_b);
 
     // Cleanup
     let _ = store.users().delete_user(user.id).await;
@@ -882,6 +1559,220 @@ async fn test_mongo_totp_lifecycle() {
         .expect("re-consume 2fa token");
     assert!(re_redeemed.is_none());
 
+    // Expired 2FA challenge token test
+    let exp_token_hash = [89u8; 32];
+    let past_expiry = Utc::now() - chrono::Duration::hours(1);
+    store
+        .totp()
+        .create_two_factor_token(user.id, &exp_token_hash, "cred_hash_exp", past_expiry)
+        .await
+        .expect("create expired 2fa token");
+
+    let exp_redeemed = store
+        .totp()
+        .consume_two_factor_token(&exp_token_hash)
+        .await
+        .expect("consume expired 2fa token")
+        .expect("token exists");
+    assert_eq!(exp_redeemed.user_id, user.id);
+    assert!(exp_redeemed.expires_at <= Utc::now());
+
+    let exp_re_redeemed = store
+        .totp()
+        .consume_two_factor_token(&exp_token_hash)
+        .await
+        .expect("re-consume expired 2fa token");
+    assert!(exp_re_redeemed.is_none());
+
+    // Cleanup
+    let _ = store.users().delete_user(user.id).await;
+}
+
+#[tokio::test]
+async fn test_mongo_totp_upsert_already_enabled() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_totp_upsert_already_enabled: MONGO_URL not set");
+        return;
+    };
+
+    let user = store
+        .users()
+        .create_user(&format!("totp_en_{}@example.com", Uuid::new_v4()), "hash")
+        .await
+        .expect("create user");
+
+    let secret = b"initial_totp_secret_bytes";
+    let backup_codes = serde_json::json!(["bc1"]);
+
+    store
+        .totp()
+        .upsert_secret(user.id, secret, backup_codes.clone())
+        .await
+        .expect("initial upsert succeeds");
+
+    store
+        .totp()
+        .enable_totp(user.id)
+        .await
+        .expect("enable totp succeeds");
+
+    // Upserting on an enabled TOTP secret must fail with TotpAlreadyEnabled
+    let res = store
+        .totp()
+        .upsert_secret(user.id, b"new_secret_bytes", serde_json::json!(["bc2"]))
+        .await;
+
+    assert!(matches!(res, Err(AppError::TotpAlreadyEnabled)));
+
+    // Verify original secret is intact and still enabled
+    let current = store
+        .totp()
+        .get_secret(user.id)
+        .await
+        .expect("get secret")
+        .expect("secret exists");
+    assert!(current.enabled);
+    assert_eq!(current.encrypted_secret, secret);
+
+    let _ = store.users().delete_user(user.id).await;
+}
+
+#[tokio::test]
+async fn test_mongo_totp_concurrent_upsert() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_totp_concurrent_upsert: MONGO_URL not set");
+        return;
+    };
+
+    let user = store
+        .users()
+        .create_user(&format!("totp_cr_{}@example.com", Uuid::new_v4()), "hash")
+        .await
+        .expect("create user");
+
+    let (res_a, res_b) = tokio::join!(
+        store
+            .totp()
+            .upsert_secret(user.id, b"secret_a_bytes", serde_json::json!(["a1"])),
+        store
+            .totp()
+            .upsert_secret(user.id, b"secret_b_bytes", serde_json::json!(["b1"]))
+    );
+
+    // Neither request should fail with a raw database duplicate key error (HTTP 500)
+    assert!(res_a.is_ok(), "res_a error: {:?}", res_a.err());
+    assert!(res_b.is_ok(), "res_b error: {:?}", res_b.err());
+
+    let final_secret = store
+        .totp()
+        .get_secret(user.id)
+        .await
+        .expect("get secret")
+        .expect("secret exists");
+    assert!(!final_secret.enabled);
+
+    let _ = store.users().delete_user(user.id).await;
+}
+
+#[tokio::test]
+async fn test_mongo_totp_disable_parity() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_totp_disable_parity: MONGO_URL not set");
+        return;
+    };
+
+    let non_existent_user_id = Uuid::new_v4();
+
+    // 1. Disabling non-existent user returns Ok(false)
+    let res = store
+        .totp()
+        .disable_totp(non_existent_user_id)
+        .await
+        .expect("disable non-existent user succeeds");
+    assert!(!res);
+
+    let user = store
+        .users()
+        .create_user(&format!("totp_dis_{}@example.com", Uuid::new_v4()), "hash")
+        .await
+        .expect("create user");
+
+    let secret = b"super_secret_disable_parity_bytes";
+    let backup_codes = serde_json::json!(["code1", "code2"]);
+
+    // 2. Disabling unconfirmed secret (enabled: false) returns Ok(false) and leaves secret intact
+    store
+        .totp()
+        .upsert_secret(user.id, secret, backup_codes.clone())
+        .await
+        .expect("upsert secret");
+
+    let res = store
+        .totp()
+        .disable_totp(user.id)
+        .await
+        .expect("disable unconfirmed secret succeeds");
+    assert!(!res);
+
+    let pending_secret = store
+        .totp()
+        .get_secret(user.id)
+        .await
+        .expect("get secret")
+        .expect("secret still exists");
+    assert!(!pending_secret.enabled);
+    assert_eq!(pending_secret.encrypted_secret, secret);
+    assert_eq!(pending_secret.backup_codes, backup_codes);
+
+    // 3. Confirm/enable TOTP and record a used code
+    store
+        .totp()
+        .enable_totp(user.id)
+        .await
+        .expect("enable totp");
+
+    let code_hash = [77u8; 32];
+    let recorded = store
+        .totp()
+        .record_used_code(user.id, &code_hash)
+        .await
+        .expect("record used code");
+    assert!(recorded);
+
+    // 4. Disabling enabled secret returns Ok(true) and secret still exists with enabled: false
+    let res = store
+        .totp()
+        .disable_totp(user.id)
+        .await
+        .expect("disable enabled secret succeeds");
+    assert!(res);
+
+    let disabled_secret = store
+        .totp()
+        .get_secret(user.id)
+        .await
+        .expect("get secret")
+        .expect("secret still exists");
+    assert!(!disabled_secret.enabled);
+    assert_eq!(disabled_secret.encrypted_secret, secret);
+    assert_eq!(disabled_secret.backup_codes, backup_codes);
+
+    // 5. Calling disable again returns Ok(false)
+    let repeat_res = store
+        .totp()
+        .disable_totp(user.id)
+        .await
+        .expect("disable already disabled secret succeeds");
+    assert!(!repeat_res);
+
+    // 6. Used codes are preserved
+    let is_used = store
+        .totp()
+        .is_code_used(user.id, &code_hash)
+        .await
+        .expect("check is_code_used");
+    assert!(is_used, "used code must be preserved after disable_totp");
+
     // Cleanup
     let _ = store.users().delete_user(user.id).await;
 }
@@ -912,6 +1803,40 @@ async fn test_mongo_totp_used_codes_ttl_index() {
     assert!(
         found_ttl,
         "idx_totp_used_codes_used_at with expire_after=300s must exist"
+    );
+}
+
+#[tokio::test]
+async fn test_mongo_sessions_compound_index() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_sessions_compound_index: MONGO_URL not set");
+        return;
+    };
+
+    let coll = store.db().collection::<bson::Document>("sessions");
+    let mut cursor = coll.list_indexes().await.expect("list indexes");
+    let mut found_index = false;
+    while cursor.advance().await.expect("advance cursor") {
+        let model = cursor
+            .deserialize_current()
+            .expect("deserialize index model");
+        if let Some(_opts) = model
+            .options
+            .as_ref()
+            .filter(|o| o.name.as_deref() == Some("idx_sessions_user_id_active"))
+        {
+            let keys: Vec<(&String, &bson::Bson)> = model.keys.iter().collect();
+            assert_eq!(keys.len(), 2);
+            assert_eq!(keys[0].0, "user_id");
+            assert_eq!(keys[0].1, &bson::Bson::Int32(1));
+            assert_eq!(keys[1].0, "last_active_at");
+            assert_eq!(keys[1].1, &bson::Bson::Int32(-1));
+            found_index = true;
+        }
+    }
+    assert!(
+        found_index,
+        "idx_sessions_user_id_active with keys {{ user_id: 1, last_active_at: -1 }} must exist"
     );
 }
 
@@ -1096,4 +2021,159 @@ async fn test_mongo_transaction_atomicity() {
         }
         Err(e) => panic!("unexpected error beginning mongo tx: {:?}", e),
     }
+}
+
+#[tokio::test]
+async fn test_mongo_delete_user_non_existent() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_delete_user_non_existent: MONGO_URL not set");
+        return;
+    };
+    let random_id = Uuid::new_v4();
+    let res = store.users().delete_user(random_id).await;
+    assert!(!res.unwrap());
+}
+
+#[tokio::test]
+async fn test_mongo_tx_delete_user_rollback() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_tx_delete_user_rollback: MONGO_URL not set");
+        return;
+    };
+
+    if !store.is_replica_set() {
+        eprintln!("Skipping test_mongo_tx_delete_user_rollback: not running on a replica set");
+        return;
+    }
+
+    let tx_res = store.begin().await;
+    let mut tx = match tx_res {
+        Ok(tx) => tx,
+        Err(AppError::TransactionNotSupported) => {
+            eprintln!(
+                "skipping test_mongo_tx_delete_user_rollback: transactions not supported on standalone"
+            );
+            return;
+        }
+        Err(e) => panic!("unexpected error beginning mongo tx: {:?}", e),
+    };
+
+    let email = format!("mongo_rollback_{}@example.com", Uuid::new_v4());
+    let user = store
+        .users()
+        .create_user(&email, "hash")
+        .await
+        .expect("create user");
+
+    let token_hash = format!("sess_{}", Uuid::new_v4());
+    let _session = store
+        .sessions()
+        .create_session(
+            user.id,
+            &token_hash,
+            "cookie",
+            Some("csrf"),
+            Utc::now() + chrono::Duration::hours(1),
+        )
+        .await
+        .expect("create session");
+
+    let deleted = tx
+        .users()
+        .delete_user(user.id)
+        .await
+        .expect("delete_user inside tx");
+    assert!(deleted);
+
+    tx.rollback().await.expect("rollback mongo tx");
+
+    // After rollback, user and session must still exist
+    assert!(
+        store
+            .users()
+            .get_user_by_id(user.id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let sessions = store.sessions().list_user_sessions(user.id).await.unwrap();
+    assert_eq!(sessions.len(), 1);
+
+    // Cleanup
+    let _ = store.users().delete_user(user.id).await;
+}
+
+#[tokio::test]
+async fn test_mongo_tx_drop_aborts_transaction() {
+    let Some(store) = get_test_mongo_store().await else {
+        eprintln!("skipping test_mongo_tx_drop_aborts_transaction: MONGO_URL not set");
+        return;
+    };
+
+    if !store.is_replica_set() {
+        eprintln!(
+            "skipping test_mongo_tx_drop_aborts_transaction: transactions not supported on standalone"
+        );
+        return;
+    }
+
+    let tx_res = store.begin().await;
+    let (user_id, email) = {
+        let mut tx = match tx_res {
+            Ok(tx) => tx,
+            Err(AppError::TransactionNotSupported) => {
+                eprintln!(
+                    "skipping test_mongo_tx_drop_aborts_transaction: transactions not supported on standalone"
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected error beginning mongo tx: {:?}", e),
+        };
+
+        let email = format!("mongo_drop_{}@example.com", Uuid::new_v4());
+        let user = tx
+            .users()
+            .create_user(&email, "hash")
+            .await
+            .expect("create user in mongo tx");
+        (user.id, email)
+        // tx is intentionally dropped here without commit() or rollback()
+    };
+
+    // Poll boundedly for background abort task spawned in Drop to complete
+    let mut aborted = false;
+    for _ in 0..20 {
+        if store
+            .users()
+            .get_user_by_id(user_id)
+            .await
+            .unwrap()
+            .is_none()
+        {
+            aborted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        aborted,
+        "uncommitted user must not exist after MongoTx drop"
+    );
+
+    // Verify subsequent operations on the collection succeed with the identical email,
+    // proving the aborted transaction released unique constraints without duplicate key error.
+    let mut user_after = None;
+    for _ in 0..20 {
+        match store.users().create_user(&email, "hash").await {
+            Ok(u) => {
+                user_after = Some(u);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    let user_after =
+        user_after.expect("create user with identical email after drop abort must succeed");
+    assert_eq!(user_after.email, email);
+    let _ = store.users().delete_user(user_after.id).await;
 }

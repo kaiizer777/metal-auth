@@ -67,6 +67,14 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), AppError> {
             )
             .build(),
         IndexModel::builder()
+            .keys(doc! { "user_id": 1, "last_active_at": -1 })
+            .options(
+                IndexOptions::builder()
+                    .name("idx_sessions_user_id_active".to_string())
+                    .build(),
+            )
+            .build(),
+        IndexModel::builder()
             .keys(doc! { "absolute_expires_at": 1 })
             .options(
                 IndexOptions::builder()

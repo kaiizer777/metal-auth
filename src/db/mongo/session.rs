@@ -59,17 +59,7 @@ pub async fn get_session_by_token_hash(
     };
 
     let doc = res.map_err(AppError::from)?;
-    match doc {
-        Some(doc) => {
-            let s = Session::from(doc);
-            if s.absolute_expires_at <= Utc::now() {
-                Ok(None)
-            } else {
-                Ok(Some(s))
-            }
-        }
-        None => Ok(None),
-    }
+    Ok(doc.map(Session::from))
 }
 
 pub async fn touch_session(

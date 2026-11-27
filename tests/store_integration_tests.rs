@@ -392,20 +392,23 @@ async fn assert_transaction_commit_and_rollback(store: &dyn DatabaseStore) {
             let _ = store.users().delete_user(created.id).await;
 
             // 3. Tx outbox unsupported methods return proper database errors (on Postgres)
-            let mut tx = store.begin().await.expect("begin tx");
-            let claim_err = tx
-                .outbox()
-                .claim_pending_outbox(10, Duration::from_secs(30))
-                .await;
-            if store.backend() == DatabaseBackend::Postgres {
-                assert!(claim_err.is_err());
-            }
-            let recover_err = tx
-                .outbox()
-                .recover_stale_processing(Duration::from_secs(30))
-                .await;
-            if store.backend() == DatabaseBackend::Postgres {
-                assert!(recover_err.is_err());
+            {
+                let mut tx = store.begin().await.expect("begin tx");
+                let claim_err = tx
+                    .outbox()
+                    .claim_pending_outbox(10, Duration::from_secs(30))
+                    .await;
+                if store.backend() == DatabaseBackend::Postgres {
+                    assert!(claim_err.is_err());
+                }
+                let recover_err = tx
+                    .outbox()
+                    .recover_stale_processing(Duration::from_secs(30))
+                    .await;
+                if store.backend() == DatabaseBackend::Postgres {
+                    assert!(recover_err.is_err());
+                }
+                tx.rollback().await.expect("rollback tx");
             }
 
             // 4. Tx delete methods with rollback
@@ -415,6 +418,7 @@ async fn assert_transaction_commit_and_rollback(store: &dyn DatabaseStore) {
                 .create_user(&email_to_delete, "hash")
                 .await
                 .expect("create user");
+            let mut tx = store.begin().await.expect("begin tx");
             let deleted_in_tx = tx
                 .users()
                 .delete_user(u.id)
@@ -887,7 +891,7 @@ async fn get_mongo_store() -> Option<metal_auth::MongoStore> {
 
     metal_auth::db::mongo::indexes::ensure_indexes(&db)
         .await
-        .ok()?;
+        .expect("Failed to create mongo indexes for store contract test");
 
     Some(metal_auth::MongoStore::new(
         client,

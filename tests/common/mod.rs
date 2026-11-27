@@ -771,7 +771,7 @@ pub async fn setup_mongo_test_app() -> Option<TestApp> {
 
     metal_auth::db::mongo::indexes::ensure_indexes(&db)
         .await
-        .ok()?;
+        .expect("Failed to create mongo indexes for test app");
 
     let mongo_store =
         metal_auth::MongoStore::new(client, &db_name, is_replica_set, allow_standalone);

@@ -43,7 +43,9 @@ async fn get_test_mongo_store() -> Option<MongoStore> {
             .map(|m| m == "isdbgrid")
             .unwrap_or(false);
 
-    ensure_indexes(&db).await.ok()?;
+    ensure_indexes(&db)
+        .await
+        .expect("Failed to create mongo indexes for mongo e2e test store");
 
     let store = MongoStore::new(client, &db_name, is_replica_set, allow_standalone);
     Some(store)

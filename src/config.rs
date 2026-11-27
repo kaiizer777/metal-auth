@@ -87,16 +87,18 @@ impl Default for MongoConfig {
 /// Redacts credentials from database connection URLs.
 #[must_use]
 pub fn redact_url(url: &str) -> String {
-    let Some((scheme_and_userinfo, host_and_rest)) = url.split_once('@') else {
+    let Some((scheme, rest)) = url.split_once("://") else {
         return url.to_string();
     };
-    let Some((scheme, userinfo)) = scheme_and_userinfo.split_once("://") else {
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, suffix) = rest.split_at(authority_end);
+    let Some((userinfo, host)) = authority.rsplit_once('@') else {
         return url.to_string();
     };
     if userinfo.contains(':') {
-        format!("{scheme}://[REDACTED]:[REDACTED]@{host_and_rest}")
+        format!("{scheme}://[REDACTED]:[REDACTED]@{host}{suffix}")
     } else if !userinfo.is_empty() {
-        format!("{scheme}://[REDACTED]@{host_and_rest}")
+        format!("{scheme}://[REDACTED]@{host}{suffix}")
     } else {
         url.to_string()
     }
@@ -415,21 +417,30 @@ impl Config {
                 database_name: name,
                 allow_non_transactional_standalone: mongo_allow_non_transactional,
             }),
-            Err(std::env::VarError::NotPresent) => {
-                if backend == DatabaseBackend::Mongodb {
-                    Some(MongoConfig {
-                        database_name: "metal_auth".to_string(),
-                        allow_non_transactional_standalone: mongo_allow_non_transactional,
-                    })
-                } else if mongo_allow_non_transactional {
-                    Some(MongoConfig {
-                        database_name: "metal_auth".to_string(),
-                        allow_non_transactional_standalone: true,
-                    })
-                } else {
-                    None
+            Err(std::env::VarError::NotPresent) => match lookup("MONGO_DATABASE") {
+                Ok(name) => Some(MongoConfig {
+                    database_name: name,
+                    allow_non_transactional_standalone: mongo_allow_non_transactional,
+                }),
+                Err(std::env::VarError::NotPresent) => {
+                    if backend == DatabaseBackend::Mongodb {
+                        Some(MongoConfig {
+                            database_name: "metal_auth".to_string(),
+                            allow_non_transactional_standalone: mongo_allow_non_transactional,
+                        })
+                    } else if mongo_allow_non_transactional {
+                        Some(MongoConfig {
+                            database_name: "metal_auth".to_string(),
+                            allow_non_transactional_standalone: true,
+                        })
+                    } else {
+                        None
+                    }
                 }
-            }
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    return Err(ConfigError::NonUnicodeEnvVar("MONGO_DATABASE"));
+                }
+            },
             Err(std::env::VarError::NotUnicode(_)) => {
                 return Err(ConfigError::NonUnicodeEnvVar("MONGO_DATABASE_NAME"));
             }
@@ -3919,6 +3930,22 @@ mod tests {
     }
 
     #[test]
+    fn test_redact_url_at_outside_authority_passthrough() {
+        assert_eq!(
+            redact_url("postgres://localhost/metal_auth?note=a@b"),
+            "postgres://localhost/metal_auth?note=a@b"
+        );
+    }
+
+    #[test]
+    fn test_redact_url_at_inside_password_suppressed() {
+        assert_eq!(
+            redact_url("postgres://user:p@ss@localhost:5432/metal_auth"),
+            "postgres://[REDACTED]:[REDACTED]@localhost:5432/metal_auth"
+        );
+    }
+
+    #[test]
     fn test_database_backend_from_scheme() {
         assert_eq!(
             DatabaseBackend::from_scheme("postgres").unwrap(),
@@ -4043,6 +4070,113 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mongodb")]
+    fn test_mongo_database_alias_fallback() {
+        let map = std::collections::HashMap::from([
+            ("BASE_URL", "http://localhost:3000"),
+            ("DATABASE_URL", "mongodb://localhost:27017/test_db"),
+            ("DATABASE_BACKEND", "mongodb"),
+            ("MONGO_DATABASE", "alias_auth"),
+        ]);
+        let cfg = Config::from_lookup(|k| {
+            map.get(k)
+                .map(|v| v.to_string())
+                .ok_or(std::env::VarError::NotPresent)
+        })
+        .unwrap();
+
+        let mongo_cfg = cfg.mongo.unwrap();
+        assert_eq!(mongo_cfg.database_name, "alias_auth");
+    }
+
+    #[test]
+    #[cfg(feature = "mongodb")]
+    fn test_mongo_database_canonical_wins_over_alias() {
+        let map = std::collections::HashMap::from([
+            ("BASE_URL", "http://localhost:3000"),
+            ("DATABASE_URL", "mongodb://localhost:27017/test_db"),
+            ("DATABASE_BACKEND", "mongodb"),
+            ("MONGO_DATABASE_NAME", "canonical_auth"),
+            ("MONGO_DATABASE", "alias_auth"),
+        ]);
+        let cfg = Config::from_lookup(|k| {
+            map.get(k)
+                .map(|v| v.to_string())
+                .ok_or(std::env::VarError::NotPresent)
+        })
+        .unwrap();
+
+        let mongo_cfg = cfg.mongo.unwrap();
+        assert_eq!(mongo_cfg.database_name, "canonical_auth");
+    }
+
+    #[test]
+    #[cfg(feature = "mongodb")]
+    fn test_mongo_database_default_without_either_key() {
+        let map = std::collections::HashMap::from([
+            ("BASE_URL", "http://localhost:3000"),
+            ("DATABASE_URL", "mongodb://localhost:27017/test_db"),
+            ("DATABASE_BACKEND", "mongodb"),
+        ]);
+        let cfg = Config::from_lookup(|k| {
+            map.get(k)
+                .map(|v| v.to_string())
+                .ok_or(std::env::VarError::NotPresent)
+        })
+        .unwrap();
+
+        let mongo_cfg = cfg.mongo.unwrap();
+        assert_eq!(mongo_cfg.database_name, "metal_auth");
+    }
+
+    #[test]
+    #[cfg(feature = "mongodb")]
+    fn test_mongo_database_empty_alias_rejected() {
+        let map = std::collections::HashMap::from([
+            ("BASE_URL", "http://localhost:3000"),
+            ("DATABASE_URL", "mongodb://localhost:27017/test_db"),
+            ("DATABASE_BACKEND", "mongodb"),
+            ("MONGO_DATABASE", ""),
+        ]);
+        let err = Config::from_lookup(|k| {
+            map.get(k)
+                .map(|v| v.to_string())
+                .ok_or(std::env::VarError::NotPresent)
+        })
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidValue {
+                field: "mongo.database_name",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "mongodb")]
+    fn test_mongo_database_non_unicode_alias_errors() {
+        let err = Config::from_lookup(|k| {
+            if k == "MONGO_DATABASE" {
+                return Err(std::env::VarError::NotUnicode(std::ffi::OsString::from(
+                    "bad",
+                )));
+            }
+            match k {
+                "BASE_URL" => Ok("http://localhost:3000".to_string()),
+                "DATABASE_URL" => Ok("mongodb://localhost:27017/test_db".to_string()),
+                "DATABASE_BACKEND" => Ok("mongodb".to_string()),
+                _ => Err(std::env::VarError::NotPresent),
+            }
+        })
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::NonUnicodeEnvVar("MONGO_DATABASE")
+        ));
+    }
+
+    #[test]
     fn test_config_backend_url_scheme_mismatch_matrix() {
         // Postgres backend rejects mysql:// and mongodb://
         let pg_with_mysql = Config {
@@ -4152,6 +4286,44 @@ mod tests {
             redact_url("postgres://appuser@localhost:5432/metal_auth"),
             "postgres://[REDACTED]@localhost:5432/metal_auth"
         );
+    }
+
+    #[test]
+    fn test_redact_url_at_in_query_passthrough() {
+        assert_eq!(
+            redact_url("postgres://localhost/metal_auth?note=a@b"),
+            "postgres://localhost/metal_auth?note=a@b"
+        );
+        assert_eq!(
+            redact_url("mongodb://localhost:27017/metal_auth?note=a@b"),
+            "mongodb://localhost:27017/metal_auth?note=a@b"
+        );
+        assert_eq!(
+            redact_url("postgres://localhost/metal_auth#frag@ment"),
+            "postgres://localhost/metal_auth#frag@ment"
+        );
+    }
+
+    #[test]
+    fn test_redact_url_at_in_password_suppressed() {
+        for (input, expected) in [
+            (
+                "postgres://user:p@ss@localhost:5432/metal_auth",
+                "postgres://[REDACTED]:[REDACTED]@localhost:5432/metal_auth",
+            ),
+            (
+                "mongodb://admin:p@ss@localhost:27017/metal_auth?authSource=admin",
+                "mongodb://[REDACTED]:[REDACTED]@localhost:27017/metal_auth?authSource=admin",
+            ),
+        ] {
+            let redacted = redact_url(input);
+            assert_eq!(redacted, expected);
+            assert!(
+                !redacted.contains("p@ss"),
+                "password fragment leaked: {redacted}"
+            );
+            assert_eq!(redact_url(&redacted), redacted, "output not idempotent");
+        }
     }
 
     #[test]

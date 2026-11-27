@@ -63,6 +63,10 @@ pub struct EmailDispatcher {
     #[allow(dead_code)]
     worker_started: Arc<AtomicBool>,
     outbox_config: OutboxWorkerConfig,
+    /// PG outbox worker runs only for the Postgres backend. On MySQL/Mongo
+    /// the pool-typed worker would claim via the placeholder pool; #119 owns
+    /// the store-backed retype, so startup stays disabled there.
+    outbox_worker_enabled: bool,
     /// Inline (caller-blocking) delivery — test-only, absent from default builds.
     #[cfg(any(test, feature = "test-utils"))]
     block_on_delivery: bool,
@@ -84,6 +88,7 @@ impl EmailDispatcher {
             notify: Arc::new(tokio::sync::Notify::new()),
             worker_started: Arc::new(AtomicBool::new(false)),
             outbox_config: OutboxWorkerConfig::default(),
+            outbox_worker_enabled: true,
             #[cfg(any(test, feature = "test-utils"))]
             block_on_delivery: false,
             #[cfg(any(test, feature = "test-utils"))]
@@ -107,6 +112,7 @@ impl EmailDispatcher {
     /// Configures outbox worker settings from application configuration.
     pub fn with_outbox_config(mut self, config: &crate::config::Config) -> Self {
         self.outbox_config = OutboxWorkerConfig::from(config);
+        self.outbox_worker_enabled = config.backend == crate::config::DatabaseBackend::Postgres;
         self
     }
 
@@ -115,6 +121,13 @@ impl EmailDispatcher {
     pub fn ensure_worker_started(&self, pool: &sqlx::PgPool) {
         #[cfg(any(test, feature = "test-utils"))]
         if self.block_on_delivery {
+            return;
+        }
+
+        if !self.outbox_worker_enabled {
+            warn!(
+                "outbox worker disabled for non-postgres backend; pool-typed worker cannot run until #119"
+            );
             return;
         }
 
@@ -323,7 +336,8 @@ impl fmt::Debug for EmailDispatcher {
             .field("timeout", &self.timeout)
             .field("sender", &self.sender.is_some())
             .field("base_url", &self.base_url)
-            .field("outbox_config", &self.outbox_config);
+            .field("outbox_config", &self.outbox_config)
+            .field("outbox_worker_enabled", &self.outbox_worker_enabled);
         #[cfg(any(test, feature = "test-utils"))]
         debug.field("block_on_delivery", &self.block_on_delivery);
         #[cfg(any(test, feature = "test-utils"))]
@@ -609,5 +623,43 @@ mod tests {
         // Subsequent call is a no-op and preserves true
         dispatcher.ensure_worker_started(&pool);
         assert!(dispatcher.worker_started.load(Ordering::SeqCst));
+    }
+
+    #[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
+    #[tokio::test]
+    async fn outbox_worker_starts_for_postgres_backend_config() {
+        let cfg = crate::config::Config {
+            backend: crate::config::DatabaseBackend::Postgres,
+            ..Default::default()
+        };
+        let dispatcher =
+            EmailDispatcher::new(None, Duration::from_secs(1)).with_outbox_config(&cfg);
+        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/dummy").unwrap();
+
+        dispatcher.ensure_worker_started(&pool);
+        assert!(dispatcher.worker_started.load(Ordering::SeqCst));
+    }
+
+    #[cfg(any(feature = "postgres", feature = "mysql", feature = "mongodb"))]
+    #[tokio::test]
+    async fn outbox_worker_stays_stopped_for_non_postgres_backend() {
+        for backend in [
+            crate::config::DatabaseBackend::Mysql,
+            crate::config::DatabaseBackend::Mongodb,
+        ] {
+            let cfg = crate::config::Config {
+                backend,
+                ..Default::default()
+            };
+            let dispatcher =
+                EmailDispatcher::new(None, Duration::from_secs(1)).with_outbox_config(&cfg);
+            let pool = sqlx::PgPool::connect_lazy("postgres://localhost/dummy").unwrap();
+
+            dispatcher.ensure_worker_started(&pool);
+            assert!(
+                !dispatcher.worker_started.load(Ordering::SeqCst),
+                "no PG worker on a non-postgres backend"
+            );
+        }
     }
 }

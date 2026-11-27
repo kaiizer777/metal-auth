@@ -121,8 +121,9 @@ impl AppState {
     /// Builds an [`AppState`] from config, connecting what the configured backend needs.
     ///
     /// Postgres reuses the pool-typed constructor; other backends pair the backend's
-    /// real store with a lazy placeholder pool (pool-typed services are #119's scope;
-    /// nothing here connects). `Config::validate` already rejects a backend whose
+    /// real store with an inert lazy placeholder pool (pool-typed services are
+    /// #119's scope; construction opens no connections and starts no outbox
+    /// worker off Postgres). `Config::validate` already rejects a backend whose
     /// Cargo feature is off, so the trailing arm is unreachable defense-in-depth.
     pub async fn with_dispatcher_for_backend(
         config: Config,

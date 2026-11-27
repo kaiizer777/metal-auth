@@ -759,7 +759,7 @@ impl From<&AppError> for ErrorResponse {
     fn from(err: &AppError) -> Self {
         Self {
             code: err.error_code(),
-            message: err.response_message().to_string(),
+            message: err.response_message(),
         }
     }
 }

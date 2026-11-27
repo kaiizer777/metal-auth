@@ -417,4 +417,135 @@ mod tests {
                 .allow("sync_key", 5, Duration::from_secs(60))
         );
     }
+
+    struct StubSender;
+
+    #[async_trait::async_trait]
+    impl crate::email::hook::EmailSender for StubSender {
+        async fn send_verification_email(
+            &self,
+            _payload: crate::email::VerificationEmailPayload,
+        ) -> Result<(), crate::email::hook::DynError> {
+            Ok(())
+        }
+
+        async fn send_password_reset_email(
+            &self,
+            _payload: crate::email::PasswordResetEmailPayload,
+        ) -> Result<(), crate::email::hook::DynError> {
+            Ok(())
+        }
+    }
+
+    // Sender-bearing dispatcher as a caller would inject it: `new` leaves the
+    // PG worker enabled, `with_outbox_config` is never applied.
+    fn sender_bearing_dispatcher() -> Arc<EmailDispatcher> {
+        let sender: crate::email::hook::SharedEmailSender = Arc::new(StubSender);
+        Arc::new(EmailDispatcher::new(Some(sender), Duration::from_secs(1)))
+    }
+
+    // `worker_started` is private to the dispatcher module; the `Debug` output
+    // carries the gate bit (`outbox_worker_enabled`, added for the default-path
+    // gate), and the dispatcher suite already proves a disabled flag means no
+    // spawn — so asserting the stored dispatcher's flag covers the choke point.
+    fn gate_flag(stored: &Arc<EmailDispatcher>) -> String {
+        format!("{stored:?}")
+    }
+
+    #[cfg(feature = "mysql")]
+    #[tokio::test]
+    async fn injected_dispatcher_starts_no_worker_on_mysql() {
+        let config = Config {
+            database_url: "mysql://localhost/test".into(),
+            backend: DatabaseBackend::Mysql,
+            ..valid_config()
+        };
+        let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
+        let store: Arc<dyn DatabaseStore> = Arc::new(crate::db::MySqlStore::new(
+            sqlx::MySqlPool::connect_lazy("mysql://localhost/test").unwrap(),
+        ));
+        let state = AppState::with_configs_dispatcher_and_store(
+            pool,
+            config,
+            Arc::new(AppConfig::default()),
+            Some(sender_bearing_dispatcher()),
+            store,
+        )
+        .expect("valid AppState initialization");
+        let stored = state
+            .email_dispatcher
+            .as_ref()
+            .expect("injected dispatcher is stored");
+        assert!(stored.sender().is_some(), "gating keeps the sender");
+        assert!(
+            gate_flag(stored).contains("outbox_worker_enabled: false"),
+            "injected dispatcher must not start the PG worker on MySQL"
+        );
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[tokio::test]
+    async fn injected_dispatcher_starts_no_worker_on_mongodb() {
+        let config = Config {
+            database_url: "mongodb://localhost:27017/test_db".into(),
+            backend: DatabaseBackend::Mongodb,
+            mongo: Some(crate::config::MongoConfig {
+                database_name: "test_db".into(),
+                ..Default::default()
+            }),
+            ..valid_config()
+        };
+        // Parse-only options and a lazy client: no connection is opened.
+        let options = mongodb::options::ClientOptions::parse("mongodb://localhost:27017/test_db")
+            .await
+            .expect("parse-only client options");
+        let client = mongodb::Client::with_options(options).expect("lazy client");
+        let store: Arc<dyn DatabaseStore> = Arc::new(crate::db::mongo::MongoStore::new(
+            client, "test_db", false, true,
+        ));
+        let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
+        let state = AppState::with_configs_dispatcher_and_store(
+            pool,
+            config,
+            Arc::new(AppConfig::default()),
+            Some(sender_bearing_dispatcher()),
+            store,
+        )
+        .expect("valid AppState initialization");
+        let stored = state
+            .email_dispatcher
+            .as_ref()
+            .expect("injected dispatcher is stored");
+        assert!(stored.sender().is_some(), "gating keeps the sender");
+        assert!(
+            gate_flag(stored).contains("outbox_worker_enabled: false"),
+            "injected dispatcher must not start the PG worker on MongoDB"
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn injected_dispatcher_keeps_worker_on_postgres() {
+        let config = valid_config();
+        let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
+        let store: Arc<dyn DatabaseStore> = Arc::new(crate::db::postgres::PostgresStore::new(
+            PgPool::connect_lazy("postgres://localhost/test").unwrap(),
+        ));
+        let state = AppState::with_configs_dispatcher_and_store(
+            pool,
+            config,
+            Arc::new(AppConfig::default()),
+            Some(sender_bearing_dispatcher()),
+            store,
+        )
+        .expect("valid AppState initialization");
+        let stored = state
+            .email_dispatcher
+            .as_ref()
+            .expect("injected dispatcher is stored");
+        assert!(
+            gate_flag(stored).contains("outbox_worker_enabled: true"),
+            "Postgres must not suppress an injected dispatcher's worker"
+        );
+    }
 }

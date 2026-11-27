@@ -449,6 +449,46 @@ async fn test_store_transaction_commit_and_rollback() {
     assert!(custom_state.store().ping().await.is_ok());
 }
 
+#[cfg(feature = "mysql")]
+fn mysql_test_config() -> metal_auth::Config {
+    metal_auth::Config {
+        database_url: "mysql://user:pass@localhost:3306/metal_auth_test".into(),
+        backend: DatabaseBackend::Mysql,
+        mongo: None,
+        port: 3000,
+        allowed_origins: vec![],
+        allowed_methods: vec!["GET".into()],
+        allowed_headers: vec!["Content-Type".into()],
+        max_connections: 5,
+        min_connections: 1,
+        base_url: "https://example.com".into(),
+        email_dispatch_timeout: Duration::from_secs(10),
+        async_email_dispatch: true,
+        outbox_poll_interval: Duration::from_millis(50),
+        outbox_batch_size: 50,
+        outbox_max_retries: 5,
+        outbox_initial_backoff: Duration::from_secs(1),
+        outbox_max_backoff: Duration::from_secs(300),
+        outbox_sent_retention: Duration::from_secs(7 * 24 * 3600),
+        session: metal_auth::SessionConfig::default(),
+        rate_limit: metal_auth::RateLimitConfig::default(),
+        oauth: metal_auth::OAuthConfig::default(),
+        totp: metal_auth::TotpConfig::default(),
+    }
+}
+
+#[cfg(feature = "mysql")]
+#[tokio::test]
+async fn new_with_store_accepts_mysql_store() {
+    let pool = sqlx::MySqlPool::connect_lazy("mysql://user:pass@localhost:3306/metal_auth_test")
+        .expect("lazy mysql pool");
+    let store: std::sync::Arc<dyn DatabaseStore> =
+        std::sync::Arc::new(metal_auth::MySqlStore::new(pool));
+    let state = metal_auth::AppState::new_with_store(store, mysql_test_config())
+        .expect("mysql store construction");
+    assert_eq!(state.store().backend(), DatabaseBackend::Mysql);
+}
+
 #[tokio::test]
 async fn test_store_oauth_round_trip() {
     let app = setup_test_app().await.expect("test app initialization");

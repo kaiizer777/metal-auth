@@ -33,9 +33,26 @@ pub fn default_email_dispatcher(config: &Config) -> Arc<EmailDispatcher> {
 
 /// Lazy pool standing in for backends whose services are still pool-typed.
 ///
-/// Opens no connections; #119 removes it with the store-backed retype.
+/// Provably inert: the target is `metal-auth-placeholder.invalid` (RFC 2606
+/// `.invalid` never resolves) on port 1, set explicitly so `PGHOST`/`PGPORT`
+/// in the environment cannot redirect it at a real database (`new()` reads
+/// both). Any use fails fast with a connection error instead of touching the
+/// wrong DB's outbox/2FA tables. #119 removes it with the store-backed retype.
 pub(crate) fn placeholder_pool() -> PgPool {
-    PgPool::connect_lazy_with(PgConnectOptions::new())
+    tracing::warn!(
+        event = "placeholder_pool_in_use",
+        reason =
+            "pool-typed services pending #119 retype; DB-backed calls on this backend fail fast",
+    );
+    PgPool::connect_lazy_with(placeholder_options())
+}
+
+/// Options behind [`placeholder_pool`]; split out so tests pin the target
+/// without opening a connection.
+fn placeholder_options() -> PgConnectOptions {
+    PgConnectOptions::new()
+        .host("metal-auth-placeholder.invalid")
+        .port(1)
 }
 
 #[derive(Clone, Debug)]
@@ -64,8 +81,9 @@ impl AppState {
     pub fn new_with_store(store: Arc<dyn DatabaseStore>, config: Config) -> Result<Self, AppError> {
         let auth_config = Arc::new(AppConfig::from_env()?);
         // The injected store selects the backend. Only Postgres builds a pool
-        // from the URL; other backends get a lazy placeholder that never
-        // connects (pool-typed services are #119's scope).
+        // from the URL; other backends get an inert lazy placeholder
+        // (unroutable by construction, any use fails fast; pool-typed
+        // services are #119's scope).
         let pool = match config.backend {
             DatabaseBackend::Postgres => {
                 PgPool::connect_lazy(&config.database_url).map_err(AppError::from)?
@@ -306,6 +324,13 @@ mod tests {
         let config = valid_config();
         let dispatcher = create_email_dispatcher(&config, None);
         assert_eq!(dispatcher.base_url(), Some("https://example.com"));
+    }
+
+    #[test]
+    fn placeholder_pool_target_is_unroutable() {
+        let options = super::placeholder_options();
+        assert_eq!(options.get_host(), "metal-auth-placeholder.invalid");
+        assert_eq!(options.get_port(), 1);
     }
 
     #[tokio::test]

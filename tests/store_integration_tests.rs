@@ -854,7 +854,7 @@ mod mysql_contract_tests {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "mongodb")]
-async fn get_mongo_store() -> Option<metal_auth::MongoStore> {
+async fn get_mongo_store() -> Option<common::MongoTestFixture> {
     if std::env::var("TEST_SKIP_DOTENV").is_err() {
         dotenvy::dotenv().ok();
     }
@@ -865,10 +865,7 @@ async fn get_mongo_store() -> Option<metal_auth::MongoStore> {
     if !url.starts_with("mongodb://") && !url.starts_with("mongodb+srv://") {
         return None;
     }
-    let base_db_name = std::env::var("MONGO_DATABASE")
-        .or_else(|_| std::env::var("MONGODB_DATABASE"))
-        .unwrap_or_else(|_| "metal_auth_test".to_string());
-    let db_name = format!("{}_{}", base_db_name, Uuid::new_v4().simple());
+    let db_name = common::mongo_test_database_name();
     let allow_standalone = std::env::var("MONGO_ALLOW_NON_TRANSACTIONAL_STANDALONE")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
@@ -896,12 +893,10 @@ async fn get_mongo_store() -> Option<metal_auth::MongoStore> {
         .await
         .expect("Failed to create mongo indexes for store contract test");
 
-    Some(metal_auth::MongoStore::new(
-        client,
-        &db_name,
-        is_replica_set,
-        allow_standalone,
-    ))
+    let store =
+        metal_auth::MongoStore::new(client.clone(), &db_name, is_replica_set, allow_standalone);
+    let guard = common::MongoTestGuard::new(client, db_name);
+    Some(common::MongoTestFixture::new(store, guard))
 }
 
 #[cfg(feature = "mongodb")]
@@ -910,84 +905,93 @@ mod mongo_contract_tests {
 
     #[tokio::test]
     async fn test_mongo_users_lifecycle() {
-        let Some(store) = get_mongo_store().await else {
+        let Some(fixture) = get_mongo_store().await else {
             eprintln!("skipping test_mongo_users_lifecycle: MONGODB_URI not set");
             return;
         };
-        assert_users_lifecycle(&store).await;
+        assert_users_lifecycle(&fixture.store).await;
+        fixture.teardown().await;
     }
 
     #[tokio::test]
     async fn test_mongo_sessions_lifecycle() {
-        let Some(store) = get_mongo_store().await else {
+        let Some(fixture) = get_mongo_store().await else {
             eprintln!("skipping test_mongo_sessions_lifecycle: MONGODB_URI not set");
             return;
         };
-        assert_sessions_lifecycle(&store).await;
+        assert_sessions_lifecycle(&fixture.store).await;
+        fixture.teardown().await;
     }
 
     #[tokio::test]
     async fn test_mongo_tokens_lifecycle() {
-        let Some(store) = get_mongo_store().await else {
+        let Some(fixture) = get_mongo_store().await else {
             eprintln!("skipping test_mongo_tokens_lifecycle: MONGODB_URI not set");
             return;
         };
-        assert_tokens_lifecycle(&store).await;
+        assert_tokens_lifecycle(&fixture.store).await;
+        fixture.teardown().await;
     }
 
     #[tokio::test]
     async fn test_mongo_two_factor_token_round_trip() {
-        let Some(store) = get_mongo_store().await else {
+        let Some(fixture) = get_mongo_store().await else {
             eprintln!("skipping test_mongo_two_factor_token_round_trip: MONGODB_URI not set");
             return;
         };
-        assert_two_factor_token_round_trip(&store).await;
+        assert_two_factor_token_round_trip(&fixture.store).await;
+        fixture.teardown().await;
     }
 
     #[tokio::test]
     async fn test_mongo_outbox_lifecycle() {
-        let Some(store) = get_mongo_store().await else {
+        let Some(fixture) = get_mongo_store().await else {
             eprintln!("skipping test_mongo_outbox_lifecycle: MONGODB_URI not set");
             return;
         };
-        assert_outbox_lifecycle(&store).await;
+        assert_outbox_lifecycle(&fixture.store).await;
+        fixture.teardown().await;
     }
 
     #[tokio::test]
     async fn test_mongo_transaction_commit_and_rollback() {
-        let Some(store) = get_mongo_store().await else {
+        let Some(fixture) = get_mongo_store().await else {
             eprintln!("skipping test_mongo_transaction_commit_and_rollback: MONGODB_URI not set");
             return;
         };
-        assert_transaction_commit_and_rollback(&store).await;
+        assert_transaction_commit_and_rollback(&fixture.store).await;
+        fixture.teardown().await;
     }
 
     #[tokio::test]
     async fn test_mongo_oauth_round_trip() {
-        let Some(store) = get_mongo_store().await else {
+        let Some(fixture) = get_mongo_store().await else {
             eprintln!("skipping test_mongo_oauth_round_trip: MONGODB_URI not set");
             return;
         };
-        assert_oauth_round_trip(&store).await;
+        assert_oauth_round_trip(&fixture.store).await;
+        fixture.teardown().await;
     }
 
     #[tokio::test]
     async fn test_mongo_totp_upsert_enabled_row_rejected() {
-        let Some(store) = get_mongo_store().await else {
+        let Some(fixture) = get_mongo_store().await else {
             eprintln!("skipping test_mongo_totp_upsert_enabled_row_rejected: MONGODB_URI not set");
             return;
         };
-        assert_totp_upsert_enabled_row_rejected(&store).await;
+        assert_totp_upsert_enabled_row_rejected(&fixture.store).await;
+        fixture.teardown().await;
     }
 
     #[tokio::test]
     async fn test_mongo_get_user_by_email_case_insensitive() {
-        let Some(store) = get_mongo_store().await else {
+        let Some(fixture) = get_mongo_store().await else {
             eprintln!(
                 "skipping test_mongo_get_user_by_email_case_insensitive: MONGODB_URI not set"
             );
             return;
         };
-        assert_get_user_by_email_case_insensitive(&store).await;
+        assert_get_user_by_email_case_insensitive(&fixture.store).await;
+        fixture.teardown().await;
     }
 }

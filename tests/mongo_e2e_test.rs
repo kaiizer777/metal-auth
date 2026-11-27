@@ -12,7 +12,7 @@ use metal_auth::{
 use mongodb::{Client, bson::doc};
 use uuid::Uuid;
 
-async fn get_test_mongo_store() -> Option<MongoStore> {
+async fn get_test_mongo_store() -> Option<common::MongoTestFixture> {
     dotenvy::dotenv().ok();
     let url = std::env::var("MONGODB_URI")
         .or_else(|_| std::env::var("MONGODB_URL"))
@@ -22,10 +22,7 @@ async fn get_test_mongo_store() -> Option<MongoStore> {
     if !url.starts_with("mongodb://") && !url.starts_with("mongodb+srv://") {
         return None;
     }
-    let base_db_name = std::env::var("MONGO_DATABASE")
-        .or_else(|_| std::env::var("MONGODB_DATABASE"))
-        .unwrap_or_else(|_| "metal_auth_test".to_string());
-    let db_name = format!("{}_{}", base_db_name, Uuid::new_v4().simple());
+    let db_name = common::mongo_test_database_name();
     let allow_standalone = std::env::var("MONGO_ALLOW_NON_TRANSACTIONAL_STANDALONE")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
@@ -48,16 +45,18 @@ async fn get_test_mongo_store() -> Option<MongoStore> {
         .await
         .expect("Failed to create mongo indexes for mongo e2e test store");
 
-    let store = MongoStore::new(client, &db_name, is_replica_set, allow_standalone);
-    Some(store)
+    let store = MongoStore::new(client.clone(), &db_name, is_replica_set, allow_standalone);
+    let guard = common::MongoTestGuard::new(client, db_name);
+    Some(common::MongoTestFixture::new(store, guard))
 }
 
 #[tokio::test]
 async fn test_mongo_complete_auth_journey() {
-    let Some(store) = get_test_mongo_store().await else {
+    let Some(fixture) = get_test_mongo_store().await else {
         eprintln!("skipping test_mongo_complete_auth_journey: MONGODB_URI not set");
         return;
     };
+    let store = &fixture.store;
     assert_eq!(store.backend(), DatabaseBackend::Mongodb);
 
     let email = format!("mongo_journey_{}@example.com", Uuid::new_v4());
@@ -340,7 +339,7 @@ async fn test_mongo_complete_auth_journey() {
     );
 
     // Drop isolated test database
-    let _ = store.db().drop().await;
+    fixture.teardown().await;
 }
 
 #[tokio::test]
@@ -433,4 +432,42 @@ async fn test_mongo_http_and_service_journey() {
             "verification email delivery recorded for {email}"
         );
     }
+
+    // Explicit teardown of the test database created by setup_mongo_test_app
+    app.teardown_mongo().await;
+}
+
+#[test]
+fn test_mongo_database_name_bounded_and_sanitized() {
+    // 1. Long name bounded to at most 30 characters before suffix
+    let long_base = "a".repeat(100);
+    let bounded = common::sanitize_and_bound_mongo_db_name(&long_base);
+    assert_eq!(bounded.len(), 30);
+    assert_eq!(bounded, "a".repeat(30));
+
+    // 2. Full generated database name is strictly <= 63 bytes
+    let db_name = common::mongo_test_database_name();
+    assert!(
+        db_name.len() <= 63,
+        "database name exceeds 63 bytes: {} (len {})",
+        db_name,
+        db_name.len()
+    );
+
+    // 3. Characters forbidden by MongoDB are stripped
+    let dirty_base = "test/db.with$invalid:chars*?\\\" ";
+    let clean = common::sanitize_and_bound_mongo_db_name(dirty_base);
+    assert!(!clean.contains('/'));
+    assert!(!clean.contains('\\'));
+    assert!(!clean.contains('.'));
+    assert!(!clean.contains('"'));
+    assert!(!clean.contains('*'));
+    assert!(!clean.contains(':'));
+    assert!(!clean.contains('?'));
+    assert!(!clean.contains('$'));
+    assert!(!clean.contains(' '));
+
+    // 4. Empty base defaults to fallback
+    let empty = common::sanitize_and_bound_mongo_db_name("");
+    assert_eq!(empty, "metal_auth_test");
 }

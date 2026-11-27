@@ -265,6 +265,8 @@ pub struct TestApp {
     pub state: AppState,
     pub email_sender: Arc<CapturingEmailSender>,
     pub base_url: String,
+    #[cfg(feature = "mongodb")]
+    pub mongo_guard: Option<Arc<MongoTestGuard>>,
 }
 
 impl TestApp {
@@ -337,6 +339,15 @@ impl TestApp {
     /// Convenience truncation helper using the test app's pool.
     pub async fn truncate(&self) -> Result<(), sqlx::Error> {
         truncate_tables(&self.pool).await
+    }
+
+    /// Explicitly drops the isolated test MongoDB database if this [`TestApp`] was
+    /// initialized via [`setup_mongo_test_app`].
+    #[cfg(feature = "mongodb")]
+    pub async fn teardown_mongo(&self) {
+        if let Some(guard) = &self.mongo_guard {
+            guard.drop_database().await;
+        }
     }
 }
 
@@ -641,6 +652,8 @@ async fn setup_test_app_with_auth_config_and(
         state,
         email_sender,
         base_url: "https://example.com".into(),
+        #[cfg(feature = "mongodb")]
+        mongo_guard: None,
     })
 }
 
@@ -734,7 +747,116 @@ pub async fn setup_mysql_test_app() -> Option<TestApp> {
         state,
         email_sender,
         base_url: "https://example.com".into(),
+        #[cfg(feature = "mongodb")]
+        mongo_guard: None,
     })
+}
+
+/// Sanitizes and bounds a MongoDB database base name before appending a unique suffix.
+pub fn sanitize_and_bound_mongo_db_name(base: &str) -> String {
+    let mut sanitized: String = base
+        .chars()
+        .filter(|c| {
+            !matches!(
+                c,
+                '/' | '\\' | '.' | '"' | '*' | '<' | '>' | ':' | '|' | '?' | '$' | '\0' | ' '
+            )
+        })
+        .collect();
+    if sanitized.is_empty() {
+        sanitized = "metal_auth_test".to_string();
+    }
+    sanitized.truncate(30);
+    sanitized
+}
+
+/// Derives an isolated, bounded database name for MongoDB test fixtures.
+///
+/// MongoDB limits database names to strictly less than 64 bytes (maximum 63 bytes).
+/// Appending a 32-character simple UUID suffix (`_` + 32 chars = 33 chars) requires
+/// bounding the sanitized base name to at most 30 characters so the total length
+/// never exceeds 63 bytes.
+pub fn mongo_test_database_name() -> String {
+    let base = std::env::var("MONGO_DATABASE")
+        .or_else(|_| std::env::var("MONGODB_DATABASE"))
+        .unwrap_or_else(|_| "metal_auth_test".to_string());
+    let prefix = sanitize_and_bound_mongo_db_name(&base);
+    let mut name = format!("{}_{}", prefix, Uuid::new_v4().simple());
+    name.truncate(63);
+    name
+}
+
+/// RAII fixture guard that drops an isolated test MongoDB database when dropped or explicitly torn down.
+#[cfg(feature = "mongodb")]
+#[derive(Debug)]
+pub struct MongoTestGuard {
+    client: mongodb::Client,
+    database_name: std::sync::Mutex<Option<String>>,
+}
+
+#[cfg(feature = "mongodb")]
+impl MongoTestGuard {
+    pub fn new(client: mongodb::Client, database_name: impl Into<String>) -> Self {
+        Self {
+            client,
+            database_name: std::sync::Mutex::new(Some(database_name.into())),
+        }
+    }
+
+    pub fn database_name(&self) -> Option<String> {
+        self.database_name.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Explicitly drops the test database asynchronously.
+    pub async fn drop_database(&self) {
+        let db_name = self.database_name.lock().ok().and_then(|mut g| g.take());
+        if let Some(name) = db_name {
+            let _ = self.client.database(&name).drop().await;
+        }
+    }
+}
+
+#[cfg(feature = "mongodb")]
+impl Drop for MongoTestGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.database_name.lock() {
+            if let Some(name) = guard.take() {
+                let client = self.client.clone();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        let _ = client.database(&name).drop().await;
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Convenience test fixture wrapping a [`metal_auth::MongoStore`] and its [`MongoTestGuard`].
+#[cfg(feature = "mongodb")]
+pub struct MongoTestFixture {
+    pub store: metal_auth::MongoStore,
+    pub guard: MongoTestGuard,
+}
+
+#[cfg(feature = "mongodb")]
+impl std::ops::Deref for MongoTestFixture {
+    type Target = metal_auth::MongoStore;
+
+    fn deref(&self) -> &Self::Target {
+        &self.store
+    }
+}
+
+#[cfg(feature = "mongodb")]
+impl MongoTestFixture {
+    pub fn new(store: metal_auth::MongoStore, guard: MongoTestGuard) -> Self {
+        Self { store, guard }
+    }
+
+    pub async fn teardown(&self) {
+        self.guard.drop_database().await;
+    }
 }
 
 /// Initializes a live MongoDB test app with the Argon2 floor and capturing email sender.
@@ -757,10 +879,7 @@ pub async fn setup_mongo_test_app() -> Option<TestApp> {
     if !url.starts_with("mongodb://") && !url.starts_with("mongodb+srv://") {
         return None;
     }
-    let base_db_name = std::env::var("MONGO_DATABASE")
-        .or_else(|_| std::env::var("MONGODB_DATABASE"))
-        .unwrap_or_else(|_| "metal_auth_test".to_string());
-    let db_name = format!("{}_{}", base_db_name, Uuid::new_v4().simple());
+    let db_name = mongo_test_database_name();
     let allow_standalone = std::env::var("MONGO_ALLOW_NON_TRANSACTIONAL_STANDALONE")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
@@ -789,14 +908,14 @@ pub async fn setup_mongo_test_app() -> Option<TestApp> {
         .expect("Failed to create mongo indexes for test app");
 
     let mongo_store =
-        metal_auth::MongoStore::new(client, &db_name, is_replica_set, allow_standalone);
+        metal_auth::MongoStore::new(client.clone(), &db_name, is_replica_set, allow_standalone);
     let store: Arc<dyn metal_auth::DatabaseStore> = Arc::new(mongo_store);
 
     let cfg = Config {
         database_url: url,
         backend: metal_auth::config::DatabaseBackend::Mongodb,
         mongo: Some(metal_auth::config::MongoConfig {
-            database_name: db_name,
+            database_name: db_name.clone(),
             allow_non_transactional_standalone: allow_standalone,
         }),
         port: 8080,
@@ -846,6 +965,7 @@ pub async fn setup_mongo_test_app() -> Option<TestApp> {
     )
     .ok()?;
     let router = metal_auth::handler::create_router(state.clone()).ok()?;
+    let guard = Arc::new(MongoTestGuard::new(client, db_name));
 
     Some(TestApp {
         router,
@@ -853,6 +973,7 @@ pub async fn setup_mongo_test_app() -> Option<TestApp> {
         state,
         email_sender,
         base_url: "https://example.com".into(),
+        mongo_guard: Some(guard),
     })
 }
 

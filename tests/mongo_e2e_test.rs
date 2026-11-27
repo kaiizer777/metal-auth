@@ -1,15 +1,18 @@
 #![cfg(feature = "mongodb")]
 
+mod common;
+
 use std::time::Duration;
 
 use chrono::Utc;
+use common::setup_mongo_test_app;
 use metal_auth::{
     AppError, DatabaseBackend, DatabaseStore, MongoStore, db::mongo::indexes::ensure_indexes,
 };
 use mongodb::{Client, bson::doc};
 use uuid::Uuid;
 
-async fn get_test_mongo_store() -> Option<MongoStore> {
+async fn get_test_mongo_store() -> Option<common::MongoTestFixture> {
     dotenvy::dotenv().ok();
     let url = std::env::var("MONGODB_URI")
         .or_else(|_| std::env::var("MONGODB_URL"))
@@ -19,12 +22,10 @@ async fn get_test_mongo_store() -> Option<MongoStore> {
     if !url.starts_with("mongodb://") && !url.starts_with("mongodb+srv://") {
         return None;
     }
-    let db_name = std::env::var("MONGO_DATABASE")
-        .or_else(|_| std::env::var("MONGODB_DATABASE"))
-        .unwrap_or_else(|_| "metal_auth_test".to_string());
+    let db_name = common::mongo_test_database_name();
     let allow_standalone = std::env::var("MONGO_ALLOW_NON_TRANSACTIONAL_STANDALONE")
         .map(|v| v == "true" || v == "1")
-        .unwrap_or(true);
+        .unwrap_or(false);
 
     let mut client_options = mongodb::options::ClientOptions::parse(&url).await.ok()?;
     client_options.connect_timeout = Some(Duration::from_secs(3));
@@ -33,18 +34,29 @@ async fn get_test_mongo_store() -> Option<MongoStore> {
     let db = client.database(&db_name);
     db.run_command(doc! { "ping": 1 }).await.ok()?;
 
-    ensure_indexes(&db).await.ok()?;
+    let hello_doc = db.run_command(doc! { "hello": 1 }).await.ok()?;
+    let is_replica_set = hello_doc.contains_key("setName")
+        || hello_doc
+            .get_str("msg")
+            .map(|m| m == "isdbgrid")
+            .unwrap_or(false);
 
-    let store = MongoStore::new(client, &db_name, false, allow_standalone);
-    Some(store)
+    ensure_indexes(&db)
+        .await
+        .expect("Failed to create mongo indexes for mongo e2e test store");
+
+    let store = MongoStore::new(client.clone(), &db_name, is_replica_set, allow_standalone);
+    let guard = common::MongoTestGuard::new(client, db_name);
+    Some(common::MongoTestFixture::new(store, guard))
 }
 
 #[tokio::test]
 async fn test_mongo_complete_auth_journey() {
-    let Some(store) = get_test_mongo_store().await else {
+    let Some(fixture) = get_test_mongo_store().await else {
         eprintln!("skipping test_mongo_complete_auth_journey: MONGODB_URI not set");
         return;
     };
+    let store = &fixture.store;
     assert_eq!(store.backend(), DatabaseBackend::Mongodb);
 
     let email = format!("mongo_journey_{}@example.com", Uuid::new_v4());
@@ -324,5 +336,164 @@ async fn test_mongo_complete_auth_journey() {
             .await
             .unwrap()
             .is_none()
+    );
+
+    // Drop isolated test database
+    fixture.teardown().await;
+}
+
+#[tokio::test]
+async fn test_mongo_http_and_service_journey() {
+    let Some(app) = setup_mongo_test_app().await else {
+        eprintln!("skipping test_mongo_http_and_service_journey: MONGODB_URI not set");
+        return;
+    };
+
+    // 1. Backend routing verification
+    assert_eq!(app.state.store().backend(), DatabaseBackend::Mongodb);
+
+    // 2. HTTP layer functionality
+    // 2a. Unauthenticated logout returns 204 No Content
+    let resp = app.post_empty("/auth/logout").await;
+    assert_eq!(resp.status(), axum::http::StatusCode::NO_CONTENT);
+
+    // 2b. Malformed signup returns 400 Bad Request with InvalidEmail
+    let resp = app
+        .post_json(
+            "/auth/signup",
+            serde_json::json!({
+                "email": "not-an-email",
+                "password": "short"
+            }),
+        )
+        .await;
+    assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(resp.error_code(), Some(metal_auth::ErrorCode::InvalidEmail));
+
+    // 2c. CORS preflight OPTIONS /auth/login
+    let req = axum::http::Request::builder()
+        .method(axum::http::Method::OPTIONS)
+        .uri("/auth/login")
+        .header(axum::http::header::ORIGIN, "https://app.example.com")
+        .header(axum::http::header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+        .body(axum::body::Body::empty())
+        .expect("build cors options request");
+    let resp = app.dispatch(req).await;
+    assert!(resp.status().is_success());
+    assert_eq!(
+        resp.header("access-control-allow-origin"),
+        Some("https://app.example.com")
+    );
+
+    // 2d. Fallback 404 Not Found
+    let req = axum::http::Request::builder()
+        .method(axum::http::Method::GET)
+        .uri("/nonexistent_route_404")
+        .body(axum::body::Body::empty())
+        .expect("build 404 request");
+    let resp = app.dispatch(req).await;
+    assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+
+    // 3. Outbox service integration
+    let store = app.state.store();
+    let email = format!("mongo_outbox_{}@example.com", Uuid::new_v4());
+    let payload = serde_json::json!({
+        "user_id": Uuid::new_v4(),
+        "to": email,
+        "token": "tok123",
+        "url": "https://example.com/verify?token=tok123",
+        "expires_at": Utc::now() + chrono::Duration::hours(24),
+    });
+    let outbox_entry = store
+        .outbox()
+        .insert_outbox(&email, "verification", payload)
+        .await
+        .expect("insert outbox entry in mongo store");
+    assert_eq!(outbox_entry.recipient, email);
+
+    // Flush through dispatcher
+    if let Some(dispatcher) = app.state.email_dispatcher.as_ref() {
+        let flushed = dispatcher
+            .flush_outbox()
+            .await
+            .expect("flush outbox via dispatcher");
+        assert!(flushed >= 1);
+        let mut delivered = false;
+        for _ in 0..20 {
+            let calls = app.email_sender.verification_calls();
+            if calls.iter().any(|c| c.to == email) {
+                delivered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            delivered,
+            "verification email delivery recorded for {email}"
+        );
+    }
+
+    // Explicit teardown of the test database created by setup_mongo_test_app
+    app.teardown_mongo().await;
+}
+
+#[test]
+fn test_mongo_database_name_bounded_and_sanitized() {
+    // 1. Long name bounded to at most 30 characters before suffix
+    let long_base = "a".repeat(100);
+    let bounded = common::sanitize_and_bound_mongo_db_name(&long_base);
+    assert_eq!(bounded.len(), 30);
+    assert_eq!(bounded, "a".repeat(30));
+
+    // 2. Full generated database name is strictly <= 63 bytes
+    let db_name = common::mongo_test_database_name();
+    assert!(
+        db_name.len() <= 63,
+        "database name exceeds 63 bytes: {} (len {})",
+        db_name,
+        db_name.len()
+    );
+
+    // 3. Characters forbidden by MongoDB are stripped
+    let dirty_base = "test/db.with$invalid:chars*?\\\" ";
+    let clean = common::sanitize_and_bound_mongo_db_name(dirty_base);
+    assert!(!clean.contains('/'));
+    assert!(!clean.contains('\\'));
+    assert!(!clean.contains('.'));
+    assert!(!clean.contains('"'));
+    assert!(!clean.contains('*'));
+    assert!(!clean.contains(':'));
+    assert!(!clean.contains('?'));
+    assert!(!clean.contains('$'));
+    assert!(!clean.contains(' '));
+
+    // 4. Empty base defaults to fallback
+    let empty = common::sanitize_and_bound_mongo_db_name("");
+    assert_eq!(empty, "metal_auth_test");
+
+    // 5. Multi-byte UTF-8 strings do not panic, truncate at valid char boundaries <= 30 bytes,
+    // and keep total database name length strictly <= 63 bytes with the 33-byte UUID suffix.
+    let multibyte_emoji = "🦀".repeat(20);
+    let bounded_emoji = common::sanitize_and_bound_mongo_db_name(&multibyte_emoji);
+    assert!(bounded_emoji.len() <= 30);
+    assert_eq!(bounded_emoji, "🦀".repeat(7)); // 7 * 4 = 28 bytes <= 30
+    assert_eq!(bounded_emoji.len(), 28);
+
+    let cjk_base = "データベース名_日本語_テスト";
+    let bounded_cjk = common::sanitize_and_bound_mongo_db_name(cjk_base);
+    assert!(bounded_cjk.len() <= 30);
+    assert_eq!(bounded_cjk, "データベース名_日本"); // Truncates cleanly before 語 at byte 28
+    assert_eq!(bounded_cjk.len(), 28);
+
+    let mixed_base = "🦀_auth_db_日本語_test_database_name_exceeding_length";
+    let bounded_mixed = common::sanitize_and_bound_mongo_db_name(mixed_base);
+    assert!(bounded_mixed.len() <= 30);
+
+    let full_name = format!("{}_{}", bounded_mixed, Uuid::new_v4().simple());
+    assert!(
+        full_name.len() <= 63,
+        "database name exceeds 63 bytes: {} (len {})",
+        full_name,
+        full_name.len()
     );
 }

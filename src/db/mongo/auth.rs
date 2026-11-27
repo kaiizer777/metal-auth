@@ -34,7 +34,7 @@ pub async fn create_user(
 ) -> Result<User, AppError> {
     let now = Utc::now();
     let id = Uuid::new_v4();
-    let normalized_email = email.to_lowercase();
+    let normalized_email = email.trim().to_lowercase();
 
     let doc = UserDoc {
         id: bson::Uuid::from(id),
@@ -79,7 +79,7 @@ pub async fn get_user_by_email(
     mut session: Option<&mut ClientSession>,
     email: &str,
 ) -> Result<Option<User>, AppError> {
-    let normalized = email.to_lowercase();
+    let normalized = email.trim().to_lowercase();
     let filter = doc! { "email": normalized };
     let collation = Collation::builder()
         .locale("en")

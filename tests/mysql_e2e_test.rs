@@ -1,8 +1,11 @@
 #![cfg(feature = "mysql")]
 
+mod common;
+
 use std::time::Duration;
 
 use chrono::Utc;
+use common::setup_mysql_test_app;
 use metal_auth::{
     AppError, DatabaseBackend, DatabaseStore, MySqlStore,
     db::{DbPoolOptions, init_mysql_pool_with_options},
@@ -316,4 +319,96 @@ async fn test_mysql_complete_auth_journey() {
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn test_mysql_http_and_service_journey() {
+    let Some(app) = setup_mysql_test_app().await else {
+        eprintln!("skipping test_mysql_http_and_service_journey: MYSQL_DATABASE_URL not set");
+        return;
+    };
+
+    // 1. Backend routing verification
+    assert_eq!(app.state.store().backend(), DatabaseBackend::Mysql);
+
+    // 2. HTTP layer functionality
+    // 2a. Unauthenticated logout returns 204 No Content
+    let resp = app.post_empty("/auth/logout").await;
+    assert_eq!(resp.status(), axum::http::StatusCode::NO_CONTENT);
+
+    // 2b. Malformed signup returns 400 Bad Request with InvalidEmail
+    let resp = app
+        .post_json(
+            "/auth/signup",
+            serde_json::json!({
+                "email": "not-an-email",
+                "password": "short"
+            }),
+        )
+        .await;
+    assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(resp.error_code(), Some(metal_auth::ErrorCode::InvalidEmail));
+
+    // 2c. CORS preflight OPTIONS /auth/login
+    let req = axum::http::Request::builder()
+        .method(axum::http::Method::OPTIONS)
+        .uri("/auth/login")
+        .header(axum::http::header::ORIGIN, "https://app.example.com")
+        .header(axum::http::header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+        .body(axum::body::Body::empty())
+        .expect("build cors options request");
+    let resp = app.dispatch(req).await;
+    assert!(resp.status().is_success());
+    assert_eq!(
+        resp.header("access-control-allow-origin"),
+        Some("https://app.example.com")
+    );
+
+    // 2d. Fallback 404 Not Found
+    let req = axum::http::Request::builder()
+        .method(axum::http::Method::GET)
+        .uri("/nonexistent_route_404")
+        .body(axum::body::Body::empty())
+        .expect("build 404 request");
+    let resp = app.dispatch(req).await;
+    assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+
+    // 3. Outbox service integration
+    let store = app.state.store();
+    let email = format!("mysql_outbox_{}@example.com", Uuid::new_v4());
+    let payload = serde_json::json!({
+        "user_id": Uuid::new_v4(),
+        "to": email,
+        "token": "tok123",
+        "url": "https://example.com/verify?token=tok123",
+        "expires_at": Utc::now() + chrono::Duration::hours(24),
+    });
+    let outbox_entry = store
+        .outbox()
+        .insert_outbox(&email, "verification", payload)
+        .await
+        .expect("insert outbox entry in mysql store");
+    assert_eq!(outbox_entry.recipient, email);
+
+    // Flush through dispatcher
+    if let Some(dispatcher) = app.state.email_dispatcher.as_ref() {
+        let flushed = dispatcher
+            .flush_outbox()
+            .await
+            .expect("flush outbox via dispatcher");
+        assert!(flushed >= 1);
+        let mut delivered = false;
+        for _ in 0..20 {
+            let calls = app.email_sender.verification_calls();
+            if calls.iter().any(|c| c.to == email) {
+                delivered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            delivered,
+            "verification email delivery recorded for {email}"
+        );
+    }
 }

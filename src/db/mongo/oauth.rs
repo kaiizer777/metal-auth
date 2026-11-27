@@ -91,7 +91,7 @@ pub async fn link_account(
         user_id: bson::Uuid::from(user_id),
         provider_id: provider_id.to_string(),
         provider_user_id: provider_user_id.to_string(),
-        email: email.to_string(),
+        email: email.trim().to_lowercase(),
         created_at: BsonDateTime::from_chrono(now),
         updated_at: BsonDateTime::from_chrono(now),
     };

@@ -265,6 +265,8 @@ pub struct TestApp {
     pub state: AppState,
     pub email_sender: Arc<CapturingEmailSender>,
     pub base_url: String,
+    #[cfg(feature = "mongodb")]
+    pub mongo_guard: Option<Arc<MongoTestGuard>>,
 }
 
 impl TestApp {
@@ -337,6 +339,15 @@ impl TestApp {
     /// Convenience truncation helper using the test app's pool.
     pub async fn truncate(&self) -> Result<(), sqlx::Error> {
         truncate_tables(&self.pool).await
+    }
+
+    /// Explicitly drops the isolated test MongoDB database if this [`TestApp`] was
+    /// initialized via [`setup_mongo_test_app`].
+    #[cfg(feature = "mongodb")]
+    pub async fn teardown_mongo(&self) {
+        if let Some(guard) = &self.mongo_guard {
+            guard.drop_database().await;
+        }
     }
 }
 
@@ -641,6 +652,331 @@ async fn setup_test_app_with_auth_config_and(
         state,
         email_sender,
         base_url: "https://example.com".into(),
+        #[cfg(feature = "mongodb")]
+        mongo_guard: None,
+    })
+}
+
+/// Initializes a live MySQL test app with the Argon2 floor and capturing email sender.
+/// Returns `None` if `MYSQL_DATABASE_URL` (or `MYSQL_URL`) is unset or unreachable.
+///
+/// # Note on `app.pool`
+/// The returned [`TestApp::pool`] contains an unreachable PostgreSQL mock/placeholder
+/// pool rather than the live MySQL pool. For database operations, tests and callers must
+/// use [`app.state.store()`] or [`TestApp::state`]'s store rather than `app.pool` (which
+/// will fail on any query).
+#[cfg(feature = "mysql")]
+pub async fn setup_mysql_test_app() -> Option<TestApp> {
+    if std::env::var("TEST_SKIP_DOTENV").is_err() {
+        dotenvy::dotenv().ok();
+    }
+    let url = std::env::var("MYSQL_DATABASE_URL")
+        .or_else(|_| std::env::var("MYSQL_URL"))
+        .ok()?;
+    if !url.starts_with("mysql://") {
+        return None;
+    }
+
+    let opts = metal_auth::db::DbPoolOptions {
+        max_connections: TEST_POOL_MAX_CONNECTIONS,
+        min_connections: 1,
+        acquire_timeout: Duration::from_secs(3),
+        max_retries: 1,
+        ..Default::default()
+    };
+    let pool = metal_auth::db::init_mysql_pool_with_options(&url, opts)
+        .await
+        .ok()?;
+    let store: Arc<dyn metal_auth::DatabaseStore> = Arc::new(metal_auth::MySqlStore::new(pool));
+
+    let cfg = Config {
+        database_url: url,
+        backend: metal_auth::config::DatabaseBackend::Mysql,
+        mongo: None,
+        port: 8080,
+        allowed_origins: vec!["https://app.example.com".into()],
+        allowed_methods: vec!["GET".into(), "POST".into(), "OPTIONS".into()],
+        allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
+        max_connections: TEST_POOL_MAX_CONNECTIONS,
+        min_connections: 1,
+        base_url: "https://example.com".into(),
+        email_dispatch_timeout: Duration::from_secs(10),
+        async_email_dispatch: true,
+        outbox_poll_interval: Duration::from_millis(50),
+        outbox_batch_size: 50,
+        outbox_max_retries: 5,
+        outbox_initial_backoff: Duration::from_secs(1),
+        outbox_max_backoff: Duration::from_secs(300),
+        outbox_sent_retention: Duration::from_secs(7 * 24 * 3600),
+        session: metal_auth::SessionConfig::default(),
+        rate_limit: metal_auth::RateLimitConfig::default(),
+        oauth: metal_auth::OAuthConfig::default(),
+        totp: metal_auth::TotpConfig {
+            encryption_key: Some("00".repeat(32)),
+            ..metal_auth::TotpConfig::default()
+        },
+    };
+
+    // Note: TestApp requires a PgPool, so non-PostgreSQL backend fixtures provide an
+    // unreachable placeholder pool. Callers must use app.state.store() instead of app.pool.
+    let placeholder_pool =
+        sqlx::PgPool::connect_lazy("postgres://metal-auth-placeholder.invalid:1/placeholder")
+            .expect("lazy placeholder pool");
+    let email_sender = Arc::new(CapturingEmailSender::new());
+    let dispatcher = Arc::new(
+        EmailDispatcher::new_blocking(
+            Some(Arc::clone(&email_sender) as metal_auth::SharedEmailSender),
+            Duration::from_secs(10),
+        )
+        .with_base_url("https://example.com"),
+    );
+
+    let state = AppState::with_configs_dispatcher_and_store(
+        placeholder_pool.clone(),
+        cfg,
+        Arc::new(test_auth_config()),
+        Some(dispatcher),
+        store,
+    )
+    .ok()?;
+    let router = metal_auth::handler::create_router(state.clone()).ok()?;
+
+    Some(TestApp {
+        router,
+        pool: placeholder_pool,
+        state,
+        email_sender,
+        base_url: "https://example.com".into(),
+        #[cfg(feature = "mongodb")]
+        mongo_guard: None,
+    })
+}
+
+/// Sanitizes and bounds a MongoDB database base name before appending a unique suffix.
+pub fn sanitize_and_bound_mongo_db_name(base: &str) -> String {
+    let mut sanitized: String = base
+        .chars()
+        .filter(|c| {
+            !matches!(
+                c,
+                '/' | '\\' | '.' | '"' | '*' | '<' | '>' | ':' | '|' | '?' | '$' | '\0' | ' '
+            )
+        })
+        .collect();
+    if sanitized.is_empty() {
+        sanitized = "metal_auth_test".to_string();
+    }
+    let boundary = sanitized.floor_char_boundary(30);
+    sanitized.truncate(boundary);
+    if sanitized.is_empty() {
+        sanitized = "metal_auth_test".to_string();
+    }
+    sanitized
+}
+
+/// Derives an isolated, bounded database name for MongoDB test fixtures.
+///
+/// MongoDB limits database names to strictly less than 64 bytes (maximum 63 bytes).
+/// Appending a 32-character simple UUID suffix (`_` + 32 chars = 33 chars) requires
+/// bounding the sanitized base name to at most 30 bytes so the total length
+/// never exceeds 63 bytes.
+pub fn mongo_test_database_name() -> String {
+    let base = std::env::var("MONGO_DATABASE")
+        .or_else(|_| std::env::var("MONGODB_DATABASE"))
+        .unwrap_or_else(|_| "metal_auth_test".to_string());
+    let prefix = sanitize_and_bound_mongo_db_name(&base);
+    let mut name = format!("{}_{}", prefix, Uuid::new_v4().simple());
+    let boundary = name.floor_char_boundary(63);
+    name.truncate(boundary);
+    name
+}
+
+/// RAII fixture guard that drops an isolated test MongoDB database when dropped or explicitly torn down.
+#[cfg(feature = "mongodb")]
+#[derive(Debug)]
+pub struct MongoTestGuard {
+    client: mongodb::Client,
+    database_name: std::sync::Mutex<Option<String>>,
+}
+
+#[cfg(feature = "mongodb")]
+impl MongoTestGuard {
+    pub fn new(client: mongodb::Client, database_name: impl Into<String>) -> Self {
+        Self {
+            client,
+            database_name: std::sync::Mutex::new(Some(database_name.into())),
+        }
+    }
+
+    pub fn database_name(&self) -> Option<String> {
+        self.database_name.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Explicitly drops the test database asynchronously.
+    pub async fn drop_database(&self) {
+        let db_name = self.database_name.lock().ok().and_then(|mut g| g.take());
+        if let Some(name) = db_name {
+            let _ = self.client.database(&name).drop().await;
+        }
+    }
+}
+
+#[cfg(feature = "mongodb")]
+impl Drop for MongoTestGuard {
+    fn drop(&mut self) {
+        if let Some(name) = self.database_name.lock().ok().and_then(|mut g| g.take()) {
+            let client = self.client.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = client.database(&name).drop().await;
+                });
+            }
+        }
+    }
+}
+
+/// Convenience test fixture wrapping a [`metal_auth::MongoStore`] and its [`MongoTestGuard`].
+#[cfg(feature = "mongodb")]
+pub struct MongoTestFixture {
+    pub store: metal_auth::MongoStore,
+    pub guard: MongoTestGuard,
+}
+
+#[cfg(feature = "mongodb")]
+impl std::ops::Deref for MongoTestFixture {
+    type Target = metal_auth::MongoStore;
+
+    fn deref(&self) -> &Self::Target {
+        &self.store
+    }
+}
+
+#[cfg(feature = "mongodb")]
+impl MongoTestFixture {
+    pub fn new(store: metal_auth::MongoStore, guard: MongoTestGuard) -> Self {
+        Self { store, guard }
+    }
+
+    pub async fn teardown(&self) {
+        self.guard.drop_database().await;
+    }
+}
+
+/// Initializes a live MongoDB test app with the Argon2 floor and capturing email sender.
+/// Returns `None` if `MONGODB_URI` (or `MONGODB_URL` / `MONGO_URL`) is unset or unreachable.
+///
+/// # Note on `app.pool`
+/// The returned [`TestApp::pool`] contains an unreachable PostgreSQL mock/placeholder
+/// pool rather than the live MongoDB pool. For database operations, tests and callers must
+/// use [`app.state.store()`] or [`TestApp::state`]'s store rather than `app.pool` (which
+/// will fail on any query). Each call uses an isolated database name to prevent race conditions.
+#[cfg(feature = "mongodb")]
+pub async fn setup_mongo_test_app() -> Option<TestApp> {
+    if std::env::var("TEST_SKIP_DOTENV").is_err() {
+        dotenvy::dotenv().ok();
+    }
+    let url = std::env::var("MONGODB_URI")
+        .or_else(|_| std::env::var("MONGODB_URL"))
+        .or_else(|_| std::env::var("MONGO_URL"))
+        .ok()?;
+    if !url.starts_with("mongodb://") && !url.starts_with("mongodb+srv://") {
+        return None;
+    }
+    let db_name = mongo_test_database_name();
+    let allow_standalone = std::env::var("MONGO_ALLOW_NON_TRANSACTIONAL_STANDALONE")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    let mut client_options = mongodb::options::ClientOptions::parse(&url).await.ok()?;
+    client_options.connect_timeout = Some(Duration::from_secs(3));
+    client_options.server_selection_timeout = Some(Duration::from_secs(3));
+    let client = mongodb::Client::with_options(client_options).ok()?;
+    let db = client.database(&db_name);
+    db.run_command(mongodb::bson::doc! { "ping": 1 })
+        .await
+        .ok()?;
+
+    let hello_doc = db
+        .run_command(mongodb::bson::doc! { "hello": 1 })
+        .await
+        .ok()?;
+    let is_replica_set = hello_doc.contains_key("setName")
+        || hello_doc
+            .get_str("msg")
+            .map(|m| m == "isdbgrid")
+            .unwrap_or(false);
+
+    metal_auth::db::mongo::indexes::ensure_indexes(&db)
+        .await
+        .expect("Failed to create mongo indexes for test app");
+
+    let mongo_store =
+        metal_auth::MongoStore::new(client.clone(), &db_name, is_replica_set, allow_standalone);
+    let store: Arc<dyn metal_auth::DatabaseStore> = Arc::new(mongo_store);
+
+    let cfg = Config {
+        database_url: url,
+        backend: metal_auth::config::DatabaseBackend::Mongodb,
+        mongo: Some(metal_auth::config::MongoConfig {
+            database_name: db_name.clone(),
+            allow_non_transactional_standalone: allow_standalone,
+        }),
+        port: 8080,
+        allowed_origins: vec!["https://app.example.com".into()],
+        allowed_methods: vec!["GET".into(), "POST".into(), "OPTIONS".into()],
+        allowed_headers: vec!["Authorization".into(), "Content-Type".into()],
+        max_connections: TEST_POOL_MAX_CONNECTIONS,
+        min_connections: 1,
+        base_url: "https://example.com".into(),
+        email_dispatch_timeout: Duration::from_secs(10),
+        async_email_dispatch: true,
+        outbox_poll_interval: Duration::from_millis(50),
+        outbox_batch_size: 50,
+        outbox_max_retries: 5,
+        outbox_initial_backoff: Duration::from_secs(1),
+        outbox_max_backoff: Duration::from_secs(300),
+        outbox_sent_retention: Duration::from_secs(7 * 24 * 3600),
+        session: metal_auth::SessionConfig::default(),
+        rate_limit: metal_auth::RateLimitConfig::default(),
+        oauth: metal_auth::OAuthConfig::default(),
+        totp: metal_auth::TotpConfig {
+            encryption_key: Some("00".repeat(32)),
+            ..metal_auth::TotpConfig::default()
+        },
+    };
+
+    // Note: TestApp requires a PgPool, so non-PostgreSQL backend fixtures provide an
+    // unreachable placeholder pool. Callers must use app.state.store() instead of app.pool.
+    let placeholder_pool =
+        sqlx::PgPool::connect_lazy("postgres://metal-auth-placeholder.invalid:1/placeholder")
+            .expect("lazy placeholder pool");
+    let email_sender = Arc::new(CapturingEmailSender::new());
+    let dispatcher = Arc::new(
+        EmailDispatcher::new_blocking(
+            Some(Arc::clone(&email_sender) as metal_auth::SharedEmailSender),
+            Duration::from_secs(10),
+        )
+        .with_base_url("https://example.com"),
+    );
+
+    let state = AppState::with_configs_dispatcher_and_store(
+        placeholder_pool.clone(),
+        cfg,
+        Arc::new(test_auth_config()),
+        Some(dispatcher),
+        store,
+    )
+    .ok()?;
+    let router = metal_auth::handler::create_router(state.clone()).ok()?;
+    let guard = Arc::new(MongoTestGuard::new(client, db_name));
+
+    Some(TestApp {
+        router,
+        pool: placeholder_pool,
+        state,
+        email_sender,
+        base_url: "https://example.com".into(),
+        mongo_guard: Some(guard),
     })
 }
 

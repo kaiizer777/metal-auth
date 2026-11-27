@@ -864,14 +864,16 @@ async fn get_mongo_store() -> Option<metal_auth::MongoStore> {
         .unwrap_or_else(|_| "metal_auth_test".to_string());
     let allow_standalone = std::env::var("MONGO_ALLOW_NON_TRANSACTIONAL_STANDALONE")
         .map(|v| v == "true" || v == "1")
-        .unwrap_or(true);
+        .unwrap_or(false);
 
     let mut client_options = mongodb::options::ClientOptions::parse(&url).await.ok()?;
     client_options.connect_timeout = Some(Duration::from_secs(3));
     client_options.server_selection_timeout = Some(Duration::from_secs(3));
     let client = mongodb::Client::with_options(client_options).ok()?;
     let db = client.database(&db_name);
-    db.run_command(mongodb::bson::doc! { "ping": 1 }).await.ok()?;
+    db.run_command(mongodb::bson::doc! { "ping": 1 })
+        .await
+        .ok()?;
 
     let hello_doc = db
         .run_command(mongodb::bson::doc! { "hello": 1 })
@@ -929,9 +931,7 @@ mod mongo_contract_tests {
     #[tokio::test]
     async fn test_mongo_two_factor_token_round_trip() {
         let Some(store) = get_mongo_store().await else {
-            eprintln!(
-                "skipping test_mongo_two_factor_token_round_trip: MONGODB_URI not set"
-            );
+            eprintln!("skipping test_mongo_two_factor_token_round_trip: MONGODB_URI not set");
             return;
         };
         assert_two_factor_token_round_trip(&store).await;
@@ -949,9 +949,7 @@ mod mongo_contract_tests {
     #[tokio::test]
     async fn test_mongo_transaction_commit_and_rollback() {
         let Some(store) = get_mongo_store().await else {
-            eprintln!(
-                "skipping test_mongo_transaction_commit_and_rollback: MONGODB_URI not set"
-            );
+            eprintln!("skipping test_mongo_transaction_commit_and_rollback: MONGODB_URI not set");
             return;
         };
         assert_transaction_commit_and_rollback(&store).await;
@@ -969,9 +967,7 @@ mod mongo_contract_tests {
     #[tokio::test]
     async fn test_mongo_totp_upsert_enabled_row_rejected() {
         let Some(store) = get_mongo_store().await else {
-            eprintln!(
-                "skipping test_mongo_totp_upsert_enabled_row_rejected: MONGODB_URI not set"
-            );
+            eprintln!("skipping test_mongo_totp_upsert_enabled_row_rejected: MONGODB_URI not set");
             return;
         };
         assert_totp_upsert_enabled_row_rejected(&store).await;

@@ -748,14 +748,16 @@ pub async fn setup_mongo_test_app() -> Option<TestApp> {
         .unwrap_or_else(|_| "metal_auth_test".to_string());
     let allow_standalone = std::env::var("MONGO_ALLOW_NON_TRANSACTIONAL_STANDALONE")
         .map(|v| v == "true" || v == "1")
-        .unwrap_or(true);
+        .unwrap_or(false);
 
     let mut client_options = mongodb::options::ClientOptions::parse(&url).await.ok()?;
     client_options.connect_timeout = Some(Duration::from_secs(3));
     client_options.server_selection_timeout = Some(Duration::from_secs(3));
     let client = mongodb::Client::with_options(client_options).ok()?;
     let db = client.database(&db_name);
-    db.run_command(mongodb::bson::doc! { "ping": 1 }).await.ok()?;
+    db.run_command(mongodb::bson::doc! { "ping": 1 })
+        .await
+        .ok()?;
 
     let hello_doc = db
         .run_command(mongodb::bson::doc! { "hello": 1 })

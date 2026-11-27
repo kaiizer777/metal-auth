@@ -40,8 +40,7 @@ impl tracing::field::Visit for StringVisitor {
 #[test]
 fn test_security_zero_leak_log_audit() {
     use metal_auth::auth::{
-        LoginRequest, LoginResponse, PasswordResetConfirmRequest, SignupRequest,
-        VerifyEmailRequest,
+        LoginRequest, LoginResponse, PasswordResetConfirmRequest, SignupRequest, VerifyEmailRequest,
     };
     use tracing_subscriber::layer::SubscriberExt;
     use uuid::Uuid;

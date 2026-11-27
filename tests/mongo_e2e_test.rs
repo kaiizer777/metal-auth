@@ -27,7 +27,7 @@ async fn get_test_mongo_store() -> Option<MongoStore> {
         .unwrap_or_else(|_| "metal_auth_test".to_string());
     let allow_standalone = std::env::var("MONGO_ALLOW_NON_TRANSACTIONAL_STANDALONE")
         .map(|v| v == "true" || v == "1")
-        .unwrap_or(true);
+        .unwrap_or(false);
 
     let mut client_options = mongodb::options::ClientOptions::parse(&url).await.ok()?;
     client_options.connect_timeout = Some(Duration::from_secs(3));
@@ -352,7 +352,7 @@ async fn test_mongo_http_and_service_journey() {
     let resp = app.post_empty("/auth/logout").await;
     assert_eq!(resp.status(), axum::http::StatusCode::NO_CONTENT);
 
-    // 2b. Malformed signup returns 400 Bad Request with ValidationError
+    // 2b. Malformed signup returns 400 Bad Request with InvalidEmail
     let resp = app
         .post_json(
             "/auth/signup",
@@ -363,10 +363,7 @@ async fn test_mongo_http_and_service_journey() {
         )
         .await;
     assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
-    assert_eq!(
-        resp.error_code(),
-        Some(metal_auth::ErrorCode::ValidationError)
-    );
+    assert_eq!(resp.error_code(), Some(metal_auth::ErrorCode::InvalidEmail));
 
     // 2c. CORS preflight OPTIONS /auth/login
     let req = axum::http::Request::builder()

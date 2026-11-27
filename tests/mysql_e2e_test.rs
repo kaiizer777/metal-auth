@@ -336,7 +336,7 @@ async fn test_mysql_http_and_service_journey() {
     let resp = app.post_empty("/auth/logout").await;
     assert_eq!(resp.status(), axum::http::StatusCode::NO_CONTENT);
 
-    // 2b. Malformed signup returns 400 Bad Request with ValidationError
+    // 2b. Malformed signup returns 400 Bad Request with InvalidEmail
     let resp = app
         .post_json(
             "/auth/signup",
@@ -347,10 +347,7 @@ async fn test_mysql_http_and_service_journey() {
         )
         .await;
     assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
-    assert_eq!(
-        resp.error_code(),
-        Some(metal_auth::ErrorCode::ValidationError)
-    );
+    assert_eq!(resp.error_code(), Some(metal_auth::ErrorCode::InvalidEmail));
 
     // 2c. CORS preflight OPTIONS /auth/login
     let req = axum::http::Request::builder()

@@ -87,6 +87,80 @@ async fn test_keyed_config_serves_the_totp_verification_route() {
     assert_eq!(err_envelope.code, ErrorCode::ValidationError);
 }
 
+#[cfg(any(feature = "mysql", feature = "mongodb"))]
+fn non_postgres_router_config(backend: metal_auth::DatabaseBackend, database_url: &str) -> Config {
+    let mut cfg = test_config();
+    cfg.database_url = database_url.into();
+    cfg.backend = backend;
+    cfg.mongo = Some(metal_auth::MongoConfig {
+        database_name: "metal_auth_test".into(),
+        allow_non_transactional_standalone: true,
+    });
+    cfg
+}
+
+#[cfg(any(feature = "mysql", feature = "mongodb"))]
+async fn served_totp_verify_status(auth: &mut Auth) -> StatusCode {
+    let req = Request::builder()
+        .uri("/auth/totp/verify")
+        .method(Method::POST)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::empty())
+        .unwrap();
+    auth.router.call(req).await.unwrap().status()
+}
+
+#[cfg(feature = "mysql")]
+#[tokio::test]
+async fn mysql_store_builds_router() {
+    let pool = sqlx::MySqlPool::connect_lazy("mysql://user:pass@localhost:3306/metal_auth_test")
+        .expect("lazy mysql pool");
+    let store: std::sync::Arc<dyn metal_auth::DatabaseStore> =
+        std::sync::Arc::new(metal_auth::MySqlStore::new(pool));
+    let state = AppState::new_with_store(
+        store,
+        non_postgres_router_config(
+            metal_auth::DatabaseBackend::Mysql,
+            "mysql://user:pass@localhost:3306/metal_auth_test",
+        ),
+    )
+    .expect("mysql state without connecting");
+    assert_eq!(state.store().backend(), metal_auth::DatabaseBackend::Mysql);
+    let mut auth = Auth::from_state(state).expect("mysql config builds the app");
+    assert_eq!(
+        served_totp_verify_status(&mut auth).await,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[cfg(feature = "mongodb")]
+#[tokio::test]
+async fn mongo_store_builds_router() {
+    let client = mongodb::Client::with_uri_str("mongodb://localhost:27017/metal_auth_test")
+        .await
+        .expect("mongo client construction");
+    let store: std::sync::Arc<dyn metal_auth::DatabaseStore> = std::sync::Arc::new(
+        metal_auth::MongoStore::new(client, "metal_auth_test", false, true),
+    );
+    let state = AppState::new_with_store(
+        store,
+        non_postgres_router_config(
+            metal_auth::DatabaseBackend::Mongodb,
+            "mongodb://localhost:27017/metal_auth_test",
+        ),
+    )
+    .expect("mongo state without connecting");
+    assert_eq!(
+        state.store().backend(),
+        metal_auth::DatabaseBackend::Mongodb
+    );
+    let mut auth = Auth::from_state(state).expect("mongo config builds the app");
+    assert_eq!(
+        served_totp_verify_status(&mut auth).await,
+        StatusCode::BAD_REQUEST
+    );
+}
+
 #[tokio::test]
 async fn test_auth_facade_and_router_boot() {
     let cfg = test_config();

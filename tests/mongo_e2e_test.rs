@@ -392,13 +392,16 @@ async fn test_mongo_http_and_service_journey() {
     // 3. Outbox service integration
     let store = app.state.store();
     let email = format!("mongo_outbox_{}@example.com", Uuid::new_v4());
+    let payload = serde_json::json!({
+        "user_id": Uuid::new_v4(),
+        "to": email,
+        "token": "tok123",
+        "url": "https://example.com/verify?token=tok123",
+        "expires_at": Utc::now() + chrono::Duration::hours(24),
+    });
     let outbox_entry = store
         .outbox()
-        .insert_outbox(
-            &email,
-            "verification",
-            serde_json::json!({"action": "verify", "email": email}),
-        )
+        .insert_outbox(&email, "verification", payload)
         .await
         .expect("insert outbox entry in mongo store");
     assert_eq!(outbox_entry.recipient, email);
@@ -410,7 +413,18 @@ async fn test_mongo_http_and_service_journey() {
             .await
             .expect("flush outbox via dispatcher");
         assert!(flushed >= 1);
-        let calls = app.email_sender.verification_calls();
-        assert!(calls.iter().any(|c| c.to == email));
+        let mut delivered = false;
+        for _ in 0..20 {
+            let calls = app.email_sender.verification_calls();
+            if calls.iter().any(|c| c.to == email) {
+                delivered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            delivered,
+            "verification email delivery recorded for {email}"
+        );
     }
 }

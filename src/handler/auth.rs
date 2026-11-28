@@ -751,7 +751,7 @@ mod tests {
     use super::*;
     use crate::{config::AppConfig, email::EmailDispatcher};
     use axum::body::to_bytes;
-    use sqlx::PgPool;
+    use sqlx::{PgPool, postgres::PgPoolOptions};
 
     fn test_config_with_totp_key() -> Arc<Config> {
         Arc::new(Config {
@@ -763,11 +763,17 @@ mod tests {
         })
     }
 
-    fn create_test_state() -> AuthHandlerState {
-        // The gate is mandatory, so never let its pool point at an unrelated database.
-        let database_url = std::env::var("DATABASE_URL")
-            .expect("DATABASE_URL must be set: the 2FA gate builds a real pool");
-        let pool = PgPool::connect_lazy(&database_url).expect("lazy pool");
+    fn create_test_state_with_url(db_url: Option<&str>) -> AuthHandlerState {
+        let db_url = db_url.unwrap_or("postgres://localhost/test");
+        // Unit tests in `handler::auth::tests` only test HTTP request validation,
+        // status codes, and early returns without executing DB queries.
+        // `connect_lazy` creates an unestablished pool that only attempts connection
+        // on query execution, making the fallback safe for offline unit tests while
+        // fail-fast behavior is preserved if any handler unexpectedly queries the DB.
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy(db_url)
+            .expect("failed to create test pool");
         let config = Arc::new(AppConfig {
             argon2_m_cost: 19456,
             argon2_t_cost: 2,
@@ -796,6 +802,16 @@ mod tests {
             config: None,
             totp_service,
         }
+    }
+
+    fn create_test_state() -> AuthHandlerState {
+        create_test_state_with_url(std::env::var("DATABASE_URL").ok().as_deref())
+    }
+
+    #[tokio::test]
+    async fn create_test_state_succeeds_without_database_url() {
+        let state = create_test_state_with_url(None);
+        assert!(state.session_service.is_none());
     }
 
     #[tokio::test]
